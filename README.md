@@ -36,7 +36,7 @@ Tiered Recovery Model:
 
 🛠 Prerequisites
 
-  - Ansible Manager: A dedicated LXC (e.g., Debian 12, VMID 121) with a static
+  - Ansible Manager: A dedicated LXC (e.g., Debian 13, VMID 121) with a static
     IP.
   - SSH Trust: Passwordless SSH keys distributed from the Manager to all Proxmox
     Nodes (ssh-copy-id).
@@ -92,31 +92,37 @@ explanation of its sections:
 
 🚀 Setup Instructions
 
-1.  Install Dependencies (on Manager LXC):
-    apt update && apt install -y ansible python3-pip python3-proxmoxer git
+1.  Prepare the Manager LXC (Debian 12+):
+    apt update && apt install -y git python3-venv
+    python3 -m venv venv
+    source venv/bin/activate
+    pip install --upgrade pip
+    pip install ansible proxmoxer
+
+2.  Install Ansible Collections:
     ansible-galaxy collection install community.proxmox
-2.  Define Nodes in hosts.ini:
-    [proxmox_nodes]
-    pve-01 ansible_host=10.10.10.10
-    pve-02 ansible_host=10.10.10.11
-3.  Run the Fleet Update:
-    ansible-playbook fleet-update.yml
+
+3.  Configure:
+    Edit `hosts.ini` to add your PVE nodes and `vars.yml` to populate credentials.
+
+4.  Run the Fleet Update:
+    ansible-playbook -i hosts.ini fleet-update.yml
 
 🏃 Usage
 
 Manual Fleet Run (With Notification)
 
-ansible-playbook fleet-update.yml -e "force_notify=true"
+ansible-playbook -i hosts.ini fleet-update.yml -e "force_notify=true"
 
 Dry Run (Simulation)
 
-ansible-playbook fleet-update.yml --check -e "force_notify=true"
+ansible-playbook -i hosts.ini fleet-update.yml --check -e "force_notify=true"
 
 Automated Schedule (Cron)
 
 Add this to the Manager LXC's crontab -e to run at 4:00 AM daily:
 
-0 4 * * * cd /root/proxmox-management && /usr/bin/ansible-playbook fleet-update.yml
+0 4 * * * cd /root/proxmox-management && /usr/bin/ansible-playbook fleet-update.yml >> /var/log/ansible-fleet-update.log 2>&1
 
 📡 Discord Briefing Format
 
