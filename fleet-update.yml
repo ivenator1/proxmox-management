@@ -1,0 +1,160 @@
+---
+# =========================================
+# PHASE 1: Update all LXCs
+# =========================================
+- name: "Phase 1: Update All LXCs"
+  hosts: proxmox_nodes
+  serial: 2
+  gather_facts: no
+  vars_files: [vars.yml]
+  tasks:
+    - name: "Get list of LXCs"
+      shell: pct list | awk 'NR>1 {print $1}'
+      register: lxc_list
+      check_mode: false
+      changed_when: false
+
+    - name: "Update LXCs"
+      include_tasks: update_individual_lxc.yml
+      loop: "{{ lxc_list.stdout_lines }}"
+      loop_control:
+        loop_var: lxc_id
+      when: lxc_id not in (exclude_list | default([]))
+
+# ============================================
+# PHASE 2: Update Nodes and reboot if needed
+# ============================================
+- name: "Phase 2: Node Updates & Reboots"
+  hosts: proxmox_nodes
+  serial: 1
+  any_errors_fatal: true
+  vars_files: [vars.yml]
+  tasks:
+    - name: "Node Maintenance Block"
+      block:
+        - name: "Identify if this is the Manager Host"
+          shell: "pct list | grep -q '^{{ manager_lxc_id }} ' && echo 'yes' || echo 'no'"
+          register: is_manager_host
+          changed_when: false
+
+        - name: "Update Host OS"
+          apt: { upgrade: dist, update_cache: yes, autoremove: yes }
+          register: host_apt
+          changed_when: "'0 upgraded, 0 newly installed' not in host_apt.stdout"
+
+        - name: "Robust Reboot Check"
+          shell: |
+            RUNNING=$(uname -r); LATEST=$(ls -1 /boot/vmlinuz-* | sort -V | tail -n 1 | sed 's|.*vmlinuz-||')
+            [ -f /var/run/reboot-required ] || [ "$RUNNING" != "$LATEST" ] && echo "reboot" || echo "ok"
+          register: reboot_decision
+          changed_when: false
+
+        - name: "Reboot Node"
+          reboot: 
+            reboot_timeout: 900
+            post_reboot_delay: 30 # Give it 30s extra before checking anything else
+          when: 
+            - "'reboot' in reboot_decision.stdout"
+            - "'yes' not in is_manager_host.stdout"
+          register: node_reboot
+
+        # --- NEW: Wait for the Proxy to be alive if we just rebooted Carter ---
+        - name: "Wait for Apt Proxy to be Ready"
+          wait_for:
+            host: "{{ apt_proxy_ip }}"
+            port: "{{ apt_proxy_port }}"
+            state: started
+            timeout: 300
+          delegate_to: localhost
+          when: node_reboot.changed
+
+        - name: "Calculate Node Status Fact"
+          set_fact:
+            node_status_str: >-
+              {% if node_reboot is defined and node_reboot.changed %}UPDATED & REBOOTED
+              {% elif 'reboot' in reboot_decision.stdout and 'yes' in is_manager_host.stdout %}UPDATED (MANUAL REBOOT REQ)
+              {% elif host_apt.changed %}UPDATED
+              {% else %}OK{% endif %}
+
+        - name: "Append Node Data to Global Report"
+          set_fact:
+            fleet_changed: "{{ (hostvars['localhost']['fleet_changed'] | default(false)) or host_apt.changed or (node_reboot is defined and node_reboot.changed) or ('reboot' in reboot_decision.stdout and 'yes' in is_manager_host.stdout) }}"
+            fleet_node_data: "{{ (hostvars['localhost']['fleet_node_data'] | default([])) + [{ 'node': inventory_hostname, 'status': node_status_str }] }}"
+          delegate_to: localhost
+          delegate_facts: true
+          check_mode: no
+
+      rescue:
+        - name: "Record Node Failure"
+          set_fact:
+            fleet_failed: true
+            fleet_node_data: "{{ (hostvars['localhost']['fleet_node_data'] | default([])) + [{ 'node': inventory_hostname, 'status': '💀 DEAD/FAILED' }] }}"
+            fleet_error_log: "{{ (hostvars['localhost']['fleet_error_log'] | default([])) + [inventory_hostname + ': Node Failure at ' + (ansible_failed_task.name | default('Unknown'))] }}"
+          delegate_to: localhost
+          delegate_facts: true
+          check_mode: no
+
+# ==========================================
+# PHASE 3: MANAGER SELF-UPDATE (Local)
+# ==========================================
+- name: "Phase 3: Manager Self-Update"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files: [vars.yml]
+  tasks:
+    - name: "Update Manager OS Packages"
+      apt:
+        upgrade: dist
+        update_cache: yes
+        autoremove: yes
+      register: manager_apt
+      # Safety: If this fails, we still want the Discord message to send
+      ignore_errors: yes
+
+    - name: "Check if Manager Needs Reboot"
+      stat:
+        path: /var/run/reboot-required
+      register: manager_reboot_file
+
+    - name: "Record Manager Status"
+      set_fact:
+        fleet_changed: "{{ fleet_changed | default(false) or manager_apt.changed }}"
+        fleet_node_data: "{{ fleet_node_data | default([]) + [{ 'node': 'Ansible-Manager', 'status': ('OK (MANUAL REBOOT REQ)' if manager_reboot_file.stat.exists else 'UPDATED' if manager_apt.changed else 'OK') }] }}"
+
+# ==========================================
+# PHASE 4: FINAL BRIEFING
+# ==========================================
+- name: "Phase 4: Final Briefing"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files: [vars.yml]
+  tasks:
+    - name: "Send Final Discord Briefing"
+      vars:
+        # Check if forced, or if anything in the fleet changed, or if anything failed
+        should_notify: "{{ (force_notify | default(false) | bool) or (fleet_changed | default(false)) or (fleet_failed | default(false)) }}"
+      when: should_notify
+      uri:
+        url: "{{ discord_webhook }}"
+        method: POST
+        body_format: json
+        body:
+          embeds:
+            - title: "{% if fleet_failed | default(false) %}⚠️ SG-1 Briefing: Failures Detected{% else %}✅ SG-1 Briefing: All Systems Clear{% endif %}"
+              description: |
+                {% for n in fleet_node_data | default([]) %}
+                **{{ n.node }}: ({{ n.status }})**
+                {% for l in fleet_lxc_data | default([]) if l.node == n.node %}
+                - {{ l.info }}
+                {% endfor %}
+
+                {% endfor %}
+
+                {% if fleet_error_log is defined %}
+                **🚨 Error Log:**
+                - {{ fleet_error_log | join('\n- ') }}
+                {% endif %}
+              color: "{{ 15158332 if fleet_failed | default(false) else 3066993 }}"
+        status_code: [200, 204]
