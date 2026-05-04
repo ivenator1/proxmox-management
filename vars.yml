@@ -1,0 +1,37 @@
+pve_api_user: "root@pam"
+pve_api_token_id: "ansible"
+pve_api_token_secret: "pve_api_token_secret" #Change with your api token secret
+discord_webhook: "discord_webhook" #Change with your Dicord Webook URL
+
+#Apt-Cacher NG
+apt_proxy_ip: "10.10.10.12" #Apt Procy IP
+apt_proxy_port: 3142 #Apt Proxy Port
+
+# Uptime Kuma Credentials
+kuma_url: "http://10.10.10.13:3001" #URL of Uptime Kuma
+kuma_user: "Username"
+kuma_pass: "Password"
+kuma_slug: "slug"
+
+# Mapping: "LXC_ID": KUMA_MONITOR_ID
+lxc_kuma_map:
+  "100": "5" #Pi-Hole
+
+# --- EXCLUSIONS ---
+#LXC of managing node
+manager_lxc_id: "121"
+
+# List IDs you want to skip entirely (VMs or sensitive LXCs)
+exclude_list:
+  - "103" # prime95
+  - "110" # EVE-NG
+  - "100" # Pi-Hole
+
+# List of IDs to skip the 'apt/apk' OS update
+os_update_exclude_list:
+  - "120" #PBS
+
+# List of IDs to update but not snapshot
+snapshot_exclude_list:
+  - "117" #Plex
+  - "120" #PBS
