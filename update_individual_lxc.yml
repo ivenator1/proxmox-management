@@ -1,0 +1,131 @@
+---
+- name: "Gather LXC details for {{ lxc_id }}"
+  shell: "pct config {{ lxc_id }}"
+  register: lxc_config
+  check_mode: false
+  changed_when: false
+
+- name: "Set LXC facts"
+  set_fact:
+    lxc_name: "{{ lxc_config.stdout | regex_search('hostname: (\\S+)', '\\1') | first | default('Unknown') }}"
+    lxc_os: "{{ lxc_config.stdout | regex_search('ostype: (\\w+)', '\\1') | first | default('debian') }}"
+
+- name: "Check status of LXC {{ lxc_id }}"
+  shell: "pct status {{ lxc_id }}"
+  register: ct_status_check
+  check_mode: false
+  changed_when: false
+
+- name: "LXC Maintenance Block: {{ lxc_id }}"
+  when: 
+    - ct_status_check.stdout is defined
+    - "'status: running' in ct_status_check.stdout"
+  block:
+    - name: "Snapshot {{ lxc_id }}"
+      community.proxmox.proxmox_snap:
+        api_host: "{{ ansible_host }}"
+        api_user: "{{ pve_api_user }}"
+        api_token_id: "{{ pve_api_token_id }}"
+        api_token_secret: "{{ pve_api_token_secret }}"
+        vmid: "{{ lxc_id }}"
+        snapname: "BEFORE_UPDATE_AUTO"
+        state: present
+      delegate_to: localhost
+      register: snap_res
+      failed_when: false
+      when: lxc_id not in (snapshot_exclude_list | default([]))
+
+    # --- STEP A: APP UPDATE ---
+    - name: "App Update (Community Script)"
+      shell: pct exec {{ lxc_id }} -- bash -c "export PHS_SILENT=1; update"
+      register: app_update_res
+      changed_when: 
+        - "'Updated successfully' in app_update_res.stdout"
+        - "app_update_res.stdout is search('Downloading|Extracting|Installing|Building|unpacking|Setting up|upgrading')"
+      ignore_errors: yes
+
+    # --- STEP B: OS UPDATE ---
+    - name: "OS Update (apt/apk)"
+      shell: |
+        {% if lxc_os in ['ubuntu', 'debian', 'devuan'] %}
+        pct exec {{ lxc_id }} -- bash -c "apt-get update && apt-get -y dist-upgrade"
+        {% elif lxc_os == 'alpine' %}
+        pct exec {{ lxc_id }} -- ash -c "apk -U upgrade"
+        {% else %}
+        pct exec {{ lxc_id }} -- bash -c "dnf -y upgrade || pacman -Syyu --noconfirm"
+        {% endif %}
+      register: os_update_res
+      when: lxc_id not in (os_update_exclude_list | default([]))
+      changed_when: >
+        ('upgraded' in os_update_res.stdout or 'OK' in os_update_res.stdout) and 
+        '0 upgraded, 0 newly installed' not in os_update_res.stdout and
+        'Your System is up-to-date' not in os_update_res.stdout
+      ignore_errors: yes
+
+    - name: "Wait for Proxmox locks"
+      pause:
+        seconds: 5
+
+    - name: "Optional Kuma Check"
+      uri:
+        url: "{{ kuma_url }}/api/status-page/heartbeat/{{ kuma_slug | default('unknown') }}"
+        method: GET
+      delegate_to: localhost
+      register: kuma_json
+      until: "(kuma_json.json.heartbeatList[lxc_kuma_map[lxc_id]|string] | last).status == 1 or ansible_check_mode"
+      retries: 5
+      delay: 30
+      when: 
+        - lxc_id in lxc_kuma_map 
+        - (ansible_check_mode or (app_update_res is defined and app_update_res.changed) or (os_update_res is defined and os_update_res.changed))
+      ignore_errors: yes
+
+    - name: "Check LXC Reboot Required"
+      shell: "pct exec {{ lxc_id }} -- [ -f /var/run/reboot-required ]"
+      register: lxc_reboot_req
+      failed_when: false
+      changed_when: false
+
+    - name: "Reboot LXC"
+      shell: "pct reboot {{ lxc_id }}"
+      when: lxc_reboot_req is defined and lxc_reboot_req.rc == 0
+      register: lxc_reboot_action
+
+    # --- REPORTING (SUCCESS PATH) ---
+    - name: "Calculate Status Components"
+      set_fact:
+        tmp_app: "{% if app_update_res is failed %}FAILED{% elif app_update_res.changed %}UPDATED{% else %}OK{% endif %}"
+        tmp_os: "{% if lxc_id in os_update_exclude_list %}SKIPPED{% elif os_update_res is failed %}FAILED{% elif lxc_reboot_action is defined and lxc_reboot_action is changed %}UPDATED & REBOOTED{% elif os_update_res is defined and os_update_res.changed %}UPDATED{% else %}OK{% endif %}"
+
+    - name: "Format and Append to Report"
+      set_fact:
+        fleet_lxc_data: "{{ (hostvars['localhost']['fleet_lxc_data'] | default([])) + [{ 'node': inventory_hostname, 'info': lxc_name + ' (' + lxc_id + '): APP: ' + tmp_app + ', LXC: ' + tmp_os + (' (No Snap)' if lxc_id in (snapshot_exclude_list | default([])) else '') }] }}"
+        fleet_changed: "{{ (hostvars['localhost']['fleet_changed'] | default(false)) or (app_update_res is defined and app_update_res.changed) or (os_update_res is defined and os_update_res.changed) or (lxc_reboot_action is defined and lxc_reboot_action.changed) }}"
+        fleet_failed: "{{ (hostvars['localhost']['fleet_failed'] | default(false)) or (app_update_res is failed) or (os_update_res is defined and os_update_res is failed) }}"
+      delegate_to: localhost
+      delegate_facts: true
+      check_mode: no
+
+  rescue:
+    - name: "Record LXC Failure"
+      set_fact:
+        fleet_lxc_data: "{{ (hostvars['localhost']['fleet_lxc_data'] | default([])) + [{ 'node': inventory_hostname, 'info': '❌ ' + lxc_name + ' (' + lxc_id + '): FAILED CRITICALLY' }] }}"
+        fleet_failed: true
+        fleet_error_log: "{{ (hostvars['localhost']['fleet_error_log'] | default([])) + [inventory_hostname + ': LXC ' + lxc_id + ' failed at ' + (ansible_failed_task.name | default('Logic Block'))] }}"
+      delegate_to: localhost
+      delegate_facts: true
+      check_mode: no
+
+  always:
+    - name: "Delete Snapshot"
+      community.proxmox.proxmox_snap:
+        api_host: "{{ ansible_host }}"
+        api_user: "{{ pve_api_user }}"
+        api_token_id: "{{ pve_api_token_id }}"
+        api_token_secret: "{{ pve_api_token_secret }}"
+        vmid: "{{ lxc_id }}"
+        snapname: "BEFORE_UPDATE_AUTO"
+        state: absent
+      delegate_to: localhost
+      ignore_errors: yes
+      when: snap_res is defined and snap_res is succeeded
