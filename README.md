@@ -54,6 +54,7 @@ The `vars.yml` file is the central intelligence of the orchestrator.
 * `exclude_list`: IDs in this list are completely ignored (No updates, no snapshots).
 * `os_update_exclude_list`: Only the specialized App update command is run. The standard `apt dist-upgrade` is skipped (Common for PBS).
 * `snapshot_exclude_list`: Updates are performed, but snapshots are skipped. Use this for LXCs with Bind Mounts.
+* **Note:** `fleet-update.yml` is configured with `any_errors_fatal: true` for the Node Update phase to ensure cluster integrity if a critical failure occurs.
 
 ## 🚀 Setup Instructions
 1. **Prepare the Manager LXC (Debian 12+):**
