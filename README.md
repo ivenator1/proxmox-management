@@ -57,24 +57,78 @@ The `vars.yml` file is the central intelligence of the orchestrator.
 * **Note:** `fleet-update.yml` is configured with `any_errors_fatal: true` for the Node Update phase to ensure cluster integrity if a critical failure occurs.
 
 ## 🚀 Setup Instructions
-1. **Prepare the Manager LXC (Debian 12+):**
+To set up this project from scratch on a brand-new Ansible Manager LXC, follow these steps in order. This ensures all dependencies are met and the "trust" between your manager and your Proxmox nodes is established correctly.
+
+### 1. Create the Manager LXC
+* **OS:** Debian 13 (highly recommended) or Ubuntu 22.04/24.04.
+* **Resources:** 1 CPU, 1GB RAM, 8GB Disk.
+* **Network:** Assign a Static IP. (If the IP changes, your SSH keys might be flagged).
+
+### 2. Install Core Software
+Log into your new Manager LXC and run these commands to install Ansible and the libraries required to talk to the Proxmox API:
+```bash
+# Update the OS
+apt update && apt upgrade -y
+
+# Install Ansible, Git, and the Proxmox Python library
+# We use the 'python3-proxmoxer' apt package to avoid pip library conflicts
+apt install -y ansible python3-pip python3-proxmoxer python3-jmespath git
+
+# Install the Proxmox Ansible Collection
+ansible-galaxy collection install community.proxmox
+```
+
+### 3. Establish SSH Trust (Passwordless Login)
+Ansible needs to log into your Proxmox nodes without a password.
+1. **Generate your SSH Key:**
    ```bash
-   apt update && apt install -y git python3-venv
-   python3 -m venv venv
-   source venv/bin/activate
-   pip install --upgrade pip
-   pip install ansible proxmoxer
+   ssh-keygen -t ed25519 -C "ansible-manager"
+   # Press Enter for all prompts (no passphrase)
    ```
-2. **Install Ansible Collections:**
+2. **Copy the key to every Proxmox Node:**
+   Run this for every node in your cluster:
    ```bash
-   ansible-galaxy collection install community.proxmox
+   ssh-copy-id root@<NODE_IP>
    ```
-3. **Configure:**
-   Edit `hosts.ini` to add your PVE nodes and `vars.yml` to populate credentials.
-4. **Run the Fleet Update:**
+   *You will be asked for the root password of each node one last time.*
+3. **Test the connection:**
    ```bash
-   ansible-playbook -i hosts.ini fleet-update.yml
+   ssh root@<NODE_IP>
+   # It should let you in without a password. Type 'exit' to return.
    ```
+
+### 4. Clone and Configure
+Clone the project repository:
+```bash
+git clone https://github.com/ivenator1/proxmox-management.git ~/proxmox-management
+cd ~/proxmox-management
+```
+Populate the core files (`hosts.ini`, `vars.yml`) with your cluster-specific configuration.
+
+### 5. Final Initial Configuration
+Once the files are created, tell Ansible to silence the purple "Python interpreter" warnings by adding this to your `hosts.ini` (under `[proxmox_nodes:vars]`):
+```ini
+[proxmox_nodes:vars]
+ansible_user=root
+ansible_python_interpreter=/usr/bin/python3
+```
+
+### 6. Verify the Whole Setup
+Run this "Ping" test to make sure Ansible can talk to all your nodes at once:
+```bash
+ansible all -i hosts.ini -m ping
+```
+If everything comes back GREEN:
+You are ready to run your first real update!
+```bash
+ansible-playbook -i hosts.ini fleet-update.yml -e "force_notify=true"
+```
+
+**Summary of what you just did:**
+* Installed Ansible as the engine.
+* Installed Proxmoxer as the bridge to the Proxmox API.
+* Set up SSH Keys as the secure doorway to your nodes.
+* Built the Folder Structure to hold your SG-1 Fleet intelligence.
 
 ## 🏃 Usage
 ### Manual Fleet Run (With Notification)
