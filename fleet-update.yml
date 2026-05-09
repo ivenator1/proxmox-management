@@ -56,22 +56,24 @@
             - "'yes' not in is_manager_host.stdout"
           register: node_reboot
 
-        - name: "Calculate Node Status Fact"
+        # --- FIX: Split into two tasks to avoid "undefined" error ---
+        - name: "Set Internal Reboot Flags"
           set_fact:
-            # We use 'needs_reboot' as a clear flag
-            needs_reboot: "{{ 'reboot' in reboot_decision.stdout }}"
-            is_manager: "{{ 'yes' in is_manager_host.stdout }}"
+            needs_reboot_flag: "{{ 'reboot' in reboot_decision.stdout }}"
+            is_manager_flag: "{{ 'yes' in is_manager_host.stdout }}"
 
+        - name: "Calculate Node Status String"
+          set_fact:
             node_status_str: >-
               {% if node_reboot is defined and node_reboot.changed %}UPDATED & REBOOTED
-              {% elif needs_reboot and is_manager %}OK (MANUAL REBOOT REQ)
-              {% elif needs_reboot and not is_manager %}REBOOT FAILED
+              {% elif needs_reboot_flag and is_manager_flag %}OK (MANUAL REBOOT REQ)
+              {% elif needs_reboot_flag and not is_manager_flag %}REBOOT FAILED
               {% elif host_apt.changed %}UPDATED
               {% else %}OK{% endif %}
 
         - name: "Append Node Data to Global Report"
           set_fact:
-            fleet_changed: "{{ (hostvars['localhost']['fleet_changed'] | default(false)) or host_apt.changed or (node_reboot is defined and node_reboot.changed) or (needs_reboot and is_manager) }}"
+            fleet_changed: "{{ (hostvars['localhost']['fleet_changed'] | default(false)) or host_apt.changed or (node_reboot is defined and node_reboot.changed) or (needs_reboot_flag and is_manager_flag) }}"
             fleet_node_data: "{{ (hostvars['localhost']['fleet_node_data'] | default([])) + [{ 'node': inventory_hostname, 'status': node_status_str }] }}"
           delegate_to: localhost
           delegate_facts: true
@@ -125,6 +127,7 @@
   tasks:
     - name: "Send Final Discord Briefing"
       vars:
+        # Check if forced via CLI (-e "force_notify=true") or if anything changed/failed
         should_notify: "{{ (force_notify | default(false) | bool) or (fleet_changed | default(false)) or (fleet_failed | default(false)) }}"
       when: should_notify
       uri:
@@ -133,10 +136,11 @@
         body_format: json
         body:
           embeds:
-            - title: "{% if fleet_failed | default(false) %}⚠️ SG-1 Briefing: Failures Detected{% else %}✅ SG-1 Briefing: All Systems Clear{% endif %}"
+            - title: "{% if fleet_failed | default(false) %}⚠️ Briefing: Failures Detected{% else %}✅ Briefing: All Systems Clear{% endif %}"
               description: |
                 {% for n in fleet_node_data | default([]) %}
                 **{{ n.node }}: ({{ n.status }})**
+                {% if n.node != 'Ansible-Manager' %}
                 {% set node_lxcs = fleet_lxc_data | default([]) | selectattr('node', 'equalto', n.node) | list %}
                 {% if node_lxcs | length > 0 %}
                 {% for l in node_lxcs %}
@@ -145,18 +149,18 @@
                 {% else %}
                 - *No container changes.*
                 {% endif %}
+                {% endif %}
 
                 {% endfor %}
-
-                {% if fleet_error_log is defined %}
+                {% if fleet_error_log is defined and fleet_error_log | length > 0 %}
                 **🚨 Error Log:**
                 - {{ fleet_error_log | join('\n- ') }}
                 {% endif %}
               color: "{{ 15158332 if fleet_failed | default(false) else 3066993 }}"
-        # --- status_code is part of uri (indented 2 spaces more) ---
+        # --- uri parameters (indented 2 spaces from uri) ---
         status_code: [200, 204, 429, 500, 502, 503, 504]
 
-      # --- Task-level keywords (aligned with uri) ---
+      # --- task-level keywords (aligned with uri) ---
       register: discord_response
       until: "discord_response.status in [200, 204]"
       retries: 15
