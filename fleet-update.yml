@@ -45,39 +45,33 @@
         - name: "Robust Reboot Check"
           shell: |
             RUNNING=$(uname -r); LATEST=$(ls -1 /boot/vmlinuz-* | sort -V | tail -n 1 | sed 's|.*vmlinuz-||')
-            [ -f /var/run/reboot-required ] || [ "$RUNNING" != "$LATEST" ] && echo "reboot" || echo "ok"
+            if [ -f /var/run/reboot-required ] || [ "$RUNNING" != "$LATEST" ]; then echo "reboot"; else echo "ok"; fi
           register: reboot_decision
           changed_when: false
 
         - name: "Reboot Node"
-          reboot: 
-            reboot_timeout: 900
-            post_reboot_delay: 30 # Give it 30s extra before checking anything else
-          when: 
+          reboot: { reboot_timeout: 900 }
+          when:
             - "'reboot' in reboot_decision.stdout"
             - "'yes' not in is_manager_host.stdout"
           register: node_reboot
 
-        - name: "Wait for Apt Proxy to be Ready"
-          wait_for:
-            host: "{{ apt_proxy_ip }}"
-            port: "{{ apt_proxy_port }}"
-            state: started
-            timeout: 300
-          delegate_to: localhost
-          when: node_reboot.changed
-
         - name: "Calculate Node Status Fact"
           set_fact:
+            # We use 'needs_reboot' as a clear flag
+            needs_reboot: "{{ 'reboot' in reboot_decision.stdout }}"
+            is_manager: "{{ 'yes' in is_manager_host.stdout }}"
+
             node_status_str: >-
               {% if node_reboot is defined and node_reboot.changed %}UPDATED & REBOOTED
-              {% elif 'reboot' in reboot_decision.stdout and 'yes' in is_manager_host.stdout %}UPDATED (MANUAL REBOOT REQ)
+              {% elif needs_reboot and is_manager %}OK (MANUAL REBOOT REQ)
+              {% elif needs_reboot and not is_manager %}REBOOT FAILED
               {% elif host_apt.changed %}UPDATED
               {% else %}OK{% endif %}
 
         - name: "Append Node Data to Global Report"
           set_fact:
-            fleet_changed: "{{ (hostvars['localhost']['fleet_changed'] | default(false)) or host_apt.changed or (node_reboot is defined and node_reboot.changed) or ('reboot' in reboot_decision.stdout and 'yes' in is_manager_host.stdout) }}"
+            fleet_changed: "{{ (hostvars['localhost']['fleet_changed'] | default(false)) or host_apt.changed or (node_reboot is defined and node_reboot.changed) or (needs_reboot and is_manager) }}"
             fleet_node_data: "{{ (hostvars['localhost']['fleet_node_data'] | default([])) + [{ 'node': inventory_hostname, 'status': node_status_str }] }}"
           delegate_to: localhost
           delegate_facts: true
