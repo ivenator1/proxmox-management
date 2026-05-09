@@ -91,7 +91,7 @@
       when: lxc_reboot_req is defined and lxc_reboot_req.rc == 0
       register: lxc_reboot_action
 
-    # --- REPORTING (SUCCESS PATH) ---
+# --- REPORTING (SUCCESS PATH) ---
     - name: "Calculate Status Components"
       set_fact:
         tmp_app: "{% if app_update_res is failed %}FAILED{% elif app_update_res.changed %}UPDATED{% else %}OK{% endif %}"
@@ -100,6 +100,14 @@
     - name: "Format and Append to Report"
       set_fact:
         fleet_lxc_data: "{{ (hostvars['localhost']['fleet_lxc_data'] | default([])) + [{ 'node': inventory_hostname, 'info': lxc_name + ' (' + lxc_id + '): APP: ' + tmp_app + ', LXC: ' + tmp_os + (' (No Snap)' if lxc_id in (snapshot_exclude_list | default([])) else '') }] }}"
+      # --- FIX: Only add to the Discord list if something actually happened ---
+      when: tmp_app != 'OK' or (tmp_os != 'OK' and tmp_os != 'SKIPPED')
+      delegate_to: localhost
+      delegate_facts: true
+      check_mode: no
+
+    - name: "Track Global Changes"
+      set_fact:
         fleet_changed: "{{ (hostvars['localhost']['fleet_changed'] | default(false)) or (app_update_res is defined and app_update_res.changed) or (os_update_res is defined and os_update_res.changed) or (lxc_reboot_action is defined and lxc_reboot_action.changed) }}"
         fleet_failed: "{{ (hostvars['localhost']['fleet_failed'] | default(false)) or (app_update_res is failed) or (os_update_res is defined and os_update_res is failed) }}"
       delegate_to: localhost
