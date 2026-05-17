@@ -38,9 +38,18 @@
           changed_when: false
 
         - name: "Update Host OS"
-          apt: { upgrade: dist, update_cache: yes, autoremove: yes }
+          apt:
+            upgrade: dist
+            update_cache: yes
+            autoremove: yes
           register: host_apt
-          changed_when: "'0 upgraded, 0 newly installed' not in host_apt.stdout"
+          retries: 5
+          delay: 20
+          until: host_apt is succeeded
+          changed_when:
+            - host_apt is succeeded
+            - host_apt.stdout is defined
+            - "'0 upgraded, 0 newly installed' not in host_apt.stdout"
 
         - name: "Robust Reboot Check"
           shell: |
@@ -50,13 +59,27 @@
           changed_when: false
 
         - name: "Reboot Node"
-          reboot: { reboot_timeout: 900 }
-          when:
+          reboot:
+            reboot_timeout: 900
+            post_reboot_delay: 60
             - "'reboot' in reboot_decision.stdout"
             - "'yes' not in is_manager_host.stdout"
           register: node_reboot
 
-        # --- FIX: Split into two tasks to avoid "undefined" error ---
+        - name: "Wait for Apt Proxy to be Ready"
+          wait_for:
+            host: "{{ apt_proxy_ip }}"
+            port: "{{ apt_proxy_port }}"
+            state: started
+            timeout: 300
+          delegate_to: localhost
+          when: node_reboot.changed
+
+        - name: "Proxy Settle Pause"
+          pause:
+            seconds: 15
+          when: node_reboot.changed
+
         - name: "Set Internal Reboot Flags"
           set_fact:
             needs_reboot_flag: "{{ 'reboot' in reboot_decision.stdout }}"
@@ -88,7 +111,6 @@
           delegate_to: localhost
           delegate_facts: true
           check_mode: no
-
 # ==========================================
 # PHASE 3: MANAGER SELF-UPDATE (Local)
 # ==========================================
