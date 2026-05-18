@@ -135,5 +135,13 @@
         snapname: "BEFORE_UPDATE_AUTO"
         state: absent
       delegate_to: localhost
+      # --- FIX: Retry on lock ---
+      register: delete_snap_res
+      until: delete_snap_res is succeeded
+      retries: 5
+      delay: 10
       ignore_errors: yes
-      when: snap_res is defined and snap_res is succeeded
+      when:
+        - snap_res is defined
+        - snap_res is succeeded
+        - not (rollback_res is defined and rollback_res is changed)

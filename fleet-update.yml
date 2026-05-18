@@ -1,4 +1,26 @@
 ---
+# ==========================================
+# PRE-FLIGHT: PROXY CHECK
+# ==========================================
+- name: "Pre-Flight: Check Apt Proxy"
+  hosts: localhost
+  connection: local
+  vars_files: [vars.yml]
+  tasks:
+    - name: "Verify Apt-Cacher-NG is Online"
+      wait_for:
+        host: "{{ apt_proxy_ip }}"
+        port: "{{ apt_proxy_port }}"
+        state: started
+        timeout: 30
+      register: proxy_check
+      ignore_errors: yes
+
+    - name: "Halt if Proxy is Offline"
+      fail:
+        msg: "CRITICAL: Apt Proxy ({{ apt_proxy_ip }}) is unreachable. Aborting fleet update to prevent mass failures."
+      when: proxy_check is failed
+
 # =========================================
 # PHASE 1: Update all LXCs
 # =========================================
@@ -44,7 +66,7 @@
             autoremove: yes
           register: host_apt
           retries: 5
-          delay: 20
+          delay: 30
           until: host_apt is succeeded
           changed_when:
             - host_apt is succeeded
