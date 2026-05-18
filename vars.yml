@@ -1,7 +1,7 @@
 pve_api_user: "root@pam"
 pve_api_token_id: "ansible"
 pve_api_token_secret: "pve_api_token_secret" #Change with your api token secret
-discord_webhook: "discord_webhook" #Change with your Dicord Webook URL
+discord_webhook: "discord_webhook" #Change with your Discord Webook URL
 
 #Apt-Cacher NG
 apt_proxy_ip: "10.10.10.12" #Apt Procy IP
