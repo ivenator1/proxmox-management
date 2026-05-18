@@ -103,7 +103,12 @@ Clone the project repository:
 git clone https://github.com/ivenator1/proxmox-management.git ~/proxmox-management
 cd ~/proxmox-management
 ```
-Populate the core files (`hosts.ini`, `vars.yml`) with your cluster-specific configuration.
+Copy the example files to create your own configuration:
+```bash
+cp vars.yml.example vars.yml
+cp hosts.ini.example hosts.ini
+```
+Populate these new files (`hosts.ini`, `vars.yml`) with your cluster-specific configuration.
 
 ### 5. Final Initial Configuration
 Once the files are created, tell Ansible to silence the purple "Python interpreter" warnings by adding this to your `hosts.ini` (under `[proxmox_nodes:vars]`):
