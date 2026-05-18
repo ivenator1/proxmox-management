@@ -84,6 +84,7 @@
           reboot:
             reboot_timeout: 900
             post_reboot_delay: 60
+          when:
             - "'reboot' in reboot_decision.stdout"
             - "'yes' not in is_manager_host.stdout"
           register: node_reboot
