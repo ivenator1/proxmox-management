@@ -46,7 +46,7 @@ roles/
       detect.yml                        # Pulls /usr/bin/update, extracts ct script name, fetches .sh from GitHub, parses resource requirements
       backup.yml                        # vzdump and/or snapshot (BEFORE_UPDATE_AUTO) based on lxc_backup_strategy
       dry_check.yml                     # Reads installed version + fetches latest GitHub release; sets dry_run_status
-      update.yml                        # Reads ver before, runs community-script update, reads ver after, OS update, reboot if needed
+      update.yml                        # OS update first, dpkg hash before/after community script, ver before/after, reboot if needed
       health_check.yml                  # Polls Uptime Kuma for containers in lxc_kuma_map; only fires when something changed
       report.yml                        # Builds tmp_app/tmp_os strings; appends LXC record (skips idle containers)
   vm_update/
