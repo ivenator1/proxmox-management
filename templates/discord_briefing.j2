@@ -1,0 +1,35 @@
+{% for n in fleet_node_data | default([]) %}
+**{{ n.node }}** ({{ n.status }})
+{% if n.node != 'Ansible-Manager' %}
+{% set node_lxcs = fleet_lxc_data | default([]) | selectattr('node', 'equalto', n.node) | list %}
+{% set node_vms = fleet_vm_data | default([]) | selectattr('node', 'equalto', n.node) | list %}
+{% if node_lxcs | length > 0 %}
+{% for l in node_lxcs %}
+- {{ l.name }} ({{ l.id }}): APP: {{ l.app }}, OS: {{ l.os }}{% if not l.snap %} *(no snap)*{% endif %}
+
+{% endfor %}
+{% endif %}
+{% if node_vms | length > 0 %}
+{% for v in node_vms %}
+- VM {{ v.vmid }} {{ v.name }}: {{ v.status }}
+{% endfor %}
+{% endif %}
+{% if node_lxcs | length == 0 and node_vms | length == 0 %}
+- *No container changes.*
+{% endif %}
+{% endif %}
+{% endfor %}
+{% set remote_hosts = fleet_remote_data | default([]) %}
+{% if remote_hosts | length > 0 %}
+**Remote Hosts**
+{% for r in remote_hosts %}
+- {{ r.host }}: {{ r.status }}
+{% endfor %}
+{% endif %}
+{% if fleet_error_log is defined and fleet_error_log | length > 0 %}
+**Error Log:**
+{% for e in fleet_error_log %}
+- **{{ e.host }}** failed at `{{ e.task }}`:
+  `{{ e.error }}`
+{% endfor %}
+{% endif %}
