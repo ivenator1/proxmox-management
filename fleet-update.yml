@@ -220,20 +220,23 @@
   gather_facts: no
   vars_files: [vars.yml]
   tasks:
+    - name: "Build Discord embed payload"
+      set_fact:
+        _discord_color: "{{ (15158332 if fleet_failed | default(false) else 3066993) | int }}"
+        _discord_title: "{% if fleet_failed | default(false) %}⚠️ Briefing: Failures Detected{% else %}✅ Briefing: All Systems Clear{% endif %}"
+        _discord_description: "{{ lookup('template', 'templates/discord_briefing.j2') | trim | truncate(4000, False, '\n...') }}"
+      check_mode: no
+
     - name: "Send Final Discord Briefing"
       vars:
         should_notify: "{{ (force_notify | default(false) | bool) or (fleet_changed | default(false)) or (fleet_failed | default(false)) }}"
-        briefing_body: "{{ lookup('template', 'templates/discord_briefing.j2') }}"
       when: should_notify
       uri:
         url: "{{ discord_webhook }}"
         method: POST
-        body_format: json
-        body:
-          embeds:
-            - title: "{% if fleet_failed | default(false) %}⚠️ Briefing: Failures Detected{% else %}✅ Briefing: All Systems Clear{% endif %}"
-              description: "{{ briefing_body }}"
-              color: "{{ 15158332 if fleet_failed | default(false) else 3066993 }}"
+        headers:
+          Content-Type: "application/json"
+        body: "{{ {'embeds': [{'title': _discord_title, 'description': _discord_description, 'color': _discord_color}]} | to_json }}"
         status_code: [200, 204, 429, 500, 502, 503, 504]
       register: discord_response
       until: "discord_response.status in [200, 204]"
