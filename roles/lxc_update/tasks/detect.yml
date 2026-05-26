@@ -42,10 +42,10 @@
   set_fact:
     lxc_no_update_script: false
     ct_script_content: "{{ ct_script_fetch.content | default('') }}"
-    lxc_build_cpu: "{{ ct_script_fetch.content | default('') | regex_search('var_cpu=\"(\\d+)\"', '\\1') | default([]) | first | default('') }}"
-    lxc_build_ram: "{{ ct_script_fetch.content | default('') | regex_search('var_ram=\"(\\d+)\"', '\\1') | default([]) | first | default('') }}"
-    lxc_run_cpu: "{{ ct_script_fetch.content | default('') | regex_search('pct set \\$CTID -cores (\\d+)', '\\1') | default([]) | first | default('') }}"
-    lxc_run_ram: "{{ ct_script_fetch.content | default('') | regex_search('pct set \\$CTID -memory (\\d+)', '\\1') | default([]) | first | default('') }}"
+    lxc_build_cpu: "{{ (ct_script_fetch.content | default('') | regex_search('var_cpu=\"(\\d+)\"', '\\1') or [''])[0] }}"
+    lxc_build_ram: "{{ (ct_script_fetch.content | default('') | regex_search('var_ram=\"(\\d+)\"', '\\1') or [''])[0] }}"
+    lxc_run_cpu: "{{ (ct_script_fetch.content | default('') | regex_search('pct set \\$CTID -cores (\\d+)', '\\1') or [''])[0] }}"
+    lxc_run_ram: "{{ (ct_script_fetch.content | default('') | regex_search('pct set \\$CTID -memory (\\d+)', '\\1') or [''])[0] }}"
   when: ct_script_name.stdout | default('') != ''
 
 - name: "Determine if resource scaling is needed"
