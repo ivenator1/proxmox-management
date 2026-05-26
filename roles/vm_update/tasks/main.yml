@@ -1,0 +1,55 @@
+---
+- name: "VM maintenance block {{ inventory_hostname }}"
+  block:
+    - name: "Snapshot"
+      include_tasks: snapshot.yml
+
+    - name: "Update packages"
+      include_tasks: update.yml
+
+    - name: "Health check"
+      include_tasks: health_check.yml
+
+    - name: "Report success"
+      include_tasks: report.yml
+
+  rescue:
+    - name: "Capture failure details"
+      set_fact:
+        _failed_task_name: "{{ ansible_failed_task.name | default('Unknown task') }}"
+        _failed_error: "{{ ansible_failed_result.stderr | default(ansible_failed_result.msg) | default('Unknown error') | truncate(300) }}"
+
+    - name: "Record failure"
+      include_tasks: "{{ playbook_dir }}/tasks/fleet-state-append.yml"
+      vars:
+        fleet_record_type: vm
+        fleet_record_payload:
+          node: "{{ pve_node }}"
+          name: "{{ inventory_hostname }}"
+          vmid: "{{ vmid }}"
+          status: "FAILED"
+        fleet_record_failed: true
+        fleet_error_detail:
+          host: "{{ pve_node }}/vm-{{ vmid }}"
+          task: "{{ _failed_task_name }}"
+          error: "{{ _failed_error }}"
+
+  always:
+    - name: "Delete VM snapshot"
+      community.proxmox.proxmox_snap:
+        api_host: "{{ hostvars[pve_node]['ansible_host'] }}"
+        api_user: "{{ pve_api_user }}"
+        api_token_id: "{{ pve_api_token_id }}"
+        api_token_secret: "{{ pve_api_token_secret }}"
+        vmid: "{{ vmid }}"
+        snapname: "BEFORE_UPDATE_AUTO"
+        state: absent
+      delegate_to: localhost
+      register: delete_vm_snap_res
+      until: delete_vm_snap_res is succeeded
+      retries: 5
+      delay: 10
+      ignore_errors: yes
+      when:
+        - vm_snap_res is defined
+        - vm_snap_res is succeeded

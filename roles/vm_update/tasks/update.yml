@@ -1,0 +1,34 @@
+---
+- name: "Update VM packages (apt)"
+  apt:
+    upgrade: dist
+    update_cache: yes
+    autoremove: yes
+  register: vm_apt_res
+  when: ansible_pkg_mgr == 'apt'
+  changed_when:
+    - vm_apt_res is succeeded
+    - vm_apt_res.stdout is defined
+    - "'0 upgraded, 0 newly installed' not in vm_apt_res.stdout"
+
+- name: "Update VM packages (dnf)"
+  dnf:
+    name: "*"
+    state: latest
+    update_cache: yes
+  register: vm_dnf_res
+  when: ansible_pkg_mgr == 'dnf'
+
+- name: "Check reboot-required"
+  stat:
+    path: /var/run/reboot-required
+  register: vm_reboot_file
+
+- name: "Reboot VM {{ inventory_hostname }}"
+  reboot:
+    reboot_timeout: 600
+    post_reboot_delay: 30
+  register: vm_reboot_action
+  when:
+    - vm_auto_reboot | bool
+    - vm_reboot_file.stat.exists

@@ -1,0 +1,30 @@
+---
+- name: "Remote host maintenance block {{ inventory_hostname }}"
+  block:
+    - name: "Update packages"
+      include_tasks: update.yml
+
+    - name: "Health check"
+      include_tasks: health_check.yml
+
+    - name: "Report success"
+      include_tasks: report.yml
+
+  rescue:
+    - name: "Capture failure details"
+      set_fact:
+        _failed_task_name: "{{ ansible_failed_task.name | default('Unknown task') }}"
+        _failed_error: "{{ ansible_failed_result.stderr | default(ansible_failed_result.msg) | default('Unknown error') | truncate(300) }}"
+
+    - name: "Record failure"
+      include_tasks: "{{ playbook_dir }}/tasks/fleet-state-append.yml"
+      vars:
+        fleet_record_type: remote_host
+        fleet_record_payload:
+          host: "{{ inventory_hostname }}"
+          status: "FAILED"
+        fleet_record_failed: true
+        fleet_error_detail:
+          host: "{{ inventory_hostname }}"
+          task: "{{ _failed_task_name }}"
+          error: "{{ _failed_error }}"

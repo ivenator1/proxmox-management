@@ -1,0 +1,13 @@
+---
+- name: "Snapshot VM {{ inventory_hostname }}"
+  community.proxmox.proxmox_snap:
+    api_host: "{{ hostvars[pve_node]['ansible_host'] }}"
+    api_user: "{{ pve_api_user }}"
+    api_token_id: "{{ pve_api_token_id }}"
+    api_token_secret: "{{ pve_api_token_secret }}"
+    vmid: "{{ vmid }}"
+    snapname: "BEFORE_UPDATE_AUTO"
+    state: present
+  delegate_to: localhost
+  register: vm_snap_res
+  failed_when: false

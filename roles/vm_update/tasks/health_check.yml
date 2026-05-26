@@ -1,0 +1,14 @@
+---
+- name: "Kuma health check {{ inventory_hostname }}"
+  uri:
+    url: "{{ kuma_url }}/api/status-page/heartbeat/{{ kuma_slug | default('unknown') }}"
+    method: GET
+  delegate_to: localhost
+  register: kuma_json
+  until: "(kuma_json.json.heartbeatList[vm_kuma_map[inventory_hostname] | string] | last).status == 1 or ansible_check_mode"
+  retries: 5
+  delay: 30
+  when:
+    - inventory_hostname in vm_kuma_map
+    - ansible_check_mode or (vm_apt_res is defined and vm_apt_res.changed) or (vm_dnf_res is defined and vm_dnf_res.changed)
+  ignore_errors: yes
