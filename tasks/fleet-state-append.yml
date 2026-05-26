@@ -1,0 +1,37 @@
+---
+# Shared state accumulator. Appends one record to the fleet state facts on localhost.
+#
+# Required vars:
+#   fleet_record_type:    lxc | vm | remote_host | node | manager
+#   fleet_record_payload: dict to append to the matching list
+#
+# Optional vars:
+#   fleet_record_changed: bool — OR'd into fleet_changed
+#   fleet_record_failed:  bool — OR'd into fleet_failed
+#   fleet_error_detail:   dict {host, task, error} — appended to fleet_error_log
+- name: "Append fleet state record"
+  set_fact:
+    fleet_lxc_data: >-
+      {{ hostvars['localhost']['fleet_lxc_data'] | default([])
+         + ([fleet_record_payload] if fleet_record_type == 'lxc' else []) }}
+    fleet_vm_data: >-
+      {{ hostvars['localhost']['fleet_vm_data'] | default([])
+         + ([fleet_record_payload] if fleet_record_type == 'vm' else []) }}
+    fleet_remote_data: >-
+      {{ hostvars['localhost']['fleet_remote_data'] | default([])
+         + ([fleet_record_payload] if fleet_record_type == 'remote_host' else []) }}
+    fleet_node_data: >-
+      {{ hostvars['localhost']['fleet_node_data'] | default([])
+         + ([fleet_record_payload] if fleet_record_type in ['node', 'manager'] else []) }}
+    fleet_changed: >-
+      {{ (hostvars['localhost']['fleet_changed'] | default(false))
+         or (fleet_record_changed | default(false) | bool) }}
+    fleet_failed: >-
+      {{ (hostvars['localhost']['fleet_failed'] | default(false))
+         or (fleet_record_failed | default(false) | bool) }}
+    fleet_error_log: >-
+      {{ hostvars['localhost']['fleet_error_log'] | default([])
+         + ([fleet_error_detail] if fleet_error_detail is defined else []) }}
+  delegate_to: localhost
+  delegate_facts: true
+  check_mode: no
