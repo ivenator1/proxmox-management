@@ -36,7 +36,7 @@
       name: "{{ lxc_name }}"
       id: "{{ lxc_id }}"
       app: "{{ tmp_app | trim }}"
-      os: "{{ tmp_os | trim }}"
+      os: "{{ '' if tmp_os is none else tmp_os | trim }}"
       snap: "{{ lxc_id not in (snapshot_exclude_list | default([])) }}"
     fleet_record_changed: >-
       {{ (app_update_res is defined and app_update_res.changed) or
