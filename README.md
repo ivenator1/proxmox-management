@@ -179,6 +179,10 @@ Add this to the Manager LXC's `crontab -e` to run at 4:00 AM daily:
 0 4 * * * cd /root/proxmox-management && /usr/bin/ansible-playbook fleet-update.yml >> /var/log/ansible-fleet-update.log 2>&1
 ```
 
+## 🗒️ TODO
+
+- **Tier 4 — Automatic Snapshot Rollback**: `health_check.yml` polls Uptime Kuma after updates but takes no action on failure (`ignore_errors: yes`). Implement: if Kuma doesn't return `status: 1` within the retry window, roll back to the `BEFORE_UPDATE_AUTO` snapshot via `community.proxmox.proxmox_snap` and record the rollback in the fleet state / Discord embed.
+
 ## 📡 Discord Briefing Format
 The orchestrator sends one consolidated embed per run:
 * **Per-Node sections:** Node status (OK / UPDATED & REBOOTED / UPDATED (MANUAL REBOOT REQ) / FAILED), followed by each changed LXC and VM.
