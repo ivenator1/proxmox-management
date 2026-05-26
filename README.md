@@ -16,8 +16,12 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 * **Location-Aware Updates:** Dynamically detects which physical node is hosting the Ansible Manager LXC and skips that node's reboot.
 * **Controlled Parallelism:** Updates LXCs across multiple nodes simultaneously to save time, while rebooting physical nodes sequentially to maintain Cluster Quorum and HA stability.
 * **Apt-Proxy Awareness:** Optimized for environments using `apt-cacher-ng`; automatically waits for the proxy service to be online before allowing subsequent nodes to start updates.
-* **Smart Discovery:** Automatically identifies any LXC containing the Proxmox Helper Script update command.
-* **Consolidated Reporting:** Aggregates results from every node and container into exactly one Discord notification every morning.
+* **Tag-Based Discovery:** Only processes LXCs tagged `community-script` or `proxmox-helper-scripts` in PVE — untagged containers are never touched.
+* **Multi-Host Support:** Handles LXC containers, QEMU VMs, and non-Proxmox remote hosts in a single run.
+* **Flexible Backup Strategy:** Choose per-run between lightweight snapshots, full `vzdump` backups (including PBS), both, or none.
+* **Resource Scaling:** Automatically scales container CPU/RAM up during build-heavy app updates and back down afterward, matching the behaviour of the community-scripts bash installer.
+* **Dry-Run Mode:** Compare installed vs. latest GitHub release versions without applying any changes.
+* **Consolidated Reporting:** Aggregates results from every node and container into exactly one Discord notification, with a structured error log showing which host, which task, and what the error was.
 
 ## 🛠 Prerequisites
 * **Ansible Manager:** A dedicated LXC (e.g., Debian 12+, VMID 121) with a static IP.
@@ -28,11 +32,18 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 ## 📂 Project Structure
 ```text
 ~/proxmox-management/
-├── ansible.cfg              # Performance & connection settings
-├── hosts.ini                # List of physical Proxmox nodes
-├── vars.yml                 # Cluster-specific IDs, credentials, and mappings
-├── fleet-update.yml         # The main 4-phase orchestrator playbook
-└── update_individual_lxc.yml # The logic for individual container maintenance
+├── ansible.cfg                      # Performance & connection settings
+├── hosts.ini                        # List of nodes (gitignored — copy from .example)
+├── vars.yml                         # Credentials and cluster config (gitignored — copy from .example)
+├── fleet-update.yml                 # Main orchestrator playbook (7 phases)
+├── tasks/
+│   └── fleet-state-append.yml       # Shared state accumulator (used by all roles)
+├── templates/
+│   └── discord_briefing.j2          # Discord embed body template
+└── roles/
+    ├── lxc_update/                  # LXC container update logic
+    ├── vm_update/                   # QEMU VM update logic
+    └── remote_host_update/          # Non-Proxmox host update logic
 ```
 
 ## ⚙️ Configuration (vars.yml)
@@ -47,14 +58,24 @@ The `vars.yml` file is the central intelligence of the orchestrator.
 
 ### 🚥 Uptime Kuma Integration
 * `kuma_url` / `kuma_slug`: Points to your Kuma instance and the specific Status Page slug.
-* `lxc_kuma_map`: Links a Proxmox LXC ID to an Uptime Kuma Monitor ID. Ansible will wait 5 minutes for Kuma to report status: 1 (Up). If it fails, an automatic rollback is triggered.
+* `lxc_kuma_map` / `vm_kuma_map` / `remote_kuma_map`: Map an inventory hostname or LXC ID to an Uptime Kuma Monitor ID. Ansible will wait up to 5×30 seconds for Kuma to report `status: 1`. The monitor ID is the integer visible in the Kuma URL when editing a monitor; `kuma_slug` is the status page slug, not a monitor slug.
+
+### 🔄 Backup Strategy
+* `lxc_backup_strategy`: `snapshot` (default) | `vzdump` | `both` | `none`
+* `lxc_backup_storage`: PVE storage name for `vzdump`. Set to your PBS storage name (as shown in Datacenter → Storage) to route backups to PBS — no other change needed.
+
+### 🏷️ LXC Tag Discovery
+* `lxc_tags`: List of PVE tags that mark community-scripts containers (default: `community-script`, `proxmox-helper-scripts`). Set tags in PVE UI → Container → Options → Tags.
+* `lxc_dry_run`: Set to `true` to compare installed vs. latest GitHub release versions without making any changes.
+* `lxc_unattended`: Sets `PHS_SILENT=1` inside containers to suppress interactive prompts.
+* `lxc_backup_strategy` / `lxc_auto_reboot` / `lxc_continue_on_error`: See `vars.yml.example` for defaults.
 
 ### 🛡️ Management & Exclusions
-* `manager_lxc_id`: The VMID of the Ansible Manager itself.
-* `exclude_list`: IDs in this list are completely ignored (No updates, no snapshots).
-* `os_update_exclude_list`: Only the specialized App update command is run. The standard `apt dist-upgrade` is skipped (Common for PBS).
-* `snapshot_exclude_list`: Updates are performed, but snapshots are skipped. Use this for LXCs with Bind Mounts.
-* **Note:** `fleet-update.yml` is configured with `any_errors_fatal: true` for the Node Update phase to ensure cluster integrity if a critical failure occurs.
+* `manager_lxc_id`: The VMID of the Ansible Manager itself. The node hosting this container is never rebooted automatically.
+* `exclude_list`: LXC IDs completely skipped (no updates, no snapshots).
+* `os_update_exclude_list`: Skip `apt dist-upgrade` / `apk upgrade` for these IDs (app update still runs).
+* `snapshot_exclude_list`: Updates run but no snapshot is taken (use for LXCs with bind mounts).
+* **Note:** Phase 2 (node OS updates) uses `any_errors_fatal: true` and `serial: 1` to protect cluster quorum.
 
 ## 🚀 Setup Instructions
 To set up this project from scratch on a brand-new Ansible Manager LXC, follow these steps in order. This ensures all dependencies are met and the "trust" between your manager and your Proxmox nodes is established correctly.
@@ -74,8 +95,8 @@ apt update && apt upgrade -y
 # We use the 'python3-proxmoxer' apt package to avoid pip library conflicts
 apt install -y ansible python3-pip python3-proxmoxer python3-jmespath git
 
-# Install the Proxmox Ansible Collection
-ansible-galaxy collection install community.proxmox
+# Install required Ansible Collections
+ansible-galaxy collection install community.proxmox community.general
 ```
 
 ### 3. Establish SSH Trust (Passwordless Login)
@@ -138,11 +159,19 @@ ansible-playbook -i hosts.ini fleet-update.yml -e "force_notify=true"
 ## 🏃 Usage
 ### Manual Fleet Run (With Notification)
 ```bash
-ansible-playbook -i hosts.ini fleet-update.yml -e "force_notify=true"
+ansible-playbook fleet-update.yml -e "force_notify=true"
 ```
-### Dry Run (Simulation)
+### Check Mode (No Changes, Forces Notification)
 ```bash
-ansible-playbook -i hosts.ini fleet-update.yml --check -e "force_notify=true"
+ansible-playbook fleet-update.yml --check -e "force_notify=true"
+```
+### Version Comparison Dry Run (No Updates Applied)
+```bash
+ansible-playbook fleet-update.yml -e "lxc_dry_run=true force_notify=true"
+```
+### Single Node
+```bash
+ansible-playbook fleet-update.yml --limit pve-01
 ```
 ### Automated Schedule (Cron)
 Add this to the Manager LXC's `crontab -e` to run at 4:00 AM daily:
@@ -151,7 +180,8 @@ Add this to the Manager LXC's `crontab -e` to run at 4:00 AM daily:
 ```
 
 ## 📡 Discord Briefing Format
-The orchestrator sends a consolidated message:
-* **Node Status:** OK, UPDATED & REBOOTED, or MANUAL REBOOT REQ.
-* **LXC Breakdown:** Shows specific status: APP: UPDATED, LXC: OK.
-* **Error Log:** Dedicated section at the bottom for any failed tasks.
+The orchestrator sends one consolidated embed per run:
+* **Per-Node sections:** Node status (OK / UPDATED & REBOOTED / UPDATED (MANUAL REBOOT REQ) / FAILED), followed by each changed LXC and VM.
+* **Remote Hosts section:** Listed separately (not tied to a PVE node).
+* **Error Log:** Structured entries showing which host failed, which task failed, and the first 300 characters of stderr.
+* Only containers where something actually happened (UPDATED, FAILED, or dry-run results) appear in the embed — already-up-to-date containers are silent.
