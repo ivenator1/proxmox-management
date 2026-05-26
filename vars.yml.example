@@ -17,6 +17,28 @@ kuma_slug: "slug"
 lxc_kuma_map:
   "100": "5" #Pi-Hole
 
+# --- LXC TAG DISCOVERY ---
+lxc_tags:
+  - "community-script"
+  - "proxmox-helper-scripts"
+
+# --- BEHAVIOUR FLAGS ---
+lxc_unattended: true       # sets PHS_SILENT=1 inside containers
+lxc_dry_run: false         # compare versions only; no actual updates
+lxc_auto_reboot: true      # reboot container when reboot-required is present
+lxc_continue_on_error: false
+
+# --- BACKUP STRATEGY ---
+# snapshot | vzdump | both | none
+lxc_backup_strategy: "snapshot"
+# PVE storage name (set to your PBS storage name to route vzdump to PBS)
+lxc_backup_storage: "local"
+
+# --- KUMA MAPS FOR VMs AND REMOTE HOSTS ---
+# "inventory_hostname": KUMA_MONITOR_ID
+vm_kuma_map: {}
+remote_kuma_map: {}
+
 # --- EXCLUSIONS ---
 #LXC of managing node
 manager_lxc_id: "121"

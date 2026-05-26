@@ -6,3 +6,26 @@ pve-02 ansible_host=10.10.10.20
 ansible_user=root
 ansible_ssh_private_key_file=~/.ssh/id_ed25519
 ansible_python_interpreter=/usr/bin/python3
+
+# QEMU VMs managed by Proxmox (SSH-reachable).
+# vmid must match the VM ID in PVE. pve_node must match the inventory hostname
+# of the PVE node that owns this VM (used to look up the PVE API host).
+# Leave the group empty (just the header) if you have no VMs.
+[proxmox_vms]
+# my-vm  ansible_host=10.10.10.50  vmid=200  pve_node=pve-01
+
+[proxmox_vms:vars]
+ansible_user=root
+ansible_ssh_private_key_file=~/.ssh/id_ed25519
+ansible_python_interpreter=/usr/bin/python3
+
+# Non-Proxmox hosts (bare-metal, cloud VMs, etc.).
+# No snapshot support. Supports apt, dnf, and apk (Alpine).
+# Leave the group empty (just the header) if you have no remote hosts.
+[remote_hosts]
+# my-server  ansible_host=192.168.1.100
+
+[remote_hosts:vars]
+ansible_user=root
+ansible_ssh_private_key_file=~/.ssh/id_ed25519
+ansible_python_interpreter=/usr/bin/python3
