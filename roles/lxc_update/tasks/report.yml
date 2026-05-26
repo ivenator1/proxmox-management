@@ -13,6 +13,11 @@
          and lxc_ver_after.stdout | default('') | trim != ''
          and lxc_ver_before.stdout | trim | regex_replace('^v', '') != lxc_ver_after.stdout | trim | regex_replace('^v', '') -%}
       Updated: {{ lxc_ver_before.stdout | trim }} → {{ lxc_ver_after.stdout | trim }}
+      {%- elif lxc_ver_before is defined and lxc_ver_after is defined
+         and lxc_ver_before.stdout | default('') | trim != ''
+         and lxc_ver_after.stdout | default('') | trim != ''
+         and lxc_ver_before.stdout | trim | regex_replace('^v', '') == lxc_ver_after.stdout | trim | regex_replace('^v', '') -%}
+      OK
       {%- else -%}UPDATED{%- endif -%}
       {%- else -%}OK{%- endif -%}
     tmp_os: >-

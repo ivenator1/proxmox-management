@@ -1,37 +1,9 @@
 ---
-- name: "Scale up resources for LXC {{ lxc_id }}"
-  shell: "pct set {{ lxc_id }} --cores {{ lxc_build_cpu }} --memory {{ lxc_build_ram }}"
-  when: needs_resource_scale | bool
-
 - name: "Read pre-update app version {{ lxc_id }}"
   shell: >
     pct exec {{ lxc_id }} -- sh -c
     "cat ~/.{{ ct_script_name.stdout | lower | replace('-','') }} 2>/dev/null || echo ''"
   register: lxc_ver_before
-  changed_when: false
-  failed_when: false
-  when: ct_script_name.stdout | default('') != '' and not (lxc_no_update_script | default(false) | bool)
-
-- name: "App update (Community Script) {{ lxc_id }}"
-  shell: |
-    pct exec {{ lxc_id }} -- {{ 'ash' if lxc_os == 'alpine' else 'bash' }} -c '
-      mkdir -p /tmp/.nc
-      printf "#!/bin/sh\n:\n" > /tmp/.nc/clear
-      chmod +x /tmp/.nc/clear
-      export PATH=/tmp/.nc:$PATH
-      export TERM=dumb
-      {{ "export PHS_SILENT=1;" if lxc_unattended | bool else "" }}update'
-  register: app_update_res
-  changed_when:
-    - app_update_res.stdout is search('Updated successfully|Downloading|Extracting|Installing|Building|unpacking|Setting up|upgrading')
-  ignore_errors: yes
-  when: not (lxc_no_update_script | default(false) | bool)
-
-- name: "Read post-update app version {{ lxc_id }}"
-  shell: >
-    pct exec {{ lxc_id }} -- sh -c
-    "cat ~/.{{ ct_script_name.stdout | lower | replace('-','') }} 2>/dev/null || echo ''"
-  register: lxc_ver_after
   changed_when: false
   failed_when: false
   when: ct_script_name.stdout | default('') != '' and not (lxc_no_update_script | default(false) | bool)
@@ -52,6 +24,35 @@
     '0 upgraded, 0 newly installed' not in os_update_res.stdout and
     'Your System is up-to-date' not in os_update_res.stdout
   ignore_errors: yes
+
+- name: "Scale up resources for LXC {{ lxc_id }}"
+  shell: "pct set {{ lxc_id }} --cores {{ lxc_build_cpu }} --memory {{ lxc_build_ram }}"
+  when: needs_resource_scale | bool
+
+- name: "App update (Community Script) {{ lxc_id }}"
+  shell: |
+    pct exec {{ lxc_id }} -- {{ 'ash' if lxc_os == 'alpine' else 'bash' }} -c '
+      mkdir -p /tmp/.nc
+      printf "#!/bin/sh\n:\n" > /tmp/.nc/clear
+      chmod +x /tmp/.nc/clear
+      export PATH=/tmp/.nc:$PATH
+      export TERM=dumb
+      {{ "export PHS_SILENT=1;" if lxc_unattended | bool else "" }}update'
+  register: app_update_res
+  changed_when:
+    - app_update_res.stdout is search('Updated successfully|Downloading|Extracting|Installing|Building|unpacking|Setting up|upgrading')
+    - "'0 upgraded, 0 newly installed' not in app_update_res.stdout"
+  ignore_errors: yes
+  when: not (lxc_no_update_script | default(false) | bool)
+
+- name: "Read post-update app version {{ lxc_id }}"
+  shell: >
+    pct exec {{ lxc_id }} -- sh -c
+    "cat ~/.{{ ct_script_name.stdout | lower | replace('-','') }} 2>/dev/null || echo ''"
+  register: lxc_ver_after
+  changed_when: false
+  failed_when: false
+  when: ct_script_name.stdout | default('') != '' and not (lxc_no_update_script | default(false) | bool)
 
 - name: "Scale down resources for LXC {{ lxc_id }}"
   shell: "pct set {{ lxc_id }} --cores {{ lxc_run_cpu }} --memory {{ lxc_run_ram }}"
