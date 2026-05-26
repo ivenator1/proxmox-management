@@ -1,0 +1,56 @@
+---
+- name: "Pull update script from LXC {{ lxc_id }}"
+  shell: "pct pull {{ lxc_id }} /usr/bin/update /tmp/ansible_update_{{ lxc_id }}"
+  changed_when: false
+  failed_when: false
+  register: pull_res
+
+- name: "Extract ct script name from update script"
+  shell: "grep -oP 'ct/\\K[^.]+(?=\\.sh)' /tmp/ansible_update_{{ lxc_id }} | head -1"
+  register: ct_script_name
+  changed_when: false
+  failed_when: false
+  when: pull_res.rc == 0
+
+- name: "Remove temp update script"
+  file:
+    path: "/tmp/ansible_update_{{ lxc_id }}"
+    state: absent
+  when: pull_res.rc == 0
+
+- name: "Set no-update-script flag"
+  set_fact:
+    lxc_no_update_script: true
+    ct_script_content: ""
+    needs_resource_scale: false
+    lxc_build_cpu: ""
+    lxc_build_ram: ""
+    lxc_run_cpu: ""
+    lxc_run_ram: ""
+  when: pull_res.rc != 0 or ct_script_name.stdout | default('') == ''
+
+- name: "Fetch ct script from GitHub"
+  uri:
+    url: "https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/{{ ct_script_name.stdout }}.sh"
+    return_content: true
+  delegate_to: localhost
+  register: ct_script_fetch
+  failed_when: false
+  when: ct_script_name.stdout | default('') != ''
+
+- name: "Parse resource requirements from ct script"
+  set_fact:
+    lxc_no_update_script: false
+    ct_script_content: "{{ ct_script_fetch.content | default('') }}"
+    lxc_build_cpu: "{{ ct_script_fetch.content | default('') | regex_search('var_cpu=\"(\\d+)\"', '\\1') | first | default('') }}"
+    lxc_build_ram: "{{ ct_script_fetch.content | default('') | regex_search('var_ram=\"(\\d+)\"', '\\1') | first | default('') }}"
+    lxc_run_cpu: "{{ ct_script_fetch.content | default('') | regex_search('pct set \\$CTID -cores (\\d+)', '\\1') | first | default('') }}"
+    lxc_run_ram: "{{ ct_script_fetch.content | default('') | regex_search('pct set \\$CTID -memory (\\d+)', '\\1') | first | default('') }}"
+  when: ct_script_name.stdout | default('') != ''
+
+- name: "Determine if resource scaling is needed"
+  set_fact:
+    needs_resource_scale: >-
+      {{ lxc_build_cpu | default('') != '' and lxc_run_cpu | default('') != ''
+         and (lxc_build_cpu | int) > (lxc_run_cpu | int) }}
+  when: ct_script_name.stdout | default('') != ''

@@ -1,0 +1,57 @@
+---
+- name: "Scale up resources for LXC {{ lxc_id }}"
+  shell: "pct set {{ lxc_id }} --cores {{ lxc_build_cpu }} --memory {{ lxc_build_ram }}"
+  when: needs_resource_scale | bool
+
+- name: "App update (Community Script) {{ lxc_id }}"
+  shell: |
+    pct exec {{ lxc_id }} -- {{ 'ash' if lxc_os == 'alpine' else 'bash' }} -c '
+      mkdir -p /tmp/.nc
+      printf "#!/bin/sh\n:\n" > /tmp/.nc/clear
+      chmod +x /tmp/.nc/clear
+      export PATH=/tmp/.nc:$PATH
+      export TERM=dumb
+      {{ "export PHS_SILENT=1;" if lxc_unattended | bool else "" }}update'
+  register: app_update_res
+  changed_when:
+    - app_update_res.stdout is search('Updated successfully|Downloading|Extracting|Installing|Building|unpacking|Setting up|upgrading')
+  ignore_errors: yes
+  when: not (lxc_no_update_script | default(false) | bool)
+
+- name: "OS update {{ lxc_id }}"
+  shell: |
+    {% if lxc_os in ['ubuntu', 'debian', 'devuan'] %}
+    pct exec {{ lxc_id }} -- bash -c "apt-get update && apt-get -y dist-upgrade"
+    {% elif lxc_os == 'alpine' %}
+    pct exec {{ lxc_id }} -- ash -c "apk -U upgrade"
+    {% else %}
+    pct exec {{ lxc_id }} -- bash -c "dnf -y upgrade || pacman -Syyu --noconfirm"
+    {% endif %}
+  register: os_update_res
+  when: lxc_id not in (os_update_exclude_list | default([]))
+  changed_when: >
+    ('upgraded' in os_update_res.stdout or 'OK' in os_update_res.stdout) and
+    '0 upgraded, 0 newly installed' not in os_update_res.stdout and
+    'Your System is up-to-date' not in os_update_res.stdout
+  ignore_errors: yes
+
+- name: "Scale down resources for LXC {{ lxc_id }}"
+  shell: "pct set {{ lxc_id }} --cores {{ lxc_run_cpu }} --memory {{ lxc_run_ram }}"
+  when: needs_resource_scale | bool
+
+- name: "Wait for Proxmox task locks"
+  pause:
+    seconds: 5
+
+- name: "Check reboot-required {{ lxc_id }}"
+  shell: "pct exec {{ lxc_id }} -- [ -f /var/run/reboot-required ]"
+  register: lxc_reboot_req
+  failed_when: false
+  changed_when: false
+
+- name: "Reboot LXC {{ lxc_id }}"
+  shell: "pct reboot {{ lxc_id }}"
+  register: lxc_reboot_action
+  when:
+    - lxc_auto_reboot | bool
+    - lxc_reboot_req.rc == 0

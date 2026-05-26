@@ -1,0 +1,22 @@
+---
+- name: "vzdump backup of LXC {{ lxc_id }}"
+  shell: >
+    vzdump {{ lxc_id }} --compress zstd --storage {{ lxc_backup_storage }}
+    --notes-template "{{ lxc_name }} - ansible fleet-update"
+  when: lxc_backup_strategy in ['vzdump', 'both']
+
+- name: "Snapshot LXC {{ lxc_id }}"
+  community.proxmox.proxmox_snap:
+    api_host: "{{ ansible_host }}"
+    api_user: "{{ pve_api_user }}"
+    api_token_id: "{{ pve_api_token_id }}"
+    api_token_secret: "{{ pve_api_token_secret }}"
+    vmid: "{{ lxc_id }}"
+    snapname: "BEFORE_UPDATE_AUTO"
+    state: present
+  delegate_to: localhost
+  register: snap_res
+  failed_when: false
+  when:
+    - lxc_backup_strategy in ['snapshot', 'both']
+    - lxc_id not in (snapshot_exclude_list | default([]))

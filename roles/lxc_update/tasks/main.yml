@@ -1,0 +1,92 @@
+---
+- name: "Introspect LXC {{ lxc_id }}"
+  include_tasks: introspect.yml
+
+- name: "LXC maintenance block {{ lxc_id }}"
+  block:
+    - name: "Detect services and resources"
+      include_tasks: detect.yml
+      when:
+        - lxc_is_running | bool
+        - not lxc_is_template | bool
+
+    - name: "Backup"
+      include_tasks: backup.yml
+      when:
+        - lxc_is_running | bool
+        - not lxc_is_template | bool
+        - not lxc_dry_run | bool
+        - lxc_backup_strategy != 'none'
+
+    - name: "Dry-run version check"
+      include_tasks: dry_check.yml
+      when:
+        - lxc_is_running | bool
+        - not lxc_is_template | bool
+        - lxc_dry_run | bool
+
+    - name: "Update"
+      include_tasks: update.yml
+      when:
+        - lxc_is_running | bool
+        - not lxc_is_template | bool
+        - not lxc_dry_run | bool
+
+    - name: "Health check"
+      include_tasks: health_check.yml
+      when:
+        - lxc_is_running | bool
+        - not lxc_is_template | bool
+        - not lxc_dry_run | bool
+
+    - name: "Report success"
+      include_tasks: report.yml
+
+  rescue:
+    - name: "Capture failure details"
+      set_fact:
+        _failed_task_name: "{{ ansible_failed_task.name | default('Unknown task') }}"
+        _failed_error: "{{ ansible_failed_result.stderr | default(ansible_failed_result.msg) | default('Unknown error') | truncate(300) }}"
+
+    - name: "Record failure"
+      include_tasks: "{{ playbook_dir }}/tasks/fleet-state-append.yml"
+      vars:
+        fleet_record_type: lxc
+        fleet_record_payload:
+          node: "{{ inventory_hostname }}"
+          name: "{{ lxc_name | default(lxc_id) }}"
+          id: "{{ lxc_id }}"
+          app: "FAILED"
+          os: "FAILED"
+          snap: false
+        fleet_record_failed: true
+        fleet_error_detail:
+          host: "{{ inventory_hostname }}/lxc-{{ lxc_id }}"
+          task: "{{ _failed_task_name }}"
+          error: "{{ _failed_error }}"
+
+  always:
+    - name: "Delete snapshot {{ lxc_id }}"
+      community.proxmox.proxmox_snap:
+        api_host: "{{ ansible_host }}"
+        api_user: "{{ pve_api_user }}"
+        api_token_id: "{{ pve_api_token_id }}"
+        api_token_secret: "{{ pve_api_token_secret }}"
+        vmid: "{{ lxc_id }}"
+        snapname: "BEFORE_UPDATE_AUTO"
+        state: absent
+      delegate_to: localhost
+      register: delete_snap_res
+      until: delete_snap_res is succeeded
+      retries: 5
+      delay: 10
+      ignore_errors: yes
+      when:
+        - snap_res is defined
+        - snap_res is succeeded
+
+    - name: "Stop LXC {{ lxc_id }} (was stopped before update)"
+      shell: "pct stop {{ lxc_id }}"
+      when:
+        - lxc_was_stopped | default(false) | bool
+        - not lxc_is_template | default(false) | bool

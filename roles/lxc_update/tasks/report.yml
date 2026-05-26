@@ -1,0 +1,41 @@
+---
+- name: "Build status strings {{ lxc_id }}"
+  set_fact:
+    tmp_app: >-
+      {%- if lxc_is_template | bool -%}TEMPLATE
+      {%- elif not lxc_is_running | bool -%}NEVER STARTED
+      {%- elif lxc_dry_run | bool -%}{{ dry_run_status | default('dry-run') }}
+      {%- elif lxc_no_update_script | default(false) | bool -%}NO SCRIPT
+      {%- elif app_update_res is defined and app_update_res is failed -%}FAILED
+      {%- elif app_update_res is defined and app_update_res.changed -%}UPDATED
+      {%- else -%}OK{%- endif -%}
+    tmp_os: >-
+      {%- if lxc_is_template | bool or not lxc_is_running | bool or lxc_dry_run | bool -%}
+      {%- elif lxc_id in (os_update_exclude_list | default([])) -%}SKIPPED
+      {%- elif os_update_res is defined and os_update_res is failed -%}FAILED
+      {%- elif lxc_reboot_action is defined and lxc_reboot_action.changed -%}UPDATED & REBOOTED
+      {%- elif os_update_res is defined and os_update_res.changed -%}UPDATED
+      {%- else -%}OK{%- endif -%}
+
+- name: "Append LXC record {{ lxc_id }}"
+  include_tasks: "{{ playbook_dir }}/tasks/fleet-state-append.yml"
+  vars:
+    fleet_record_type: lxc
+    fleet_record_payload:
+      node: "{{ inventory_hostname }}"
+      name: "{{ lxc_name }}"
+      id: "{{ lxc_id }}"
+      app: "{{ tmp_app | trim }}"
+      os: "{{ tmp_os | trim }}"
+      snap: "{{ lxc_id not in (snapshot_exclude_list | default([])) }}"
+    fleet_record_changed: >-
+      {{ (app_update_res is defined and app_update_res.changed) or
+         (os_update_res is defined and os_update_res.changed) or
+         (lxc_reboot_action is defined and lxc_reboot_action.changed) }}
+    fleet_record_failed: >-
+      {{ (app_update_res is defined and app_update_res is failed) or
+         (os_update_res is defined and os_update_res is failed) }}
+  when: >
+    lxc_dry_run | bool or
+    (tmp_app | trim) in ['FAILED', 'UPDATED', 'NO SCRIPT', 'NEVER STARTED'] or
+    (tmp_os | trim) in ['FAILED', 'UPDATED', 'UPDATED & REBOOTED']

@@ -1,0 +1,18 @@
+---
+lxc_tags:
+  - "community-script"
+  - "proxmox-helper-scripts"
+
+lxc_unattended: true
+lxc_dry_run: false
+lxc_auto_reboot: true
+lxc_continue_on_error: false
+
+# snapshot | vzdump | both | none
+lxc_backup_strategy: "snapshot"
+lxc_backup_storage: "local"
+
+exclude_list: []
+os_update_exclude_list: []
+snapshot_exclude_list: []
+lxc_kuma_map: {}
