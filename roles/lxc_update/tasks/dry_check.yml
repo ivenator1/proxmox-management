@@ -1,7 +1,7 @@
 ---
 - name: "Extract GitHub repo from ct script"
   set_fact:
-    gh_repo: "{{ ct_script_content | regex_search('check_for_gh_release\\s+\"[^\"]+\"\\s+\"([^\"]+)\"', '\\1') | first | default('') }}"
+    gh_repo: "{{ (ct_script_content | regex_search('check_for_gh_release\\s+\"[^\"]+\"\\s+\"([^\"]+)\"', '\\1') or [''])[0] }}"
 
 - name: "Read installed version from container"
   shell: >

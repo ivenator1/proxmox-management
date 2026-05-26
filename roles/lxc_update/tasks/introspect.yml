@@ -7,8 +7,8 @@
 
 - name: "Set LXC facts"
   set_fact:
-    lxc_name: "{{ lxc_config.stdout | regex_search('hostname: (\\S+)', '\\1') | first | default('Unknown') }}"
-    lxc_os: "{{ lxc_config.stdout | regex_search('ostype: (\\w+)', '\\1') | first | default('debian') }}"
+    lxc_name: "{{ (lxc_config.stdout | regex_search('hostname: (\\S+)', '\\1') or ['Unknown'])[0] }}"
+    lxc_os: "{{ (lxc_config.stdout | regex_search('ostype: (\\w+)', '\\1') or ['debian'])[0] }}"
     lxc_is_template: "{{ 'template: 1' in lxc_config.stdout }}"
 
 - name: "Check LXC status {{ lxc_id }}"
