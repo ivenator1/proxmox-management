@@ -18,6 +18,10 @@
          and lxc_ver_after.stdout | default('') | trim != ''
          and lxc_ver_before.stdout | trim | regex_replace('^v', '') == lxc_ver_after.stdout | trim | regex_replace('^v', '') -%}
       OK
+      {%- elif dpkg_hash_before is defined and dpkg_hash_after is defined
+         and dpkg_hash_before.stdout | default('') | trim != ''
+         and dpkg_hash_after.stdout | default('') | trim != '' -%}
+      {%- if dpkg_hash_before.stdout | trim != dpkg_hash_after.stdout | trim -%}UPDATED{%- else -%}OK{%- endif -%}
       {%- else -%}UPDATED{%- endif -%}
       {%- else -%}OK{%- endif -%}
     tmp_os: >-

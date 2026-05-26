@@ -25,6 +25,20 @@
     'Your System is up-to-date' not in os_update_res.stdout
   ignore_errors: yes
 
+- name: "Read package state before app update {{ lxc_id }}"
+  shell: |
+    {% if lxc_os == 'alpine' %}
+    pct exec {{ lxc_id }} -- ash -c "apk info -v 2>/dev/null | sort | md5sum"
+    {% elif lxc_os in ['ubuntu', 'debian', 'devuan'] %}
+    pct exec {{ lxc_id }} -- bash -c "dpkg-query -W 2>/dev/null | sort | md5sum"
+    {% else %}
+    echo ""
+    {% endif %}
+  register: dpkg_hash_before
+  changed_when: false
+  failed_when: false
+  when: not (lxc_no_update_script | default(false) | bool) and not (lxc_dry_run | bool)
+
 - name: "Scale up resources for LXC {{ lxc_id }}"
   shell: "pct set {{ lxc_id }} --cores {{ lxc_build_cpu }} --memory {{ lxc_build_ram }}"
   when: needs_resource_scale | bool
@@ -44,6 +58,20 @@
     - "'0 upgraded, 0 newly installed' not in app_update_res.stdout"
   ignore_errors: yes
   when: not (lxc_no_update_script | default(false) | bool)
+
+- name: "Read package state after app update {{ lxc_id }}"
+  shell: |
+    {% if lxc_os == 'alpine' %}
+    pct exec {{ lxc_id }} -- ash -c "apk info -v 2>/dev/null | sort | md5sum"
+    {% elif lxc_os in ['ubuntu', 'debian', 'devuan'] %}
+    pct exec {{ lxc_id }} -- bash -c "dpkg-query -W 2>/dev/null | sort | md5sum"
+    {% else %}
+    echo ""
+    {% endif %}
+  register: dpkg_hash_after
+  changed_when: false
+  failed_when: false
+  when: not (lxc_no_update_script | default(false) | bool) and not (lxc_dry_run | bool)
 
 - name: "Read post-update app version {{ lxc_id }}"
   shell: >
