@@ -96,6 +96,28 @@ Do not write `set_fact` + `delegate_to: localhost` blocks directly — always ca
 
 `vm_update` and `remote_host_update` follow the same block/rescue/always pattern. `remote_host_update` has no always block (no snapshots to clean up).
 
+### `update.yml` task order and change detection
+
+The task order matters for correct attribution:
+1. Read `lxc_ver_before`
+2. OS update (`apt dist-upgrade` / `apk upgrade`) — runs **first** so OS packages get credited to the OS line, not the app line
+3. Read `dpkg_hash_before` — md5sum of `dpkg-query -W` (package→version pairs) after OS update, before community script
+4. Scale up resources (if `needs_resource_scale`)
+5. Community script (`app_update_res`)
+6. Read `dpkg_hash_after` — same query; if hash matches `dpkg_hash_before`, nothing was installed
+7. Read `lxc_ver_after`
+8. Scale down → reboot check
+
+**`tmp_app` decision tree in `report.yml`** (in priority order):
+- Version files differ → `Updated: X → Y`
+- Version files both non-empty and equal → `OK` (confirmed no app change)
+- dpkg hash differs → `UPDATED` (packages changed, no version file)
+- dpkg hash matches → `OK` (nothing installed, no version file)
+- No hash data (non-apt OS) → `UPDATED` (fallback)
+- `app_update_res.changed` is false → `OK`
+
+**Why dpkg hash instead of stdout parsing:** `PHS_SILENT=1` (set by `lxc_unattended: true`) routes apt's stdout to `/dev/null` inside community scripts, so keywords like `0 upgraded, 0 newly installed` never appear in `app_update_res.stdout`. The dpkg hash is a direct query, immune to output suppression.
+
 ### `detect.yml` flow and version file convention
 
 `detect.yml` does three things in sequence:
