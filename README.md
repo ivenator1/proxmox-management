@@ -21,6 +21,7 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 * **Flexible Backup Strategy:** Choose per-run between lightweight snapshots, full `vzdump` backups (including PBS), both, or none.
 * **Resource Scaling:** Automatically scales container CPU/RAM up during build-heavy app updates and back down afterward, matching the behaviour of the community-scripts bash installer.
 * **Dry-Run Mode:** Compare installed vs. latest GitHub release versions without applying any changes.
+* **Accurate Change Detection:** OS packages are updated before the community script runs, so each line is correctly attributed. For apps without a version file, a `dpkg-query` package-state hash is taken before and after the community script — if it matches, the container is silent even if the script produced output. This prevents false-positive "UPDATED" reports caused by `PHS_SILENT=1` suppressing apt's stdout inside community scripts.
 * **Consolidated Reporting:** Aggregates results from every node and container into exactly one Discord notification, with a structured error log showing which host, which task, and what the error was.
 
 ## 🛠 Prerequisites
@@ -185,7 +186,9 @@ Add this to the Manager LXC's `crontab -e` to run at 4:00 AM daily:
 
 ## 📡 Discord Briefing Format
 The orchestrator sends one consolidated embed per run:
-* **Per-Node sections:** Node status (OK / UPDATED & REBOOTED / UPDATED (MANUAL REBOOT REQ) / FAILED), followed by each changed LXC and VM.
+* **Per-Node sections:** Node status (`OK` / `UPDATED & REBOOTED` / `UPDATED (MANUAL REBOOT REQ)` / `FAILED`), followed by each changed LXC and VM.
+* **App status per container:** `Updated: X → Y` (version changed), `UPDATED` (packages changed, no version file), `OK` (nothing changed), `NO SCRIPT` (no community-script update binary), `FAILED`.
+* **OS status per container:** `Updated (N upgraded)` (with package count), `OK`, `SKIPPED` (in `os_update_exclude_list`), `FAILED`.
 * **Remote Hosts section:** Listed separately (not tied to a PVE node).
 * **Error Log:** Structured entries showing which host failed, which task failed, and the first 300 characters of stderr.
-* Only containers where something actually happened (UPDATED, FAILED, or dry-run results) appear in the embed — already-up-to-date containers are silent.
+* Containers where nothing changed produce no embed entry — they are absorbed into `*No container changes.*` for that node.
