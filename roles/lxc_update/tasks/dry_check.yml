@@ -32,7 +32,7 @@
         cannot fetch latest from {{ gh_repo }}
       {%- elif installed_ver.stdout | default('') == '' -%}
         version unknown — latest: {{ (gh_release.json.tag_name | default('?')) }}
-      {%- elif installed_ver.stdout | trim == (gh_release.json.tag_name | default('') | trim) -%}
+      {%- elif installed_ver.stdout | trim | regex_replace('^v', '') == (gh_release.json.tag_name | default('') | trim | regex_replace('^v', '')) -%}
         up to date ({{ installed_ver.stdout | trim }})
       {%- else -%}
         update available: {{ installed_ver.stdout | trim }} → {{ gh_release.json.tag_name | default('?') }}

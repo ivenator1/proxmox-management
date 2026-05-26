@@ -7,14 +7,24 @@
       {%- elif lxc_dry_run | bool -%}{{ dry_run_status | default('dry-run') }}
       {%- elif lxc_no_update_script | default(false) | bool -%}NO SCRIPT
       {%- elif app_update_res is defined and app_update_res is failed -%}FAILED
-      {%- elif app_update_res is defined and app_update_res.changed -%}UPDATED
+      {%- elif app_update_res is defined and app_update_res.changed -%}
+      {%- if lxc_ver_before is defined and lxc_ver_after is defined
+         and lxc_ver_before.stdout | default('') | trim != ''
+         and lxc_ver_after.stdout | default('') | trim != ''
+         and lxc_ver_before.stdout | trim | regex_replace('^v', '') != lxc_ver_after.stdout | trim | regex_replace('^v', '') -%}
+      Updated: {{ lxc_ver_before.stdout | trim }} → {{ lxc_ver_after.stdout | trim }}
+      {%- else -%}UPDATED{%- endif -%}
       {%- else -%}OK{%- endif -%}
     tmp_os: >-
       {%- if lxc_is_template | bool or not lxc_is_running | bool or lxc_dry_run | bool -%}
       {%- elif lxc_id in (os_update_exclude_list | default([])) -%}SKIPPED
       {%- elif os_update_res is defined and os_update_res is failed -%}FAILED
-      {%- elif lxc_reboot_action is defined and lxc_reboot_action.changed -%}UPDATED & REBOOTED
-      {%- elif os_update_res is defined and os_update_res.changed -%}UPDATED
+      {%- elif lxc_reboot_action is defined and lxc_reboot_action.changed -%}
+      {%- set _pkg = (os_update_res.stdout | default('') | regex_search('(\\d+ upgraded)', '\\1') or [''])[0] -%}
+      Updated{% if _pkg %} ({{ _pkg }}){% endif %} & Rebooted
+      {%- elif os_update_res is defined and os_update_res.changed -%}
+      {%- set _pkg = (os_update_res.stdout | default('') | regex_search('(\\d+ upgraded)', '\\1') or [''])[0] -%}
+      Updated{% if _pkg %} ({{ _pkg }}){% endif %}
       {%- else -%}OK{%- endif -%}
 
 - name: "Append LXC record {{ lxc_id }}"
@@ -37,5 +47,5 @@
          (os_update_res is defined and os_update_res is failed) }}
   when: >
     lxc_dry_run | bool or
-    (tmp_app | trim) in ['FAILED', 'UPDATED', 'NO SCRIPT', 'NEVER STARTED'] or
-    (tmp_os | trim) in ['FAILED', 'UPDATED', 'UPDATED & REBOOTED']
+    (tmp_app | trim | lower) is search('updated|failed|no script|never started') or
+    (tmp_os | trim | lower) is search('updated|failed')
