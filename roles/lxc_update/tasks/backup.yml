@@ -1,5 +1,5 @@
 ---
-- name: "vzdump backup of LXC {{ lxc_id }}"
+- name: "Vzdump backup of LXC {{ lxc_id }}"
   shell: >
     vzdump {{ lxc_id }} --compress zstd --storage {{ lxc_backup_storage }}
     --notes-template "{{ lxc_name }} - ansible fleet-update"

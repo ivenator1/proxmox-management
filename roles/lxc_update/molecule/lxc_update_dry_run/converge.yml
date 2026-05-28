@@ -4,7 +4,7 @@
   connection: local
   gather_facts: false
   environment:
-    PATH: "/tmp/mol_stubs:{{ ansible_env.PATH }}"
+    PATH: "/tmp/mol_stubs:{{ lookup('env', 'PATH') }}"
   vars:
     lxc_id: "101"
     lxc_dry_run: true
