@@ -37,14 +37,22 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 ├── hosts.ini                        # List of nodes (gitignored — copy from .example)
 ├── vars.yml                         # Credentials and cluster config (gitignored — copy from .example)
 ├── fleet-update.yml                 # Main orchestrator playbook (7 phases)
+├── .ansible-lint                    # Lint profile and skip rules
+├── .yamllint.yml                    # YAML style rules
+├── .github/workflows/ci.yml         # CI: yamllint, ansible-lint, syntax-check, pytest, molecule
 ├── tasks/
 │   └── fleet-state-append.yml       # Shared state accumulator (used by all roles)
 ├── templates/
 │   └── discord_briefing.j2          # Discord embed body template
+├── tests/
+│   ├── requirements.txt             # pytest, jinja2, pyyaml
+│   ├── conftest.py                  # Ansible-compatible Jinja2 environment for unit tests
+│   ├── unit/                        # 104 pytest tests — no Ansible or PVE required
+│   └── integration/                 # Standalone ansible-playbook tests
 └── roles/
-    ├── lxc_update/                  # LXC container update logic
-    ├── vm_update/                   # QEMU VM update logic
-    └── remote_host_update/          # Non-Proxmox host update logic
+    ├── lxc_update/                  # LXC container update logic + 5 molecule scenarios
+    ├── vm_update/                   # QEMU VM update logic + molecule scenario
+    └── remote_host_update/          # Non-Proxmox host update logic + molecule scenario
 ```
 
 ## ⚙️ Configuration (vars.yml)
@@ -179,6 +187,25 @@ Add this to the Manager LXC's `crontab -e` to run at 4:00 AM daily:
 ```cron
 0 4 * * * cd /root/proxmox-management && /usr/bin/ansible-playbook fleet-update.yml >> /var/log/ansible-fleet-update.log 2>&1
 ```
+
+## 🧪 Development & Testing
+
+No Proxmox infrastructure is needed to run the tests.
+
+```bash
+# Jinja2 unit tests (covers report logic, Discord template, state accumulation)
+pip install -r tests/requirements.txt
+pytest tests/unit/ -v
+
+# Static analysis
+yamllint .
+ansible-lint fleet-update.yml
+
+# Molecule (uses stub pct/vzdump scripts, runs against localhost)
+cd roles/lxc_update && molecule test -s lxc_update_normal
+```
+
+CI runs automatically on push/PR via GitHub Actions (`.github/workflows/ci.yml`).
 
 ## 🗒️ TODO
 
