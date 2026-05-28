@@ -3,6 +3,10 @@
   hosts: localhost
   connection: local
   gather_facts: false
+  pre_tasks:
+    - name: Load fleet state from converge play
+      include_vars:
+        file: /tmp/mol_fleet_state.json
   tasks:
     - name: Check fleet_lxc_data was populated
       assert:

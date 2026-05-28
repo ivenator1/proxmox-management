@@ -17,7 +17,7 @@
         _failed_error: "{{ ansible_failed_result.stderr | default(ansible_failed_result.msg) | default('Unknown error') | truncate(300) }}"
 
     - name: "Record failure"
-      include_tasks: "{{ playbook_dir }}/tasks/fleet-state-append.yml"
+      include_tasks: "{{ role_path }}/../../tasks/fleet-state-append.yml"
       vars:
         fleet_record_type: remote_host
         fleet_record_payload:

@@ -37,7 +37,7 @@
       {%- else -%}OK{%- endif -%}
 
 - name: "Append LXC record {{ lxc_id }}"
-  include_tasks: "{{ playbook_dir }}/tasks/fleet-state-append.yml"
+  include_tasks: "{{ role_path }}/../../tasks/fleet-state-append.yml"
   vars:
     fleet_record_type: lxc
     fleet_record_payload:

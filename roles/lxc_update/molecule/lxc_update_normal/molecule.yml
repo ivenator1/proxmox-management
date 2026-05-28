@@ -9,6 +9,9 @@ platforms:
 
 provisioner:
   name: ansible
+  env:
+    ANSIBLE_ROLES_PATH: "${MOLECULE_PROJECT_DIRECTORY}/.."
+    PATH: "/tmp/mol_stubs:${PATH}"
   inventory:
     hosts:
       all:
@@ -22,3 +25,12 @@ provisioner:
 
 verifier:
   name: ansible
+
+scenario:
+  test_sequence:
+    - create
+    - prepare
+    - converge
+    - verify
+    - cleanup
+    - destroy
