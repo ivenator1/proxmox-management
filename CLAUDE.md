@@ -22,6 +22,20 @@ ansible-playbook fleet-update.yml -e "force_notify=true"
 
 # Install required collections
 ansible-galaxy collection install community.proxmox community.general
+
+# Jinja2 unit tests (no Ansible or PVE needed)
+pip install -r tests/requirements.txt
+pytest tests/unit/ -v
+pytest tests/unit/test_report_tmp_app.py -v    # single file
+pytest tests/unit/ -k "test_version_updated"   # single test
+
+# Static analysis
+yamllint .
+ansible-lint fleet-update.yml
+
+# Molecule scenario (runs against localhost via stub pct/vzdump scripts)
+cd roles/lxc_update && molecule test -s lxc_update_normal
+cd roles/lxc_update && molecule converge -s lxc_update_normal  # converge only, no verify/destroy
 ```
 
 `hosts.ini` and `vars.yml` are gitignored (contain secrets/IPs). Copy from `.example` files to run locally.
@@ -92,7 +106,7 @@ Do not write `set_fact` + `delegate_to: localhost` blocks directly — always ca
 - `introspect.yml` runs **outside** the block (fail loud if `pct config` fails)
 - Inside the block: `detect.yml` → `backup.yml` → `dry_check.yml` or `update.yml` → `health_check.yml` → `report.yml`
 - Rescue block captures `ansible_failed_task.name` and `ansible_failed_result.stderr` as the **first** `set_fact` before anything else (subsequent tasks reset these vars), then calls `fleet-state-append.yml`
-- Always block: delete snapshot (only if `snap_res` is defined and succeeded), stop container if `lxc_was_stopped`
+- Always block: delete snapshot (only if `snap_res.changed` — skipped tasks still register with `changed=false`, so `is succeeded` is not sufficient), stop container if `lxc_was_stopped`
 
 `vm_update` and `remote_host_update` follow the same block/rescue/always pattern. `remote_host_update` has no always block (no snapshots to clean up).
 
@@ -148,6 +162,27 @@ The task order matters for correct attribution:
 - **Snapshot name is fixed**: always `BEFORE_UPDATE_AUTO`. The `always:` cleanup hardcodes this name — changing it in `backup.yml` without also changing `main.yml` would leave orphaned snapshots.
 - **`report.yml` skips idle containers**: the `when:` condition only appends a record when something changed or failed. Fully up-to-date containers with nothing to do produce no Discord entry.
 - **`lxc_continue_on_error`**: when `true`, Phase 1 uses `ignore_errors: yes` on the LXC loop, so a single failing container doesn't abort the rest of the node's containers.
+
+### Testing infrastructure
+
+**Jinja2 unit tests** (`tests/unit/`) exercise the conditional logic inside role task files without Ansible or PVE. Each test file targets a specific expression:
+
+| File | What it covers |
+|---|---|
+| `test_report_tmp_app.py` | 11-branch `tmp_app` decision tree in `report.yml` |
+| `test_report_tmp_os.py` | `tmp_os` expression + the `None`-guard in the payload |
+| `test_report_when_condition.py` | The `when:` gate that suppresses idle `OK`/`OK` containers |
+| `test_dry_check_status.py` | `dry_run_status` branches in `dry_check.yml` |
+| `test_detect_regex.py` | `regex_search` patterns in `detect.yml` and `needs_resource_scale` |
+| `test_discord_briefing.py` | Full `discord_briefing.j2` template rendering |
+| `test_fleet_state_append_logic.py` | `set_fact` expressions in `tasks/fleet-state-append.yml` |
+| `test_introspect_regex.py` | `pct config` output parsing in `introspect.yml` |
+
+`tests/conftest.py` implements Ansible-specific Jinja2 filters (`regex_search` with list-return for capture groups, `regex_replace`, `selectattr`) and tests (`failed`, `search`, `equalto`) so templates render identically to Ansible. When writing new tests, use `render()` for string output and `render_native()` (via `NativeEnvironment`) for Python objects.
+
+**Molecule scenarios** (`roles/lxc_update/molecule/`) test role orchestration against localhost using stub `pct`/`vzdump` shell scripts placed in `/tmp/mol_stubs/` by `prepare.yml`. Each scenario's `molecule.yml` sets `PATH: "/tmp/mol_stubs:${PATH}"` at the provisioner level so stubs are found by all shell tasks inside included roles. Converge serialises `fleet_*` facts to `/tmp/mol_fleet_state.json`; verify loads it with `include_vars` (necessary because converge and verify run as separate `ansible-playbook` processes). Idempotency checking is disabled for all scenarios — backup and update operations are intentionally non-idempotent.
+
+**CI** (`.github/workflows/ci.yml`) runs five parallel jobs: `yamllint`, `ansible-lint`, `syntax-check`, `unit-tests` (pytest), and `molecule-lxc-update`. The `ansible-lint` job excludes the six role task files that use `include_tasks: "{{ role_path }}/..."` via `exclude_paths` in `.ansible-lint` (the `load-failure[not-found]` rule is unskippable).
 
 ### Jinja2 / Ansible patterns
 
