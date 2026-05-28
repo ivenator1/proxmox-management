@@ -23,3 +23,11 @@ provisioner:
 
 verifier:
   name: ansible
+
+scenario:
+  test_sequence:
+    - create
+    - converge
+    - verify
+    - cleanup
+    - destroy
