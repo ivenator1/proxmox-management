@@ -4,7 +4,7 @@
     vm_pkg_res: "{{ vm_apt_res if vm_apt_res is defined else vm_dnf_res | default({}) }}"
 
 - name: "Append VM record"
-  include_tasks: "{{ playbook_dir }}/tasks/fleet-state-append.yml"
+  include_tasks: "{{ role_path }}/../../tasks/fleet-state-append.yml"
   vars:
     fleet_record_type: vm
     fleet_record_payload:

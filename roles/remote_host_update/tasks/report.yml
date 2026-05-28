@@ -7,7 +7,7 @@
          else remote_apk_res | default({}) }}
 
 - name: "Append remote host record"
-  include_tasks: "{{ playbook_dir }}/tasks/fleet-state-append.yml"
+  include_tasks: "{{ role_path }}/../../tasks/fleet-state-append.yml"
   vars:
     fleet_record_type: remote_host
     fleet_record_payload:
