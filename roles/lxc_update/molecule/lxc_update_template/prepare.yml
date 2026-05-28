@@ -10,7 +10,7 @@
         state: directory
         mode: '0755'
 
-    - name: Write pct stub — returns template: 1 in config
+    - name: "Write pct stub — returns template: 1 in config"
       copy:
         dest: /tmp/mol_stubs/pct
         mode: '0755'
