@@ -1,0 +1,20 @@
+---
+# Runs vm_update in check_mode so the apt/dnf modules report what they would
+# do without touching the host's packages.  This exercises the role's
+# conditional paths (pkg_mgr detection, reboot decision, report) without
+# requiring a real PVE VM.
+- name: Converge — vm_update (check_mode)
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  check_mode: true
+  vars:
+    vmid: "200"
+    pve_node: "pve-01"
+    vm_auto_reboot: false
+    vm_kuma_map: {}
+    playbook_dir: "{{ molecule_scenario_directory }}/../../../.."
+  tasks:
+    - name: Run vm_update role
+      include_role:
+        name: vm_update

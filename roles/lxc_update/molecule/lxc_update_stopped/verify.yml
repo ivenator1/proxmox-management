@@ -1,0 +1,39 @@
+---
+- name: Verify — lxc_update stopped container
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check pct start was called
+      stat:
+        path: /tmp/mol_pct_start_called
+      register: start_touch
+
+    - name: Assert pct start ran
+      assert:
+        that:
+          - start_touch.stat.exists
+        fail_msg: "pct start should have been called for a stopped container"
+
+    - name: Check pct stop was called in always block
+      stat:
+        path: /tmp/mol_pct_stop_called
+      register: stop_touch
+
+    - name: Assert pct stop ran
+      assert:
+        that:
+          - stop_touch.stat.exists
+        fail_msg: "pct stop should have been called in the always block to restore the stopped state"
+
+    - name: Check fleet record was appended
+      assert:
+        that:
+          - hostvars['localhost']['fleet_lxc_data'] | default([]) | length == 1
+        fail_msg: "A stopped container that was started should still produce a fleet record"
+
+    - name: Confirm no failure
+      assert:
+        that:
+          - not (hostvars['localhost']['fleet_failed'] | default(false) | bool)
+        fail_msg: "fleet_failed should be False for a cleanly started/updated/stopped container"

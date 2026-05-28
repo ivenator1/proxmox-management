@@ -1,0 +1,47 @@
+---
+- name: Create stubs for rescue scenario
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create stubs directory
+      file:
+        path: /tmp/mol_stubs
+        state: directory
+        mode: '0755'
+
+    - name: Write pct stub (normal — introspect succeeds)
+      copy:
+        dest: /tmp/mol_stubs/pct
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          CMD="$1"; shift
+          case "$CMD" in
+            config)
+              echo "arch: amd64"
+              echo "hostname: sonarr"
+              echo "ostype: ubuntu"
+              echo "cores: 2"
+              echo "memory: 2048"
+              echo "tags: community-script"
+              ;;
+            status)
+              echo "status: running"
+              ;;
+            pull)
+              # No update script — so lxc_no_update_script=true
+              exit 1
+              ;;
+            exec) exit 0 ;;
+            set) exit 0 ;;
+          esac
+
+    - name: Write vzdump stub that FAILS (triggers rescue block)
+      copy:
+        dest: /tmp/mol_stubs/vzdump
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          echo "vzdump: simulated backup failure" >&2
+          exit 1

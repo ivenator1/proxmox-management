@@ -1,0 +1,50 @@
+---
+- name: Verify — lxc_update normal
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check fleet_lxc_data was populated
+      assert:
+        that:
+          - hostvars['localhost']['fleet_lxc_data'] | default([]) | length == 1
+        fail_msg: "fleet_lxc_data should have exactly one entry after a normal update run"
+
+    - name: Check LXC record structure
+      vars:
+        record: "{{ hostvars['localhost']['fleet_lxc_data'][0] }}"
+      assert:
+        that:
+          - record.id == '101'
+          - record.name == 'sonarr'
+          - record.app == 'NO SCRIPT'
+          - record.snap is defined
+        fail_msg: "LXC record has unexpected content: {{ record }}"
+
+    - name: Confirm no failure recorded
+      assert:
+        that:
+          - not (hostvars['localhost']['fleet_failed'] | default(false) | bool)
+        fail_msg: "fleet_failed should be False for a clean run"
+
+    - name: Confirm vzdump was called
+      stat:
+        path: /tmp/mol_vzdump_called
+      register: vzdump_touch
+
+    - name: Assert vzdump ran
+      assert:
+        that:
+          - vzdump_touch.stat.exists
+        fail_msg: "vzdump stub should have been called with lxc_backup_strategy=vzdump"
+
+    - name: Confirm pct start was NOT called (container was already running)
+      stat:
+        path: /tmp/mol_pct_start_called
+      register: start_touch
+
+    - name: Assert pct start not called
+      assert:
+        that:
+          - not start_touch.stat.exists
+        fail_msg: "pct start should NOT be called when container is already running"

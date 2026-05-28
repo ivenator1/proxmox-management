@@ -1,0 +1,42 @@
+---
+- name: Verify — lxc_update template
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check that no fleet record was appended for a template container
+      assert:
+        that:
+          - hostvars['localhost']['fleet_lxc_data'] | default([]) | length == 0
+        fail_msg: >
+          Template containers should produce no fleet record.
+          TEMPLATE does not match the when-gate search pattern
+          'updated|failed|no script|never started'.
+
+    - name: Confirm no failure recorded
+      assert:
+        that:
+          - not (hostvars['localhost']['fleet_failed'] | default(false) | bool)
+        fail_msg: "fleet_failed should be False — template containers are skipped silently"
+
+    - name: Confirm vzdump was NOT called
+      stat:
+        path: /tmp/mol_template_vzdump_called
+      register: vzdump_touch
+
+    - name: Assert vzdump not called
+      assert:
+        that:
+          - not vzdump_touch.stat.exists
+        fail_msg: "vzdump should NOT run for template containers"
+
+    - name: Check no unexpected pct commands were issued
+      stat:
+        path: /tmp/mol_template_unexpected_pct_call
+      register: unexpected_touch
+
+    - name: Assert no unexpected calls
+      assert:
+        that:
+          - not unexpected_touch.stat.exists
+        fail_msg: "Unexpected pct command was called during template container processing"
