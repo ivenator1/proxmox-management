@@ -1,0 +1,43 @@
+---
+- name: Verify — lxc_update rescue block
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check fleet record was appended by rescue block
+      assert:
+        that:
+          - hostvars['localhost']['fleet_lxc_data'] | default([]) | length == 1
+        fail_msg: "Rescue block should append a FAILED record to fleet_lxc_data"
+
+    - name: Check FAILED status in record
+      vars:
+        record: "{{ hostvars['localhost']['fleet_lxc_data'][0] }}"
+      assert:
+        that:
+          - record.app == 'FAILED'
+          - record.os == 'FAILED'
+          - record.snap == false
+        fail_msg: "Rescue block should set app='FAILED', os='FAILED', snap=false. Got: {{ record }}"
+
+    - name: Check fleet_failed is set
+      assert:
+        that:
+          - hostvars['localhost']['fleet_failed'] | default(false) | bool
+        fail_msg: "fleet_failed should be True after a rescue"
+
+    - name: Check error log has an entry
+      assert:
+        that:
+          - hostvars['localhost']['fleet_error_log'] | default([]) | length == 1
+        fail_msg: "fleet_error_log should have one entry from the rescue block"
+
+    - name: Check error log entry has non-empty error field
+      vars:
+        entry: "{{ hostvars['localhost']['fleet_error_log'][0] }}"
+      assert:
+        that:
+          - entry.error | length > 0
+          - entry.error | length <= 300
+          - entry.host is search('lxc-101')
+        fail_msg: "Error log entry has unexpected content: {{ entry }}"

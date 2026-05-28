@@ -1,3 +1,7 @@
 vars.yml
 hosts.ini
 session_notes.md
+__pycache__/
+*.pyc
+.pytest_cache/
+

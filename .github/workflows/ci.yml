@@ -1,0 +1,72 @@
+---
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-yaml:
+    name: yamllint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install yamllint
+        run: pip install yamllint
+      - name: Run yamllint
+        run: yamllint .
+
+  lint-ansible:
+    name: ansible-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ansible-lint
+        run: pip install ansible-lint
+      - name: Install collections
+        run: ansible-galaxy collection install community.proxmox community.general
+      - name: Create stub vars.yml for linting
+        run: cp vars.yml.example vars.yml
+      - name: Run ansible-lint
+        run: ansible-lint fleet-update.yml
+
+  syntax-check:
+    name: syntax-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ansible
+        run: pip install ansible
+      - name: Install collections
+        run: ansible-galaxy collection install community.proxmox community.general
+      - name: Create stub inventory and vars
+        run: |
+          cp vars.yml.example vars.yml
+          cp hosts.ini.example hosts.ini
+      - name: Syntax check
+        run: ansible-playbook fleet-update.yml --syntax-check
+
+  unit-tests:
+    name: Jinja2 unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt
+      - name: Run pytest
+        run: pytest tests/unit/ -v --tb=short
+
+  molecule-lxc-update:
+    name: Molecule — lxc_update normal
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install molecule and dependencies
+        run: pip install molecule ansible community.proxmox community.general
+      - name: Install collections
+        run: ansible-galaxy collection install community.proxmox community.general
+      - name: Run molecule scenario
+        run: molecule test -s lxc_update_normal
+        working-directory: roles/lxc_update

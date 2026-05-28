@@ -1,0 +1,24 @@
+---
+driver:
+  name: default
+  options:
+    managed: false
+
+platforms:
+  - name: localhost
+
+provisioner:
+  name: ansible
+  inventory:
+    hosts:
+      all:
+        hosts:
+          localhost:
+            ansible_connection: local
+  playbooks:
+    prepare: prepare.yml
+    converge: converge.yml
+    verify: verify.yml
+
+verifier:
+  name: ansible

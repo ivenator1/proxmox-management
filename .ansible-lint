@@ -1,0 +1,22 @@
+---
+# 'moderate' rather than 'strict': strict flags every shell: task lacking
+# changed_when, but this project uses shell: for pct/vzdump which have no
+# Ansible module equivalents — that is intentional, not a defect.
+profile: moderate
+
+warn_list:
+  - yaml[line-length]
+  - no-changed-when
+
+skip_list:
+  - command-instead-of-module
+  - no-free-form
+
+exclude_paths:
+  - vars.yml
+  - hosts.ini
+  - .git/
+  - tests/
+  - roles/lxc_update/molecule/
+  - roles/vm_update/molecule/
+  - roles/remote_host_update/molecule/

@@ -1,0 +1,22 @@
+---
+- name: Converge — lxc_update dry-run
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    PATH: "/tmp/mol_stubs:{{ ansible_env.PATH }}"
+  vars:
+    lxc_id: "101"
+    lxc_dry_run: true
+    lxc_backup_strategy: vzdump
+    lxc_backup_storage: local
+    lxc_kuma_map: {}
+    pve_api_user: "root@pam"
+    pve_api_token_id: "ansible"
+    pve_api_token_secret: "mol-fake-secret"
+    ansible_host: "127.0.0.1"
+    playbook_dir: "{{ molecule_scenario_directory }}/../../../.."
+  tasks:
+    - name: Run lxc_update role
+      include_role:
+        name: lxc_update

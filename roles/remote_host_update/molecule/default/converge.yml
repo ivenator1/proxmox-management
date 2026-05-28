@@ -1,0 +1,17 @@
+---
+# Runs remote_host_update in check_mode so apt/dnf/apk modules report what
+# they would do without touching packages.
+- name: Converge — remote_host_update (check_mode)
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  check_mode: true
+  vars:
+    remote_auto_reboot: false
+    remote_pre_update_cmd: ""
+    remote_kuma_map: {}
+    playbook_dir: "{{ molecule_scenario_directory }}/../../../.."
+  tasks:
+    - name: Run remote_host_update role
+      include_role:
+        name: remote_host_update
