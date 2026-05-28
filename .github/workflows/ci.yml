@@ -1,7 +1,7 @@
 ---
 name: CI
 
-on:
+"on":
   push:
     branches: [main]
   pull_request:
@@ -63,8 +63,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install molecule and dependencies
-        run: pip install molecule ansible community.proxmox community.general
+      - name: Install molecule and ansible
+        run: pip install molecule ansible
       - name: Install collections
         run: ansible-galaxy collection install community.proxmox community.general
       - name: Run molecule scenario
