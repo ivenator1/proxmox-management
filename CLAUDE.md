@@ -47,10 +47,19 @@ fleet-update.yml                        # Main playbook — 7 phases, entry poin
 ansible.cfg                             # forks=20, pipelining=true, inventory=./hosts.ini
 vars.yml / vars.yml.example             # Secrets + behaviour flags (gitignored; copy from .example)
 hosts.ini / hosts.ini.example           # Inventory (gitignored; copy from .example)
+.ansible-lint                           # profile: moderate; excludes role task files that use {{ role_path }} includes
+.yamllint.yml                           # extends: default; line-length warning at 160
+.github/workflows/ci.yml                # Five parallel jobs: yamllint, ansible-lint, syntax-check, unit-tests, molecule
 tasks/
   fleet-state-append.yml                # Shared state accumulator — always use this, never inline set_fact+delegate
 templates/
   discord_briefing.j2                   # Discord embed body — renders fleet_*_data lists into markdown
+tests/
+  requirements.txt                      # pytest, jinja2, pyyaml — all that's needed for unit tests
+  conftest.py                           # Ansible-compatible Jinja2 env: regex_search (list return), bool, failed/search tests
+  unit/                                 # 104 pytest tests; no Ansible or PVE required
+  integration/
+    test_fleet_state_append.yml         # Standalone ansible-playbook test for delegate_to+delegate_facts accumulation
 roles/
   lxc_update/
     defaults/main.yml                   # Default values for all lxc_* vars
@@ -63,6 +72,12 @@ roles/
       update.yml                        # OS update first, dpkg hash before/after community script, ver before/after, reboot if needed
       health_check.yml                  # Polls Uptime Kuma for containers in lxc_kuma_map; only fires when something changed
       report.yml                        # Builds tmp_app/tmp_os strings; appends LXC record (skips idle containers)
+    molecule/
+      lxc_update_normal/                # Running container, vzdump backup, app+OS update
+      lxc_update_template/              # pct config returns template:1 → all tasks skipped
+      lxc_update_stopped/               # pct status:stopped → start → update → stop in always block
+      lxc_update_dry_run/               # lxc_dry_run=true → only dry_check runs, no backup/update
+      lxc_update_rescue/                # vzdump stub exits 1 → rescue block fires, fleet_failed=True
   vm_update/
     defaults/main.yml                   # Default values for vm_* vars
     tasks/
@@ -71,6 +86,7 @@ roles/
       update.yml                        # apt/dnf/apk upgrade + reboot check
       health_check.yml                  # Polls Uptime Kuma (vm_kuma_map)
       report.yml                        # Appends VM record to fleet_vm_data
+    molecule/default/                   # Runs role in check_mode against localhost; no PVE needed
   remote_host_update/
     defaults/main.yml                   # Default values for remote_* vars
     tasks/
@@ -78,6 +94,7 @@ roles/
       update.yml                        # apt/dnf/apk upgrade + reboot check
       health_check.yml                  # Polls Uptime Kuma (remote_kuma_map)
       report.yml                        # Appends remote host record to fleet_remote_data
+    molecule/default/                   # Runs role in check_mode against localhost; no PVE needed
 ```
 
 ## Architecture
