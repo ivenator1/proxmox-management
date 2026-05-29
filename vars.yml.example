@@ -57,6 +57,12 @@ remote_kuma_map: {}
 # --- CUSTOM SYSTEM SETTINGS ---
 custom_dry_run: false
 
+# --- RUN HISTORY ---
+# Each run writes <dir>/run-<UTC-timestamp>.json and overwrites <dir>/latest.json.
+fleet_history_enabled: true
+fleet_history_dir: "/var/log/fleet-update"
+fleet_history_keep: 30          # keep the newest N run-*.json (0 = keep all)
+
 # --- EXCLUSIONS ---
 #LXC of managing node
 manager_lxc_id: "121"

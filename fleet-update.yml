@@ -245,6 +245,10 @@
         _should_notify: "{{ (force_notify | default(false) | bool) or (fleet_changed | default(false)) or (fleet_failed | default(false)) }}"
       check_mode: no
 
+    - name: "Persist run history"
+      include_tasks: tasks/persist-history.yml
+      when: fleet_history_enabled | default(true) | bool
+
     - name: "Resolve notifier list (back-compat shim for discord_webhook)"
       set_fact:
         _notifiers: >-
