@@ -6,8 +6,31 @@
   include_tasks: "{{ role_path }}/../../tasks/check-window.yml"
   when: maintenance_window is defined
 
+# Dependency gating: if any host this one depends_on already FAILED this run,
+# skip (serial:1 + Phase 0a ordering guarantee the dependency ran first).
+- name: "Dependency check {{ inventory_hostname }}"
+  set_fact:
+    _dep_failed: >-
+      {{ ((depends_on | default([]))
+          | intersect((hostvars['localhost']['fleet_custom_data'] | default([]))
+                      | selectattr('app', 'search', 'FAILED') | map(attribute='host') | list))
+         | length > 0 }}
+  when: (depends_on | default([])) | length > 0
+
+- name: "Record dependency skip {{ inventory_hostname }}"
+  include_tasks: "{{ role_path }}/../../tasks/fleet-state-append.yml"
+  vars:
+    fleet_record_type: warning
+    fleet_warning_detail:
+      host: "{{ inventory_hostname }}"
+      task: "Dependency check"
+      warning: "skipped — a dependency failed earlier this run"
+  when: _dep_failed | default(false) | bool
+
 - name: "Custom system maintenance block {{ inventory_hostname }}"
-  when: (maintenance_window is not defined) or (_in_window | default(true) | bool)
+  when:
+    - (maintenance_window is not defined) or (_in_window | default(true) | bool)
+    - not (_dep_failed | default(false) | bool)
   block:
     - name: "Detect version and latest"
       include_tasks: detect.yml

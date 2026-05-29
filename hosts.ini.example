@@ -42,7 +42,14 @@ ansible_python_interpreter=/usr/bin/python3
 #     start: "02:00"
 #     end: "04:00"           # may wrap past midnight
 #     tz: "UTC"
+#
+# Optional dependency ordering: set depends_on (a list of other custom hostnames)
+# in host_vars/<host>.yml. A host is skipped if any dependency FAILED this run.
+# Phase 0b uses serial:1, so list dependencies BEFORE their dependents here;
+# Phase 0a fails loudly if a dependent is listed before its dependency.
+#   # host_vars/app-01.yml →  depends_on: ["db-01"]
 [custom_hosts]
+# db-01         ansible_host=10.0.0.59  custom_config=postgres
 # gitea-server  ansible_host=10.0.0.60  custom_config=gitea
 
 [custom_hosts:vars]

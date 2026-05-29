@@ -53,6 +53,16 @@ def _lower(value):
     return str(value).lower()
 
 
+def _intersect(a, b):
+    """Ansible-compatible intersect filter — elements of a also present in b."""
+    bset = list(b or [])
+    seen = []
+    for x in (a or []):
+        if x in bset and x not in seen:
+            seen.append(x)
+    return seen
+
+
 def _combine(*dicts, recursive=False, **kwargs):
     """Ansible-compatible combine filter — merges dicts left to right.
 
@@ -114,6 +124,7 @@ def _configure_env(env):
     env.filters['trim'] = _trim
     env.filters['lower'] = _lower
     env.filters['combine'] = _combine
+    env.filters['intersect'] = _intersect
     env.tests['failed'] = _failed_test
     env.tests['search'] = _search_test
     env.tests['equalto'] = _equalto_test
