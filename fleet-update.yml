@@ -265,3 +265,18 @@
         loop_var: notifier
         label: "{{ notifier.type }}"
       when: _should_notify | bool
+
+    # Dead-man's-switch: ping a monitor so its ABSENCE alerts you when the whole
+    # orchestrator silently stops running (healthchecks.io convention: /fail on failure).
+    - name: "Ping dead-man's-switch"
+      uri:
+        url: "{{ fleet_deadmans_url ~ ('/fail' if (fleet_failed | default(false)) else '') }}"
+        method: GET
+        status_code: [200, 201, 202, 204]
+      register: _deadmans_res
+      until: "_deadmans_res.status in [200, 201, 202, 204]"
+      retries: 5
+      delay: 10
+      ignore_errors: yes
+      check_mode: no
+      when: fleet_deadmans_url is defined and fleet_deadmans_url | default('') | trim != ''
