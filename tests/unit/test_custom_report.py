@@ -3,7 +3,7 @@ Unit tests for the tmp_custom Jinja2 expression in
 roles/custom_update/tasks/report.yml.
 """
 import pytest
-from tests.conftest import render, make_result
+from tests.conftest import render, make_result, make_native_env
 
 TMP_CUSTOM = """\
 {%- set _cw_type = (custom_cfg.changed_when | default({})).type | default('version') -%}
@@ -103,3 +103,60 @@ def test_no_version_data_fallback():
 
 def test_no_version_data_fallback_with_reboot():
     assert t(custom_reboot_res=make_result(changed=True)) == 'Updated + Rebooted'
+
+
+# --- custom_changed fact (update.yml) — gates health_check and fleet_record_changed ---
+
+CUSTOM_CHANGED = """\
+{{
+  (true if ((custom_cfg.changed_when | default({})).type | default('version')) == 'always'
+   else (
+     ((custom_changed_cmd_res.rc | default(1)) == 0)
+     if (((custom_cfg.changed_when | default({})).type | default('version')) == 'command'
+         and custom_changed_cmd_res is defined
+         and not (custom_changed_cmd_res.skipped | default(false)))
+     else (
+       (custom_ver_before | default('') | trim != custom_ver_after | default('') | trim)
+       if (custom_ver_before | default('') | trim != ''
+           and custom_ver_after | default('') | trim != '')
+       else true
+     )
+   )) | bool
+}}"""
+
+
+def changed(**ctx):
+    env = make_native_env()
+    base = dict(custom_cfg={'changed_when': {'type': 'version'}},
+                custom_ver_before='', custom_ver_after='')
+    return env.from_string(CUSTOM_CHANGED).render(**{**base, **ctx})
+
+
+def test_changed_always_is_true():
+    assert changed(custom_cfg={'changed_when': {'type': 'always'}}) is True
+
+
+def test_changed_command_exit_zero_is_true():
+    assert changed(
+        custom_cfg={'changed_when': {'type': 'command'}},
+        custom_changed_cmd_res={'rc': 0, 'skipped': False},
+    ) is True
+
+
+def test_changed_command_exit_nonzero_is_false():
+    assert changed(
+        custom_cfg={'changed_when': {'type': 'command'}},
+        custom_changed_cmd_res={'rc': 3, 'skipped': False},
+    ) is False
+
+
+def test_changed_version_differs_is_true():
+    assert changed(custom_ver_before='1.0', custom_ver_after='1.1') is True
+
+
+def test_changed_version_same_is_false():
+    assert changed(custom_ver_before='1.0', custom_ver_after='1.0') is False
+
+
+def test_changed_no_version_data_defaults_true():
+    assert changed() is True

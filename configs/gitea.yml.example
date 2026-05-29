@@ -30,7 +30,8 @@ changed_when:
 
 health_check:
   type: kuma
-  kuma_slug: "gitea"
+  kuma_slug: "gitea"        # status-page slug (URL path)
+  kuma_monitor_id: "7"      # numeric monitor ID (key in heartbeatList) — adjust to yours
 
 reboot: false
 

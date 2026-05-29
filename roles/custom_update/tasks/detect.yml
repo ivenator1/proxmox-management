@@ -18,6 +18,8 @@
     - _custom_ver_before_res is defined
     - not (_custom_ver_before_res.skipped | default(false))
 
+# latest_version is only surfaced in the dry-run report, so resolve it only then —
+# no point hitting the GitHub API on every normal converge for data we discard.
 - name: "Resolve latest version from GitHub release {{ inventory_hostname }}"
   uri:
     url: "https://api.github.com/repos/{{ (custom_cfg.latest_version | default({})).repo | default('') }}/releases/latest"
@@ -30,6 +32,7 @@
   changed_when: false
   failed_when: false
   when:
+    - custom_dry_run | bool
     - (custom_cfg.latest_version | default({})).type | default('none') == 'github_release'
     - (custom_cfg.latest_version | default({})).repo | default('') | trim != ''
 
@@ -48,6 +51,7 @@
   changed_when: false
   failed_when: false
   when:
+    - custom_dry_run | bool
     - (custom_cfg.latest_version | default({})).type | default('none') == 'command'
     - (custom_cfg.latest_version | default({})).command | default('') | trim != ''
 

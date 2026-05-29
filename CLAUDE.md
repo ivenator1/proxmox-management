@@ -226,6 +226,7 @@ The task order matters for correct attribution:
 - **`lxc_continue_on_error`**: when `true`, Phase 1 uses `ignore_errors: yes` on the LXC loop, so a single failing container doesn't abort the rest of the node's containers.
 - **`health_check.yml` no longer has `ignore_errors: yes`** in `lxc_update` — Kuma failure now triggers the rescue block (and snapshot rollback if a snapshot was taken). Retries and delay are controlled by `kuma_health_check_retries` (default 5) and `kuma_health_check_delay` (default 30s), which molecule scenarios can override to 1/1 for fast tests.
 - **Rollback only fires when `snap_res.changed`** — if `lxc_backup_strategy: none` or the snapshot API call failed (both result in `snap_res.changed=false`), the rescue skips rollback and just records `FAILED`.
+- **Auto-rollback covers snapshots only, never vzdump**: a `vzdump`-only strategy produces a backup archive but `snap_res` is never set, so a failed update is **not** automatically restored — only `FAILED` is recorded. Restore vzdump archives manually. Use `snapshot` or `both` if you want automatic rollback.
 - **`custom_update` molecule scenarios use temp config dirs** at `/tmp/mol_custom_<scenario>/configs/`. The `playbook_dir` var in converge.yml points there, overriding Ansible's automatic `playbook_dir` magic variable.
 
 ### Testing infrastructure

@@ -21,6 +21,7 @@
       include_tasks: health_check.yml
       when:
         - not custom_dry_run | bool
+        - custom_changed | default(false) | bool
         - (custom_cfg.health_check | default({})).type | default('none') != 'none'
 
     - name: "Report"

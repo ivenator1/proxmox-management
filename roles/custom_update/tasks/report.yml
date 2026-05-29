@@ -29,10 +29,11 @@
     fleet_record_type: custom
     fleet_record_payload:
       host: "{{ inventory_hostname }}"
-      name: "{{ custom_cfg.name }}"
+      name: "{{ custom_cfg.name | default(inventory_hostname) }}"
       app: "{{ tmp_custom | trim }}"
-    fleet_record_changed: >-
-      {{ (tmp_custom | lower) is search('updated|dry-run') }}
+    # Dry-run is informational only — leave fleet_changed false (matches lxc_update),
+    # so a preview run does not trigger a Discord notification without force_notify.
+    fleet_record_changed: "{{ custom_changed | default(false) | bool }}"
     fleet_record_failed: false
   when: >
     custom_dry_run | bool or

@@ -5,16 +5,18 @@
     method: GET
   delegate_to: localhost
   register: custom_kuma_res
-  until: "(custom_kuma_res.json.heartbeatList[(custom_cfg.health_check | default({})).kuma_slug | default('') | string] | last).status == 1"
+  until: "(custom_kuma_res.json.heartbeatList[(custom_cfg.health_check).kuma_monitor_id | string] | last).status == 1"
   retries: "{{ kuma_health_check_retries | default(5) }}"
   delay: "{{ kuma_health_check_delay | default(30) }}"
   when:
+    - custom_changed | default(false) | bool
     - (custom_cfg.health_check | default({})).type | default('none') == 'kuma'
 
 - name: "Command health check {{ inventory_hostname }}"
   shell: "{{ (custom_cfg.health_check | default({})).command }}"
   changed_when: false
   when:
+    - custom_changed | default(false) | bool
     - (custom_cfg.health_check | default({})).type | default('none') == 'command'
 
 - name: "HTTP health check {{ inventory_hostname }}"
@@ -28,4 +30,5 @@
   retries: "{{ kuma_health_check_retries | default(5) }}"
   delay: "{{ kuma_health_check_delay | default(30) }}"
   when:
+    - custom_changed | default(false) | bool
     - (custom_cfg.health_check | default({})).type | default('none') == 'http'

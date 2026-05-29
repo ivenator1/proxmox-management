@@ -7,3 +7,21 @@
 - name: "Merge inventory overrides {{ inventory_hostname }}"
   set_fact:
     custom_cfg: "{{ custom_cfg_file | combine(custom_overrides | default({}), recursive=true) }}"
+
+# Validate here (outside the block) so a malformed config fails loudly at load
+# time with a clear message — not three tasks later disguised as an update failure.
+- name: "Validate custom config {{ inventory_hostname }}"
+  assert:
+    that:
+      - custom_cfg.name is defined
+      - custom_cfg.name | string | trim != ''
+      - custom_cfg.update_steps is defined
+      - custom_cfg.update_steps is sequence
+      - custom_cfg.update_steps is not string
+      - (custom_cfg.update_steps | length) > 0
+    fail_msg: >-
+      Config 'configs/{{ custom_config }}.yml' is invalid: it must define a
+      non-empty 'name' and a non-empty 'update_steps' list. Got name={{
+      custom_cfg.name | default('<undefined>') }}, update_steps={{
+      custom_cfg.update_steps | default('<undefined>') }}.
+    success_msg: "Config '{{ custom_config }}' validated."

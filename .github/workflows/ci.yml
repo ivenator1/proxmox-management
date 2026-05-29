@@ -85,12 +85,20 @@ jobs:
         working-directory: roles/lxc_update
 
   molecule-custom-update:
-    name: Molecule — custom_update normal
+    name: Molecule — custom_update ${{ matrix.scenario }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - custom_update_normal
+          - custom_update_noop
+          - custom_update_rescue
+          - custom_update_dry_run
     steps:
       - uses: actions/checkout@v4
       - name: Install molecule and ansible
         run: pip install molecule ansible
       - name: Run molecule scenario
-        run: molecule test -s custom_update_normal
+        run: molecule test -s ${{ matrix.scenario }}
         working-directory: roles/custom_update

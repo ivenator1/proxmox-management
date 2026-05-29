@@ -10,6 +10,15 @@
 #     reboot: false                    # override any field from the config file
 #     health_check:
 #       kuma_slug: "app-prod"
+#
+# NOTE on overrides: merging is done with combine(recursive=true), which REPLACES
+# lists rather than merging them. Overriding 'update_steps' replaces the entire
+# list — you cannot append or tweak a single step via custom_overrides.
+#
+# SECURITY: every *_command and update_steps[].command below is executed via the
+# shell on the target host. Treat these configs as trusted, operator-authored
+# code. Never inline secrets/tokens — use Ansible Vault and reference the
+# variable, e.g. command: "deploy --token {{ vault_my_app_token }}".
 
 ---
 # Display name used in Discord and logs.
@@ -57,12 +66,19 @@ changed_when:
   command: ""
 
 # ── Health check (optional) ───────────────────────────────────────────────────
+# Runs only when the system actually changed. Failure (after the retry window)
+# triggers the rescue block.
 health_check:
   # kuma | command | http | none (default)
   type: none
 
-  # For type: kuma — slug key in Uptime Kuma heartbeatList.
+  # For type: kuma — these are TWO DIFFERENT values:
+  #   kuma_slug:       the status-page slug, used in the API URL path.
+  #   kuma_monitor_id: the monitor's numeric ID — the key inside the returned
+  #                    heartbeatList. Find it in the Uptime Kuma monitor URL
+  #                    (/dashboard/<id>). Do NOT reuse the slug here.
   kuma_slug: ""
+  kuma_monitor_id: ""
 
   # For type: command — exit 0 = healthy, non-0 = unhealthy. Failure → rescue.
   command: ""
