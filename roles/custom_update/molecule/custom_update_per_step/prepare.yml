@@ -16,7 +16,7 @@
         path: "{{ item }}"
         state: absent
       loop:
-        - /tmp/mol_perstep_used
+        - /tmp/mol_perstep_ran
         - /tmp/mol_perstep_skip_ran
 
     - name: Write test config file
@@ -31,11 +31,9 @@
             type: none
           reboot: false
           update_steps:
-            - name: "compute greeting"
-              command: "echo HELLO"
-              register: greeting
-            - name: "use greeting"
-              command: "echo {{ custom_step_results['greeting'] }} > /tmp/mol_perstep_used"
+            - name: "real step with timeout"
+              command: "touch /tmp/mol_perstep_ran"
+              timeout: 30
             - name: "should be skipped"
               command: "touch /tmp/mol_perstep_skip_ran"
               when: false

@@ -242,7 +242,8 @@ The task order matters for correct attribution:
 - **`health_check.yml` no longer has `ignore_errors: yes`** in `lxc_update` — Kuma failure now triggers the rescue block (and snapshot rollback if a snapshot was taken). Retries and delay are controlled by `kuma_health_check_retries` (default 5) and `kuma_health_check_delay` (default 30s), which molecule scenarios can override to 1/1 for fast tests.
 - **Rollback only fires when `snap_res.changed`** — if `lxc_backup_strategy: none` or the snapshot API call failed (both result in `snap_res.changed=false`), the rescue skips rollback and just records `FAILED`.
 - **Auto-rollback covers snapshots only, never vzdump**: a `vzdump`-only strategy produces a backup archive but `snap_res` is never set, so a failed update is **not** automatically restored — only `FAILED` is recorded. Restore vzdump archives manually. Use `snapshot` or `both` if you want automatic rollback.
-- **`custom_update` molecule scenarios use temp config dirs** at `/tmp/mol_custom_<scenario>/configs/`. The `playbook_dir` var in converge.yml points there, overriding Ansible's automatic `playbook_dir` magic variable.
+- **`custom_update` config dir**: `load_config.yml` reads `{{ custom_config_dir | default(playbook_dir ~ '/configs') }}/<name>.yml`. Molecule sets `custom_config_dir: /tmp/mol_custom_<scenario>/configs` — do **not** try to override `playbook_dir` (it is a reserved magic variable and the override is silently ignored).
+- **Deferred Jinja in custom configs**: command strings are rendered eagerly (validation, combine, loop), so a step `command` cannot interpolate runtime facts like `custom_step_results`. `register` stashes stdout for use in a later step's `when:` only. `load_config` skips the `combine` when there are no `custom_overrides` to avoid prematurely rendering deferred `{{ }}`.
 
 ### Testing infrastructure
 

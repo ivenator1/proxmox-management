@@ -8,7 +8,7 @@
   vars:
     custom_config: mol_test_rescue
     custom_dry_run: false
-    playbook_dir: /tmp/mol_custom_rescue
+    custom_config_dir: /tmp/mol_custom_rescue/configs
   tasks:
     - name: Run custom_update role
       include_role:

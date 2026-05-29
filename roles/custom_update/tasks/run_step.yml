@@ -3,8 +3,10 @@
 # update.yml with loop_var `step`. A bare {name, command} step still works.
 #
 # Optional step keys: when, become, chdir, timeout (seconds), retries, delay,
-# changed_when, ignore_errors, environment, register (stash stdout for later steps
-# via custom_step_results[<register>]).
+# changed_when, ignore_errors, environment, register. `register` stashes the
+# step's stdout into custom_step_results[<register>] for use in a later step's
+# `when:` condition — NOT for interpolation inside a command string (Ansible
+# renders command strings eagerly, before the value exists).
 - name: "Step - {{ step.name }}"
   shell: "{{ ('timeout ' ~ step.timeout ~ 's ' if step.timeout is defined else '') ~ step.command }}"
   args:
@@ -12,7 +14,9 @@
   environment: "{{ step.environment | default({}) }}"
   become: "{{ step.become | default(false) }}"
   register: _step_res
-  changed_when: "{{ step.changed_when | default(omit) }}"
+  # default(true) keeps the normal shell semantics (always "changed"); a template
+  # resolving to omit is rejected for changed_when on ansible-core 2.19+.
+  changed_when: "{{ step.changed_when | default(true) }}"
   ignore_errors: "{{ step.ignore_errors | default(false) }}"
   until: _step_res is succeeded
   retries: "{{ step.retries | default(1) }}"

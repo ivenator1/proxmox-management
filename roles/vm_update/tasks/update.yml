@@ -1,6 +1,7 @@
 ---
 # Dry-run: simulate via check_mode and report what WOULD change. No reboot.
 - name: "Simulate VM updates (dry-run)"
+  when: vm_dry_run | default(false) | bool
   block:
     - name: "Simulate apt {{ inventory_hostname }}"
       apt:
@@ -18,9 +19,9 @@
       check_mode: yes
       register: vm_dnf_res
       when: ansible_pkg_mgr == 'dnf'
-  when: vm_dry_run | default(false) | bool
 
 - name: "Apply VM updates"
+  when: not (vm_dry_run | default(false) | bool)
   block:
     - name: "Update VM packages (apt)"
       apt:
@@ -55,4 +56,3 @@
       when:
         - vm_auto_reboot | bool
         - vm_reboot_file.stat.exists
-  when: not (vm_dry_run | default(false) | bool)

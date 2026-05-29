@@ -7,6 +7,7 @@
 
 # Dry-run: simulate via check_mode and report what WOULD change. No reboot.
 - name: "Simulate remote updates (dry-run)"
+  when: remote_dry_run | default(false) | bool
   block:
     - name: "Simulate apt {{ inventory_hostname }}"
       apt:
@@ -32,9 +33,9 @@
       check_mode: yes
       register: remote_apk_res
       when: ansible_pkg_mgr == 'apk'
-  when: remote_dry_run | default(false) | bool
 
 - name: "Apply remote updates"
+  when: not (remote_dry_run | default(false) | bool)
   block:
     - name: "Update packages (apt) {{ inventory_hostname }}"
       apt:
@@ -76,4 +77,3 @@
       when:
         - remote_auto_reboot | bool
         - remote_reboot_file.stat.exists
-  when: not (remote_dry_run | default(false) | bool)

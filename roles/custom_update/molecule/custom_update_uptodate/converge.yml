@@ -8,7 +8,7 @@
   vars:
     custom_config: mol_test_uptodate
     custom_dry_run: false
-    playbook_dir: /tmp/mol_custom_uptodate
+    custom_config_dir: /tmp/mol_custom_uptodate/configs
   tasks:
     - name: Run custom_update role
       include_role:

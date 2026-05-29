@@ -4,16 +4,16 @@
   connection: local
   gather_facts: false
   tasks:
-    - name: Registered output was consumed by a later step
-      slurp:
-        src: /tmp/mol_perstep_used
-      register: used
+    - name: The normal (timeout-wrapped) step ran
+      stat:
+        path: /tmp/mol_perstep_ran
+      register: ran_marker
 
-    - name: Assert the register value propagated
+    - name: Assert the real step executed
       assert:
         that:
-          - "'HELLO' in (used.content | b64decode)"
-        fail_msg: "Later step should have received custom_step_results['greeting'] == HELLO"
+          - ran_marker.stat.exists
+        fail_msg: "The timeout-wrapped step should have executed"
 
     - name: The when:false step did NOT run
       stat:

@@ -52,7 +52,9 @@
               shift; shift
               CMD_STR="$*"
               if echo "$CMD_STR" | grep -q 'dist-upgrade'; then
-                echo "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded."
+                # Report a real upgrade so os_update_res.changed=true and the Kuma
+                # health check actually fires (then fails against the dead URL).
+                echo "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded."
               elif echo "$CMD_STR" | grep -q 'reboot-required'; then
                 exit 1
               fi

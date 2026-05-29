@@ -1,12 +1,15 @@
 ---
 - name: "Load custom config file {{ inventory_hostname }}"
   include_vars:
-    file: "{{ playbook_dir }}/configs/{{ custom_config }}.yml"
-    name: custom_cfg_file
+    file: "{{ custom_config_dir | default(playbook_dir ~ '/configs') }}/{{ custom_config }}.yml"
+    name: custom_cfg
 
+# Only re-template the config via combine when overrides actually exist — combine
+# would otherwise prematurely evaluate any {{ }} a step command defers to runtime.
 - name: "Merge inventory overrides {{ inventory_hostname }}"
   set_fact:
-    custom_cfg: "{{ custom_cfg_file | combine(custom_overrides | default({}), recursive=true) }}"
+    custom_cfg: "{{ custom_cfg | combine(custom_overrides, recursive=true) }}"
+  when: (custom_overrides | default({})) | length > 0
 
 # Validate here (outside the block) so a malformed config fails loudly at load
 # time with a clear message — not three tasks later disguised as an update failure.
@@ -19,11 +22,13 @@
       - custom_cfg.update_steps is sequence
       - custom_cfg.update_steps is not string
       - (custom_cfg.update_steps | length) > 0
+    # Don't render the update_steps list here — a step command may defer {{ }} to
+    # runtime, which fail_msg finalization would evaluate prematurely.
     fail_msg: >-
       Config 'configs/{{ custom_config }}.yml' is invalid: it must define a
-      non-empty 'name' and a non-empty 'update_steps' list. Got name={{
-      custom_cfg.name | default('<undefined>') }}, update_steps={{
-      custom_cfg.update_steps | default('<undefined>') }}.
+      non-empty 'name' and a non-empty 'update_steps' list (got name={{
+      custom_cfg.name | default('<undefined>') }},
+      {{ (custom_cfg.update_steps | default([])) | length }} steps).
     success_msg: "Config '{{ custom_config }}' validated."
 
 - name: "Validate each update step {{ inventory_hostname }}"
@@ -31,7 +36,9 @@
     that:
       - item.name is defined and item.name | string | trim != ''
       - item.command is defined and item.command | string | trim != ''
-    fail_msg: "Every update_steps entry needs a non-empty 'name' and 'command'. Bad entry: {{ item }}"
+    # Reference item.name only — rendering the whole {{ item }} would prematurely
+    # evaluate any runtime {{ }} a command defers (e.g. custom_step_results).
+    fail_msg: "update_steps entry '{{ item.name | default('<unnamed>') }}' needs a non-empty 'name' and 'command'."
     quiet: true
   loop: "{{ custom_cfg.update_steps }}"
   loop_control:

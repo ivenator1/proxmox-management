@@ -6,7 +6,7 @@
   vars:
     custom_config: mol_test_per_step
     custom_dry_run: false
-    playbook_dir: /tmp/mol_custom_per_step
+    custom_config_dir: /tmp/mol_custom_per_step/configs
   tasks:
     - name: Run custom_update role
       include_role:

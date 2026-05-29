@@ -55,8 +55,9 @@ backup_command: ""
 # ── Update procedure (required) ───────────────────────────────────────────────
 # Ordered list of steps run on the target host. A step needs at least name+command.
 # Optional per-step keys: when (condition), become, chdir, timeout (seconds),
-# retries, delay, changed_when, ignore_errors, environment, and register (stash
-# stdout for a later step to read via {{ custom_step_results['<name>'] }}).
+# retries, delay, changed_when, ignore_errors, environment.
+# NOTE: command strings are NOT a place for runtime fact interpolation — Ansible
+# renders them eagerly during validation. Keep commands literal.
 update_steps:
   - name: "stop service"
     command: "systemctl stop my-app"
@@ -68,13 +69,10 @@ update_steps:
   - name: "start service"
     command: "systemctl start my-app"
     become: true
-  # Example of conditional + output capture:
-  # - name: "read build id"
-  #   command: "cat /opt/my-app/BUILD"
-  #   register: build_id
-  # - name: "log build id"
-  #   command: "logger my-app build {{ custom_step_results['build_id'] }}"
-  #   when: "custom_step_results['build_id'] | default('') | length > 0"
+  # Example of a conditional step:
+  # - name: "reload only on debian"
+  #   command: "systemctl reload my-app"
+  #   when: "ansible_facts['os_family'] == 'Debian'"
 
 # ── Change detection ──────────────────────────────────────────────────────────
 changed_when:
