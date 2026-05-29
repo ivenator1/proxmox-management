@@ -33,6 +33,15 @@ ansible_python_interpreter=/usr/bin/python3
 # Non-standard systems updated via per-system YAML config files (configs/<name>.yml).
 # Set custom_config=<name> per host to select the config file.
 # Leave the group empty (just the header) if you have no custom systems.
+#
+# Optional per-host maintenance window (applies to remote_hosts, proxmox_vms, and
+# custom_hosts — i.e. inventory hosts). The host is silently skipped outside it;
+# pass -e force_window=true to bypass. Define in host_vars/<host>.yml:
+#   maintenance_window:
+#     days: ["Sat", "Sun"]   # optional; omit for any day
+#     start: "02:00"
+#     end: "04:00"           # may wrap past midnight
+#     tz: "UTC"
 [custom_hosts]
 # gitea-server  ansible_host=10.0.0.60  custom_config=gitea
 

@@ -1,5 +1,10 @@
 ---
+- name: "Maintenance window check {{ inventory_hostname }}"
+  include_tasks: "{{ role_path }}/../../tasks/check-window.yml"
+  when: maintenance_window is defined
+
 - name: "VM maintenance block {{ inventory_hostname }}"
+  when: (maintenance_window is not defined) or (_in_window | default(true) | bool)
   block:
     - name: "Snapshot"
       include_tasks: snapshot.yml

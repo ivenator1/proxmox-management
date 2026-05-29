@@ -1,0 +1,34 @@
+---
+# Computes _in_window for the current host given a `maintenance_window` dict:
+#   maintenance_window:
+#     days: ["Sat", "Sun"]     # optional; omit = any day. Match is case-insensitive.
+#     start: "02:00"           # 24h HH:MM in the given tz
+#     end: "04:00"             # may wrap past midnight (start > end)
+#     tz: "UTC"                # optional; default UTC
+# force_window=true bypasses the check (always in-window).
+- name: "Resolve current local time for window"
+  set_fact:
+    _mw_now: "{{ lookup('pipe', 'TZ=\"' ~ (maintenance_window.tz | default('UTC')) ~ '\" date +\"%a %H:%M\"') }}"
+  check_mode: no
+
+- name: "Parse window bounds"
+  set_fact:
+    _mw_day: "{{ _mw_now.split(' ')[0] }}"
+    _mw_time: "{{ _mw_now.split(' ')[1] }}"
+    _mw_start: "{{ maintenance_window.start | default('00:00') }}"
+    _mw_end: "{{ maintenance_window.end | default('23:59') }}"
+
+- name: "Evaluate day and time match"
+  set_fact:
+    _mw_day_ok: >-
+      {{ (maintenance_window.days is not defined)
+         or (_mw_day | lower in (maintenance_window.days | map('lower') | list)) }}
+    _mw_time_ok: >-
+      {{ (_mw_time >= _mw_start and _mw_time <= _mw_end) if (_mw_start <= _mw_end)
+         else (_mw_time >= _mw_start or _mw_time <= _mw_end) }}
+
+- name: "Set in-window flag"
+  set_fact:
+    _in_window: >-
+      {{ true if (force_window | default(false) | bool)
+         else ((_mw_day_ok | bool) and (_mw_time_ok | bool)) }}

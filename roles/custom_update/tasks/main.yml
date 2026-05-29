@@ -2,7 +2,12 @@
 - name: "Load custom config {{ inventory_hostname }}"
   include_tasks: load_config.yml
 
+- name: "Maintenance window check {{ inventory_hostname }}"
+  include_tasks: "{{ role_path }}/../../tasks/check-window.yml"
+  when: maintenance_window is defined
+
 - name: "Custom system maintenance block {{ inventory_hostname }}"
+  when: (maintenance_window is not defined) or (_in_window | default(true) | bool)
   block:
     - name: "Detect version and latest"
       include_tasks: detect.yml
