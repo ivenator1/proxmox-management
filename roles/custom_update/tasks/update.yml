@@ -1,0 +1,40 @@
+---
+- name: "Run update step - {{ step.name }}"
+  shell: "{{ step.command }}"
+  loop: "{{ custom_cfg.update_steps | default([]) }}"
+  loop_control:
+    loop_var: step
+    label: "{{ step.name }}"
+  register: custom_update_steps_res
+
+- name: "Read version after update {{ inventory_hostname }}"
+  shell: "{{ custom_cfg.version_command }}"
+  register: _custom_ver_after_res
+  changed_when: false
+  failed_when: false
+  when: custom_cfg.version_command | default('') | trim != ''
+
+- name: "Apply version after {{ inventory_hostname }}"
+  set_fact:
+    custom_ver_after: "{{ _custom_ver_after_res.stdout | default('') | trim }}"
+  when:
+    - _custom_ver_after_res is defined
+    - not (_custom_ver_after_res.skipped | default(false))
+
+- name: "Check changed_when command {{ inventory_hostname }}"
+  shell: "{{ (custom_cfg.changed_when | default({})).command }}"
+  register: custom_changed_cmd_res
+  changed_when: false
+  failed_when: false
+  when:
+    - (custom_cfg.changed_when | default({})).type | default('version') == 'command'
+    - (custom_cfg.changed_when | default({})).command | default('') | trim != ''
+
+- name: "Reboot {{ inventory_hostname }}"
+  reboot:
+    reboot_timeout: 600
+    post_reboot_delay: 30
+  register: custom_reboot_res
+  when:
+    - custom_cfg.reboot | default(false) | bool
+    - custom_allow_reboot | default(true) | bool

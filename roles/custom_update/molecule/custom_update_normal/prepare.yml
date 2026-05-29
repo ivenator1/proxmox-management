@@ -1,0 +1,70 @@
+---
+# Stubs version_command to return "1.0" first call, "1.1" thereafter.
+# update_steps call mol_update_step (a no-op that records being called).
+- name: Prepare stubs and test config for custom_update normal scenario
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create stubs directory
+      file:
+        path: /tmp/mol_stubs
+        state: directory
+        mode: '0755'
+
+    - name: Create temp config directory
+      file:
+        path: /tmp/mol_custom_normal/configs
+        state: directory
+        mode: '0755'
+
+    - name: Clean up previous run state files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/mol_ver_call_count
+        - /tmp/mol_update_step_called
+
+    - name: Write version stub (returns 1.0 first call, 1.1 thereafter)
+      copy:
+        dest: /tmp/mol_stubs/mol_version
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          COUNT_FILE=/tmp/mol_ver_call_count
+          COUNT=$(cat "$COUNT_FILE" 2>/dev/null || echo 0)
+          COUNT=$((COUNT + 1))
+          echo "$COUNT" > "$COUNT_FILE"
+          if [ "$COUNT" -le 1 ]; then
+            echo "1.0"
+          else
+            echo "1.1"
+          fi
+
+    - name: Write update step stub
+      copy:
+        dest: /tmp/mol_stubs/mol_update_step
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          touch /tmp/mol_update_step_called
+          exit 0
+
+    - name: Write test config file
+      copy:
+        dest: /tmp/mol_custom_normal/configs/mol_test_normal.yml
+        mode: '0644'
+        content: |
+          name: "mol-test-app"
+          version_command: "mol_version"
+          latest_version:
+            type: none
+          update_steps:
+            - name: "install new binary"
+              command: "mol_update_step"
+          changed_when:
+            type: version
+          health_check:
+            type: none
+          reboot: false

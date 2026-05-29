@@ -1,0 +1,27 @@
+---
+- name: Verify — custom_update noop (no change, record suppressed)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  pre_tasks:
+    - name: Load fleet state from converge play
+      include_vars:
+        file: /tmp/mol_fleet_state_noop.json
+  tasks:
+    - name: Check fleet_custom_data is empty (idle system suppressed)
+      assert:
+        that:
+          - hostvars['localhost']['fleet_custom_data'] | default([]) | length == 0
+        fail_msg: "fleet_custom_data should be empty when version is unchanged (idle system suppressed)"
+
+    - name: Confirm fleet_changed is False
+      assert:
+        that:
+          - not (hostvars['localhost']['fleet_changed'] | default(false) | bool)
+        fail_msg: "fleet_changed should be False when version is unchanged"
+
+    - name: Confirm no failure recorded
+      assert:
+        that:
+          - not (hostvars['localhost']['fleet_failed'] | default(false) | bool)
+        fail_msg: "fleet_failed should be False for a noop run"

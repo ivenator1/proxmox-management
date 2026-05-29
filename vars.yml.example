@@ -39,6 +39,9 @@ lxc_backup_storage: "local"
 vm_kuma_map: {}
 remote_kuma_map: {}
 
+# --- CUSTOM SYSTEM SETTINGS ---
+custom_dry_run: false
+
 # --- EXCLUSIONS ---
 #LXC of managing node
 manager_lxc_id: "121"

@@ -49,28 +49,33 @@ vars.yml / vars.yml.example             # Secrets + behaviour flags (gitignored;
 hosts.ini / hosts.ini.example           # Inventory (gitignored; copy from .example)
 .ansible-lint                           # profile: moderate; excludes role task files that use {{ role_path }} includes
 .yamllint.yml                           # extends: default; line-length warning at 160
-.github/workflows/ci.yml                # Five parallel jobs: yamllint, ansible-lint, syntax-check, unit-tests, molecule
+.github/workflows/ci.yml                # Seven parallel jobs: yamllint, ansible-lint, syntax-check, unit-tests, molecule-lxc, molecule-rollback, molecule-custom
 tasks/
   fleet-state-append.yml                # Shared state accumulator — always use this, never inline set_fact+delegate
 templates/
   discord_briefing.j2                   # Discord embed body — renders fleet_*_data lists into markdown
+config_templates/
+  custom_system.yml.example             # Fully-commented schema template — copy to configs/<name>.yml
+configs/
+  .gitkeep                              # Real configs/*.yml are gitignored; commit *.yml.example worked examples only
+  gitea.yml.example                     # Worked example: Gitea binary update
 tests/
   requirements.txt                      # pytest, jinja2, pyyaml — all that's needed for unit tests
   conftest.py                           # Ansible-compatible Jinja2 env: regex_search (list return), bool, failed/search tests
-  unit/                                 # 104 pytest tests; no Ansible or PVE required
+  unit/                                 # 125 pytest tests; no Ansible or PVE required
   integration/
     test_fleet_state_append.yml         # Standalone ansible-playbook test for delegate_to+delegate_facts accumulation
 roles/
   lxc_update/
-    defaults/main.yml                   # Default values for all lxc_* vars
+    defaults/main.yml                   # Default values for all lxc_* vars + kuma_health_check_retries/delay
     tasks/
-      main.yml                          # Orchestrator: introspect → block(detect→backup→dry_check|update→health_check→report) → rescue → always
+      main.yml                          # Orchestrator: introspect → block(detect→backup→dry_check|update→health_check→report) → rescue(rollback) → always
       introspect.yml                    # pct config + pct status; starts stopped containers; sets lxc_name, lxc_os, lxc_is_running, lxc_was_stopped
       detect.yml                        # Pulls /usr/bin/update, extracts ct script name, fetches .sh from GitHub, parses resource requirements
       backup.yml                        # vzdump and/or snapshot (BEFORE_UPDATE_AUTO) based on lxc_backup_strategy
       dry_check.yml                     # Reads installed version + fetches latest GitHub release; sets dry_run_status
       update.yml                        # OS update first, dpkg hash before/after community script, ver before/after, reboot if needed
-      health_check.yml                  # Polls Uptime Kuma for containers in lxc_kuma_map; only fires when something changed
+      health_check.yml                  # Polls Uptime Kuma; failure → rescue (no ignore_errors); retries/delay are vars
       report.yml                        # Builds tmp_app/tmp_os strings; appends LXC record (skips idle containers)
     molecule/
       lxc_update_normal/                # Running container, vzdump backup, app+OS update
@@ -78,6 +83,7 @@ roles/
       lxc_update_stopped/               # pct status:stopped → start → update → stop in always block
       lxc_update_dry_run/               # lxc_dry_run=true → only dry_check runs, no backup/update
       lxc_update_rescue/                # vzdump stub exits 1 → rescue block fires, fleet_failed=True
+      lxc_update_rollback/              # health_check fails (Kuma unreachable) → rescue fires, FAILED recorded
   vm_update/
     defaults/main.yml                   # Default values for vm_* vars
     tasks/
@@ -95,6 +101,21 @@ roles/
       health_check.yml                  # Polls Uptime Kuma (remote_kuma_map)
       report.yml                        # Appends remote host record to fleet_remote_data
     molecule/default/                   # Runs role in check_mode against localhost; no PVE needed
+  custom_update/
+    defaults/main.yml                   # custom_dry_run, custom_allow_reboot, custom_kuma_map, kuma health check vars
+    tasks/
+      main.yml                          # Orchestrator: load_config → block(detect→backup→update→health_check→report) → rescue(rollback_command)
+      load_config.yml                   # include_vars configs/{{ custom_config }}.yml → combine custom_overrides → custom_cfg
+      detect.yml                        # version_command (before); latest_version via GitHub API or command (delegated to localhost)
+      backup.yml                        # backup_command if defined
+      update.yml                        # loop update_steps; version_command (after); changed_when command; reboot if cfg.reboot
+      health_check.yml                  # kuma | command | http | none; failure → rescue (no ignore_errors)
+      report.yml                        # tmp_custom decision tree; appends fleet_custom_data (skips idle)
+    molecule/
+      custom_update_normal/             # Version changes 1.0 → 1.1; "Updated: 1.0 → 1.1" recorded
+      custom_update_noop/               # Version unchanged; record suppressed (idle)
+      custom_update_rescue/             # Update step exits 1; rollback_command runs; fleet_failed=True
+      custom_update_dry_run/            # custom_dry_run=true; detect only; "dry-run: X → Y" recorded
 ```
 
 ## Architecture
@@ -105,6 +126,7 @@ roles/
 |---|---|---|
 | Pre-Flight | localhost | Verify apt-cacher-ng proxy is reachable |
 | Phase 0 | `remote_hosts` | Non-Proxmox hosts via `remote_host_update` role |
+| Phase 0b | `custom_hosts` | Non-standard systems via `custom_update` role + per-system config files |
 | Phase 1 | `proxmox_nodes` | Tag-filtered LXC discovery + `lxc_update` role per container |
 | Phase 1b | `proxmox_vms` | QEMU VMs via `vm_update` role |
 | Phase 2 | `proxmox_nodes` | PVE node OS update + sequential reboot (`serial: 1`, `any_errors_fatal: true`) |
@@ -113,7 +135,7 @@ roles/
 
 ### State accumulation pattern
 
-All fleet state lives as facts on `localhost` across plays. Every role and play appends to it via `tasks/fleet-state-append.yml` using `delegate_to: localhost` + `delegate_facts: true` + `check_mode: no`. The four state lists are `fleet_lxc_data`, `fleet_vm_data`, `fleet_remote_data`, and `fleet_node_data`. `fleet_changed`, `fleet_failed`, and `fleet_error_log` (a `list[{host, task, error}]`) are also maintained here.
+All fleet state lives as facts on `localhost` across plays. Every role and play appends to it via `tasks/fleet-state-append.yml` using `delegate_to: localhost` + `delegate_facts: true` + `check_mode: no`. The five state lists are `fleet_lxc_data`, `fleet_vm_data`, `fleet_remote_data`, `fleet_node_data`, and `fleet_custom_data`. `fleet_changed`, `fleet_failed`, and `fleet_error_log` (a `list[{host, task, error}]`) are also maintained here.
 
 Do not write `set_fact` + `delegate_to: localhost` blocks directly — always call `tasks/fleet-state-append.yml` instead.
 
@@ -123,9 +145,31 @@ Do not write `set_fact` + `delegate_to: localhost` blocks directly — always ca
 - `introspect.yml` runs **outside** the block (fail loud if `pct config` fails)
 - Inside the block: `detect.yml` → `backup.yml` → `dry_check.yml` or `update.yml` → `health_check.yml` → `report.yml`
 - Rescue block captures `ansible_failed_task.name` and `ansible_failed_result.stderr` as the **first** `set_fact` before anything else (subsequent tasks reset these vars), then calls `fleet-state-append.yml`
-- Always block: delete snapshot (only if `snap_res.changed` — skipped tasks still register with `changed=false`, so `is succeeded` is not sufficient), stop container if `lxc_was_stopped`
+- Rescue block: capture failure → attempt `pct rollback BEFORE_UPDATE_AUTO` (only if `snap_res.changed`) → wait for container → set `lxc_rollback_done: true` → fleet-state-append with `FAILED + ROLLED BACK` or `FAILED`
+- Always block: delete snapshot (only if `snap_res.changed`), stop container if `lxc_was_stopped` **and** `not lxc_rollback_done` (rollback restores the container, so don't stop it again)
 
 `vm_update` and `remote_host_update` follow the same block/rescue/always pattern. `remote_host_update` has no always block (no snapshots to clean up).
+
+### `custom_update` role structure
+
+`tasks/main.yml` orchestrator:
+- `load_config.yml` runs **outside** the block (fail loud on bad config) — loads `configs/{{ custom_config }}.yml` and merges `custom_overrides` (from inventory) into `custom_cfg`
+- Inside the block: `detect.yml` → `backup.yml` (if `backup_command` defined and not dry-run) → `update.yml` (if not dry-run) → `health_check.yml` (if `health_check.type != none` and not dry-run) → `report.yml`
+- Rescue block: capture failure → run `rollback_command` (ignore_errors) → fleet-state-append `FAILED`
+- No always block (v1 — no snapshot to clean up)
+
+**`custom_config` inventory var**: each host in `[custom_hosts]` must have `custom_config=<name>` pointing to `configs/<name>.yml`. Optionally set `custom_overrides: {...}` in host_vars to deep-merge over the config file.
+
+**Config files**: `configs/*.yml` is gitignored. Commit `configs/*.yml.example` as templates. Real configs live only on the Ansible manager. See `config_templates/custom_system.yml.example` for the full schema.
+
+**`tmp_custom` decision tree in `report.yml`** (custom_update):
+- `custom_dry_run=true` → `dry-run: <before> → <latest>`
+- `changed_when.type == always` → `Updated [+ Rebooted]`
+- `changed_when.type == command`, exit 0 → `Updated [+ Rebooted]`
+- `changed_when.type == command`, exit non-0 → `OK`
+- `changed_when.type == version` (default), before/after differ → `Updated: X → Y [+ Rebooted]`
+- `changed_when.type == version`, before/after same → `OK`
+- No version data (no `version_command`) → `Updated [+ Rebooted]` (fallback)
 
 ### `update.yml` task order and change detection
 
@@ -171,7 +215,8 @@ The task order matters for correct attribution:
 - **URI calls in `detect.yml` are delegated to localhost**: PVE nodes may not have outbound HTTPS to GitHub. The Ansible manager always does.
 - **`pve_node` inventory var** (VM inventory): must match the PVE node's **inventory hostname** (not its IP) — it is used as a key into `hostvars` for the snapshot API call: `hostvars[pve_node]['ansible_host']`.
 - **PBS is transparent**: setting `lxc_backup_storage` to a PBS storage name routes `vzdump` to PBS automatically — no special code path.
-- **`[proxmox_vms]` and `[remote_hosts]` must exist** in `hosts.ini` even if empty (just the group header). Ansible raises "no hosts matched" otherwise.
+- **`[proxmox_vms]`, `[remote_hosts]`, and `[custom_hosts]` must exist** in `hosts.ini` even if empty (just the group header). Ansible raises "no hosts matched" otherwise.
+- **`custom_config` is a required per-host inventory var** for `[custom_hosts]` — set it in hosts.ini or host_vars. The role will fail loudly if it's missing (include_vars will not find the file).
 - **Node reboot is skipped** when `manager_lxc_id` runs on that node — rebooting the node would kill the manager mid-run.
 - **Discord `check_mode: no`**: the URI task has this so `--check` runs still produce a notification when `force_notify=true`.
 - **`lxc_backup_strategy`** is a four-value enum: `snapshot | vzdump | both | none` — not boolean flags.
@@ -179,6 +224,9 @@ The task order matters for correct attribution:
 - **Snapshot name is fixed**: always `BEFORE_UPDATE_AUTO`. The `always:` cleanup hardcodes this name — changing it in `backup.yml` without also changing `main.yml` would leave orphaned snapshots.
 - **`report.yml` skips idle containers**: the `when:` condition only appends a record when something changed or failed. Fully up-to-date containers with nothing to do produce no Discord entry.
 - **`lxc_continue_on_error`**: when `true`, Phase 1 uses `ignore_errors: yes` on the LXC loop, so a single failing container doesn't abort the rest of the node's containers.
+- **`health_check.yml` no longer has `ignore_errors: yes`** in `lxc_update` — Kuma failure now triggers the rescue block (and snapshot rollback if a snapshot was taken). Retries and delay are controlled by `kuma_health_check_retries` (default 5) and `kuma_health_check_delay` (default 30s), which molecule scenarios can override to 1/1 for fast tests.
+- **Rollback only fires when `snap_res.changed`** — if `lxc_backup_strategy: none` or the snapshot API call failed (both result in `snap_res.changed=false`), the rescue skips rollback and just records `FAILED`.
+- **`custom_update` molecule scenarios use temp config dirs** at `/tmp/mol_custom_<scenario>/configs/`. The `playbook_dir` var in converge.yml points there, overriding Ansible's automatic `playbook_dir` magic variable.
 
 ### Testing infrastructure
 
@@ -186,20 +234,21 @@ The task order matters for correct attribution:
 
 | File | What it covers |
 |---|---|
-| `test_report_tmp_app.py` | 11-branch `tmp_app` decision tree in `report.yml` |
+| `test_report_tmp_app.py` | 11-branch `tmp_app` + rollback rescue app string |
 | `test_report_tmp_os.py` | `tmp_os` expression + the `None`-guard in the payload |
 | `test_report_when_condition.py` | The `when:` gate that suppresses idle `OK`/`OK` containers |
 | `test_dry_check_status.py` | `dry_run_status` branches in `dry_check.yml` |
 | `test_detect_regex.py` | `regex_search` patterns in `detect.yml` and `needs_resource_scale` |
-| `test_discord_briefing.py` | Full `discord_briefing.j2` template rendering |
-| `test_fleet_state_append_logic.py` | `set_fact` expressions in `tasks/fleet-state-append.yml` |
+| `test_discord_briefing.py` | Full `discord_briefing.j2` including Custom Systems section |
+| `test_fleet_state_append_logic.py` | `set_fact` expressions in `tasks/fleet-state-append.yml` including `fleet_custom_data` |
 | `test_introspect_regex.py` | `pct config` output parsing in `introspect.yml` |
+| `test_custom_report.py` | 11-branch `tmp_custom` decision tree in `custom_update/tasks/report.yml` |
 
 `tests/conftest.py` implements Ansible-specific Jinja2 filters (`regex_search` with list-return for capture groups, `regex_replace`, `selectattr`) and tests (`failed`, `search`, `equalto`) so templates render identically to Ansible. When writing new tests, use `render()` for string output and `render_native()` (via `NativeEnvironment`) for Python objects.
 
 **Molecule scenarios** (`roles/lxc_update/molecule/`) test role orchestration against localhost using stub `pct`/`vzdump` shell scripts placed in `/tmp/mol_stubs/` by `prepare.yml`. Each scenario's `molecule.yml` sets `PATH: "/tmp/mol_stubs:${PATH}"` at the provisioner level so stubs are found by all shell tasks inside included roles. Converge serialises `fleet_*` facts to `/tmp/mol_fleet_state.json`; verify loads it with `include_vars` (necessary because converge and verify run as separate `ansible-playbook` processes). Idempotency checking is disabled for all scenarios — backup and update operations are intentionally non-idempotent.
 
-**CI** (`.github/workflows/ci.yml`) runs five parallel jobs: `yamllint`, `ansible-lint`, `syntax-check`, `unit-tests` (pytest), and `molecule-lxc-update`. The `ansible-lint` job excludes the six role task files that use `include_tasks: "{{ role_path }}/..."` via `exclude_paths` in `.ansible-lint` (the `load-failure[not-found]` rule is unskippable).
+**CI** (`.github/workflows/ci.yml`) runs seven parallel jobs: `yamllint`, `ansible-lint`, `syntax-check`, `unit-tests` (pytest), `molecule-lxc-update`, `molecule-lxc-rollback`, and `molecule-custom-update`. The `ansible-lint` job excludes the nine role task files that use `include_tasks: "{{ role_path }}/..."` via `exclude_paths` in `.ansible-lint` (the `load-failure[not-found]` rule is unskippable).
 
 ### Jinja2 / Ansible patterns
 

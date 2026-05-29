@@ -1,0 +1,40 @@
+# Worked example: Gitea binary on a NAS or dedicated VM.
+# Copy to configs/gitea.yml (gitignored) and adjust paths/URLs for your environment.
+# Set in inventory: nas-01 ... custom_config=gitea
+
+---
+name: "Gitea"
+
+version_command: "/usr/local/bin/gitea --version | awk '{print $3}'"
+
+latest_version:
+  type: github_release
+  repo: "go-gitea/gitea"
+
+backup_command: "tar czf /backups/gitea-$(date +%F-%H%M).tgz /var/lib/gitea /etc/gitea"
+
+update_steps:
+  - name: "stop gitea"
+    command: "systemctl stop gitea"
+  - name: "download new binary"
+    command: >
+      VER=$(curl -fsSL https://api.github.com/repos/go-gitea/gitea/releases/latest
+      | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'][1:])")
+      && curl -fsSL "https://dl.gitea.com/gitea/${VER}/gitea-${VER}-linux-amd64"
+      -o /usr/local/bin/gitea && chmod +x /usr/local/bin/gitea
+  - name: "start gitea"
+    command: "systemctl start gitea"
+
+changed_when:
+  type: version
+
+health_check:
+  type: kuma
+  kuma_slug: "gitea"
+
+reboot: false
+
+rollback_command: >
+  cp /usr/local/bin/gitea.bak /usr/local/bin/gitea
+  && chmod +x /usr/local/bin/gitea
+  && systemctl start gitea

@@ -1,0 +1,58 @@
+---
+# custom_dry_run=true → only detect runs, no update_steps, record shows dry-run status.
+- name: Prepare stubs for custom_update dry_run scenario
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create stubs directory
+      file:
+        path: /tmp/mol_stubs
+        state: directory
+        mode: '0755'
+
+    - name: Create temp config directory
+      file:
+        path: /tmp/mol_custom_dry_run/configs
+        state: directory
+        mode: '0755'
+
+    - name: Clean up state files
+      file:
+        path: /tmp/mol_dry_update_step_called
+        state: absent
+
+    - name: Write version stub (returns 3.0)
+      copy:
+        dest: /tmp/mol_stubs/mol_version_dry
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          echo "3.0"
+
+    - name: Write update step stub (should NOT be called in dry-run)
+      copy:
+        dest: /tmp/mol_stubs/mol_update_dry
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          touch /tmp/mol_dry_update_step_called
+          exit 0
+
+    - name: Write test config file
+      copy:
+        dest: /tmp/mol_custom_dry_run/configs/mol_test_dry_run.yml
+        mode: '0644'
+        content: |
+          name: "mol-dry-app"
+          version_command: "mol_version_dry"
+          latest_version:
+            type: none
+          update_steps:
+            - name: "update binary"
+              command: "mol_update_dry"
+          changed_when:
+            type: version
+          health_check:
+            type: none
+          reboot: false

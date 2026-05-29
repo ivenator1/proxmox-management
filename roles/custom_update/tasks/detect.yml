@@ -1,0 +1,60 @@
+---
+- name: "Initialize version facts {{ inventory_hostname }}"
+  set_fact:
+    custom_ver_before: ''
+    custom_latest_ver: ''
+
+- name: "Read current version {{ inventory_hostname }}"
+  shell: "{{ custom_cfg.version_command }}"
+  register: _custom_ver_before_res
+  changed_when: false
+  failed_when: false
+  when: custom_cfg.version_command | default('') | trim != ''
+
+- name: "Apply version before {{ inventory_hostname }}"
+  set_fact:
+    custom_ver_before: "{{ _custom_ver_before_res.stdout | default('') | trim }}"
+  when:
+    - _custom_ver_before_res is defined
+    - not (_custom_ver_before_res.skipped | default(false))
+
+- name: "Resolve latest version from GitHub release {{ inventory_hostname }}"
+  uri:
+    url: "https://api.github.com/repos/{{ (custom_cfg.latest_version | default({})).repo | default('') }}/releases/latest"
+    method: GET
+    headers:
+      Accept: "application/vnd.github+json"
+    return_content: yes
+  register: _custom_github_res
+  delegate_to: localhost
+  changed_when: false
+  failed_when: false
+  when:
+    - (custom_cfg.latest_version | default({})).type | default('none') == 'github_release'
+    - (custom_cfg.latest_version | default({})).repo | default('') | trim != ''
+
+- name: "Apply latest version from GitHub {{ inventory_hostname }}"
+  set_fact:
+    custom_latest_ver: "{{ (_custom_github_res.json | default({})).tag_name | default('') | trim }}"
+  when:
+    - _custom_github_res is defined
+    - not (_custom_github_res.skipped | default(false))
+    - not (_custom_github_res.failed | default(false))
+
+- name: "Resolve latest version from command {{ inventory_hostname }}"
+  shell: "{{ (custom_cfg.latest_version | default({})).command | default('true') }}"
+  register: _custom_latest_cmd_res
+  delegate_to: localhost
+  changed_when: false
+  failed_when: false
+  when:
+    - (custom_cfg.latest_version | default({})).type | default('none') == 'command'
+    - (custom_cfg.latest_version | default({})).command | default('') | trim != ''
+
+- name: "Apply latest version from command {{ inventory_hostname }}"
+  set_fact:
+    custom_latest_ver: "{{ _custom_latest_cmd_res.stdout | default('') | trim }}"
+  when:
+    - _custom_latest_cmd_res is defined
+    - not (_custom_latest_cmd_res.skipped | default(false))
+    - not (_custom_latest_cmd_res.failed | default(false))

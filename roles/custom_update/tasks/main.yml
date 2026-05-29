@@ -1,0 +1,52 @@
+---
+- name: "Load custom config {{ inventory_hostname }}"
+  include_tasks: load_config.yml
+
+- name: "Custom system maintenance block {{ inventory_hostname }}"
+  block:
+    - name: "Detect version and latest"
+      include_tasks: detect.yml
+
+    - name: "Backup"
+      include_tasks: backup.yml
+      when:
+        - not custom_dry_run | bool
+        - custom_cfg.backup_command | default('') | trim != ''
+
+    - name: "Update"
+      include_tasks: update.yml
+      when: not custom_dry_run | bool
+
+    - name: "Health check"
+      include_tasks: health_check.yml
+      when:
+        - not custom_dry_run | bool
+        - (custom_cfg.health_check | default({})).type | default('none') != 'none'
+
+    - name: "Report"
+      include_tasks: report.yml
+
+  rescue:
+    - name: "Capture failure details"
+      set_fact:
+        _failed_task_name: "{{ ansible_failed_task.name | default('Unknown task') }}"
+        _failed_error: "{{ ansible_failed_result.stderr | default(ansible_failed_result.msg) | default('Unknown error') | truncate(300) }}"
+
+    - name: "Run rollback command {{ inventory_hostname }}"
+      shell: "{{ custom_cfg.rollback_command }}"
+      when: custom_cfg.rollback_command | default('') | trim != ''
+      ignore_errors: yes
+
+    - name: "Record failure"
+      include_tasks: "{{ role_path }}/../../tasks/fleet-state-append.yml"
+      vars:
+        fleet_record_type: custom
+        fleet_record_payload:
+          host: "{{ inventory_hostname }}"
+          name: "{{ custom_cfg.name | default(inventory_hostname) }}"
+          app: "FAILED"
+        fleet_record_failed: true
+        fleet_error_detail:
+          host: "{{ inventory_hostname }}"
+          task: "{{ _failed_task_name }}"
+          error: "{{ _failed_error }}"

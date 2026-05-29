@@ -48,6 +48,30 @@
         _failed_task_name: "{{ ansible_failed_task.name | default('Unknown task') }}"
         _failed_error: "{{ ansible_failed_result.stderr | default(ansible_failed_result.msg) | default('Unknown error') | truncate(300) }}"
 
+    - name: "Roll back to pre-update snapshot {{ lxc_id }}"
+      command: "pct rollback {{ lxc_id }} BEFORE_UPDATE_AUTO"
+      when:
+        - snap_res is defined
+        - snap_res.changed | default(false) | bool
+      register: rollback_res
+
+    - name: "Wait for container after rollback {{ lxc_id }}"
+      command: "pct status {{ lxc_id }}"
+      register: rollback_status
+      until: "'running' in rollback_status.stdout"
+      retries: 12
+      delay: 10
+      when:
+        - rollback_res is defined
+        - rollback_res.changed | default(false) | bool
+
+    - name: "Mark rollback performed {{ lxc_id }}"
+      set_fact:
+        lxc_rollback_done: true
+      when:
+        - rollback_res is defined
+        - rollback_res.changed | default(false) | bool
+
     - name: "Record failure"
       include_tasks: "{{ role_path }}/../../tasks/fleet-state-append.yml"
       vars:
@@ -56,7 +80,7 @@
           node: "{{ inventory_hostname }}"
           name: "{{ lxc_name | default(lxc_id) }}"
           id: "{{ lxc_id }}"
-          app: "FAILED"
+          app: "{{ 'FAILED + ROLLED BACK' if (lxc_rollback_done | default(false)) else 'FAILED' }}"
           os: "FAILED"
           snap: false
         fleet_record_failed: true
@@ -90,3 +114,4 @@
       when:
         - lxc_was_stopped | default(false) | bool
         - not lxc_is_template | default(false) | bool
+        - not lxc_rollback_done | default(false) | bool

@@ -2,7 +2,7 @@
 # Shared state accumulator. Appends one record to the fleet state facts on localhost.
 #
 # Required vars:
-#   fleet_record_type:    lxc | vm | remote_host | node | manager
+#   fleet_record_type:    lxc | vm | remote_host | node | manager | custom
 #   fleet_record_payload: dict to append to the matching list
 #
 # Optional vars:
@@ -23,6 +23,9 @@
     fleet_node_data: >-
       {{ hostvars['localhost']['fleet_node_data'] | default([])
          + ([fleet_record_payload] if fleet_record_type in ['node', 'manager'] else []) }}
+    fleet_custom_data: >-
+      {{ hostvars['localhost']['fleet_custom_data'] | default([])
+         + ([fleet_record_payload] if fleet_record_type == 'custom' else []) }}
     fleet_changed: >-
       {{ (hostvars['localhost']['fleet_changed'] | default(false))
          or (fleet_record_changed | default(false) | bool) }}

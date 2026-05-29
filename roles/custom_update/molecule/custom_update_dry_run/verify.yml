@@ -1,0 +1,41 @@
+---
+- name: Verify — custom_update dry_run
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  pre_tasks:
+    - name: Load fleet state from converge play
+      include_vars:
+        file: /tmp/mol_fleet_state_dry_run.json
+  tasks:
+    - name: Check fleet_custom_data has one entry (dry-run is always recorded)
+      assert:
+        that:
+          - hostvars['localhost']['fleet_custom_data'] | default([]) | length == 1
+        fail_msg: "fleet_custom_data should have one entry for dry-run"
+
+    - name: Check custom record shows dry-run status
+      vars:
+        record: "{{ hostvars['localhost']['fleet_custom_data'][0] }}"
+      assert:
+        that:
+          - record.name == 'mol-dry-app'
+          - "'dry-run' in record.app"
+        fail_msg: "Custom record should contain 'dry-run': {{ record }}"
+
+    - name: Confirm no failure recorded
+      assert:
+        that:
+          - not (hostvars['localhost']['fleet_failed'] | default(false) | bool)
+        fail_msg: "fleet_failed should be False for a dry-run"
+
+    - name: Confirm update step was NOT called
+      stat:
+        path: /tmp/mol_dry_update_step_called
+      register: update_touch
+
+    - name: Assert update step was not called
+      assert:
+        that:
+          - not update_touch.stat.exists
+        fail_msg: "update_steps should NOT run when custom_dry_run=true"

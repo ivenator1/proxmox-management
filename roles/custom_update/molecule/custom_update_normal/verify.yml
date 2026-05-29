@@ -1,0 +1,48 @@
+---
+- name: Verify — custom_update normal
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  pre_tasks:
+    - name: Load fleet state from converge play
+      include_vars:
+        file: /tmp/mol_fleet_state.json
+  tasks:
+    - name: Check fleet_custom_data was populated
+      assert:
+        that:
+          - hostvars['localhost']['fleet_custom_data'] | default([]) | length == 1
+        fail_msg: "fleet_custom_data should have exactly one entry after a normal update run"
+
+    - name: Check custom record shows version update
+      vars:
+        record: "{{ hostvars['localhost']['fleet_custom_data'][0] }}"
+      assert:
+        that:
+          - record.name == 'mol-test-app'
+          - "'Updated: 1.0' in record.app"
+          - "'1.1' in record.app"
+        fail_msg: "Custom record should show 'Updated: 1.0 → 1.1': {{ record }}"
+
+    - name: Confirm no failure recorded
+      assert:
+        that:
+          - not (hostvars['localhost']['fleet_failed'] | default(false) | bool)
+        fail_msg: "fleet_failed should be False for a clean run"
+
+    - name: Confirm fleet_changed is True
+      assert:
+        that:
+          - hostvars['localhost']['fleet_changed'] | default(false) | bool
+        fail_msg: "fleet_changed should be True when version changed"
+
+    - name: Confirm update step was called
+      stat:
+        path: /tmp/mol_update_step_called
+      register: update_step_touch
+
+    - name: Assert update step ran
+      assert:
+        that:
+          - update_step_touch.stat.exists
+        fail_msg: "mol_update_step should have been called by update_steps"

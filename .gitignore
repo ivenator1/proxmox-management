@@ -4,4 +4,7 @@ session_notes.md
 __pycache__/
 *.pyc
 .pytest_cache/
+configs/*.yml
+!configs/*.yml.example
+!configs/.gitkeep
 

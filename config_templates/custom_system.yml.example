@@ -1,0 +1,82 @@
+# Config template for a non-standard system managed by the custom_update role.
+# Copy this file to configs/<name>.yml and fill in your values.
+# configs/*.yml is gitignored; commit configs/*.yml.example files as worked examples.
+#
+# Required inventory vars per host:
+#   custom_config: <name>   (resolves to configs/<name>.yml)
+#
+# Optional per-host override (host_vars/<host>.yml):
+#   custom_overrides:
+#     reboot: false                    # override any field from the config file
+#     health_check:
+#       kuma_slug: "app-prod"
+
+---
+# Display name used in Discord and logs.
+name: "my-app"
+
+# ── Version detection (optional) ──────────────────────────────────────────────
+# Shell command run on the target host. stdout is trimmed and used as the version
+# string. Leave empty ("") to skip version detection.
+version_command: "/usr/local/bin/my-app --version | awk '{print $2}'"
+
+# Latest version source. Used for informational reporting only (not a gate).
+latest_version:
+  # github_release | command | none
+  type: none
+
+  # For type: github_release — GitHub repo in owner/name format.
+  repo: ""
+
+  # For type: command — shell run on the Ansible manager (localhost), stdout = latest.
+  command: ""
+
+# ── Backup before update (optional) ───────────────────────────────────────────
+# Shell run on the target host before update_steps. Leave empty to skip.
+backup_command: ""
+# Example: "tar czf /backups/my-app-$(date +%F-%H%M).tgz /opt/my-app"
+
+# ── Update procedure (required) ───────────────────────────────────────────────
+# Ordered list of steps run on the target host. Each step is a name + command.
+update_steps:
+  - name: "stop service"
+    command: "systemctl stop my-app"
+  - name: "install new binary"
+    command: "curl -fsSL https://example.com/my-app -o /usr/local/bin/my-app && chmod +x /usr/local/bin/my-app"
+  - name: "start service"
+    command: "systemctl start my-app"
+
+# ── Change detection ──────────────────────────────────────────────────────────
+changed_when:
+  # version: compare version_command output before and after (default)
+  # command: exit 0 = changed, non-0 = no change
+  # always: always report Updated
+  type: version
+
+  # For type: command — run on target host, not delegated.
+  command: ""
+
+# ── Health check (optional) ───────────────────────────────────────────────────
+health_check:
+  # kuma | command | http | none (default)
+  type: none
+
+  # For type: kuma — slug key in Uptime Kuma heartbeatList.
+  kuma_slug: ""
+
+  # For type: command — exit 0 = healthy, non-0 = unhealthy. Failure → rescue.
+  command: ""
+
+  # For type: http — URL to GET; status 200 = healthy.
+  url: ""
+
+# ── Post-update reboot (optional) ─────────────────────────────────────────────
+# Set to true to reboot the host after update_steps complete.
+# Requires custom_allow_reboot: true (role default) and reboot_timeout=600s.
+reboot: false
+
+# ── Rollback on failure (optional) ────────────────────────────────────────────
+# Shell run on the target host inside the rescue block when any step fails.
+# Errors from rollback_command are ignored (ignore_errors: yes).
+rollback_command: ""
+# Example: "cp /usr/local/bin/my-app.bak /usr/local/bin/my-app && systemctl start my-app"

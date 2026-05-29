@@ -29,3 +29,14 @@ ansible_python_interpreter=/usr/bin/python3
 ansible_user=root
 ansible_ssh_private_key_file=~/.ssh/id_ed25519
 ansible_python_interpreter=/usr/bin/python3
+
+# Non-standard systems updated via per-system YAML config files (configs/<name>.yml).
+# Set custom_config=<name> per host to select the config file.
+# Leave the group empty (just the header) if you have no custom systems.
+[custom_hosts]
+# gitea-server  ansible_host=10.0.0.60  custom_config=gitea
+
+[custom_hosts:vars]
+ansible_user=root
+ansible_ssh_private_key_file=~/.ssh/id_ed25519
+ansible_python_interpreter=/usr/bin/python3

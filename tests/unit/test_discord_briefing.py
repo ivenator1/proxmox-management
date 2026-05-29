@@ -174,6 +174,32 @@ def test_multiple_nodes_both_appear(template):
     assert 'radarr' in result
 
 
+def test_custom_systems_section_shown(template):
+    result = render_briefing(
+        template,
+        fleet_custom_data=[dict(host='nas-01', name='Gitea', app='Updated: 1.20 → 1.21')],
+    )
+    assert '**Custom Systems**' in result
+    assert '- **Gitea** (nas-01) — Updated: 1.20 → 1.21' in result
+
+
+def test_custom_systems_section_absent_when_empty(template):
+    result = render_briefing(template)
+    assert '**Custom Systems**' not in result
+
+
+def test_custom_systems_multiple_entries(template):
+    result = render_briefing(
+        template,
+        fleet_custom_data=[
+            dict(host='nas-01', name='Gitea', app='Updated: 1.20 → 1.21'),
+            dict(host='nas-02', name='Grafana', app='OK'),
+        ],
+    )
+    assert 'Gitea' in result
+    assert 'Grafana' in result
+
+
 def test_lxc_filtered_per_node(template):
     # sonarr is on pve-01, radarr is on pve-02 — they should not bleed across nodes.
     result = render_briefing(

@@ -118,3 +118,20 @@ def test_no_hash_data_fallback():
 
 def test_app_not_changed():
     assert t(app_update_res=make_result(changed=False)) == 'OK'
+
+
+# --- Rescue block app string (inline expression in main.yml, not in TMP_APP) ---
+
+RESCUE_APP_EXPR = "{{ 'FAILED + ROLLED BACK' if (lxc_rollback_done | default(false)) else 'FAILED' }}"
+
+
+def test_rollback_performed():
+    assert render(RESCUE_APP_EXPR, lxc_rollback_done=True) == 'FAILED + ROLLED BACK'
+
+
+def test_rollback_not_performed():
+    assert render(RESCUE_APP_EXPR, lxc_rollback_done=False) == 'FAILED'
+
+
+def test_rollback_not_performed_default():
+    assert render(RESCUE_APP_EXPR) == 'FAILED'

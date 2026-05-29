@@ -1,0 +1,39 @@
+---
+- name: "Build custom status string {{ inventory_hostname }}"
+  set_fact:
+    tmp_custom: >-
+      {%- set _cw_type = (custom_cfg.changed_when | default({})).type | default('version') -%}
+      {%- set _reboot_done = custom_reboot_res is defined and (custom_reboot_res.changed | default(false)) -%}
+      {%- if custom_dry_run | bool -%}
+      dry-run: {{ custom_ver_before | default('?') }} → {{ custom_latest_ver | default('unknown') }}
+      {%- elif _cw_type == 'always' -%}
+      Updated{% if _reboot_done %} + Rebooted{% endif %}
+      {%- elif _cw_type == 'command'
+           and custom_changed_cmd_res is defined
+           and not (custom_changed_cmd_res.skipped | default(false)) -%}
+      {%- if custom_changed_cmd_res.rc | default(1) == 0 -%}
+      Updated{% if _reboot_done %} + Rebooted{% endif %}
+      {%- else -%}OK{%- endif -%}
+      {%- elif custom_ver_before | default('') | trim != ''
+           and custom_ver_after | default('') | trim != '' -%}
+      {%- if custom_ver_before | trim != custom_ver_after | trim -%}
+      Updated: {{ custom_ver_before | trim }} → {{ custom_ver_after | trim }}{% if _reboot_done %} + Rebooted{% endif %}
+      {%- else -%}OK{%- endif -%}
+      {%- else -%}
+      Updated{% if _reboot_done %} + Rebooted{% endif %}
+      {%- endif -%}
+
+- name: "Append custom record {{ inventory_hostname }}"
+  include_tasks: "{{ role_path }}/../../tasks/fleet-state-append.yml"
+  vars:
+    fleet_record_type: custom
+    fleet_record_payload:
+      host: "{{ inventory_hostname }}"
+      name: "{{ custom_cfg.name }}"
+      app: "{{ tmp_custom | trim }}"
+    fleet_record_changed: >-
+      {{ (tmp_custom | lower) is search('updated|dry-run') }}
+    fleet_record_failed: false
+  when: >
+    custom_dry_run | bool or
+    (tmp_custom | trim | lower) is search('updated|failed')

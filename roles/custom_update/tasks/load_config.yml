@@ -1,0 +1,9 @@
+---
+- name: "Load custom config file {{ inventory_hostname }}"
+  include_vars:
+    file: "{{ playbook_dir }}/configs/{{ custom_config }}.yml"
+    name: custom_cfg_file
+
+- name: "Merge inventory overrides {{ inventory_hostname }}"
+  set_fact:
+    custom_cfg: "{{ custom_cfg_file | combine(custom_overrides | default({}), recursive=true) }}"

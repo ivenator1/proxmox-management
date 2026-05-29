@@ -70,3 +70,27 @@ jobs:
       - name: Run molecule scenario
         run: molecule test -s lxc_update_normal
         working-directory: roles/lxc_update
+
+  molecule-lxc-rollback:
+    name: Molecule — lxc_update rollback
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install molecule and ansible
+        run: pip install molecule ansible
+      - name: Install collections
+        run: ansible-galaxy collection install community.proxmox community.general
+      - name: Run molecule scenario
+        run: molecule test -s lxc_update_rollback
+        working-directory: roles/lxc_update
+
+  molecule-custom-update:
+    name: Molecule — custom_update normal
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install molecule and ansible
+        run: pip install molecule ansible
+      - name: Run molecule scenario
+        run: molecule test -s custom_update_normal
+        working-directory: roles/custom_update

@@ -27,6 +27,11 @@ NODE_DATA_EXPR = (
     "{{ hostvars['localhost']['fleet_node_data'] | default([]) "
     "+ ([fleet_record_payload] if fleet_record_type in ['node', 'manager'] else []) }}"
 )
+CUSTOM_DATA_EXPR = (
+    "{{ hostvars['localhost']['fleet_custom_data'] | default([]) "
+    "+ ([fleet_record_payload] if fleet_record_type == 'custom' else []) }}"
+)
+
 CHANGED_EXPR = (
     "{{ (hostvars['localhost']['fleet_changed'] | default(false)) "
     "or (fleet_record_changed | default(false) | bool) }}"
@@ -125,6 +130,30 @@ def test_node_type_goes_to_node_list(env):
                fleet_record_type='node',
                fleet_record_payload={'node': 'pve-01', 'status': 'OK'})
     assert result == [{'node': 'pve-01', 'status': 'OK'}]
+
+
+def test_custom_type_goes_to_custom_list(env):
+    result = r(env, CUSTOM_DATA_EXPR,
+               hostvars=empty_hostvars(),
+               fleet_record_type='custom',
+               fleet_record_payload={'host': 'nas-01', 'name': 'Gitea', 'app': 'Updated: 1.20 → 1.21'})
+    assert result == [{'host': 'nas-01', 'name': 'Gitea', 'app': 'Updated: 1.20 → 1.21'}]
+
+
+def test_custom_type_does_not_pollute_lxc(env):
+    result = r(env, LXC_DATA_EXPR,
+               hostvars=empty_hostvars(),
+               fleet_record_type='custom',
+               fleet_record_payload={'host': 'nas-01', 'name': 'Gitea'})
+    assert result == []
+
+
+def test_lxc_type_does_not_pollute_custom(env):
+    result = r(env, CUSTOM_DATA_EXPR,
+               hostvars=empty_hostvars(),
+               fleet_record_type='lxc',
+               fleet_record_payload={'id': '101', 'name': 'sonarr'})
+    assert result == []
 
 
 def test_manager_type_goes_to_node_list(env):

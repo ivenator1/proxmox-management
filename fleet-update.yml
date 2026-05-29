@@ -35,6 +35,19 @@
         name: remote_host_update
 
 # ==========================================
+# PHASE 0b: Custom (non-standard) system updates
+# ==========================================
+- name: "Phase 0b: Custom System Updates"
+  hosts: custom_hosts
+  serial: 1
+  gather_facts: yes
+  vars_files: [vars.yml]
+  tasks:
+    - name: "Update custom system"
+      include_role:
+        name: custom_update
+
+# ==========================================
 # PHASE 1: Update all tagged LXCs
 # ==========================================
 - name: "Phase 1: Update All LXCs"

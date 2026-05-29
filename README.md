@@ -207,9 +207,10 @@ cd roles/lxc_update && molecule test -s lxc_update_normal
 
 CI runs automatically on push/PR via GitHub Actions (`.github/workflows/ci.yml`).
 
-## 🗒️ TODO
+## ✅ Recent additions
 
-- **Tier 4 — Automatic Snapshot Rollback**: `health_check.yml` polls Uptime Kuma after updates but takes no action on failure (`ignore_errors: yes`). Implement: if Kuma doesn't return `status: 1` within the retry window, roll back to the `BEFORE_UPDATE_AUTO` snapshot via `community.proxmox.proxmox_snap` and record the rollback in the fleet state / Discord embed.
+- **Tier 4 — Automatic Snapshot Rollback** (done): `health_check.yml` in `lxc_update` no longer silently swallows Kuma failures. When the retry window is exhausted the rescue block fires, and `pct rollback BEFORE_UPDATE_AUTO` is called if a snapshot was taken. The Discord report shows `FAILED + ROLLED BACK`.
+- **`custom_update` role** (done): a config-driven update path for non-standard systems (binary apps, docker compose stacks, git-deployed apps, vendor CLIs). Describe the update procedure in `configs/<name>.yml` (copied from `config_templates/custom_system.yml.example`) and add the host to `[custom_hosts]` in `hosts.ini`. No new role required per system.
 
 ## 📡 Discord Briefing Format
 The orchestrator sends one consolidated embed per run:
