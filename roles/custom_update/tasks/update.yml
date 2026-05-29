@@ -1,11 +1,10 @@
 ---
-- name: "Run update step - {{ step.name }}"
-  shell: "{{ step.command }}"
+- name: "Run update steps {{ inventory_hostname }}"
+  include_tasks: run_step.yml
   loop: "{{ custom_cfg.update_steps | default([]) }}"
   loop_control:
     loop_var: step
     label: "{{ step.name }}"
-  register: custom_update_steps_res
 
 - name: "Read version after update {{ inventory_hostname }}"
   shell: "{{ custom_cfg.version_command }}"

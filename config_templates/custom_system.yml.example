@@ -53,14 +53,28 @@ backup_command: ""
 # Example: "tar czf /backups/my-app-$(date +%F-%H%M).tgz /opt/my-app"
 
 # ── Update procedure (required) ───────────────────────────────────────────────
-# Ordered list of steps run on the target host. Each step is a name + command.
+# Ordered list of steps run on the target host. A step needs at least name+command.
+# Optional per-step keys: when (condition), become, chdir, timeout (seconds),
+# retries, delay, changed_when, ignore_errors, environment, and register (stash
+# stdout for a later step to read via {{ custom_step_results['<name>'] }}).
 update_steps:
   - name: "stop service"
     command: "systemctl stop my-app"
   - name: "install new binary"
     command: "curl -fsSL https://example.com/my-app -o /usr/local/bin/my-app && chmod +x /usr/local/bin/my-app"
+    timeout: 120
+    retries: 3
+    delay: 10
   - name: "start service"
     command: "systemctl start my-app"
+    become: true
+  # Example of conditional + output capture:
+  # - name: "read build id"
+  #   command: "cat /opt/my-app/BUILD"
+  #   register: build_id
+  # - name: "log build id"
+  #   command: "logger my-app build {{ custom_step_results['build_id'] }}"
+  #   when: "custom_step_results['build_id'] | default('') | length > 0"
 
 # ── Change detection ──────────────────────────────────────────────────────────
 changed_when:
