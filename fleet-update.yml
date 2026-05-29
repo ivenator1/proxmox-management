@@ -30,6 +30,10 @@
   gather_facts: yes
   vars_files: [vars.yml]
   tasks:
+    - name: "Apply fleet-wide dry-run"
+      set_fact:
+        remote_dry_run: "{{ (fleet_dry_run | default(false) | bool) or (remote_dry_run | default(false) | bool) }}"
+
     - name: "Update remote host"
       include_role:
         name: remote_host_update
@@ -43,6 +47,10 @@
   gather_facts: yes
   vars_files: [vars.yml]
   tasks:
+    - name: "Apply fleet-wide dry-run"
+      set_fact:
+        custom_dry_run: "{{ (fleet_dry_run | default(false) | bool) or (custom_dry_run | default(false) | bool) }}"
+
     - name: "Update custom system"
       include_role:
         name: custom_update
@@ -56,6 +64,10 @@
   gather_facts: no
   vars_files: [vars.yml]
   tasks:
+    - name: "Apply fleet-wide dry-run"
+      set_fact:
+        lxc_dry_run: "{{ (fleet_dry_run | default(false) | bool) or (lxc_dry_run | default(false) | bool) }}"
+
     - name: "Discover tagged LXCs"
       shell: |
         pct list | awk 'NR>1 {print $1}' | while read id; do
@@ -83,6 +95,10 @@
   gather_facts: yes
   vars_files: [vars.yml]
   tasks:
+    - name: "Apply fleet-wide dry-run"
+      set_fact:
+        vm_dry_run: "{{ (fleet_dry_run | default(false) | bool) or (vm_dry_run | default(false) | bool) }}"
+
     - name: "Update VM"
       include_role:
         name: vm_update
@@ -242,7 +258,7 @@
         _ntfy_title: "{% if fleet_failed | default(false) %}Fleet Update: Failures Detected{% else %}Fleet Update: All Systems Clear{% endif %}"
         # Canonical rendered body — shared verbatim by every notifier.
         _briefing_body: "{{ lookup('template', 'templates/discord_briefing.j2') | trim | truncate(4000, False, '\n...') }}"
-        _should_notify: "{{ (force_notify | default(false) | bool) or (fleet_changed | default(false)) or (fleet_failed | default(false)) }}"
+        _should_notify: "{{ (force_notify | default(false) | bool) or (fleet_dry_run | default(false) | bool) or (fleet_changed | default(false)) or (fleet_failed | default(false)) }}"
       check_mode: no
 
     - name: "Persist run history"

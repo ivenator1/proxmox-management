@@ -9,6 +9,7 @@ from tests.conftest import render, make_result
 # Success-path status from report.yml
 VM_STATUS = """\
 {%- if vm_pkg_res is failed -%}FAILED
+{%- elif vm_dry_run | default(false) -%}{% if vm_pkg_res.changed | default(false) %}WOULD UPDATE{% else %}OK{% endif %}
 {%- elif vm_reboot_action is defined and vm_reboot_action.changed -%}UPDATED & REBOOTED
 {%- elif vm_pkg_res.changed | default(false) -%}UPDATED
 {%- else -%}OK{%- endif -%}"""
@@ -39,6 +40,18 @@ def test_status_updated():
 
 def test_status_ok():
     assert s(vm_pkg_res=make_result(changed=False)) == 'OK'
+
+
+def test_status_dry_run_would_update():
+    assert s(vm_dry_run=True, vm_pkg_res=make_result(changed=True)) == 'WOULD UPDATE'
+
+
+def test_status_dry_run_ok():
+    assert s(vm_dry_run=True, vm_pkg_res=make_result(changed=False)) == 'OK'
+
+
+def test_status_failed_beats_dry_run():
+    assert s(vm_dry_run=True, vm_pkg_res=make_result(failed=True)) == 'FAILED'
 
 
 # --- rescue status ---

@@ -1,45 +1,79 @@
 ---
 - name: "Pre-update command {{ inventory_hostname }}"
   shell: "{{ remote_pre_update_cmd }}"
-  when: remote_pre_update_cmd | default('') != ''
-
-- name: "Update packages (apt) {{ inventory_hostname }}"
-  apt:
-    upgrade: dist
-    update_cache: yes
-    autoremove: yes
-  register: remote_apt_res
-  when: ansible_pkg_mgr == 'apt'
-  changed_when:
-    - remote_apt_res is succeeded
-    - remote_apt_res.stdout is defined
-    - "'0 upgraded, 0 newly installed' not in remote_apt_res.stdout"
-
-- name: "Update packages (dnf) {{ inventory_hostname }}"
-  dnf:
-    name: "*"
-    state: latest
-    update_cache: yes
-  register: remote_dnf_res
-  when: ansible_pkg_mgr == 'dnf'
-
-- name: "Update packages (apk) {{ inventory_hostname }}"
-  community.general.apk:
-    upgrade: yes
-    update_cache: yes
-  register: remote_apk_res
-  when: ansible_pkg_mgr == 'apk'
-
-- name: "Check reboot-required"
-  stat:
-    path: /var/run/reboot-required
-  register: remote_reboot_file
-
-- name: "Reboot {{ inventory_hostname }}"
-  reboot:
-    reboot_timeout: 600
-    post_reboot_delay: 30
-  register: remote_reboot_action
   when:
-    - remote_auto_reboot | bool
-    - remote_reboot_file.stat.exists
+    - not (remote_dry_run | default(false) | bool)
+    - remote_pre_update_cmd | default('') != ''
+
+# Dry-run: simulate via check_mode and report what WOULD change. No reboot.
+- name: "Simulate remote updates (dry-run)"
+  block:
+    - name: "Simulate apt {{ inventory_hostname }}"
+      apt:
+        upgrade: dist
+        update_cache: yes
+      check_mode: yes
+      register: remote_apt_res
+      when: ansible_pkg_mgr == 'apt'
+
+    - name: "Simulate dnf {{ inventory_hostname }}"
+      dnf:
+        name: "*"
+        state: latest
+        update_cache: yes
+      check_mode: yes
+      register: remote_dnf_res
+      when: ansible_pkg_mgr == 'dnf'
+
+    - name: "Simulate apk {{ inventory_hostname }}"
+      community.general.apk:
+        upgrade: yes
+        update_cache: yes
+      check_mode: yes
+      register: remote_apk_res
+      when: ansible_pkg_mgr == 'apk'
+  when: remote_dry_run | default(false) | bool
+
+- name: "Apply remote updates"
+  block:
+    - name: "Update packages (apt) {{ inventory_hostname }}"
+      apt:
+        upgrade: dist
+        update_cache: yes
+        autoremove: yes
+      register: remote_apt_res
+      when: ansible_pkg_mgr == 'apt'
+      changed_when:
+        - remote_apt_res is succeeded
+        - remote_apt_res.stdout is defined
+        - "'0 upgraded, 0 newly installed' not in remote_apt_res.stdout"
+
+    - name: "Update packages (dnf) {{ inventory_hostname }}"
+      dnf:
+        name: "*"
+        state: latest
+        update_cache: yes
+      register: remote_dnf_res
+      when: ansible_pkg_mgr == 'dnf'
+
+    - name: "Update packages (apk) {{ inventory_hostname }}"
+      community.general.apk:
+        upgrade: yes
+        update_cache: yes
+      register: remote_apk_res
+      when: ansible_pkg_mgr == 'apk'
+
+    - name: "Check reboot-required"
+      stat:
+        path: /var/run/reboot-required
+      register: remote_reboot_file
+
+    - name: "Reboot {{ inventory_hostname }}"
+      reboot:
+        reboot_timeout: 600
+        post_reboot_delay: 30
+      register: remote_reboot_action
+      when:
+        - remote_auto_reboot | bool
+        - remote_reboot_file.stat.exists
+  when: not (remote_dry_run | default(false) | bool)

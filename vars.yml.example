@@ -57,6 +57,11 @@ remote_kuma_map: {}
 # --- CUSTOM SYSTEM SETTINGS ---
 custom_dry_run: false
 
+# --- FLEET-WIDE DRY RUN ---
+# Master switch (usually passed as -e fleet_dry_run=true). Forces every role into
+# its dry-run / simulate mode (no changes, no reboots) and forces a notification.
+fleet_dry_run: false
+
 # --- RUN HISTORY ---
 # Each run writes <dir>/run-<UTC-timestamp>.json and overwrites <dir>/latest.json.
 fleet_history_enabled: true

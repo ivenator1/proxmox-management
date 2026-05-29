@@ -1,6 +1,7 @@
 ---
 vm_kuma_map: {}
 vm_auto_reboot: true
+vm_dry_run: false
 
 # Backup strategy before update. Rollback is snapshot-based only.
 # snapshot | both | none   (both = snapshot + a simultaneous vzdump archive)

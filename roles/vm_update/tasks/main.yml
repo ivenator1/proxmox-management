@@ -3,6 +3,7 @@
   block:
     - name: "Snapshot"
       include_tasks: snapshot.yml
+      when: not (vm_dry_run | default(false) | bool)
 
     - name: "Warn: snapshot unavailable {{ vmid }}"
       include_tasks: "{{ role_path }}/../../tasks/fleet-state-append.yml"
@@ -19,6 +20,7 @@
 
     - name: "Health check"
       include_tasks: health_check.yml
+      when: not (vm_dry_run | default(false) | bool)
 
     - name: "Report success"
       include_tasks: report.yml

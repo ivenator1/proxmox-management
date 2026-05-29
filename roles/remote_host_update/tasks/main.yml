@@ -6,6 +6,7 @@
 
     - name: "Health check"
       include_tasks: health_check.yml
+      when: not (remote_dry_run | default(false) | bool)
 
     - name: "Report success"
       include_tasks: report.yml

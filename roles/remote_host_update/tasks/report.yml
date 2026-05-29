@@ -14,6 +14,7 @@
       host: "{{ inventory_hostname }}"
       status: >-
         {%- if remote_pkg_res is failed -%}FAILED
+        {%- elif remote_dry_run | default(false) -%}{% if remote_pkg_res.changed | default(false) %}WOULD UPDATE{% else %}OK{% endif %}
         {%- elif remote_reboot_action is defined and remote_reboot_action.changed -%}UPDATED & REBOOTED
         {%- elif remote_pkg_res.changed | default(false) -%}UPDATED
         {%- else -%}OK{%- endif -%}

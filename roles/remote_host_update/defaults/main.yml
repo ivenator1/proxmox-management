@@ -2,3 +2,4 @@
 remote_kuma_map: {}
 remote_auto_reboot: true
 remote_pre_update_cmd: ""
+remote_dry_run: false
