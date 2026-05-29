@@ -1,0 +1,22 @@
+---
+# Execution primitive: reboot the target host and wait for it to return.
+# Makes no decisions — the control plane decides whether/when to call it.
+#
+# Params (extravars):
+#   target_hosts     host to reboot (set by invoke_primitive)
+#   reboot_timeout   seconds to wait for the host to come back (default 600)
+- name: "reboot_host primitive"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  tasks:
+    - name: "Reboot host"
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ reboot_timeout | default(600) | int }}"
+        post_reboot_delay: 30
+      register: _reboot
+
+    - name: "Return result to the control plane"
+      ansible.builtin.set_stats:
+        data:
+          changed: "{{ _reboot.changed | default(true) }}"
+        aggregate: false

@@ -43,8 +43,14 @@ pytest tests/unit/ -v
 
 Landed so far: pydantic schemas for `configs/<name>.yml` (`CustomConfig`) and the
 fleet state records (`FleetState`), stdlib orchestration helpers (the
-`forks`/`serial`/`retries` equivalents), manager-local IO helpers (`http.py`), and the
-ansible-runner wrapper. See the migration plan for the full phased roadmap.
+`forks`/`serial`/`retries` equivalents), manager-local IO helpers (`http.py`), the
+ansible-runner wrapper, the custom_update decision logic (`status.py`/`changes.py`),
+and the full **custom_update flow** (`flows/custom.py` + `steps.py` + `executor.py`)
+driven by the `run_shell`/`reboot_host` execution primitives. The flow does per-step
+command interpolation in Python — so a later step can use `{{ steps.NAME }}` from an
+earlier step's output (the eager-templating limitation is gone). Still pending for
+custom_update: wiring the flow into the driver as the default + reworking its molecule
+scenarios. See the migration plan for the full phased roadmap.
 
 ## 🛠 Prerequisites
 * **Ansible Manager:** A dedicated LXC (e.g., Debian 12+, VMID 121) with a static IP.
