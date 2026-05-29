@@ -49,14 +49,26 @@ jobs:
         run: ansible-playbook fleet-update.yml --syntax-check
 
   unit-tests:
-    name: Jinja2 unit tests
+    name: Python unit tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install test dependencies
         run: pip install -r tests/requirements.txt
+      - name: Install proxmox_fleet package
+        run: pip install -e .
       - name: Run pytest
         run: pytest tests/unit/ -v --tb=short
+
+  typecheck:
+    name: mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install package + dev deps
+        run: pip install -e '.[dev]'
+      - name: Run mypy
+        run: python -m mypy proxmox_fleet/
 
   molecule-lxc-update:
     name: Molecule — lxc_update ${{ matrix.scenario }}
