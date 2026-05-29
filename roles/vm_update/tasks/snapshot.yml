@@ -1,4 +1,11 @@
 ---
+- name: "Vzdump backup of VM {{ vmid }}"
+  shell: >
+    vzdump {{ vmid }} --compress zstd --storage {{ vm_backup_storage }}
+    --notes-template "{{ inventory_hostname }} - ansible fleet-update"
+  delegate_to: "{{ pve_node }}"
+  when: vm_backup_strategy in ['both']
+
 - name: "Snapshot VM {{ inventory_hostname }}"
   community.proxmox.proxmox_snap:
     api_host: "{{ hostvars[pve_node]['ansible_host'] }}"
@@ -11,3 +18,12 @@
   delegate_to: localhost
   register: vm_snap_res
   failed_when: false
+  when: vm_backup_strategy in ['snapshot', 'both']
+
+# Snapshot wanted but not taken → rollback impossible; surface it (see backup.yml note).
+- name: "Flag VM snapshot failure {{ vmid }}"
+  set_fact:
+    vm_snapshot_failed: true
+  when:
+    - vm_backup_strategy in ['snapshot', 'both']
+    - not (vm_snap_res.changed | default(false) | bool)

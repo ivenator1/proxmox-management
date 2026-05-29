@@ -59,8 +59,15 @@ jobs:
         run: pytest tests/unit/ -v --tb=short
 
   molecule-lxc-update:
-    name: Molecule — lxc_update normal
+    name: Molecule — lxc_update ${{ matrix.scenario }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - lxc_update_normal
+          - lxc_update_rollback
+          - lxc_update_snapfail
     steps:
       - uses: actions/checkout@v4
       - name: Install molecule and ansible
@@ -68,20 +75,7 @@ jobs:
       - name: Install collections
         run: ansible-galaxy collection install community.proxmox community.general
       - name: Run molecule scenario
-        run: molecule test -s lxc_update_normal
-        working-directory: roles/lxc_update
-
-  molecule-lxc-rollback:
-    name: Molecule — lxc_update rollback
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install molecule and ansible
-        run: pip install molecule ansible
-      - name: Install collections
-        run: ansible-galaxy collection install community.proxmox community.general
-      - name: Run molecule scenario
-        run: molecule test -s lxc_update_rollback
+        run: molecule test -s ${{ matrix.scenario }}
         working-directory: roles/lxc_update
 
   molecule-custom-update:

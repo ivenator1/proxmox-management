@@ -4,6 +4,16 @@
     - name: "Snapshot"
       include_tasks: snapshot.yml
 
+    - name: "Warn: snapshot unavailable {{ vmid }}"
+      include_tasks: "{{ role_path }}/../../tasks/fleet-state-append.yml"
+      vars:
+        fleet_record_type: warning
+        fleet_warning_detail:
+          host: "{{ pve_node }}/vm-{{ vmid }}"
+          task: "Snapshot {{ vmid }}"
+          warning: "snapshot failed — automatic rollback unavailable for this update"
+      when: vm_snapshot_failed | default(false) | bool
+
     - name: "Update packages"
       include_tasks: update.yml
 
@@ -19,6 +29,32 @@
         _failed_task_name: "{{ ansible_failed_task.name | default('Unknown task') }}"
         _failed_error: "{{ ansible_failed_result.stderr | default(ansible_failed_result.msg) | default('Unknown error') | truncate(300) }}"
 
+    - name: "Roll back VM to pre-update snapshot {{ vmid }}"
+      command: "qm rollback {{ vmid }} BEFORE_UPDATE_AUTO"
+      delegate_to: "{{ pve_node }}"
+      when:
+        - vm_snap_res is defined
+        - vm_snap_res.changed | default(false) | bool
+      register: vm_rollback_res
+
+    - name: "Wait for VM after rollback {{ vmid }}"
+      command: "qm status {{ vmid }}"
+      delegate_to: "{{ pve_node }}"
+      register: vm_rollback_status
+      until: "'running' in vm_rollback_status.stdout"
+      retries: 12
+      delay: 10
+      when:
+        - vm_rollback_res is defined
+        - vm_rollback_res.changed | default(false) | bool
+
+    - name: "Mark VM rollback performed {{ vmid }}"
+      set_fact:
+        vm_rollback_done: true
+      when:
+        - vm_rollback_res is defined
+        - vm_rollback_res.changed | default(false) | bool
+
     - name: "Record failure"
       include_tasks: "{{ role_path }}/../../tasks/fleet-state-append.yml"
       vars:
@@ -27,7 +63,9 @@
           node: "{{ pve_node }}"
           name: "{{ inventory_hostname }}"
           vmid: "{{ vmid }}"
-          status: "FAILED"
+          status: >-
+            {{ 'FAILED + ROLLED BACK' if (vm_rollback_done | default(false))
+               else ('FAILED (NO SNAPSHOT)' if (vm_snapshot_failed | default(false)) else 'FAILED') }}
         fleet_record_failed: true
         fleet_error_detail:
           host: "{{ pve_node }}/vm-{{ vmid }}"

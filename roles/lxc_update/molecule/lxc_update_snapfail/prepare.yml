@@ -1,0 +1,57 @@
+---
+# Snapshot strategy with fake PVE creds → proxmox_snap returns changed=false →
+# lxc_snapshot_failed is set, a warning is recorded, and the update proceeds.
+- name: Create stub binaries for snapfail scenario
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create stubs directory
+      file:
+        path: /tmp/mol_stubs
+        state: directory
+        mode: '0755'
+
+    - name: Clean up previous run state files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/mol_pct_start_called
+        - /tmp/mol_pct_stop_called
+        - /tmp/mol_pct_rollback_called
+
+    - name: Write pct stub
+      copy:
+        dest: /tmp/mol_stubs/pct
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          CMD="$1"; shift
+          case "$CMD" in
+            config)
+              echo "arch: amd64"
+              echo "hostname: sonarr"
+              echo "ostype: ubuntu"
+              echo "cores: 2"
+              echo "memory: 2048"
+              echo "tags: community-script"
+              ;;
+            status) echo "status: running" ;;
+            start) touch /tmp/mol_pct_start_called ;;
+            stop) touch /tmp/mol_pct_stop_called ;;
+            pull) exit 1 ;;
+            exec)
+              shift; shift
+              CMD_STR="$*"
+              if echo "$CMD_STR" | grep -q 'dist-upgrade'; then
+                echo "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded."
+              elif echo "$CMD_STR" | grep -q 'reboot-required'; then
+                exit 1
+              fi
+              ;;
+            rollback) touch /tmp/mol_pct_rollback_called ;;
+            set) exit 0 ;;
+            reboot) exit 0 ;;
+            delsnapshot) exit 0 ;;
+          esac

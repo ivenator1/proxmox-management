@@ -18,6 +18,16 @@
         - not lxc_dry_run | bool
         - lxc_backup_strategy != 'none'
 
+    - name: "Warn: snapshot unavailable {{ lxc_id }}"
+      include_tasks: "{{ role_path }}/../../tasks/fleet-state-append.yml"
+      vars:
+        fleet_record_type: warning
+        fleet_warning_detail:
+          host: "{{ inventory_hostname }}/lxc-{{ lxc_id }}"
+          task: "Snapshot {{ lxc_id }}"
+          warning: "snapshot failed — automatic rollback unavailable for this update"
+      when: lxc_snapshot_failed | default(false) | bool
+
     - name: "Dry-run version check"
       include_tasks: dry_check.yml
       when:
@@ -80,7 +90,9 @@
           node: "{{ inventory_hostname }}"
           name: "{{ lxc_name | default(lxc_id) }}"
           id: "{{ lxc_id }}"
-          app: "{{ 'FAILED + ROLLED BACK' if (lxc_rollback_done | default(false)) else 'FAILED' }}"
+          app: >-
+            {{ 'FAILED + ROLLED BACK' if (lxc_rollback_done | default(false))
+               else ('FAILED (NO SNAPSHOT)' if (lxc_snapshot_failed | default(false)) else 'FAILED') }}
           os: "FAILED"
           snap: false
         fleet_record_failed: true

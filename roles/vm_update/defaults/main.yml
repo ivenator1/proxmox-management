@@ -1,3 +1,9 @@
 ---
 vm_kuma_map: {}
 vm_auto_reboot: true
+
+# Backup strategy before update. Rollback is snapshot-based only.
+# snapshot | both | none   (both = snapshot + a simultaneous vzdump archive)
+vm_backup_strategy: "snapshot"
+# PVE storage for the vzdump archive when strategy is 'both'.
+vm_backup_storage: "local"

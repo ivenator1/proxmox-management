@@ -20,3 +20,13 @@
   when:
     - lxc_backup_strategy in ['snapshot', 'both']
     - lxc_id not in (snapshot_exclude_list | default([]))
+
+# A snapshot was wanted but not taken (API error / failed_when:false hides .failed,
+# so we detect via "not changed"). Rollback will be impossible; surface it.
+- name: "Flag snapshot failure {{ lxc_id }}"
+  set_fact:
+    lxc_snapshot_failed: true
+  when:
+    - lxc_backup_strategy in ['snapshot', 'both']
+    - lxc_id not in (snapshot_exclude_list | default([]))
+    - not (snap_res.changed | default(false) | bool)
