@@ -233,27 +233,31 @@
   gather_facts: no
   vars_files: [vars.yml]
   tasks:
-    - name: "Build Discord embed payload"
+    - name: "Build briefing payload"
       set_fact:
+        # _discord_color / _briefing_title kept identical to the previous behaviour.
         _discord_color: "{{ (15158332 if fleet_failed | default(false) else 3066993) | int }}"
-        _discord_title: "{% if fleet_failed | default(false) %}⚠️ Briefing: Failures Detected{% else %}✅ Briefing: All Systems Clear{% endif %}"
-        _discord_description: "{{ lookup('template', 'templates/discord_briefing.j2') | trim | truncate(4000, False, '\n...') }}"
+        _briefing_title: "{% if fleet_failed | default(false) %}⚠️ Briefing: Failures Detected{% else %}✅ Briefing: All Systems Clear{% endif %}"
+        # Plain (ASCII-safe) title for the ntfy 'Title' HTTP header.
+        _ntfy_title: "{% if fleet_failed | default(false) %}Fleet Update: Failures Detected{% else %}Fleet Update: All Systems Clear{% endif %}"
+        # Canonical rendered body — shared verbatim by every notifier.
+        _briefing_body: "{{ lookup('template', 'templates/discord_briefing.j2') | trim | truncate(4000, False, '\n...') }}"
+        _should_notify: "{{ (force_notify | default(false) | bool) or (fleet_changed | default(false)) or (fleet_failed | default(false)) }}"
       check_mode: no
 
-    - name: "Send Final Discord Briefing"
-      vars:
-        should_notify: "{{ (force_notify | default(false) | bool) or (fleet_changed | default(false)) or (fleet_failed | default(false)) }}"
-      when: should_notify
-      uri:
-        url: "{{ discord_webhook }}"
-        method: POST
-        headers:
-          Content-Type: "application/json"
-        body: "{{ {'embeds': [{'title': _discord_title, 'description': _discord_description, 'color': _discord_color}]} | to_json }}"
-        status_code: [200, 204, 429, 500, 502, 503, 504]
-      register: discord_response
-      until: "discord_response.status in [200, 204]"
-      retries: 15
-      delay: 10
-      ignore_errors: yes
+    - name: "Resolve notifier list (back-compat shim for discord_webhook)"
+      set_fact:
+        _notifiers: >-
+          {{ notifiers if notifiers is defined
+             else ([{'type': 'discord', 'enabled': true, 'webhook': discord_webhook}]
+                   if (discord_webhook is defined and discord_webhook | default('') | trim != '')
+                   else []) }}
       check_mode: no
+
+    - name: "Dispatch briefing to notifiers"
+      include_tasks: tasks/notify.yml
+      loop: "{{ _notifiers }}"
+      loop_control:
+        loop_var: notifier
+        label: "{{ notifier.type }}"
+      when: _should_notify | bool

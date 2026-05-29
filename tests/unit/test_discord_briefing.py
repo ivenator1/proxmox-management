@@ -188,6 +188,22 @@ def test_custom_systems_section_absent_when_empty(template):
     assert '**Custom Systems**' not in result
 
 
+def test_warnings_section_shown(template):
+    result = render_briefing(
+        template,
+        fleet_warning_log=[dict(host='pve-01/lxc-101', task='Snapshot 101',
+                                warning='snapshot failed — rollback unavailable')],
+    )
+    assert '**⚠️ Warnings**' in result
+    assert 'pve-01/lxc-101' in result
+    assert 'snapshot failed — rollback unavailable' in result
+
+
+def test_warnings_section_absent_when_empty(template):
+    result = render_briefing(template)
+    assert '**⚠️ Warnings**' not in result
+
+
 def test_custom_systems_multiple_entries(template):
     result = render_briefing(
         template,

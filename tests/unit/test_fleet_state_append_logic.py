@@ -44,6 +44,10 @@ ERROR_LOG_EXPR = (
     "{{ hostvars['localhost']['fleet_error_log'] | default([]) "
     "+ ([fleet_error_detail] if fleet_error_detail is defined else []) }}"
 )
+WARNING_LOG_EXPR = (
+    "{{ hostvars['localhost']['fleet_warning_log'] | default([]) "
+    "+ ([fleet_warning_detail] if fleet_warning_detail is defined else []) }}"
+)
 
 
 @pytest.fixture
@@ -231,5 +235,31 @@ def test_error_log_accumulates(env):
     result = r(env, ERROR_LOG_EXPR,
                hostvars=populated_hostvars(fleet_error_log=existing),
                fleet_error_detail=new_detail)
+    assert len(result) == 2
+    assert result[1] == new_detail
+
+
+# --- fleet_warning_log ---
+
+def test_warning_log_appended_when_detail_provided(env):
+    detail = {'host': 'pve-01', 'task': 'Snapshot', 'warning': 'snapshot failed'}
+    result = r(env, WARNING_LOG_EXPR,
+               hostvars=empty_hostvars(),
+               fleet_warning_detail=detail)
+    assert result == [detail]
+
+
+def test_warning_log_not_appended_when_detail_absent(env):
+    result = r(env, WARNING_LOG_EXPR,
+               hostvars=populated_hostvars(fleet_warning_log=[{'host': 'existing'}]))
+    assert result == [{'host': 'existing'}]
+
+
+def test_warning_log_accumulates(env):
+    existing = [{'host': 'pve-01', 'task': 't1', 'warning': 'w1'}]
+    new_detail = {'host': 'pve-02', 'task': 't2', 'warning': 'w2'}
+    result = r(env, WARNING_LOG_EXPR,
+               hostvars=populated_hostvars(fleet_warning_log=existing),
+               fleet_warning_detail=new_detail)
     assert len(result) == 2
     assert result[1] == new_detail

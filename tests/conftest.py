@@ -53,6 +53,24 @@ def _lower(value):
     return str(value).lower()
 
 
+def _combine(*dicts, recursive=False, **kwargs):
+    """Ansible-compatible combine filter — merges dicts left to right.
+
+    Supports recursive=True for deep merge (matching Ansible's combine).
+    """
+    recursive = kwargs.get('recursive', recursive)
+    result = {}
+    for d in dicts:
+        if not d:
+            continue
+        for k, v in d.items():
+            if recursive and k in result and isinstance(result[k], dict) and isinstance(v, dict):
+                result[k] = _combine(result[k], v, recursive=True)
+            else:
+                result[k] = v
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Custom tests mirroring Ansible's behaviour
 # ---------------------------------------------------------------------------
@@ -95,6 +113,7 @@ def _configure_env(env):
     env.filters['bool'] = _bool_filter
     env.filters['trim'] = _trim
     env.filters['lower'] = _lower
+    env.filters['combine'] = _combine
     env.tests['failed'] = _failed_test
     env.tests['search'] = _search_test
     env.tests['equalto'] = _equalto_test

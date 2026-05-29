@@ -3,6 +3,21 @@ pve_api_token_id: "ansible"
 pve_api_token_secret: "pve_api_token_secret" #Change with your api token secret
 discord_webhook: "discord_webhook" #Change with your Discord Webook URL
 
+# --- NOTIFIERS ---
+# Pluggable notifier list. If omitted, the legacy `discord_webhook` above is used
+# as a single Discord notifier (back-compat). Define `notifiers` to fan the same
+# briefing out to multiple targets. Supported types: discord, ntfy.
+# notifiers:
+#   - type: discord
+#     enabled: true
+#     webhook: "{{ discord_webhook }}"
+#   - type: ntfy
+#     enabled: true
+#     url: "https://ntfy.sh/my-fleet-topic"   # server + topic
+#     token: ""                                # optional bearer token for protected topics
+#     priority: 3                              # 1-5 (default: 5 on failure, else 3)
+#     tags: "package"                          # optional ntfy tags/emoji
+
 #Apt-Cacher NG
 apt_proxy_ip: "10.10.10.12" #Apt Procy IP
 apt_proxy_port: 3142 #Apt Proxy Port
