@@ -8,3 +8,10 @@ configs/*.yml
 !configs/*.yml.example
 !configs/.gitkeep
 
+# Python packaging / build artifacts
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.venv/
+

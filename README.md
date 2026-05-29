@@ -24,6 +24,34 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 * **Accurate Change Detection:** OS packages are updated before the community script runs, so each line is correctly attributed. For apps without a version file, a `dpkg-query` package-state hash is taken before and after the community script — if it matches, the container is silent even if the script produced output. This prevents false-positive "UPDATED" reports caused by `PHS_SILENT=1` suppressing apt's stdout inside community scripts.
 * **Consolidated Reporting:** Aggregates results from every node and container into exactly one Discord notification, with a structured error log showing which host, which task, and what the error was.
 
+## 🐍 Python Control Plane (migration in progress)
+A typed-Python "brain" (`proxmox_fleet/`) is being introduced to own all decision
+logic, config/state schemas, and reporting, while Ansible is reduced to a catalogue
+of single-purpose execution primitives. The migration is phased and the existing
+`ansible-playbook fleet-update.yml` keeps working throughout.
+
+```bash
+# On the Ansible manager (into the same interpreter ansible uses):
+pip install -e '.[runner]'      # adds the `fleet-update` entrypoint
+fleet-update --check -e force_notify=true   # drop-in for ansible-playbook (Phase 0)
+
+# Dev / CI:
+pip install -e '.[dev]'
+python -m mypy proxmox_fleet/
+pytest tests/unit/ -v
+```
+
+Landed so far: pydantic schemas for `configs/<name>.yml` (`CustomConfig`) and the
+fleet state records (`FleetState`), stdlib orchestration helpers (the
+`forks`/`serial`/`retries` equivalents), manager-local IO helpers (`http.py`), the
+ansible-runner wrapper, the custom_update decision logic (`status.py`/`changes.py`),
+and the full **custom_update flow** (`flows/custom.py` + `steps.py` + `executor.py`)
+driven by the `run_shell`/`reboot_host` execution primitives. The flow does per-step
+command interpolation in Python — so a later step can use `{{ steps.NAME }}` from an
+earlier step's output (the eager-templating limitation is gone). Still pending for
+custom_update: wiring the flow into the driver as the default + reworking its molecule
+scenarios. See the migration plan for the full phased roadmap.
+
 ## 🛠 Prerequisites
 * **Ansible Manager:** A dedicated LXC (e.g., Debian 12+, VMID 121) with a static IP.
 * **SSH Trust:** Passwordless SSH keys distributed from the Manager to all Proxmox Nodes (`ssh-copy-id`).

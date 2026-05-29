@@ -1,0 +1,34 @@
+---
+# Execution primitive: run ONE shell command on the target and return its result.
+# Makes no decisions. Invoked by proxmox_fleet.executor.RunnerExecutor.
+#
+# Params (extravars):
+#   target_hosts        host/group to run on (set by invoke_primitive)
+#   shell_command       the command to run (already interpolated by Python)
+#   shell_chdir         optional working directory
+#   shell_environment   optional environment dict
+#   shell_become        optional privilege escalation (bool)
+#   shell_changed_when  optional changed_when override (default true)
+#   shell_ignore_errors optional ignore_errors (bool)
+- name: "run_shell primitive"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  tasks:
+    - name: "Execute shell command"
+      ansible.builtin.shell: "{{ shell_command }}"
+      args:
+        chdir: "{{ shell_chdir | default(omit) }}"
+      environment: "{{ shell_environment | default({}) }}"
+      become: "{{ shell_become | default(false) }}"
+      register: _shell
+      changed_when: "{{ shell_changed_when | default(true) }}"
+      ignore_errors: "{{ shell_ignore_errors | default(false) }}"
+
+    - name: "Return result to the control plane"
+      ansible.builtin.set_stats:
+        data:
+          rc: "{{ _shell.rc | default(1) }}"
+          stdout: "{{ _shell.stdout | default('') }}"
+          stderr: "{{ _shell.stderr | default('') }}"
+          changed: "{{ _shell.changed | default(false) }}"
+        aggregate: false
