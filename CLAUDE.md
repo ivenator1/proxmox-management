@@ -49,7 +49,7 @@ vars.yml / vars.yml.example             # Secrets + behaviour flags (gitignored;
 hosts.ini / hosts.ini.example           # Inventory (gitignored; copy from .example)
 .ansible-lint                           # profile: moderate; excludes role task files that use {{ role_path }} includes
 .yamllint.yml                           # extends: default; line-length warning at 160
-.github/workflows/ci.yml                # Seven parallel jobs: yamllint, ansible-lint, syntax-check, unit-tests, molecule-lxc, molecule-rollback, molecule-custom
+.github/workflows/ci.yml                # yamllint, ansible-lint, syntax-check, unit-tests, + molecule matrices (lxc, custom)
 tasks/
   fleet-state-append.yml                # Shared state accumulator — always use this, never inline set_fact+delegate
 templates/
@@ -62,7 +62,7 @@ configs/
 tests/
   requirements.txt                      # pytest, jinja2, pyyaml — all that's needed for unit tests
   conftest.py                           # Ansible-compatible Jinja2 env: regex_search (list return), bool, failed/search tests
-  unit/                                 # 125 pytest tests; no Ansible or PVE required
+  unit/                                 # 185 pytest tests; no Ansible or PVE required
   integration/
     test_fleet_state_append.yml         # Standalone ansible-playbook test for delegate_to+delegate_facts accumulation
 roles/
@@ -126,18 +126,33 @@ roles/
 |---|---|---|
 | Pre-Flight | localhost | Verify apt-cacher-ng proxy is reachable |
 | Phase 0 | `remote_hosts` | Non-Proxmox hosts via `remote_host_update` role |
+| Phase 0a | localhost | Validate `custom_hosts` `depends_on` ordering (fail loud on missing/after) |
 | Phase 0b | `custom_hosts` | Non-standard systems via `custom_update` role + per-system config files |
 | Phase 1 | `proxmox_nodes` | Tag-filtered LXC discovery + `lxc_update` role per container |
 | Phase 1b | `proxmox_vms` | QEMU VMs via `vm_update` role |
 | Phase 2 | `proxmox_nodes` | PVE node OS update + sequential reboot (`serial: 1`, `any_errors_fatal: true`) |
 | Phase 3 | localhost | Manager container self-update |
-| Phase 4 | localhost | Send Discord embed via `templates/discord_briefing.j2` |
+| Phase 4 | localhost | Persist run history → dispatch notifiers → dead-man's-switch ping |
+
+Each phase ORs the master `fleet_dry_run` into its role's dry flag via an eager `set_fact` (no self-reference recursion); `fleet_dry_run` also forces a notification.
 
 ### State accumulation pattern
 
-All fleet state lives as facts on `localhost` across plays. Every role and play appends to it via `tasks/fleet-state-append.yml` using `delegate_to: localhost` + `delegate_facts: true` + `check_mode: no`. The five state lists are `fleet_lxc_data`, `fleet_vm_data`, `fleet_remote_data`, `fleet_node_data`, and `fleet_custom_data`. `fleet_changed`, `fleet_failed`, and `fleet_error_log` (a `list[{host, task, error}]`) are also maintained here.
+All fleet state lives as facts on `localhost` across plays. Every role and play appends to it via `tasks/fleet-state-append.yml` using `delegate_to: localhost` + `delegate_facts: true` + `check_mode: no`. The five state lists are `fleet_lxc_data`, `fleet_vm_data`, `fleet_remote_data`, `fleet_node_data`, and `fleet_custom_data`. `fleet_changed`, `fleet_failed`, `fleet_error_log` (`list[{host, task, error}]`), and `fleet_warning_log` (`list[{host, task, warning}]`, non-fatal) are also maintained here.
 
-Do not write `set_fact` + `delegate_to: localhost` blocks directly — always call `tasks/fleet-state-append.yml` instead.
+Do not write `set_fact` + `delegate_to: localhost` blocks directly — always call `tasks/fleet-state-append.yml` instead. A warning-only call passes `fleet_record_type: warning` + `fleet_warning_detail` (no list matches, so only the warning is appended).
+
+### Phase 4 subsystems
+
+- **Notifiers** (`tasks/notify.yml`): the briefing is rendered **once** from `discord_briefing.j2` into `_briefing_body` and fanned out to a `notifiers` list (types `discord`, `ntfy`). Back-compat: if `notifiers` is unset but `discord_webhook` is, a single Discord notifier is synthesized. ntfy reuses the same body verbatim; only the transport envelope differs.
+- **Run history** (`tasks/persist-history.yml`): writes `run-<UTC-ts>.json` + `latest.json` to `fleet_history_dir`, pruned to `fleet_history_keep`. Gated on `fleet_history_enabled`.
+- **Dead-man's-switch**: pings `fleet_deadmans_url` (`/fail` on failure) so its absence alerts when the orchestrator stops running.
+
+### Cross-cutting subsystems
+
+- **Snapshot-only rollback + warnings**: LXC and VM roles roll back via snapshot (`pct/qm rollback BEFORE_UPDATE_AUTO`) only when the snapshot was actually taken (`*_snap_res.changed`). A failed snapshot records a non-fatal warning and continues; rescue app/status string is `FAILED (NO SNAPSHOT)` vs `FAILED + ROLLED BACK` vs `FAILED`. `lxc_backup_strategy: both` / `vm_backup_strategy: both` take a simultaneous vzdump (never used for restore).
+- **Fleet-wide dry-run**: `-e fleet_dry_run=true` puts every role in simulate mode. VM/remote use a dedicated `check_mode: yes` simulate task and report `WOULD UPDATE`/`OK`.
+- **Maintenance windows** (`tasks/check-window.yml`): inventory hosts (remote/vm/custom) with a `maintenance_window` dict are silently skipped outside the window; `force_window=true` bypasses.
 
 ### Role structure (`roles/lxc_update/`)
 
@@ -243,13 +258,19 @@ The task order matters for correct attribution:
 | `test_discord_briefing.py` | Full `discord_briefing.j2` including Custom Systems section |
 | `test_fleet_state_append_logic.py` | `set_fact` expressions in `tasks/fleet-state-append.yml` including `fleet_custom_data` |
 | `test_introspect_regex.py` | `pct config` output parsing in `introspect.yml` |
-| `test_custom_report.py` | 11-branch `tmp_custom` decision tree in `custom_update/tasks/report.yml` |
+| `test_custom_report.py` | `tmp_custom` tree + `custom_changed` + `custom_is_outdated` (Tier 5) |
+| `test_vm_report.py` | VM success status tree, rescue rollback string, dry-run `WOULD UPDATE` |
+| `test_notify.py` | notifier back-compat shim + ntfy header construction |
+| `test_persist_history.py` | run-summary count assembly |
+| `test_run_step.py` | per-step `timeout` command wrapping |
+| `test_check_window.py` | maintenance-window day/time/wrap/force logic |
+| `test_custom_depends.py` | Phase 0a dependency-order validator + runtime `_dep_failed` gate |
 
-`tests/conftest.py` implements Ansible-specific Jinja2 filters (`regex_search` with list-return for capture groups, `regex_replace`, `selectattr`) and tests (`failed`, `search`, `equalto`) so templates render identically to Ansible. When writing new tests, use `render()` for string output and `render_native()` (via `NativeEnvironment`) for Python objects.
+`tests/conftest.py` implements Ansible-specific Jinja2 filters (`regex_search` list-return, `regex_replace`, `combine`, `intersect`) and tests (`failed`, `search`, `equalto`, `succeeded`) so templates render identically to Ansible. When writing new tests, use `render()` for string output and `render_native()` / `make_native_env()` (via `NativeEnvironment`) for Python objects.
 
 **Molecule scenarios** (`roles/lxc_update/molecule/`) test role orchestration against localhost using stub `pct`/`vzdump` shell scripts placed in `/tmp/mol_stubs/` by `prepare.yml`. Each scenario's `molecule.yml` sets `PATH: "/tmp/mol_stubs:${PATH}"` at the provisioner level so stubs are found by all shell tasks inside included roles. Converge serialises `fleet_*` facts to `/tmp/mol_fleet_state.json`; verify loads it with `include_vars` (necessary because converge and verify run as separate `ansible-playbook` processes). Idempotency checking is disabled for all scenarios — backup and update operations are intentionally non-idempotent.
 
-**CI** (`.github/workflows/ci.yml`) runs seven parallel jobs: `yamllint`, `ansible-lint`, `syntax-check`, `unit-tests` (pytest), `molecule-lxc-update`, `molecule-lxc-rollback`, and `molecule-custom-update`. The `ansible-lint` job excludes the nine role task files that use `include_tasks: "{{ role_path }}/..."` via `exclude_paths` in `.ansible-lint` (the `load-failure[not-found]` rule is unskippable).
+**CI** (`.github/workflows/ci.yml`): `yamllint`, `ansible-lint`, `syntax-check`, `unit-tests` (pytest), plus two molecule matrices — `molecule-lxc-update` (normal, rollback, snapfail) and `molecule-custom-update` (normal, noop, rescue, dry_run, uptodate, per_step). The `ansible-lint` job excludes role task files that use dynamic `include_tasks` via `exclude_paths` in `.ansible-lint` (the `load-failure[not-found]` rule is unskippable).
 
 ### Jinja2 / Ansible patterns
 

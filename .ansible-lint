@@ -46,4 +46,5 @@ exclude_paths:
   - roles/custom_update/tasks/main.yml
   - roles/custom_update/tasks/load_config.yml
   - roles/custom_update/tasks/report.yml
+  - roles/custom_update/tasks/detect.yml
   - roles/custom_update/molecule/

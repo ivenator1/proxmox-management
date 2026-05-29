@@ -209,8 +209,12 @@ CI runs automatically on push/PR via GitHub Actions (`.github/workflows/ci.yml`)
 
 ## ✅ Recent additions
 
-- **Tier 4 — Automatic Snapshot Rollback** (done): `health_check.yml` in `lxc_update` no longer silently swallows Kuma failures. When the retry window is exhausted the rescue block fires, and `pct rollback BEFORE_UPDATE_AUTO` is called if a snapshot was taken. The Discord report shows `FAILED + ROLLED BACK`.
-- **`custom_update` role** (done): a config-driven update path for non-standard systems (binary apps, docker compose stacks, git-deployed apps, vendor CLIs). Describe the update procedure in `configs/<name>.yml` (copied from `config_templates/custom_system.yml.example`) and add the host to `[custom_hosts]` in `hosts.ini`. No new role required per system.
+- **Automatic Snapshot Rollback** (LXC + VM): health-check failure triggers the rescue block and a snapshot rollback (`pct`/`qm rollback BEFORE_UPDATE_AUTO`) when a snapshot was taken. Rollback is **snapshot-only** — never a destructive restore. A failed snapshot records a non-fatal warning and continues; reports distinguish `FAILED + ROLLED BACK` / `FAILED (NO SNAPSHOT)` / `FAILED`. `*_backup_strategy: both` also takes a simultaneous vzdump.
+- **`custom_update` role**: config-driven updates for non-standard systems (binary apps, compose stacks, git deploys, vendor CLIs) via `configs/<name>.yml` (template in `config_templates/`). Supports per-step controls (`when`/`become`/`timeout`/`register`/…), `update_only_if_outdated`, config validation, dependency ordering (`depends_on`), and maintenance windows.
+- **Pluggable notifiers**: the briefing fans out to a `notifiers` list (Discord + ntfy); `discord_webhook` alone still works (back-compat).
+- **Run history**: each run writes `run-<ts>.json` + `latest.json` under `fleet_history_dir`.
+- **Fleet-wide dry-run**: `-e fleet_dry_run=true` simulates every role (LXC/VM/remote/custom) and reports what *would* change.
+- **Dead-man's-switch**: optional `fleet_deadmans_url` ping so absence of a run alerts you.
 
 ## 📡 Discord Briefing Format
 The orchestrator sends one consolidated embed per run:
