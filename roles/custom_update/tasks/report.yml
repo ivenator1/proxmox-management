@@ -6,6 +6,8 @@
       {%- set _reboot_done = custom_reboot_res is defined and (custom_reboot_res.changed | default(false)) -%}
       {%- if custom_dry_run | bool -%}
       dry-run: {{ custom_ver_before | default('?') }} → {{ custom_latest_ver | default('unknown') }}
+      {%- elif (custom_cfg.update_only_if_outdated | default(false)) and not (custom_is_outdated | default(true)) -%}
+      OK (up to date)
       {%- elif _cw_type == 'always' -%}
       Updated{% if _reboot_done %} + Rebooted{% endif %}
       {%- elif _cw_type == 'command'

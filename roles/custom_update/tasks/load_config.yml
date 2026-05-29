@@ -25,3 +25,46 @@
       custom_cfg.name | default('<undefined>') }}, update_steps={{
       custom_cfg.update_steps | default('<undefined>') }}.
     success_msg: "Config '{{ custom_config }}' validated."
+
+- name: "Validate each update step {{ inventory_hostname }}"
+  assert:
+    that:
+      - item.name is defined and item.name | string | trim != ''
+      - item.command is defined and item.command | string | trim != ''
+    fail_msg: "Every update_steps entry needs a non-empty 'name' and 'command'. Bad entry: {{ item }}"
+    quiet: true
+  loop: "{{ custom_cfg.update_steps }}"
+  loop_control:
+    label: "{{ item.name | default('<unnamed>') }}"
+
+- name: "Validate enum / conditional fields {{ inventory_hostname }}"
+  assert:
+    that:
+      # type enums
+      - (custom_cfg.changed_when | default({})).type | default('version') in ['version', 'command', 'always']
+      - (custom_cfg.health_check | default({})).type | default('none') in ['kuma', 'command', 'http', 'none']
+      - (custom_cfg.latest_version | default({})).type | default('none') in ['github_release', 'command', 'none']
+      # conditional requirements
+      - (custom_cfg.changed_when | default({})).type | default('version') != 'command'
+        or (custom_cfg.changed_when.command | default('') | trim != '')
+      - (custom_cfg.health_check | default({})).type | default('none') != 'kuma'
+        or ((custom_cfg.health_check.kuma_slug | default('') | trim != '')
+            and (custom_cfg.health_check.kuma_monitor_id | default('') | string | trim != ''))
+      - (custom_cfg.health_check | default({})).type | default('none') != 'http'
+        or (custom_cfg.health_check.url | default('') | trim != '')
+      - (custom_cfg.health_check | default({})).type | default('none') != 'command'
+        or (custom_cfg.health_check.command | default('') | trim != '')
+      - (custom_cfg.latest_version | default({})).type | default('none') != 'github_release'
+        or (custom_cfg.latest_version.repo | default('') | trim != '')
+      - (custom_cfg.latest_version | default({})).type | default('none') != 'command'
+        or (custom_cfg.latest_version.command | default('') | trim != '')
+      # outdated gate needs a version source
+      - not (custom_cfg.update_only_if_outdated | default(false) | bool)
+        or ((custom_cfg.version_command | default('') | trim != '')
+            and (custom_cfg.latest_version | default({})).type | default('none') != 'none')
+    fail_msg: >-
+      Config 'configs/{{ custom_config }}.yml' has an invalid or incomplete field.
+      Check changed_when/health_check/latest_version types and their required
+      sub-fields (e.g. kuma needs kuma_slug + kuma_monitor_id; github_release needs
+      repo; update_only_if_outdated needs version_command + a latest_version source).
+    quiet: true

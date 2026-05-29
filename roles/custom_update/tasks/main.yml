@@ -15,7 +15,9 @@
 
     - name: "Update"
       include_tasks: update.yml
-      when: not custom_dry_run | bool
+      when:
+        - not custom_dry_run | bool
+        - (not (custom_cfg.update_only_if_outdated | default(false) | bool)) or (custom_is_outdated | default(true) | bool)
 
     - name: "Health check"
       include_tasks: health_check.yml

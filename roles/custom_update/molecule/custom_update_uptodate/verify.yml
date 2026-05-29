@@ -1,0 +1,28 @@
+---
+- name: Verify — custom_update uptodate
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  pre_tasks:
+    - name: Load fleet state from converge play
+      include_vars:
+        file: /tmp/mol_fleet_state_uptodate.json
+  tasks:
+    - name: Update step was NOT executed (already up to date)
+      stat:
+        path: /tmp/mol_uptodate_step_called
+      register: step_touch
+
+    - name: Assert step skipped
+      assert:
+        that:
+          - not step_touch.stat.exists
+        fail_msg: "update_steps must be skipped when version == latest and update_only_if_outdated is true"
+
+    - name: Idle system produces no record and no change
+      assert:
+        that:
+          - (hostvars['localhost']['fleet_custom_data'] | default([])) | length == 0
+          - not (hostvars['localhost']['fleet_changed'] | default(false) | bool)
+          - not (hostvars['localhost']['fleet_failed'] | default(false) | bool)
+        fail_msg: "An up-to-date system should be idle-suppressed: {{ hostvars['localhost']['fleet_custom_data'] | default([]) }}"

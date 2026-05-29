@@ -40,6 +40,13 @@ latest_version:
   # For type: command — shell run on the Ansible manager (localhost), stdout = latest.
   command: ""
 
+# ── Outdated gate (optional) ──────────────────────────────────────────────────
+# When true, update_steps are SKIPPED if version_command output already equals the
+# resolved latest_version. Requires a version_command AND a latest_version source
+# (type != none). Fail-open: if latest can't be resolved, the update runs and a
+# warning is recorded.
+update_only_if_outdated: false
+
 # ── Backup before update (optional) ───────────────────────────────────────────
 # Shell run on the target host before update_steps. Leave empty to skip.
 backup_command: ""
