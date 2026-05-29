@@ -29,3 +29,30 @@ ansible_python_interpreter=/usr/bin/python3
 ansible_user=root
 ansible_ssh_private_key_file=~/.ssh/id_ed25519
 ansible_python_interpreter=/usr/bin/python3
+
+# Non-standard systems updated via per-system YAML config files (configs/<name>.yml).
+# Set custom_config=<name> per host to select the config file.
+# Leave the group empty (just the header) if you have no custom systems.
+#
+# Optional per-host maintenance window (applies to remote_hosts, proxmox_vms, and
+# custom_hosts — i.e. inventory hosts). The host is silently skipped outside it;
+# pass -e force_window=true to bypass. Define in host_vars/<host>.yml:
+#   maintenance_window:
+#     days: ["Sat", "Sun"]   # optional; omit for any day
+#     start: "02:00"
+#     end: "04:00"           # may wrap past midnight
+#     tz: "UTC"
+#
+# Optional dependency ordering: set depends_on (a list of other custom hostnames)
+# in host_vars/<host>.yml. A host is skipped if any dependency FAILED this run.
+# Phase 0b uses serial:1, so list dependencies BEFORE their dependents here;
+# Phase 0a fails loudly if a dependent is listed before its dependency.
+#   # host_vars/app-01.yml →  depends_on: ["db-01"]
+[custom_hosts]
+# db-01         ansible_host=10.0.0.59  custom_config=postgres
+# gitea-server  ansible_host=10.0.0.60  custom_config=gitea
+
+[custom_hosts:vars]
+ansible_user=root
+ansible_ssh_private_key_file=~/.ssh/id_ed25519
+ansible_python_interpreter=/usr/bin/python3

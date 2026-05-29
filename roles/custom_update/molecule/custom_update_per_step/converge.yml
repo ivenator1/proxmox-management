@@ -1,0 +1,13 @@
+---
+- name: Converge — custom_update per-step controls
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    custom_config: mol_test_per_step
+    custom_dry_run: false
+    custom_config_dir: /tmp/mol_custom_per_step/configs
+  tasks:
+    - name: Run custom_update role
+      include_role:
+        name: custom_update

@@ -16,3 +16,7 @@ exclude_list: []
 os_update_exclude_list: []
 snapshot_exclude_list: []
 lxc_kuma_map: {}
+
+# Uptime Kuma retry settings for health_check.yml (override in converge to speed up molecule)
+kuma_health_check_retries: 5
+kuma_health_check_delay: 30

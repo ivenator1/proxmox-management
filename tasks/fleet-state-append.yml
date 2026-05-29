@@ -2,13 +2,15 @@
 # Shared state accumulator. Appends one record to the fleet state facts on localhost.
 #
 # Required vars:
-#   fleet_record_type:    lxc | vm | remote_host | node | manager
+#   fleet_record_type:    lxc | vm | remote_host | node | manager | custom
 #   fleet_record_payload: dict to append to the matching list
 #
 # Optional vars:
 #   fleet_record_changed: bool — OR'd into fleet_changed
 #   fleet_record_failed:  bool — OR'd into fleet_failed
 #   fleet_error_detail:   dict {host, task, error} — appended to fleet_error_log
+#   fleet_warning_detail: dict {host, task, warning} — appended to fleet_warning_log
+#                         (non-fatal; does NOT set fleet_failed)
 - name: "Append fleet state record"
   set_fact:
     fleet_lxc_data: >-
@@ -23,6 +25,9 @@
     fleet_node_data: >-
       {{ hostvars['localhost']['fleet_node_data'] | default([])
          + ([fleet_record_payload] if fleet_record_type in ['node', 'manager'] else []) }}
+    fleet_custom_data: >-
+      {{ hostvars['localhost']['fleet_custom_data'] | default([])
+         + ([fleet_record_payload] if fleet_record_type == 'custom' else []) }}
     fleet_changed: >-
       {{ (hostvars['localhost']['fleet_changed'] | default(false))
          or (fleet_record_changed | default(false) | bool) }}
@@ -32,6 +37,9 @@
     fleet_error_log: >-
       {{ hostvars['localhost']['fleet_error_log'] | default([])
          + ([fleet_error_detail] if fleet_error_detail is defined else []) }}
+    fleet_warning_log: >-
+      {{ hostvars['localhost']['fleet_warning_log'] | default([])
+         + ([fleet_warning_detail] if fleet_warning_detail is defined else []) }}
   delegate_to: localhost
   delegate_facts: true
   check_mode: no

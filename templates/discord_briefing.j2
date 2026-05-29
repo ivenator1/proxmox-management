@@ -12,5 +12,10 @@
 {%- set remote_hosts = fleet_remote_data | default([]) -%}
 {%- if remote_hosts | length > 0 -%}{{ '\n\n' }}**Remote Hosts**{%- for r in remote_hosts -%}{{ '\n' }}- {{ r.host }} — {{ r.status }}{%- endfor -%}
 {%- endif -%}
+{%- set custom_hosts = fleet_custom_data | default([]) -%}
+{%- if custom_hosts | length > 0 -%}{{ '\n\n' }}**Custom Systems**{%- for c in custom_hosts -%}{{ '\n' }}- **{{ c.name }}** ({{ c.host }}) — {{ c.app }}{%- endfor -%}
+{%- endif -%}
 {%- if fleet_error_log is defined and fleet_error_log | length > 0 -%}{{ '\n\n' }}**Error Log:**{%- for e in fleet_error_log -%}{{ '\n' }}- **{{ e.host }}** failed at `{{ e.task }}`: `{{ e.error }}`{%- endfor -%}
+{%- endif -%}
+{%- if fleet_warning_log is defined and fleet_warning_log | length > 0 -%}{{ '\n\n' }}**⚠️ Warnings**{%- for w in fleet_warning_log -%}{{ '\n' }}- **{{ w.host }}** at `{{ w.task }}`: {{ w.warning }}{%- endfor -%}
 {%- endif %}

@@ -1,0 +1,77 @@
+---
+- name: "Load custom config file {{ inventory_hostname }}"
+  include_vars:
+    file: "{{ custom_config_dir | default(playbook_dir ~ '/configs') }}/{{ custom_config }}.yml"
+    name: custom_cfg
+
+# Only re-template the config via combine when overrides actually exist — combine
+# would otherwise prematurely evaluate any {{ }} a step command defers to runtime.
+- name: "Merge inventory overrides {{ inventory_hostname }}"
+  set_fact:
+    custom_cfg: "{{ custom_cfg | combine(custom_overrides, recursive=true) }}"
+  when: (custom_overrides | default({})) | length > 0
+
+# Validate here (outside the block) so a malformed config fails loudly at load
+# time with a clear message — not three tasks later disguised as an update failure.
+- name: "Validate custom config {{ inventory_hostname }}"
+  assert:
+    that:
+      - custom_cfg.name is defined
+      - custom_cfg.name | string | trim != ''
+      - custom_cfg.update_steps is defined
+      - custom_cfg.update_steps is sequence
+      - custom_cfg.update_steps is not string
+      - (custom_cfg.update_steps | length) > 0
+    # Don't render the update_steps list here — a step command may defer {{ }} to
+    # runtime, which fail_msg finalization would evaluate prematurely.
+    fail_msg: >-
+      Config 'configs/{{ custom_config }}.yml' is invalid: it must define a
+      non-empty 'name' and a non-empty 'update_steps' list (got name={{
+      custom_cfg.name | default('<undefined>') }},
+      {{ (custom_cfg.update_steps | default([])) | length }} steps).
+    success_msg: "Config '{{ custom_config }}' validated."
+
+- name: "Validate each update step {{ inventory_hostname }}"
+  assert:
+    that:
+      - item.name is defined and item.name | string | trim != ''
+      - item.command is defined and item.command | string | trim != ''
+    # Reference item.name only — rendering the whole {{ item }} would prematurely
+    # evaluate any runtime {{ }} a command defers (e.g. custom_step_results).
+    fail_msg: "update_steps entry '{{ item.name | default('<unnamed>') }}' needs a non-empty 'name' and 'command'."
+    quiet: true
+  loop: "{{ custom_cfg.update_steps }}"
+  loop_control:
+    label: "{{ item.name | default('<unnamed>') }}"
+
+- name: "Validate enum / conditional fields {{ inventory_hostname }}"
+  assert:
+    that:
+      # type enums
+      - (custom_cfg.changed_when | default({})).type | default('version') in ['version', 'command', 'always']
+      - (custom_cfg.health_check | default({})).type | default('none') in ['kuma', 'command', 'http', 'none']
+      - (custom_cfg.latest_version | default({})).type | default('none') in ['github_release', 'command', 'none']
+      # conditional requirements
+      - (custom_cfg.changed_when | default({})).type | default('version') != 'command'
+        or (custom_cfg.changed_when.command | default('') | trim != '')
+      - (custom_cfg.health_check | default({})).type | default('none') != 'kuma'
+        or ((custom_cfg.health_check.kuma_slug | default('') | trim != '')
+            and (custom_cfg.health_check.kuma_monitor_id | default('') | string | trim != ''))
+      - (custom_cfg.health_check | default({})).type | default('none') != 'http'
+        or (custom_cfg.health_check.url | default('') | trim != '')
+      - (custom_cfg.health_check | default({})).type | default('none') != 'command'
+        or (custom_cfg.health_check.command | default('') | trim != '')
+      - (custom_cfg.latest_version | default({})).type | default('none') != 'github_release'
+        or (custom_cfg.latest_version.repo | default('') | trim != '')
+      - (custom_cfg.latest_version | default({})).type | default('none') != 'command'
+        or (custom_cfg.latest_version.command | default('') | trim != '')
+      # outdated gate needs a version source
+      - not (custom_cfg.update_only_if_outdated | default(false) | bool)
+        or ((custom_cfg.version_command | default('') | trim != '')
+            and (custom_cfg.latest_version | default({})).type | default('none') != 'none')
+    fail_msg: >-
+      Config 'configs/{{ custom_config }}.yml' has an invalid or incomplete field.
+      Check changed_when/health_check/latest_version types and their required
+      sub-fields (e.g. kuma needs kuma_slug + kuma_monitor_id; github_release needs
+      repo; update_only_if_outdated needs version_command + a latest_version source).
+    quiet: true

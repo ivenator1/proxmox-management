@@ -118,3 +118,32 @@ def test_no_hash_data_fallback():
 
 def test_app_not_changed():
     assert t(app_update_res=make_result(changed=False)) == 'OK'
+
+
+# --- Rescue block app string (inline expression in main.yml, not in TMP_APP) ---
+
+RESCUE_APP_EXPR = (
+    "{{ 'FAILED + ROLLED BACK' if (lxc_rollback_done | default(false)) "
+    "else ('FAILED (NO SNAPSHOT)' if (lxc_snapshot_failed | default(false)) else 'FAILED') }}"
+)
+
+
+def test_rollback_performed():
+    assert render(RESCUE_APP_EXPR, lxc_rollback_done=True) == 'FAILED + ROLLED BACK'
+
+
+def test_rollback_performed_wins_over_snapshot_failed():
+    # If a rollback happened, a snapshot existed, so rolled-back takes priority.
+    assert render(RESCUE_APP_EXPR, lxc_rollback_done=True, lxc_snapshot_failed=True) == 'FAILED + ROLLED BACK'
+
+
+def test_snapshot_failed_no_rollback():
+    assert render(RESCUE_APP_EXPR, lxc_rollback_done=False, lxc_snapshot_failed=True) == 'FAILED (NO SNAPSHOT)'
+
+
+def test_failed_plain_when_snapshot_ok_but_no_rollback():
+    assert render(RESCUE_APP_EXPR, lxc_rollback_done=False, lxc_snapshot_failed=False) == 'FAILED'
+
+
+def test_rescue_app_default():
+    assert render(RESCUE_APP_EXPR) == 'FAILED'

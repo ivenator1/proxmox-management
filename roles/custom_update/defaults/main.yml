@@ -1,0 +1,7 @@
+---
+custom_dry_run: false
+custom_allow_reboot: true
+
+# Override in molecule scenarios to avoid 2.5-minute wait on health check retries
+kuma_health_check_retries: 5
+kuma_health_check_delay: 30

@@ -1,0 +1,27 @@
+---
+- name: Verify — custom_update per-step controls
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: The normal (timeout-wrapped) step ran
+      stat:
+        path: /tmp/mol_perstep_ran
+      register: ran_marker
+
+    - name: Assert the real step executed
+      assert:
+        that:
+          - ran_marker.stat.exists
+        fail_msg: "The timeout-wrapped step should have executed"
+
+    - name: The when:false step did NOT run
+      stat:
+        path: /tmp/mol_perstep_skip_ran
+      register: skip_marker
+
+    - name: Assert skipped step skipped
+      assert:
+        that:
+          - not skip_marker.stat.exists
+        fail_msg: "A step with when:false must not execute"

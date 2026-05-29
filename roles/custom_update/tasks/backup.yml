@@ -1,0 +1,4 @@
+---
+- name: "Run backup command {{ inventory_hostname }}"
+  shell: "{{ custom_cfg.backup_command }}"
+  register: custom_backup_res

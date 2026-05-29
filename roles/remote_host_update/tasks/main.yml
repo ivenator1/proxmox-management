@@ -1,11 +1,17 @@
 ---
+- name: "Maintenance window check {{ inventory_hostname }}"
+  include_tasks: "{{ role_path }}/../../tasks/check-window.yml"
+  when: maintenance_window is defined
+
 - name: "Remote host maintenance block {{ inventory_hostname }}"
+  when: (maintenance_window is not defined) or (_in_window | default(true) | bool)
   block:
     - name: "Update packages"
       include_tasks: update.yml
 
     - name: "Health check"
       include_tasks: health_check.yml
+      when: not (remote_dry_run | default(false) | bool)
 
     - name: "Report success"
       include_tasks: report.yml

@@ -1,0 +1,39 @@
+---
+# Exercises per-step controls: register/output-reuse and `when: false` skipping.
+- name: Prepare config for custom_update per-step scenario
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create temp config directory
+      file:
+        path: /tmp/mol_custom_per_step/configs
+        state: directory
+        mode: '0755'
+
+    - name: Clean up state files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/mol_perstep_ran
+        - /tmp/mol_perstep_skip_ran
+
+    - name: Write test config file
+      copy:
+        dest: /tmp/mol_custom_per_step/configs/mol_test_per_step.yml
+        mode: '0644'
+        content: |
+          name: "mol-per-step-app"
+          changed_when:
+            type: always
+          health_check:
+            type: none
+          reboot: false
+          update_steps:
+            - name: "real step with timeout"
+              command: "touch /tmp/mol_perstep_ran"
+              timeout: 30
+            - name: "should be skipped"
+              command: "touch /tmp/mol_perstep_skip_ran"
+              when: false

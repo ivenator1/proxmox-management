@@ -27,6 +27,11 @@ NODE_DATA_EXPR = (
     "{{ hostvars['localhost']['fleet_node_data'] | default([]) "
     "+ ([fleet_record_payload] if fleet_record_type in ['node', 'manager'] else []) }}"
 )
+CUSTOM_DATA_EXPR = (
+    "{{ hostvars['localhost']['fleet_custom_data'] | default([]) "
+    "+ ([fleet_record_payload] if fleet_record_type == 'custom' else []) }}"
+)
+
 CHANGED_EXPR = (
     "{{ (hostvars['localhost']['fleet_changed'] | default(false)) "
     "or (fleet_record_changed | default(false) | bool) }}"
@@ -38,6 +43,10 @@ FAILED_EXPR = (
 ERROR_LOG_EXPR = (
     "{{ hostvars['localhost']['fleet_error_log'] | default([]) "
     "+ ([fleet_error_detail] if fleet_error_detail is defined else []) }}"
+)
+WARNING_LOG_EXPR = (
+    "{{ hostvars['localhost']['fleet_warning_log'] | default([]) "
+    "+ ([fleet_warning_detail] if fleet_warning_detail is defined else []) }}"
 )
 
 
@@ -127,6 +136,30 @@ def test_node_type_goes_to_node_list(env):
     assert result == [{'node': 'pve-01', 'status': 'OK'}]
 
 
+def test_custom_type_goes_to_custom_list(env):
+    result = r(env, CUSTOM_DATA_EXPR,
+               hostvars=empty_hostvars(),
+               fleet_record_type='custom',
+               fleet_record_payload={'host': 'nas-01', 'name': 'Gitea', 'app': 'Updated: 1.20 → 1.21'})
+    assert result == [{'host': 'nas-01', 'name': 'Gitea', 'app': 'Updated: 1.20 → 1.21'}]
+
+
+def test_custom_type_does_not_pollute_lxc(env):
+    result = r(env, LXC_DATA_EXPR,
+               hostvars=empty_hostvars(),
+               fleet_record_type='custom',
+               fleet_record_payload={'host': 'nas-01', 'name': 'Gitea'})
+    assert result == []
+
+
+def test_lxc_type_does_not_pollute_custom(env):
+    result = r(env, CUSTOM_DATA_EXPR,
+               hostvars=empty_hostvars(),
+               fleet_record_type='lxc',
+               fleet_record_payload={'id': '101', 'name': 'sonarr'})
+    assert result == []
+
+
 def test_manager_type_goes_to_node_list(env):
     result = r(env, NODE_DATA_EXPR,
                hostvars=empty_hostvars(),
@@ -202,5 +235,31 @@ def test_error_log_accumulates(env):
     result = r(env, ERROR_LOG_EXPR,
                hostvars=populated_hostvars(fleet_error_log=existing),
                fleet_error_detail=new_detail)
+    assert len(result) == 2
+    assert result[1] == new_detail
+
+
+# --- fleet_warning_log ---
+
+def test_warning_log_appended_when_detail_provided(env):
+    detail = {'host': 'pve-01', 'task': 'Snapshot', 'warning': 'snapshot failed'}
+    result = r(env, WARNING_LOG_EXPR,
+               hostvars=empty_hostvars(),
+               fleet_warning_detail=detail)
+    assert result == [detail]
+
+
+def test_warning_log_not_appended_when_detail_absent(env):
+    result = r(env, WARNING_LOG_EXPR,
+               hostvars=populated_hostvars(fleet_warning_log=[{'host': 'existing'}]))
+    assert result == [{'host': 'existing'}]
+
+
+def test_warning_log_accumulates(env):
+    existing = [{'host': 'pve-01', 'task': 't1', 'warning': 'w1'}]
+    new_detail = {'host': 'pve-02', 'task': 't2', 'warning': 'w2'}
+    result = r(env, WARNING_LOG_EXPR,
+               hostvars=populated_hostvars(fleet_warning_log=existing),
+               fleet_warning_detail=new_detail)
     assert len(result) == 2
     assert result[1] == new_detail

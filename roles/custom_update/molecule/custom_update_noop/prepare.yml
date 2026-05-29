@@ -1,0 +1,52 @@
+---
+# Version stub always returns the same version → no change → record suppressed.
+- name: Prepare stubs for custom_update noop scenario
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create stubs directory
+      file:
+        path: /tmp/mol_stubs
+        state: directory
+        mode: '0755'
+
+    - name: Create temp config directory
+      file:
+        path: /tmp/mol_custom_noop/configs
+        state: directory
+        mode: '0755'
+
+    - name: Write version stub (always returns 1.0)
+      copy:
+        dest: /tmp/mol_stubs/mol_version_noop
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          echo "1.0"
+
+    - name: Write noop update step
+      copy:
+        dest: /tmp/mol_stubs/mol_update_noop
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          exit 0
+
+    - name: Write test config file
+      copy:
+        dest: /tmp/mol_custom_noop/configs/mol_test_noop.yml
+        mode: '0644'
+        content: |
+          name: "mol-noop-app"
+          version_command: "mol_version_noop"
+          latest_version:
+            type: none
+          update_steps:
+            - name: "noop"
+              command: "mol_update_noop"
+          changed_when:
+            type: version
+          health_check:
+            type: none
+          reboot: false

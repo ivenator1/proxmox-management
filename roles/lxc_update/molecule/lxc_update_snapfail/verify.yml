@@ -1,0 +1,35 @@
+---
+- name: Verify — lxc_update snapfail
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  pre_tasks:
+    - name: Load fleet state from converge play
+      include_vars:
+        file: /tmp/mol_fleet_state.json
+  tasks:
+    - name: A snapshot-failure warning was recorded
+      assert:
+        that:
+          - (hostvars['localhost']['fleet_warning_log'] | default([])) | length == 1
+          - "'rollback unavailable' in hostvars['localhost']['fleet_warning_log'][0].warning"
+        fail_msg: "Expected one snapshot-failure warning: {{ hostvars['localhost']['fleet_warning_log'] | default([]) }}"
+
+    - name: The update still proceeded (no fatal failure)
+      assert:
+        that:
+          - not (hostvars['localhost']['fleet_failed'] | default(false) | bool)
+          - (hostvars['localhost']['fleet_lxc_data'] | default([])) | length == 1
+          - hostvars['localhost']['fleet_lxc_data'][0].app == 'NO SCRIPT'
+        fail_msg: "Update should continue despite the snapshot failure"
+
+    - name: Rollback was NOT attempted (no snapshot existed)
+      stat:
+        path: /tmp/mol_pct_rollback_called
+      register: rb
+
+    - name: Assert no rollback
+      assert:
+        that:
+          - not rb.stat.exists
+        fail_msg: "pct rollback must not run when no snapshot was taken"

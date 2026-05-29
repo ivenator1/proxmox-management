@@ -1,0 +1,26 @@
+---
+- name: Converge — custom_update noop (version unchanged, record suppressed)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    PATH: "/tmp/mol_stubs:{{ lookup('env', 'PATH') }}"
+  vars:
+    custom_config: mol_test_noop
+    custom_dry_run: false
+    custom_config_dir: /tmp/mol_custom_noop/configs
+  tasks:
+    - name: Run custom_update role
+      include_role:
+        name: custom_update
+
+    - name: Dump fleet state for verify play
+      check_mode: false
+      copy:
+        dest: /tmp/mol_fleet_state_noop.json
+        mode: '0644'
+        content: "{{ {
+          'fleet_custom_data': hostvars['localhost']['fleet_custom_data'] | default([]),
+          'fleet_changed': hostvars['localhost']['fleet_changed'] | default(false),
+          'fleet_failed': hostvars['localhost']['fleet_failed'] | default(false)
+          } | to_nice_json }}"

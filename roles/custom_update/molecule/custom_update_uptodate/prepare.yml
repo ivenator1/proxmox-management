@@ -1,0 +1,68 @@
+---
+# version_command and latest both report 2.0 → update_only_if_outdated skips steps.
+- name: Prepare stubs for custom_update uptodate scenario
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create stubs directory
+      file:
+        path: /tmp/mol_stubs
+        state: directory
+        mode: '0755'
+
+    - name: Create temp config directory
+      file:
+        path: /tmp/mol_custom_uptodate/configs
+        state: directory
+        mode: '0755'
+
+    - name: Clean up state files
+      file:
+        path: /tmp/mol_uptodate_step_called
+        state: absent
+
+    - name: Write version stub (current == latest == 2.0)
+      copy:
+        dest: /tmp/mol_stubs/mol_version_ut
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          echo "2.0"
+
+    - name: Write latest stub (2.0)
+      copy:
+        dest: /tmp/mol_stubs/mol_latest_ut
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          echo "2.0"
+
+    - name: Write update step stub (must NOT run)
+      copy:
+        dest: /tmp/mol_stubs/mol_update_ut
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          touch /tmp/mol_uptodate_step_called
+          exit 0
+
+    - name: Write test config file
+      copy:
+        dest: /tmp/mol_custom_uptodate/configs/mol_test_uptodate.yml
+        mode: '0644'
+        content: |
+          name: "mol-uptodate-app"
+          version_command: "mol_version_ut"
+          update_only_if_outdated: true
+          latest_version:
+            type: command
+            command: "mol_latest_ut"
+          update_steps:
+            - name: "update binary"
+              command: "mol_update_ut"
+          changed_when:
+            type: version
+          health_check:
+            type: none
+          reboot: false

@@ -1,0 +1,33 @@
+---
+# Runs a single update_steps entry with optional per-step controls. Looped from
+# update.yml with loop_var `step`. A bare {name, command} step still works.
+#
+# Optional step keys: when, become, chdir, timeout (seconds), retries, delay,
+# changed_when, ignore_errors, environment, register. `register` stashes the
+# step's stdout into custom_step_results[<register>] for use in a later step's
+# `when:` condition — NOT for interpolation inside a command string (Ansible
+# renders command strings eagerly, before the value exists).
+- name: "Step - {{ step.name }}"
+  shell: "{{ ('timeout ' ~ step.timeout ~ 's ' if step.timeout is defined else '') ~ step.command }}"
+  args:
+    chdir: "{{ step.chdir | default(omit) }}"
+  environment: "{{ step.environment | default({}) }}"
+  become: "{{ step.become | default(false) }}"
+  register: _step_res
+  # default(true) keeps the normal shell semantics (always "changed"); a template
+  # resolving to omit is rejected for changed_when on ansible-core 2.19+.
+  changed_when: "{{ step.changed_when | default(true) }}"
+  ignore_errors: "{{ step.ignore_errors | default(false) }}"
+  until: _step_res is succeeded
+  retries: "{{ step.retries | default(1) }}"
+  delay: "{{ step.delay | default(5) }}"
+  when: step.when | default(true)
+
+- name: "Stash step output - {{ step.name }}"
+  set_fact:
+    custom_step_results: >-
+      {{ (custom_step_results | default({}))
+         | combine({step.register: (_step_res.stdout | default('')) | trim}) }}
+  when:
+    - step.register is defined
+    - not (_step_res.skipped | default(false))

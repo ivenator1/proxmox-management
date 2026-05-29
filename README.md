@@ -207,9 +207,14 @@ cd roles/lxc_update && molecule test -s lxc_update_normal
 
 CI runs automatically on push/PR via GitHub Actions (`.github/workflows/ci.yml`).
 
-## 🗒️ TODO
+## ✅ Recent additions
 
-- **Tier 4 — Automatic Snapshot Rollback**: `health_check.yml` polls Uptime Kuma after updates but takes no action on failure (`ignore_errors: yes`). Implement: if Kuma doesn't return `status: 1` within the retry window, roll back to the `BEFORE_UPDATE_AUTO` snapshot via `community.proxmox.proxmox_snap` and record the rollback in the fleet state / Discord embed.
+- **Automatic Snapshot Rollback** (LXC + VM): health-check failure triggers the rescue block and a snapshot rollback (`pct`/`qm rollback BEFORE_UPDATE_AUTO`) when a snapshot was taken. Rollback is **snapshot-only** — never a destructive restore. A failed snapshot records a non-fatal warning and continues; reports distinguish `FAILED + ROLLED BACK` / `FAILED (NO SNAPSHOT)` / `FAILED`. `*_backup_strategy: both` also takes a simultaneous vzdump.
+- **`custom_update` role**: config-driven updates for non-standard systems (binary apps, compose stacks, git deploys, vendor CLIs) via `configs/<name>.yml` (template in `config_templates/`). Supports per-step controls (`when`/`become`/`timeout`/`register`/…), `update_only_if_outdated`, config validation, dependency ordering (`depends_on`), and maintenance windows.
+- **Pluggable notifiers**: the briefing fans out to a `notifiers` list (Discord + ntfy); `discord_webhook` alone still works (back-compat).
+- **Run history**: each run writes `run-<ts>.json` + `latest.json` under `fleet_history_dir`.
+- **Fleet-wide dry-run**: `-e fleet_dry_run=true` simulates every role (LXC/VM/remote/custom) and reports what *would* change.
+- **Dead-man's-switch**: optional `fleet_deadmans_url` ping so absence of a run alerts you.
 
 ## 📡 Discord Briefing Format
 The orchestrator sends one consolidated embed per run:

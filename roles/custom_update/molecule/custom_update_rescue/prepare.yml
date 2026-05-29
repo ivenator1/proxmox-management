@@ -1,0 +1,70 @@
+---
+# Update step exits 1 → rescue fires → rollback_command runs.
+- name: Prepare stubs for custom_update rescue scenario
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create stubs directory
+      file:
+        path: /tmp/mol_stubs
+        state: directory
+        mode: '0755'
+
+    - name: Create temp config directory
+      file:
+        path: /tmp/mol_custom_rescue/configs
+        state: directory
+        mode: '0755'
+
+    - name: Clean up previous run state files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/mol_rollback_called
+
+    - name: Write version stub
+      copy:
+        dest: /tmp/mol_stubs/mol_version_rescue
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          echo "2.0"
+
+    - name: Write failing update step stub
+      copy:
+        dest: /tmp/mol_stubs/mol_update_fail
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          echo "ERROR: download failed" >&2
+          exit 1
+
+    - name: Write rollback stub
+      copy:
+        dest: /tmp/mol_stubs/mol_rollback
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          touch /tmp/mol_rollback_called
+          exit 0
+
+    - name: Write test config file
+      copy:
+        dest: /tmp/mol_custom_rescue/configs/mol_test_rescue.yml
+        mode: '0644'
+        content: |
+          name: "mol-rescue-app"
+          version_command: "mol_version_rescue"
+          latest_version:
+            type: none
+          update_steps:
+            - name: "failing step"
+              command: "mol_update_fail"
+          changed_when:
+            type: version
+          health_check:
+            type: none
+          reboot: false
+          rollback_command: "mol_rollback"

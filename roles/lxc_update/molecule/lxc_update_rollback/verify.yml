@@ -1,0 +1,52 @@
+---
+- name: Verify — lxc_update rollback
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  pre_tasks:
+    - name: Load fleet state from converge play
+      include_vars:
+        file: /tmp/mol_fleet_state.json
+  tasks:
+    - name: Check fleet_lxc_data has one failure entry
+      assert:
+        that:
+          - hostvars['localhost']['fleet_lxc_data'] | default([]) | length == 1
+        fail_msg: "fleet_lxc_data should have exactly one entry after health-check failure"
+
+    - name: Check LXC record shows FAILED (no snapshot was taken, so no rollback)
+      vars:
+        record: "{{ hostvars['localhost']['fleet_lxc_data'][0] }}"
+      assert:
+        that:
+          - record.id == '101'
+          - record.app == 'FAILED'
+        fail_msg: "LXC record should be FAILED (no snapshot = no rollback): {{ record }}"
+
+    - name: Confirm fleet_failed is True
+      assert:
+        that:
+          - hostvars['localhost']['fleet_failed'] | default(false) | bool
+        fail_msg: "fleet_failed should be True when health check triggers rescue"
+
+    - name: Confirm pct rollback was NOT called (no snapshot to roll back to)
+      stat:
+        path: /tmp/mol_pct_rollback_called
+      register: rollback_touch
+
+    - name: Assert pct rollback not called
+      assert:
+        that:
+          - not rollback_touch.stat.exists
+        fail_msg: "pct rollback should NOT be called when lxc_backup_strategy=none"
+
+    - name: Confirm pct start was NOT called (container was already running)
+      stat:
+        path: /tmp/mol_pct_start_called
+      register: start_touch
+
+    - name: Assert pct start not called
+      assert:
+        that:
+          - not start_touch.stat.exists
+        fail_msg: "pct start should NOT be called when container was already running"

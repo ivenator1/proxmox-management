@@ -1,0 +1,41 @@
+---
+- name: Verify — custom_update rescue
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  pre_tasks:
+    - name: Load fleet state from converge play
+      include_vars:
+        file: /tmp/mol_fleet_state_rescue.json
+  tasks:
+    - name: Check fleet_custom_data has one failure entry
+      assert:
+        that:
+          - hostvars['localhost']['fleet_custom_data'] | default([]) | length == 1
+        fail_msg: "fleet_custom_data should have exactly one entry after rescue"
+
+    - name: Check custom record shows FAILED
+      vars:
+        record: "{{ hostvars['localhost']['fleet_custom_data'][0] }}"
+      assert:
+        that:
+          - record.name == 'mol-rescue-app'
+          - record.app == 'FAILED'
+        fail_msg: "Custom record should show FAILED: {{ record }}"
+
+    - name: Confirm fleet_failed is True
+      assert:
+        that:
+          - hostvars['localhost']['fleet_failed'] | default(false) | bool
+        fail_msg: "fleet_failed should be True when update step fails"
+
+    - name: Confirm rollback_command was called
+      stat:
+        path: /tmp/mol_rollback_called
+      register: rollback_touch
+
+    - name: Assert rollback ran
+      assert:
+        that:
+          - rollback_touch.stat.exists
+        fail_msg: "mol_rollback should have been called by rollback_command in rescue block"
