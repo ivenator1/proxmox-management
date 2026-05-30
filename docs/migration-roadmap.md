@@ -22,8 +22,10 @@ doc — a later session should be able to resume from here without further conte
 
 ## Conventions established (reuse these)
 - **Executor boundary** (`proxmox_fleet/executor.py`): a flow is bound to one host and
-  calls `run_shell` (target), `run_local` (manager), `reboot`. `RunnerExecutor` invokes
-  primitives; tests inject a scripted fake. New flows take an `Executor`.
+  calls `run_shell` (target), `run_local` (manager), `reboot`, `snapshot` (proxmox API, delegated
+  to localhost inside the primitive). `RunnerExecutor` invokes primitives; tests inject a scripted
+  fake. New flows take an `Executor`. Phase 3 added `snapshot(lxc_id, *, snap_state, api_host, …)`;
+  `api_host` must be the node's `ansible_host` IP, not the inventory name.
 - **Primitives** return values via `ansible.builtin.set_stats: { data: {...}, aggregate: false }`;
   `runner._harvest` reads `res['ansible_stats']['data']` into `PrimitiveResult.facts`.
 - **`invoke_primitive` CWD contract**: `ansible_runner.run()` is called with
@@ -44,9 +46,10 @@ doc — a later session should be able to resume from here without further conte
   not `configparser` — `configparser` splits on the first `=` and mis-parses Ansible host
   lines of the form `hostname key=val key=val …`.
 - **`FleetState.dump_for_ansible(path)`**: writes `fleet_*`-keyed JSON (reverse of `from_raw()`
-  alias map). The "Merge Python custom state" play in `fleet-update.yml` loads this file and
-  seeds `fleet_changed`/`fleet_failed` on localhost **before Phase 1**, so Phases 1–3
-  fleet-state-append calls OR-join against the already-seeded values rather than `false`.
+  alias map). There are now two merge plays in `fleet-update.yml`: (a) "Merge Python custom state"
+  between Phase 0b and Phase 1, (b) "Merge Python lxc state" between Phase 1 and Phase 1b. Both
+  gate on `is defined` for their respective `fleet_*_state_path` extravar. Each must stay in its
+  correct position — loading lxc state after Phase 1b would OR-join against already-false flags.
 - **`GlobalSettings`** (`proxmox_fleet/models/settings.py`): pydantic model for `vars.yml`;
   `extra="allow"` tolerates unknown keys. `load(path)` returns all defaults when the file is
   missing — safe for `--check` runs with no secrets file.
@@ -158,40 +161,97 @@ rm tests/unit/test_custom_report.py tests/unit/test_run_step.py tests/unit/test_
 
 ---
 
-## Phase 3 — `lxc_update`
+## Phase 3 — `lxc_update` (🔶 wired, retire pending)
 
 Move `roles/lxc_update/tasks/*` into `flows/lxc.py`. The per-container `block/rescue/always`
 becomes Python `try/except/finally`.
 
-- **Status → `status.py`**: `lxc_app_status()` (the 11-branch `tmp_app`), `lxc_os_status()`
-  (`tmp_os`), and the rescue app-string (`FAILED + ROLLED BACK` / `FAILED (NO SNAPSHOT)` /
-  `FAILED`). Parity tests mirroring `test_report_tmp_app.py`, `test_report_tmp_os.py`,
-  `test_report_when_condition.py`, `test_dry_check_status.py`.
-- **Parsing → `status.py`/helpers**: `introspect.yml` (`pct config`/`status`, template/running
-  detection — mirror `test_introspect_regex.py`), `detect.yml` resource regexes
-  (mirror `test_detect_regex.py`), the dpkg-hash compare in `update.yml`.
-- **Primitives**: `discover_lxcs.yml` (tag-filter discovery shell), `pct_config.yml`,
-  `pct_status.yml`, `pct_start.yml`, `pct_stop.yml`, `snapshot.yml`
-  (`community.proxmox.proxmox_snap` create + delete), `rollback.yml` (`pct rollback`),
-  `pct_pull.yml`, `vzdump.yml`, `lxc_os_update.yml`, `lxc_app_update.yml` (community-script
-  run incl. the `/tmp/.nc/clear` trick + resource scale up/down).
-- **Control flow in Python**: start-if-stopped (and stop again in `finally` unless rollback
-  restored it), backup strategy enum (`snapshot|vzdump|both|none`), **snapshot-only rollback**
-  (call `rollback.yml` ONLY when the snapshot primitive reported `changed`), health-gate (run
-  only if changed; Kuma via `http.py`), `always` snapshot-delete.
-- **Driver**: Phase 1 loops nodes; per node, discover LXCs, run containers with
-  `orchestration.run_concurrent(max_workers=…)` (replaces `forks`/`serial: 2`);
-  `lxc_continue_on_error` → don't abort siblings (already the default of `run_concurrent`).
-- **Molecule**: rework `roles/lxc_update/molecule/{normal,rollback,snapfail}` to drive
-  `flows/lxc.py` with stub `pct`/`vzdump`. Parity gate against the old Jinja before deleting.
+### What was built
 
-Footgun: Kuma map + the `pve_node` → `hostvars[...]['ansible_host']` lookup for the snapshot
-API call; manager-host node must never be rebooted.
+- **`proxmox_fleet/lxc_parse.py`** — `parse_pct_config()`, `parse_pct_status()`,
+  `parse_ct_script()`, `script_name_from_update()`. All regex patterns copied verbatim from
+  `test_introspect_regex.py` and `test_detect_regex.py` — parity locked there.
+- **`proxmox_fleet/status.py`** — `lxc_app_status()` (11-branch `tmp_app`), `lxc_os_status()`
+  (`tmp_os`), `lxc_rescue_app_status()` (rollback string), `lxc_should_report()` (when gate),
+  `lxc_dry_run_status()` (dry-run status string).
+- **`proxmox_fleet/changes.py`** — `lxc_os_changed()`, `lxc_os_pkg_count()`, `dpkg_hash_differs()`.
+- **`proxmox_fleet/executor.py`** — `snapshot(lxc_id, *, snap_state, api_host, …)` added to
+  Protocol + RunnerExecutor. Invokes `snapshot.yml` which runs `community.proxmox.proxmox_snap`
+  on localhost. `api_host` = node's `ansible_host` IP (not inventory name).
+- **`proxmox_fleet/flows/lxc.py`** — `run_lxc_update(node, lxc_id, executor, settings, *, dry_run,
+  api_host)`. Full `try/except/finally` mirroring `block/rescue/always`:
+  introspect (outside try, fail-loud) → detect → dry_check → backup → update → health → report /
+  rescue (rollback if snap_taken) / always (delete snapshot; stop if was_stopped and not rolled back).
+  `_discover_lxcs(executor, settings)` does the tag-filter shell loop.
+- **`proxmox_fleet/driver.py`** — `run_lxc_phase(settings, inventory_path, …)`: serial over
+  `load_proxmox_nodes()`, concurrent per node via `run_concurrent(max_workers=lxc_forks)`, folds
+  `LxcFlowOutcome` into `FleetState`, writes `dump_for_ansible()`.
+- **`proxmox_fleet/inventory.py`** — `load_proxmox_nodes()` added; parses `[proxmox_nodes]`.
+- **`proxmox_fleet/models/settings.py`** — LXC fields added: `lxc_dry_run`, `lxc_auto_reboot`,
+  `lxc_unattended`, `lxc_backup_strategy/storage`, `lxc_tags`, `lxc_forks`, `lxc_kuma_map`,
+  `exclude_list`, `os_update_exclude_list`, `snapshot_exclude_list`, `pve_api_*`.
+- **`proxmox_fleet/cli.py`** — `--use-lxc-flow` flag. Calls `driver.run_lxc_phase()`, writes
+  `/tmp/fleet_lxc_state.json`, passes `skip_phase_1=true` + `fleet_lxc_state_path` to playbook.
+- **`fleet-update.yml`** — two surgical edits: (a) Phase 1 block gated on `skip_phase_1`; (b)
+  "Merge Python lxc state" play inserted between Phase 1 and Phase 1b.
+- **11 primitives** in `ansible/primitives/`: `discover_lxcs.yml`, `pct_config/status/start/stop/
+  pull.yml`, `snapshot.yml` (single file, `snap_state=present|absent`), `rollback.yml`,
+  `vzdump.yml`, `lxc_os_update.yml`, `lxc_app_update.yml` (includes `/tmp/.nc/clear` trick +
+  resource scaling).
+- **`roles/lxc_update/molecule/mol_run_flow.py`** — `MolLxcExecutor(RunnerExecutor)` overrides
+  `snapshot()` with a touch-file stub (no PVE API needed in molecule). Three CI scenarios
+  (`normal`, `rollback`, `snapfail`) reworked to drive this; four non-CI scenarios still use
+  the legacy role.
+- **`tests/unit/test_status_lxc.py`** — 90 parity tests mirroring `test_report_tmp_app.py`,
+  `test_report_tmp_os.py`, `test_report_when_condition.py`, `test_dry_check_status.py`,
+  `test_detect_regex.py`, `test_introspect_regex.py`.
+- **`tests/unit/test_flow_lxc.py`** — 14 integration tests with `ScriptedLxcExecutor`.
+
+### Key pitfalls discovered
+
+- **`"FAILED (NO SNAPSHOT)"` vs `"FAILED"`**: `snapshot_failed=True` only when a snapshot was
+  explicitly requested AND `snap_res.changed=False` (API returned no-op). When
+  `backup_strategy=none` (no snapshot attempted at all), `snapshot_failed` stays False → plain
+  `"FAILED"`. Tests must distinguish these two scenarios.
+- **dpkg hash is a fallback, not a parallel check**: when both `ver_before` and `ver_after` are
+  non-empty, version comparison wins and dpkg hash is never consulted. Hash only fires when
+  there is no version file (empty cat output from the container).
+- **Reboot check is inside the `not lxc_no_update_script` guard**: the `/var/run/reboot-required`
+  check is only run when `pct pull` succeeded (container has an update script). A container with
+  no update script never gets a reboot check.
+- **`snapshot.yml` runs `hosts: localhost`** (not the node): `community.proxmox.proxmox_snap`
+  speaks the PVE API directly. `RunnerExecutor.snapshot()` passes no `host_pattern` — the
+  primitive hardcodes localhost. This differs from all other lxc primitives which target the node.
+- **`lxc_app_update.yml` is not single-action**: it does scale-up → update → scale-down. This is
+  an accepted deviation because the three steps must be atomic from the control-plane's perspective
+  (all-or-nothing with respect to resource state). Python cannot call three separate primitives
+  here without risking orphaned scaled-up resources on failure.
+
+### Retire step (after real-run parity is confirmed)
+
+```bash
+# Run with the flag and compare results against a flag-off run:
+fleet-update --use-lxc-flow --check -e fleet_dry_run=true
+fleet-update --check -e fleet_dry_run=true
+# Confirm fleet_lxc_data, fleet_changed, fleet_failed match.
+
+# Then delete:
+rm -rf roles/lxc_update/tasks/ roles/lxc_update/defaults/
+rm tests/unit/test_report_tmp_app.py tests/unit/test_report_tmp_os.py \
+   tests/unit/test_report_when_condition.py tests/unit/test_dry_check_status.py \
+   tests/unit/test_detect_regex.py tests/unit/test_introspect_regex.py
+# Flip --use-lxc-flow to the unconditional default in cli.py and remove the flag.
+```
 
 ---
 
 ## Phase 4 — vm / remote / node / manager
 
+Already done (landed in Phase 2-wire): `window.py.in_window()` ← `tasks/check-window.yml`;
+`deps.py` — `validate_depends_order()` + `dependency_failed()`. Both have plain-Python parity
+tests (`test_window.py`, `test_deps.py`) and are wired into `run_custom_phase()` already.
+
+Remaining:
 - **`flows/vm.py`** ← `roles/vm_update` (qm snapshot→update→health→rescue→delete snapshot).
   Status → `status.py.vm_status()` + rescue rollback string (mirror `test_vm_report.py`).
   Primitives: `qm_snapshot.yml`, `qm_rollback.yml`, `apt_upgrade.yml`.
@@ -200,13 +260,13 @@ API call; manager-host node must never be rebooted.
 - **`flows/node.py`** ← Phase 2 of `fleet-update.yml`: serial node OS update + reboot. Replace
   `serial: 1`/`any_errors_fatal` with `orchestration.run_serial(abort_on_error=True)`. Port
   `node_status_str` → `status.py.node_status()`; port the manager-host skip
-  (`manager_lxc_id`) and manager self-update (Phase 3). Use `http.wait_for_port` for the
-  apt-proxy + post-reboot waits.
-- **`window.py.in_window(now, window)`** ← `tasks/check-window.yml` (use Python
-  `datetime`/`zoneinfo`; no `date` shell-out). Mirror `test_check_window.py`. Driver evaluates
-  the window before invoking a host's flow.
-- **`deps.py`** ← Phase 0a `_dep_problems` validator + `main.yml` `_dep_failed`
-  (`validate_depends_order()`, `dependency_failed()`). Mirror `test_custom_depends.py`.
+  (`manager_lxc_id`) and manager self-update (Phase 3 playbook). Use `http.wait_for_port` for
+  the apt-proxy + post-reboot waits.
+
+For each flow, follow the Phase 3 pattern exactly: `try/except/finally`, `LxcFlowOutcome`-style
+dataclass outcome, `ScriptedExecutor` tests, molecule `mol_run_flow.py`, parity test vs. the
+existing Jinja test, flag behind `--use-vm-flow` / `--use-remote-flow` / `--use-node-flow` until
+real-run parity confirmed.
 
 ---
 
