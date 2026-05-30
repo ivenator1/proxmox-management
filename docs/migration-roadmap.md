@@ -70,16 +70,17 @@ pytest tests/unit/ -v
 | 2-logic | `custom_update` decision trees → `status.py`/`changes.py` (+ parity tests) | ✅ done (`57ade9f`) |
 | 2-flow | `custom_update` orchestration → `flows/custom.py` + `steps.py` + `executor.py` + primitives | ✅ done (`d7d6308`) |
 | 2-wire | Driver runs the custom flow behind `--use-custom-flow`; molecule reworked; retire pending real-run parity | 🔶 wired (`759f3ad`) |
-| 3 | `lxc_update` → `flows/lxc.py` + primitives; `tmp_app`/`tmp_os` ports | ⬜ **next** |
-| 4 | `vm_update`/`remote_host_update`/node + manager; serial reboot loop; window eval | ⬜ |
+| 3 | `lxc_update` → `flows/lxc.py` + primitives; `tmp_app`/`tmp_os` ports; molecule reworked | 🔶 wired (`6a30716`) |
+| 4 | `vm_update`/`remote_host_update`/node + manager; serial reboot loop; window eval | ⬜ **next** |
 | 5 | Briefing/history/notifiers in Python (byte-parity); split monolith; retire `conftest.py` + delete `.j2` | ⬜ |
 
-What exists now: `proxmox_fleet/{__init__,cli,__main__,runner,orchestration,http,steps,executor,status,changes,deps,driver,inventory,window}.py`,
-`proxmox_fleet/models/{config,state,settings}.py`, `proxmox_fleet/flows/custom.py`,
-`ansible/primitives/{run_shell,reboot_host}.yml`, `roles/custom_update/molecule/mol_run_flow.py`,
-and tests `tests/unit/test_{config_model,state_model,orchestration,http,status_custom,steps,flow_custom,settings,deps,window,inventory,driver}.py`.
-338 tests green, mypy clean. The `--use-custom-flow` CLI flag routes Phase 0b through the Python
-driver; without it the legacy `custom_update` role still runs unchanged.
+What exists now: `proxmox_fleet/{__init__,cli,__main__,runner,orchestration,http,steps,executor,status,changes,deps,driver,inventory,window,lxc_parse}.py`,
+`proxmox_fleet/models/{config,state,settings}.py`, `proxmox_fleet/flows/{custom,lxc}.py`,
+`ansible/primitives/{run_shell,reboot_host,discover_lxcs,pct_config,pct_status,pct_start,pct_stop,pct_pull,snapshot,rollback,vzdump,lxc_os_update,lxc_app_update}.yml`,
+`roles/{custom_update,lxc_update}/molecule/mol_run_flow.py`,
+and tests `tests/unit/test_{config_model,state_model,orchestration,http,status_custom,steps,flow_custom,settings,deps,window,inventory,driver,status_lxc,flow_lxc}.py`.
+442 tests green, mypy clean. `--use-custom-flow` routes Phase 0b and `--use-lxc-flow` routes Phase 1
+through the Python driver; both flags keep the legacy Ansible role as the default until real-run parity is confirmed.
 
 ---
 
