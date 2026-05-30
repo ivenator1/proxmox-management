@@ -23,10 +23,12 @@ import yaml
 from proxmox_fleet import deps, inventory, window
 from proxmox_fleet.executor import RunnerExecutor
 from proxmox_fleet.flows.custom import run_custom_update
+from proxmox_fleet.flows.lxc import LxcFlowOutcome, _discover_lxcs, run_lxc_update
 from proxmox_fleet.inventory import HostSpec
 from proxmox_fleet.models.config import CustomConfig
 from proxmox_fleet.models.settings import GlobalSettings
-from proxmox_fleet.models.state import FleetState
+from proxmox_fleet.models.state import ErrorEntry, FleetState
+from proxmox_fleet.orchestration import run_concurrent
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -130,6 +132,90 @@ def run_custom_phase(
         if outcome.error is not None:
             state.errors.append(outcome.error)
         state.warnings.extend(outcome.warnings)
+
+    state.dump_for_ansible(state_output_path)
+    return state
+
+
+def _fold_lxc_outcome(
+    state: FleetState,
+    lxc_id: str,
+    outcome: LxcFlowOutcome,
+) -> None:
+    """Merge one container's outcome into the running FleetState."""
+    if outcome.record is not None:
+        state.lxc.append(outcome.record)
+    if outcome.changed:
+        state.changed = True
+    if outcome.failed:
+        state.failed = True
+    if outcome.error is not None:
+        state.errors.append(outcome.error)
+    state.warnings.extend(outcome.warnings)
+
+
+def run_lxc_phase(
+    *,
+    settings: GlobalSettings,
+    inventory_path: str = "hosts.ini",
+    check: bool = False,
+    state_output_path: Union[str, Path] = "/tmp/fleet_lxc_state.json",
+) -> FleetState:
+    """Run Phase 1 (LXC container updates) via the Python driver.
+
+    For each Proxmox node: discovers tagged LXCs, then updates them
+    concurrently (max_workers=lxc_forks, default 20), mirroring Ansible's
+    forks setting. Nodes are processed serially.
+
+    Writes the resulting FleetState via dump_for_ansible() so fleet-update.yml
+    can seed fleet_lxc_data / fleet_changed / fleet_failed before Phase 1b.
+
+    Never raises for per-container failures — those become FAILED records.
+    """
+    nodes = inventory.load_proxmox_nodes(inventory_path)
+    dry_run = settings.fleet_dry_run or settings.lxc_dry_run
+    state = FleetState()
+
+    for node_info in nodes:
+        node_name = node_info["name"]
+        api_host = node_info["ansible_host"]
+
+        executor = RunnerExecutor(node_name, inventory=inventory_path, check=check)
+
+        # Discover which LXCs are on this node (filters exclude_list)
+        try:
+            lxc_ids = _discover_lxcs(executor, settings)
+        except Exception as exc:  # noqa: BLE001
+            state.failed = True
+            state.errors.append(ErrorEntry(
+                host=node_name, task="discover_lxcs", error=str(exc)[:300]
+            ))
+            continue
+
+        # Concurrent per-container updates (lxc_continue_on_error is the default)
+        def _run_one(lxc_id: str) -> LxcFlowOutcome:
+            ex = RunnerExecutor(node_name, inventory=inventory_path, check=check)
+            return run_lxc_update(
+                node_name, lxc_id, ex, settings,
+                dry_run=dry_run, api_host=api_host,
+            )
+
+        results = run_concurrent(
+            lxc_ids,
+            _run_one,
+            max_workers=settings.lxc_forks,
+        )
+
+        for lxc_id, outcome, run_err in results:
+            if outcome is not None:
+                _fold_lxc_outcome(state, lxc_id, outcome)
+            elif run_err is not None:
+                state.failed = True
+                state.errors.append(ErrorEntry(
+                    host=str(lxc_id),
+                    task="run_lxc_update",
+                    error=str(run_err)[:300],
+                ))
 
     state.dump_for_ansible(state_output_path)
     return state

@@ -7,8 +7,12 @@ logic into ``proxmox_fleet.flows`` and reduce the YAML to execution primitives.
 
 Phase 2-wire: ``--use-custom-flow`` routes Phase 0b through the Python driver
 before handing off to the playbook (with skip_phase_0b=true so the Ansible
-role is not also executed). Both imports are lazy so unit tests never need
-ansible-runner.
+role is not also executed).
+
+Phase 3-wire: ``--use-lxc-flow`` routes Phase 1 (LXC updates) through the
+Python driver (skip_phase_1=true tells the playbook to skip its Phase 1 block).
+
+Both imports are lazy so unit tests never need ansible-runner.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import sys
 from typing import List, Optional
 
 _CUSTOM_STATE_PATH = "/tmp/fleet_custom_state.json"
+_LXC_STATE_PATH = "/tmp/fleet_lxc_state.json"
 
 
 def _parse_extra_vars(pairs: List[str]) -> dict:
@@ -44,29 +49,48 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Route Phase 0b through flows/custom.py (Python driver) instead of the custom_update role.",
     )
     parser.add_argument(
+        "--use-lxc-flow",
+        action="store_true",
+        default=False,
+        help="Route Phase 1 (LXC updates) through flows/lxc.py (Python driver) instead of the lxc_update role.",
+    )
+    parser.add_argument(
         "--vars-file",
         default="vars.yml",
-        help="Path to vars.yml used by --use-custom-flow to load GlobalSettings.",
+        help="Path to vars.yml used by --use-custom-flow / --use-lxc-flow to load GlobalSettings.",
     )
     args = parser.parse_args(argv)
 
     extravars = _parse_extra_vars(args.extra_vars)
 
     # Phase 2-wire: run Phase 0b in Python, then tell the playbook to skip it.
-    if args.use_custom_flow:
+    if args.use_custom_flow or args.use_lxc_flow:
         from proxmox_fleet import driver  # lazy: avoids ansible-runner import in unit tests
         from proxmox_fleet.models.settings import GlobalSettings
 
         settings = GlobalSettings.load(args.vars_file)
-        driver.run_custom_phase(
-            settings=settings,
-            inventory_path=args.inventory,
-            extra_vars=extravars,
-            check=args.check,
-            state_output_path=_CUSTOM_STATE_PATH,
-        )
-        extravars["skip_phase_0b"] = "true"
-        extravars["fleet_custom_state_path"] = _CUSTOM_STATE_PATH
+
+        if args.use_custom_flow:
+            driver.run_custom_phase(
+                settings=settings,
+                inventory_path=args.inventory,
+                extra_vars=extravars,
+                check=args.check,
+                state_output_path=_CUSTOM_STATE_PATH,
+            )
+            extravars["skip_phase_0b"] = "true"
+            extravars["fleet_custom_state_path"] = _CUSTOM_STATE_PATH
+
+        # Phase 3-wire: run Phase 1 (LXC) in Python, then tell the playbook to skip it.
+        if args.use_lxc_flow:
+            driver.run_lxc_phase(
+                settings=settings,
+                inventory_path=args.inventory,
+                check=args.check,
+                state_output_path=_LXC_STATE_PATH,
+            )
+            extravars["skip_phase_1"] = "true"
+            extravars["fleet_lxc_state_path"] = _LXC_STATE_PATH
 
     try:
         import ansible_runner  # lazy: not needed for unit tests

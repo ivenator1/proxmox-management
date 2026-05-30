@@ -1,0 +1,25 @@
+---
+# Execution primitive: read a container's runtime status via `pct status`.
+# Makes no decisions. Invoked by proxmox_fleet.flows.lxc.
+#
+# Params (extravars):
+#   target_hosts   Proxmox node hosting the container (set by invoke_primitive)
+#   lxc_id         Container VMID
+- name: "pct_status primitive"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  tasks:
+    - name: "Get container status"
+      ansible.builtin.command: "pct status {{ lxc_id }}"
+      register: _res
+      changed_when: false
+      check_mode: false
+
+    - name: "Return result"
+      ansible.builtin.set_stats:
+        data:
+          rc: "{{ _res.rc | default(1) }}"
+          stdout: "{{ _res.stdout | default('') }}"
+          stderr: "{{ _res.stderr | default('') }}"
+          changed: false
+        aggregate: false

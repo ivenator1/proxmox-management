@@ -25,6 +25,39 @@ def is_outdated(ver_before: str, latest_ver: str) -> bool:
     return normalize_version(ver_before) != normalize_version(latest_ver)
 
 
+def lxc_os_changed(stdout: str) -> bool:
+    """True if apt/apk/dnf output indicates packages were upgraded.
+
+    Mirrors the changed_when logic in roles/lxc_update/tasks/update.yml:
+    output contains upgrade keywords AND not '0 upgraded, 0 newly installed'.
+    """
+    if not stdout:
+        return False
+    keywords = re.search(r"upgraded|Installing|Upgrading|Setting up", stdout)
+    if not keywords:
+        return False
+    return "0 upgraded, 0 newly installed" not in stdout
+
+
+def lxc_os_pkg_count(stdout: str) -> Optional[int]:
+    """Extract the N from 'N upgraded' in apt output.
+
+    Returns None when the pattern is absent (non-apt OS or no count in output).
+    """
+    m = re.search(r"(\d+) upgraded", stdout)
+    return int(m.group(1)) if m else None
+
+
+def dpkg_hash_differs(before: str, after: str) -> bool:
+    """True when both hashes are non-empty and differ after strip.
+
+    An empty string on either side (non-apt OS or hash not collected) → False,
+    so callers fall through to the next branch in lxc_app_status().
+    """
+    b, a = before.strip(), after.strip()
+    return bool(b and a and b != a)
+
+
 def custom_changed(
     *,
     changed_when_type: str = "version",

@@ -1,0 +1,31 @@
+---
+# Execution primitive: create a full vzdump backup of an LXC container.
+# Failure is hard (not ignored) — a failed vzdump triggers the rescue path.
+# Makes no decisions. Invoked by proxmox_fleet.flows.lxc (backup phase).
+#
+# Params (extravars):
+#   target_hosts    Proxmox node hosting the container (set by invoke_primitive)
+#   lxc_id          Container VMID
+#   backup_storage  PVE storage name for the dump (e.g. "local" or PBS name)
+#   lxc_name        Human-readable name for the notes-template
+- name: "vzdump primitive"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  tasks:
+    - name: "Create vzdump backup"
+      ansible.builtin.command: >
+        vzdump {{ lxc_id }}
+        --compress zstd
+        --storage {{ backup_storage }}
+        --notes-template "{{ lxc_name }} - ansible fleet-update"
+      register: _res
+      check_mode: false
+
+    - name: "Return result"
+      ansible.builtin.set_stats:
+        data:
+          rc: "{{ _res.rc | default(1) }}"
+          stdout: "{{ _res.stdout | default('') }}"
+          stderr: "{{ _res.stderr | default('') }}"
+          changed: "{{ _res.rc | default(1) == 0 }}"
+        aggregate: false

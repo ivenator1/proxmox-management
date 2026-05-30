@@ -1,0 +1,31 @@
+---
+# Execution primitive: run an OS package upgrade inside an LXC container.
+# The exact command is passed in by the control plane (Python picks the right
+# package manager based on os_type). Changed detection uses the command exit
+# code and output — the control plane inspects stdout afterwards.
+# Makes no decisions. Invoked by proxmox_fleet.flows.lxc (update phase).
+#
+# Params (extravars):
+#   target_hosts    Proxmox node hosting the container (set by invoke_primitive)
+#   lxc_id          Container VMID
+#   os_update_cmd   Full command string to run inside the container via pct exec
+#                   e.g. "pct exec 101 -- bash -c 'apt-get update && apt-get -y dist-upgrade'"
+- name: "lxc_os_update primitive"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  tasks:
+    - name: "Run OS update inside container"
+      ansible.builtin.shell: "{{ os_update_cmd }}"
+      register: _res
+      changed_when: true
+      ignore_errors: true
+      check_mode: false
+
+    - name: "Return result"
+      ansible.builtin.set_stats:
+        data:
+          rc: "{{ _res.rc | default(1) }}"
+          stdout: "{{ _res.stdout | default('') }}"
+          stderr: "{{ _res.stderr | default('') }}"
+          changed: "{{ _res.rc | default(1) == 0 }}"
+        aggregate: false

@@ -1,0 +1,24 @@
+---
+# Execution primitive: start a stopped LXC container.
+# Makes no decisions. Invoked by proxmox_fleet.flows.lxc.
+#
+# Params (extravars):
+#   target_hosts   Proxmox node hosting the container (set by invoke_primitive)
+#   lxc_id         Container VMID
+- name: "pct_start primitive"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  tasks:
+    - name: "Start container"
+      ansible.builtin.command: "pct start {{ lxc_id }}"
+      register: _res
+      check_mode: false
+
+    - name: "Return result"
+      ansible.builtin.set_stats:
+        data:
+          rc: "{{ _res.rc | default(1) }}"
+          stdout: "{{ _res.stdout | default('') }}"
+          stderr: "{{ _res.stderr | default('') }}"
+          changed: "{{ _res.rc | default(1) == 0 }}"
+        aggregate: false

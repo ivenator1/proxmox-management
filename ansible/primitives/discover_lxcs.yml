@@ -1,0 +1,29 @@
+---
+# Execution primitive: discover LXC IDs on a Proxmox node that carry any of
+# the fleet tags. Returns a newline-separated string of matching VMIDs.
+# Makes no decisions. Invoked by proxmox_fleet.flows.lxc.
+#
+# Params (extravars):
+#   target_hosts   Proxmox node to query (set by invoke_primitive)
+#   lxc_tag_regex  alternation-ready regex of tags, e.g. "community-script|proxmox-helper-scripts"
+- name: "discover_lxcs primitive"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  tasks:
+    - name: "List LXCs matching fleet tags"
+      ansible.builtin.shell: |
+        pct list | awk 'NR>1 {print $1}' | while read id; do
+          pct config "$id" 2>/dev/null \
+            | grep -qE '^tags:.*{{ lxc_tag_regex }}' && echo "$id"
+        done
+      register: _disc
+      changed_when: false
+      check_mode: false
+
+    - name: "Return discovered LXC IDs"
+      ansible.builtin.set_stats:
+        data:
+          rc: "{{ _disc.rc | default(0) }}"
+          stdout: "{{ _disc.stdout | default('') }}"
+          changed: false
+        aggregate: false

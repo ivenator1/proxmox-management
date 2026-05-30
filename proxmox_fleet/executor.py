@@ -34,6 +34,23 @@ class Executor(Protocol):
     def reboot(self, *, timeout: int = 600) -> PrimitiveResult:
         ...
 
+    def snapshot(
+        self,
+        lxc_id: str,
+        *,
+        snap_state: str,
+        api_host: str,
+        api_user: str,
+        api_token_id: str,
+        api_token_secret: str,
+    ) -> PrimitiveResult:
+        """Create (snap_state='present') or delete (snap_state='absent') a snapshot.
+
+        Uses snapshot.yml which invokes community.proxmox.proxmox_snap on localhost.
+        api_host must be the node's ansible_host IP (not the inventory name).
+        """
+        ...
+
 
 class RunnerExecutor:
     """Executor backed by ansible-runner primitives, bound to a single host."""
@@ -78,6 +95,36 @@ class RunnerExecutor:
             extravars={"reboot_timeout": timeout},
             check=self.check,
         )
+
+    def snapshot(
+        self,
+        lxc_id: str,
+        *,
+        snap_state: str,
+        api_host: str,
+        api_user: str,
+        api_token_id: str,
+        api_token_secret: str,
+    ) -> PrimitiveResult:
+        result = invoke_primitive(
+            "snapshot",
+            inventory=self.inventory,
+            extravars={
+                "lxc_id": lxc_id,
+                "snap_state": snap_state,
+                "api_host": api_host,
+                "api_user": api_user,
+                "api_token_id": api_token_id,
+                "api_token_secret": api_token_secret,
+            },
+            check=self.check,
+        )
+        facts = result.facts
+        if "changed" in facts:
+            result.changed = bool(facts["changed"])
+        if "failed" in facts:
+            result.failed = bool(facts["failed"])
+        return result
 
 
 def _merge_facts(result: PrimitiveResult) -> PrimitiveResult:

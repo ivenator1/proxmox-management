@@ -1,0 +1,64 @@
+---
+# Execution primitive: run the community-scripts /usr/bin/update inside an LXC
+# container with the required environment overrides, and optionally scale CPU/RAM
+# around the update (for build-heavy apps that need more resources temporarily).
+#
+# Tricks applied:
+#   /tmp/.nc/clear   no-op override of `clear` so the update output is not wiped
+#   TERM=dumb        prevents interactive prompts
+#   PHS_SILENT=1     suppresses apt stdout inside the community script (when set)
+#
+# Resource scaling (when lxc_needs_scale=true):
+#   pct set <id> --cores <build_cpu> --memory <build_ram>   # scale up
+#   /usr/bin/update                                          # run update
+#   pct set <id> --cores <run_cpu>   --memory <run_ram>     # scale down
+#
+# Makes no decisions. Invoked by proxmox_fleet.flows.lxc (update phase).
+#
+# Params (extravars):
+#   target_hosts      Proxmox node hosting the container (set by invoke_primitive)
+#   lxc_id            Container VMID
+#   lxc_shell         Shell to use inside the container: "bash" or "ash" (alpine)
+#   lxc_unattended    true → add PHS_SILENT=1 to suppress prompts
+#   lxc_needs_scale   true → run pct set resource commands around the update
+#   lxc_build_cpu     CPU cores for build (only used when lxc_needs_scale=true)
+#   lxc_build_ram     RAM MB for build
+#   lxc_run_cpu       CPU cores for runtime
+#   lxc_run_ram       RAM MB for runtime
+- name: "lxc_app_update primitive"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  tasks:
+    - name: "Scale up resources for build"
+      ansible.builtin.command: "pct set {{ lxc_id }} --cores {{ lxc_build_cpu }} --memory {{ lxc_build_ram }}"
+      when: lxc_needs_scale | default(false) | bool
+      check_mode: false
+
+    - name: "Run community-scripts update inside container"
+      ansible.builtin.shell: |
+        pct exec {{ lxc_id }} -- {{ lxc_shell | default('bash') }} -c '
+          mkdir -p /tmp/.nc
+          printf "#!/bin/sh\n:\n" > /tmp/.nc/clear
+          chmod +x /tmp/.nc/clear
+          export PATH=/tmp/.nc:$PATH
+          export TERM=dumb
+          {% if lxc_unattended | default(true) | bool %}export PHS_SILENT=1{% endif %}
+          /usr/bin/update'
+      register: _app
+      changed_when: true
+      ignore_errors: true
+      check_mode: false
+
+    - name: "Scale down resources after build"
+      ansible.builtin.command: "pct set {{ lxc_id }} --cores {{ lxc_run_cpu }} --memory {{ lxc_run_ram }}"
+      when: lxc_needs_scale | default(false) | bool
+      check_mode: false
+
+    - name: "Return result"
+      ansible.builtin.set_stats:
+        data:
+          rc: "{{ _app.rc | default(1) }}"
+          stdout: "{{ _app.stdout | default('') }}"
+          stderr: "{{ _app.stderr | default('') }}"
+          changed: "{{ _app.rc | default(1) == 0 }}"
+        aggregate: false

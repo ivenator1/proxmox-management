@@ -1,0 +1,28 @@
+---
+# Execution primitive: copy a file from inside an LXC container to the
+# Proxmox node's filesystem using `pct pull`.
+# Makes no decisions. Invoked by proxmox_fleet.flows.lxc (detect phase).
+#
+# Params (extravars):
+#   target_hosts   Proxmox node hosting the container (set by invoke_primitive)
+#   lxc_id         Container VMID
+#   pct_pull_src   Path inside the container (e.g. /usr/bin/update)
+#   pct_pull_dst   Destination path on the node (e.g. /tmp/ansible_update_101)
+- name: "pct_pull primitive"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  tasks:
+    - name: "Pull file from container"
+      ansible.builtin.command: "pct pull {{ lxc_id }} {{ pct_pull_src }} {{ pct_pull_dst }}"
+      register: _res
+      changed_when: false
+      check_mode: false
+
+    - name: "Return result"
+      ansible.builtin.set_stats:
+        data:
+          rc: "{{ _res.rc | default(1) }}"
+          stdout: "{{ _res.stdout | default('') }}"
+          stderr: "{{ _res.stderr | default('') }}"
+          changed: false
+        aggregate: false
