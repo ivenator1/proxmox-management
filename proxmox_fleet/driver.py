@@ -214,6 +214,12 @@ def run_lxc_phase(
         for lxc_id, outcome, run_err in results:
             if outcome is not None:
                 _fold_lxc_outcome(state, lxc_id, outcome)
+                rec = outcome.record
+                if rec is not None:
+                    status = "FAILED" if outcome.failed else f"app={rec.app}  os={rec.os}"
+                    print(f"  [{node_name}/{lxc_id}] {rec.name}: {status}")
+                else:
+                    print(f"  [{node_name}/{lxc_id}] idle (no changes)")
             elif run_err is not None:
                 state.failed = True
                 state.errors.append(ErrorEntry(
@@ -221,6 +227,7 @@ def run_lxc_phase(
                     task="run_lxc_update",
                     error=str(run_err)[:300],
                 ))
+                print(f"  [{node_name}/{lxc_id}] ERROR: {run_err}")
 
     state.dump_for_ansible(state_output_path)
     return state
