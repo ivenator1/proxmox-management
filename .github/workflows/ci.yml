@@ -105,8 +105,8 @@ jobs:
           - custom_update_per_step
     steps:
       - uses: actions/checkout@v4
-      - name: Install molecule and ansible
-        run: pip install molecule ansible
+      - name: Install molecule, ansible, proxmox_fleet, and ansible-runner
+        run: pip install molecule ansible ansible-runner && pip install -e .
       - name: Run molecule scenario
         run: molecule test -s ${{ matrix.scenario }}
         working-directory: roles/custom_update
