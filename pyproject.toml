@@ -10,12 +10,11 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "pydantic>=2,<3",
+    "pyyaml>=6",
+    "ansible-runner>=2.3",
 ]
 
-# ansible-runner is only needed when actually driving real plays on the manager.
-# Unit tests + type-checking do not require it, so it is an optional extra.
 [project.optional-dependencies]
-runner = ["ansible-runner>=2.3"]
 dev = [
     "mypy>=1.8",
     "pytest>=7",
