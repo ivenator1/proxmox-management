@@ -115,7 +115,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         playbook="fleet-update.yml",
         inventory=args.inventory,
         extravars=extravars,
-        project_dir=os.getcwd(),
         cmdline=" ".join(cmdline_parts) or None,
     )
     return runner.rc if runner.rc is not None else 1
