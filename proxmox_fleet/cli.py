@@ -18,6 +18,7 @@ Both imports are lazy so unit tests never need ansible-runner.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from typing import List, Optional
 
@@ -106,6 +107,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         cmdline_parts.extend(["--limit", args.limit])
 
     runner = ansible_runner.run(
+        project_dir=os.getcwd(),
         playbook="fleet-update.yml",
         inventory=args.inventory,
         extravars=extravars,
