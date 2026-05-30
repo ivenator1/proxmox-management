@@ -31,9 +31,11 @@ of single-purpose execution primitives. The migration is phased and the existing
 `ansible-playbook fleet-update.yml` keeps working throughout.
 
 ```bash
-# On the Ansible manager (into the same interpreter ansible uses):
-pip install -e '.[runner]'      # adds the `fleet-update` entrypoint
-fleet-update --check -e force_notify=true   # drop-in for ansible-playbook (Phase 0)
+# On the Ansible manager (Debian — system Python is externally managed):
+apt install python3.13-venv          # match your Python version
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .                     # adds the fleet-update entrypoint + all deps
+fleet-update --use-lxc-flow --check -e fleet_dry_run=true   # dry-run
 
 # Dev / CI:
 pip install -e '.[dev]'
