@@ -109,3 +109,22 @@ class FleetState(BaseModel):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(self.model_dump(), fh, indent=2, ensure_ascii=False)
+
+    def dump_for_ansible(self, path: Union[str, Path]) -> None:
+        """Write with fleet_* key names so include_vars in fleet-update.yml
+        populates the same localhost facts that fleet-state-append.yml uses."""
+        alias = {
+            "lxc": "fleet_lxc_data",
+            "vm": "fleet_vm_data",
+            "remote": "fleet_remote_data",
+            "node": "fleet_node_data",
+            "custom": "fleet_custom_data",
+            "errors": "fleet_error_log",
+            "warnings": "fleet_warning_log",
+            "changed": "fleet_changed",
+            "failed": "fleet_failed",
+        }
+        data = {alias[k]: v for k, v in self.model_dump().items() if k in alias}
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)

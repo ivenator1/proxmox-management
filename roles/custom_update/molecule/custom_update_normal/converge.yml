@@ -1,27 +1,17 @@
 ---
-- name: Converge — custom_update normal (version changes 1.0 → 1.1)
+- name: Converge — custom_update normal (Python flow, version 1.0 → 1.1)
   hosts: localhost
   connection: local
   gather_facts: false
   environment:
     PATH: "/tmp/mol_stubs:{{ lookup('env', 'PATH') }}"
-  vars:
-    custom_config: mol_test_normal
-    custom_dry_run: false
-    custom_config_dir: /tmp/mol_custom_normal/configs
   tasks:
-    - name: Run custom_update role
-      include_role:
-        name: custom_update
-
-    - name: Dump fleet state for verify play
-      check_mode: false
-      copy:
-        dest: /tmp/mol_fleet_state.json
-        mode: '0644'
-        content: "{{ {
-          'fleet_custom_data': hostvars['localhost']['fleet_custom_data'] | default([]),
-          'fleet_changed': hostvars['localhost']['fleet_changed'] | default(false),
-          'fleet_failed': hostvars['localhost']['fleet_failed'] | default(false),
-          'fleet_error_log': hostvars['localhost']['fleet_error_log'] | default([])
-          } | to_nice_json }}"
+    - name: Run flow via Python (RunnerExecutor path)
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/../mol_run_flow.py"
+          - "--config-file=/tmp/mol_custom_normal/configs/mol_test_normal.yml"
+          - "--host=localhost"
+          - "--inventory=/tmp/mol_hosts.ini"
+          - "--state-out=/tmp/mol_fleet_state.json"

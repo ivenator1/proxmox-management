@@ -75,6 +75,7 @@
 
 # ==========================================
 # PHASE 0b: Custom (non-standard) system updates
+# Skipped when skip_phase_0b=true (Python driver ran Phase 0b instead).
 # ==========================================
 - name: "Phase 0b: Custom System Updates"
   hosts: custom_hosts
@@ -82,13 +83,39 @@
   gather_facts: yes
   vars_files: [vars.yml]
   tasks:
-    - name: "Apply fleet-wide dry-run"
-      set_fact:
-        custom_dry_run: "{{ (fleet_dry_run | default(false) | bool) or (custom_dry_run | default(false) | bool) }}"
+    - name: "Run custom system update"
+      when: not (skip_phase_0b | default(false) | bool)
+      block:
+        - name: "Apply fleet-wide dry-run"
+          set_fact:
+            custom_dry_run: "{{ (fleet_dry_run | default(false) | bool) or (custom_dry_run | default(false) | bool) }}"
 
-    - name: "Update custom system"
-      include_role:
-        name: custom_update
+        - name: "Update custom system"
+          include_role:
+            name: custom_update
+
+# When skip_phase_0b=true the Python driver wrote fleet_custom_data etc. to a
+# JSON file; load it into localhost facts here so Phases 1–3 fleet-state-append
+# calls OR-join against the already-seeded fleet_changed/fleet_failed values.
+- name: "Merge Python custom state into fleet"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  tasks:
+    - name: "Load Python custom state"
+      include_vars:
+        file: "{{ fleet_custom_state_path }}"
+        name: _py
+      when: fleet_custom_state_path is defined
+
+    - name: "Seed fleet state from Python driver"
+      set_fact:
+        fleet_custom_data: "{{ _py.fleet_custom_data | default([]) }}"
+        fleet_changed: "{{ _py.fleet_changed | default(false) | bool }}"
+        fleet_failed: "{{ _py.fleet_failed | default(false) | bool }}"
+        fleet_error_log: "{{ _py.fleet_error_log | default([]) }}"
+        fleet_warning_log: "{{ _py.fleet_warning_log | default([]) }}"
+      when: fleet_custom_state_path is defined
 
 # ==========================================
 # PHASE 1: Update all tagged LXCs

@@ -1,0 +1,59 @@
+"""Tests for proxmox_fleet.models.settings.GlobalSettings."""
+import pytest
+
+from proxmox_fleet.models.settings import GlobalSettings
+
+
+def test_all_defaults():
+    s = GlobalSettings()
+    assert s.kuma_url == ""
+    assert s.kuma_health_check_retries == 5
+    assert s.kuma_health_check_delay == 30.0
+    assert s.custom_dry_run is False
+    assert s.fleet_dry_run is False
+    assert s.custom_allow_reboot is True
+    assert s.force_window is False
+    assert s.configs_dir == "configs"
+    assert s.host_vars_dir == "host_vars"
+
+
+def test_load_missing_file_returns_defaults(tmp_path):
+    s = GlobalSettings.load(tmp_path / "nonexistent.yml")
+    assert s.kuma_url == ""
+    assert s.kuma_health_check_retries == 5
+
+
+def test_load_from_yaml(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text(
+        "kuma_url: http://kuma:3001\n"
+        "kuma_health_check_retries: 3\n"
+        "custom_dry_run: true\n"
+        "fleet_dry_run: false\n"
+    )
+    s = GlobalSettings.load(f)
+    assert s.kuma_url == "http://kuma:3001"
+    assert s.kuma_health_check_retries == 3
+    assert s.custom_dry_run is True
+    assert s.fleet_dry_run is False
+
+
+def test_extra_fields_allowed(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text("discord_webhook: https://discord.example.com\n")
+    s = GlobalSettings.load(f)
+    assert s.kuma_url == ""  # defaults still work with extra fields
+
+
+def test_load_empty_yaml(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text("")
+    s = GlobalSettings.load(f)
+    assert s.configs_dir == "configs"
+
+
+def test_load_configs_dir_override(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text("configs_dir: /opt/fleet/configs\n")
+    s = GlobalSettings.load(f)
+    assert s.configs_dir == "/opt/fleet/configs"

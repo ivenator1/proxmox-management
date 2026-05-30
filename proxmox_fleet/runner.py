@@ -9,6 +9,7 @@ tests and type-checking do not require it installed.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -80,6 +81,7 @@ def invoke_primitive(
     host_pattern: Optional[str] = None,
     extravars: Optional[Dict[str, Any]] = None,
     private_data_dir: Optional[str] = None,
+    project_dir: Optional[str] = None,
     check: bool = False,
     quiet: bool = True,
 ) -> PrimitiveResult:
@@ -87,6 +89,11 @@ def invoke_primitive(
 
     ``extravars`` flows in as ``-e`` vars (target host, params). ``host_pattern``
     limits the play to one host/group.
+
+    ``project_dir`` sets the CWD for the ansible-playbook subprocess so that
+    the relative path ``ansible/primitives/<primitive>.yml`` resolves correctly.
+    Defaults to the current working directory (callers must ensure CWD is the
+    project root — the fleet-update CLI and mol_run_flow.py both guarantee this).
     """
     import ansible_runner  # lazy: only needed when actually executing
 
@@ -100,6 +107,7 @@ def invoke_primitive(
         inventory=inventory,
         extravars=evars,
         private_data_dir=private_data_dir,
+        project_dir=project_dir if project_dir is not None else os.getcwd(),
         cmdline=cmdline,
         quiet=quiet,
     )
