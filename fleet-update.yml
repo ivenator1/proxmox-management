@@ -83,7 +83,9 @@
   gather_facts: yes
   vars_files: [vars.yml]
   tasks:
-    - block:
+    - name: "Run custom system update"
+      when: not (skip_phase_0b | default(false) | bool)
+      block:
         - name: "Apply fleet-wide dry-run"
           set_fact:
             custom_dry_run: "{{ (fleet_dry_run | default(false) | bool) or (custom_dry_run | default(false) | bool) }}"
@@ -91,7 +93,6 @@
         - name: "Update custom system"
           include_role:
             name: custom_update
-      when: not (skip_phase_0b | default(false) | bool)
 
 # When skip_phase_0b=true the Python driver wrote fleet_custom_data etc. to a
 # JSON file; load it into localhost facts here so Phases 1–3 fleet-state-append

@@ -8,11 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:  # Python 3.8 fallback (unlikely on 3.9+ target)
-    from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
+from zoneinfo import ZoneInfo
 
 
 def in_window(
