@@ -183,6 +183,7 @@ def run_lxc_phase(
         executor = RunnerExecutor(node_name, inventory=inventory_path, check=check)
 
         # Discover which LXCs are on this node (filters exclude_list)
+        print(f"[{node_name}] discovering LXCs (first run loads Ansible — may take a moment)...")
         try:
             lxc_ids = _discover_lxcs(executor, settings)
         except Exception as exc:  # noqa: BLE001
@@ -191,6 +192,8 @@ def run_lxc_phase(
                 host=node_name, task="discover_lxcs", error=str(exc)[:300]
             ))
             continue
+
+        print(f"[{node_name}] found {len(lxc_ids)} tagged LXC(s): {', '.join(lxc_ids) or 'none'}")
 
         # Concurrent per-container updates (lxc_continue_on_error is the default)
         def _run_one(lxc_id: str) -> LxcFlowOutcome:
