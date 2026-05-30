@@ -1,5 +1,8 @@
 ---
-- name: Create stub binaries for rollback scenario
+# Scenario: Kuma health check fails, no snapshot (strategy=none) → FAILED
+# The OS update reports 1 upgraded so the Kuma check fires (then fails because
+# the URL is unreachable in molecule).
+- name: Prepare stubs for lxc_update_rollback scenario
   hosts: localhost
   connection: local
   gather_facts: false
@@ -18,9 +21,10 @@
         - /tmp/mol_pct_start_called
         - /tmp/mol_pct_stop_called
         - /tmp/mol_pct_rollback_called
-        - /tmp/mol_lxc_started
+        - /tmp/mol_snap_created
+        - /tmp/mol_fleet_state.json
 
-    - name: Write pct stub
+    - name: Write pct stub (running container, OS upgrade reported)
       copy:
         dest: /tmp/mol_stubs/pct
         mode: '0755'
@@ -39,31 +43,35 @@
             status)
               echo "status: running"
               ;;
-            start)
-              touch /tmp/mol_pct_start_called
-              ;;
-            stop)
-              touch /tmp/mol_pct_stop_called
-              ;;
-            pull)
-              exit 1
-              ;;
+            start)  touch /tmp/mol_pct_start_called ;;
+            stop)   touch /tmp/mol_pct_stop_called ;;
+            pull)   exit 1 ;;
             exec)
               shift; shift
               CMD_STR="$*"
               if echo "$CMD_STR" | grep -q 'dist-upgrade'; then
-                # Report a real upgrade so os_update_res.changed=true and the Kuma
-                # health check actually fires (then fails against the dead URL).
+                # Report a real upgrade so the Kuma health check fires (then fails).
                 echo "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded."
               elif echo "$CMD_STR" | grep -q 'reboot-required'; then
                 exit 1
               fi
               ;;
-            rollback)
-              touch /tmp/mol_pct_rollback_called
-              exit 0
-              ;;
-            set) exit 0 ;;
+            rollback) touch /tmp/mol_pct_rollback_called; exit 0 ;;
+            set)    exit 0 ;;
             reboot) exit 0 ;;
-            delsnapshot) exit 0 ;;
           esac
+
+    - name: Install proxmox_fleet package for mol_run_flow.py
+      ansible.builtin.pip:
+        name: "{{ playbook_dir }}/../../../../"
+        editable: true
+        state: present
+      ignore_errors: yes
+
+    - name: Write minimal localhost inventory for RunnerExecutor
+      copy:
+        dest: /tmp/mol_hosts.ini
+        mode: '0644'
+        content: |
+          [all]
+          localhost ansible_connection=local ansible_python_interpreter={{ ansible_python_interpreter | default('/usr/bin/python3') }}

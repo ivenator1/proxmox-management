@@ -47,6 +47,47 @@ def _load_host_vars(host: str, host_vars_dir: Path) -> Dict[str, Any]:
     return {}
 
 
+def load_proxmox_nodes(
+    inventory_path: str = "hosts.ini",
+) -> List[Dict[str, str]]:
+    """Parse ``[proxmox_nodes]`` from *inventory_path*.
+
+    Returns a list of ``{name, ansible_host}`` dicts in inventory order.
+    ansible_host falls back to the node name if not set inline or in host_vars.
+    """
+    nodes: List[Dict[str, str]] = []
+    in_section = False
+
+    try:
+        lines = Path(inventory_path).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        if line.startswith("["):
+            section_name = line.strip("[]").split(":")[0]  # strip :vars, :children etc.
+            in_section = section_name == "proxmox_nodes"
+            continue
+        if not in_section:
+            continue
+
+        m = _HOST_LINE.match(line)
+        if not m:
+            continue
+
+        name = m.group(1)
+        inline = _parse_inline_vars(m.group(2))
+        nodes.append({
+            "name": name,
+            "ansible_host": inline.get("ansible_host", name),
+        })
+
+    return nodes
+
+
 def load_custom_hosts(
     inventory_path: str = "hosts.ini",
     *,

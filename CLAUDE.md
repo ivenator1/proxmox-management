@@ -39,12 +39,17 @@ ansible-lint fleet-update.yml
 
 # Molecule scenario (runs against localhost via stub pct/vzdump scripts)
 cd roles/lxc_update && molecule test -s lxc_update_normal
+cd roles/lxc_update && molecule test -s lxc_update_rollback
 cd roles/lxc_update && molecule converge -s lxc_update_normal  # converge only, no verify/destroy
 cd roles/custom_update && molecule test -s custom_update_normal  # Python flow via RunnerExecutor
 
-# Python driver (Phase 0b via Python instead of custom_update role)
+# Python driver — Phase 0b via Python instead of custom_update role
 fleet-update --use-custom-flow --check -e fleet_dry_run=true   # dry-run via Python driver
 fleet-update --use-custom-flow --vars-file vars.yml            # full run via Python driver
+
+# Python driver — Phase 1 (LXC updates) via Python instead of lxc_update role
+fleet-update --use-lxc-flow --check -e fleet_dry_run=true     # dry-run via Python driver
+fleet-update --use-lxc-flow --vars-file vars.yml               # full run via Python driver
 ```
 
 `hosts.ini` and `vars.yml` are gitignored (contain secrets/IPs). Copy from `.example` files to run locally.
@@ -64,21 +69,23 @@ proxmox_fleet/
   models/
     config.py                           # CustomConfig pydantic schema (custom_update config files)
     state.py                            # FleetState + per-type records; dump_for_ansible() writes fleet_* JSON
-    settings.py                         # GlobalSettings pydantic model for vars.yml; load() returns defaults on missing file
+    settings.py                         # GlobalSettings pydantic model for vars.yml; load() returns defaults on missing file; includes LXC + PVE API fields
   flows/
     custom.py                           # run_custom_update() — the full custom flow (detect→backup→update→health→report)
+    lxc.py                              # run_lxc_update() — the full LXC flow (introspect→detect→backup→update→health→report); try/except/finally = block/rescue/always
   deps.py                               # validate_depends_order() + dependency_failed() — ports of Phase-0a Jinja logic
-  driver.py                             # run_custom_phase() — Phase 0a+0b in Python: load hosts, validate deps, serial loop
-  executor.py                           # Executor protocol + RunnerExecutor (ansible-runner backed)
+  driver.py                             # run_custom_phase() + run_lxc_phase() — Phase 0a+0b and Phase 1 in Python
+  executor.py                           # Executor protocol + RunnerExecutor; snapshot() added for proxmox_snap primitive
   http.py                               # Manager-local HTTP: get_json, poll_until, request, post_json
-  inventory.py                          # load_custom_hosts() — line-by-line hosts.ini parser + host_vars/ merge
+  inventory.py                          # load_custom_hosts() + load_proxmox_nodes() — line-by-line hosts.ini parsers
+  lxc_parse.py                          # parse_pct_config(), parse_pct_status(), parse_ct_script() — regex helpers for lxc flow
   orchestration.py                      # run_serial(), run_concurrent() — Python equivalents of serial/forks
   runner.py                             # invoke_primitive() — thin ansible-runner wrapper; passes project_dir=os.getcwd()
   steps.py                              # run_steps() — executes update_steps with per-step timeout + when gate
-  status.py                             # custom_status(), custom_should_report(), is_outdated() — ported decision trees
-  changes.py                            # change detection helpers
+  status.py                             # custom_status(), lxc_app_status(), lxc_os_status(), lxc_rescue_app_status(), lxc_dry_run_status(), lxc_should_report()
+  changes.py                            # change detection helpers; lxc_os_changed(), dpkg_hash_differs(), lxc_os_pkg_count()
   window.py                             # in_window() — port of tasks/check-window.yml using stdlib zoneinfo
-  cli.py                                # fleet-update CLI; --use-custom-flow routes Phase 0b through driver.py
+  cli.py                                # fleet-update CLI; --use-custom-flow (Phase 0b) and --use-lxc-flow (Phase 1) flags
 tasks/
   fleet-state-append.yml                # Shared state accumulator — always use this, never inline set_fact+delegate
 templates/
@@ -92,10 +99,19 @@ ansible/
   primitives/
     run_shell.yml                       # Single-action primitive: run a shell command, return rc/stdout/stderr via set_stats
     reboot_host.yml                     # Single-action primitive: reboot and wait
+    discover_lxcs.yml                   # Tag-filter LXC discovery shell on a Proxmox node
+    pct_config.yml / pct_status.yml     # Read container config / status
+    pct_start.yml / pct_stop.yml        # Start / stop a container
+    pct_pull.yml                        # Copy file from container to node
+    snapshot.yml                        # community.proxmox.proxmox_snap create/delete (runs on localhost; snap_state=present|absent)
+    rollback.yml                        # pct rollback BEFORE_UPDATE_AUTO
+    vzdump.yml                          # vzdump backup
+    lxc_os_update.yml                   # OS upgrade inside container (pct exec)
+    lxc_app_update.yml                  # /usr/bin/update with /tmp/.nc/clear trick + resource scaling
 tests/
   requirements.txt                      # pytest, jinja2, pyyaml — all that's needed for Jinja-shim unit tests
   conftest.py                           # Ansible-compatible Jinja2 env: regex_search (list return), bool, failed/search tests
-  unit/                                 # 338 pytest tests; no Ansible or PVE required
+  unit/                                 # 442 pytest tests; no Ansible or PVE required
   integration/
     test_fleet_state_append.yml         # Standalone ansible-playbook test for delegate_to+delegate_facts accumulation
 roles/
@@ -111,12 +127,14 @@ roles/
       health_check.yml                  # Polls Uptime Kuma; failure → rescue (no ignore_errors); retries/delay are vars
       report.yml                        # Builds tmp_app/tmp_os strings; appends LXC record (skips idle containers)
     molecule/
-      lxc_update_normal/                # Running container, vzdump backup, app+OS update
-      lxc_update_template/              # pct config returns template:1 → all tasks skipped
-      lxc_update_stopped/               # pct status:stopped → start → update → stop in always block
-      lxc_update_dry_run/               # lxc_dry_run=true → only dry_check runs, no backup/update
-      lxc_update_rescue/                # vzdump stub exits 1 → rescue block fires, fleet_failed=True
-      lxc_update_rollback/              # health_check fails (Kuma unreachable) → rescue fires, FAILED recorded
+      mol_run_flow.py                   # Shared converge helper: builds MolLxcExecutor (snapshot stubbed), calls run_lxc_update(), writes dump_for_ansible() JSON
+      lxc_update_normal/                # Running container, vzdump backup, no update script → NO SCRIPT
+      lxc_update_template/              # pct config returns template:1 → all tasks skipped (legacy role)
+      lxc_update_stopped/               # pct status:stopped → start → update → stop in always block (legacy role)
+      lxc_update_dry_run/               # lxc_dry_run=true → only dry_check runs (legacy role)
+      lxc_update_rescue/                # vzdump stub exits 1 → rescue fires (legacy role)
+      lxc_update_rollback/              # Kuma unreachable, no snapshot → FAILED (no rollback)
+      lxc_update_snapfail/              # snapshot() returns changed=False → warning, update continues
   vm_update/
     defaults/main.yml                   # Default values for vm_* vars
     tasks/
@@ -174,6 +192,8 @@ roles/
 Each phase ORs the master `fleet_dry_run` into its role's dry flag via an eager `set_fact` (no self-reference recursion); `fleet_dry_run` also forces a notification.
 
 **`--use-custom-flow` CLI flag**: when set, `cli.py` calls `driver.run_custom_phase()` before the playbook, writes `/tmp/fleet_custom_state.json`, and passes `skip_phase_0b=true` + `fleet_custom_state_path` as extravars. Phase 0b is skipped; the merge play loads the JSON and seeds `fleet_changed`/`fleet_failed` **before Phase 1** so the downstream `fleet-state-append.yml` calls OR-join correctly. Without the flag the legacy `custom_update` role runs unchanged.
+
+**`--use-lxc-flow` CLI flag**: same pattern for Phase 1. `cli.py` calls `driver.run_lxc_phase()`, writes `/tmp/fleet_lxc_state.json`, passes `skip_phase_1=true` + `fleet_lxc_state_path`. A "Merge Python lxc state" play (between the custom merge play and Phase 1b) seeds `fleet_lxc_data`/`fleet_changed`/`fleet_failed`. Without the flag the legacy `lxc_update` role runs unchanged.
 
 ### State accumulation pattern
 
@@ -287,6 +307,9 @@ The task order matters for correct attribution:
 - **`FleetState.dump_for_ansible()` + merge-play timing**: the "Merge Python custom state" play in `fleet-update.yml` must come **between Phase 0b and Phase 1** — not in Phase 4 pre_tasks. Loading it later would let Phases 1–3 `fleet-state-append.yml` calls start from Ansible-default `fleet_changed=false`/`fleet_failed=false` and silently drop the Python driver's values via OR-join.
 - **Inventory parser must not use `configparser`**: `configparser` splits on the first `=` and mis-parses Ansible host lines of the form `hostname key=val key=val …` (it produces key=`hostname key` and value=`val key=val …`). `proxmox_fleet/inventory.py` uses a manual regex parser instead.
 - **`--use-custom-flow` flag is temporary**: once a real `--check` run confirms parity, flip it to the unconditional default in `cli.py`, remove the flag, and delete the legacy `roles/custom_update/tasks/` files and Jinja-shim tests `test_custom_report.py`, `test_run_step.py`, `test_custom_depends.py`.
+- **`--use-lxc-flow` flag is temporary**: same retire step — confirm parity via `fleet-update --use-lxc-flow --check -e fleet_dry_run=true`, then flip to default and delete `roles/lxc_update/tasks/`, `roles/lxc_update/defaults/`, and six Jinja-shim tests (`test_report_tmp_app.py`, `test_report_tmp_os.py`, `test_report_when_condition.py`, `test_dry_check_status.py`, `test_detect_regex.py`, `test_introspect_regex.py`).
+- **`executor.snapshot(lxc_id, *, snap_state, api_host, ...)` added for Phase 3**: invokes `snapshot.yml` (which runs `community.proxmox.proxmox_snap` on localhost). `api_host` must be the node's `ansible_host` IP — not the inventory name. Molecule overrides this with `MolLxcExecutor` (touch-file stub).
+- **`lxc_parse.py` owns all regex extraction**: `parse_pct_config()`, `parse_pct_status()`, `parse_ct_script()`. Patterns are verbatim from `test_introspect_regex.py` and `test_detect_regex.py` — if a pattern changes, update both the parser and its parity test.
 
 ### Testing infrastructure
 
@@ -326,12 +349,14 @@ The task order matters for correct attribution:
 | `test_status_custom.py` | `custom_status()` — mirrors `test_custom_report.py` |
 | `test_steps.py` | `run_steps()` — mirrors `test_run_step.py` |
 | `test_flow_custom.py` | `run_custom_update()` end-to-end with fake executor |
+| `test_status_lxc.py` | `lxc_app_status()`, `lxc_os_status()`, `lxc_rescue_app_status()`, `lxc_dry_run_status()`, `lxc_should_report()`, `parse_pct_config/status()`, `parse_ct_script()` — mirrors 6 existing Jinja test files |
+| `test_flow_lxc.py` | `run_lxc_update()` end-to-end with `ScriptedLxcExecutor` (snapshot stubbed) |
 
 `tests/conftest.py` implements Ansible-specific Jinja2 filters (`regex_search` list-return, `regex_replace`, `combine`, `intersect`) and tests (`failed`, `search`, `equalto`, `succeeded`) so templates render identically to Ansible. When writing new tests, use `render()` for string output and `render_native()` / `make_native_env()` (via `NativeEnvironment`) for Python objects.
 
-**Molecule scenarios** (`roles/lxc_update/molecule/`) test lxc role orchestration against localhost using stub `pct`/`vzdump` shell scripts placed in `/tmp/mol_stubs/` by `prepare.yml`. **`roles/custom_update/molecule/`** scenarios drive `mol_run_flow.py` which builds a real `RunnerExecutor` and calls `run_custom_update()` — the full Python→ansible-runner→primitive→shell-stub stack. Each scenario's `converge.yml` invokes `mol_run_flow.py` with `ansible.builtin.command`; `verify.yml` loads the `dump_for_ansible()` JSON with `include_vars`. Idempotency checking is disabled for all scenarios — backup and update operations are intentionally non-idempotent.
+**Molecule scenarios** (`roles/lxc_update/molecule/`) — the three CI-active scenarios (`normal`, `rollback`, `snapfail`) now drive `mol_run_flow.py` which builds a `MolLxcExecutor` and calls `run_lxc_update()` directly (same Python→ansible-runner→stub-shell stack as custom_update). The four non-CI scenarios (`template`, `stopped`, `dry_run`, `rescue`) still use the legacy role. **`roles/custom_update/molecule/`** scenarios all drive `mol_run_flow.py` → `run_custom_update()`. Each scenario's `converge.yml` invokes `mol_run_flow.py` with `ansible.builtin.command`; `verify.yml` loads the `dump_for_ansible()` JSON with `include_vars`. Idempotency checking is disabled for all scenarios — backup and update operations are intentionally non-idempotent.
 
-**CI** (`.github/workflows/ci.yml`): `yamllint`, `ansible-lint`, `syntax-check`, `unit-tests` (pytest), plus two molecule matrices — `molecule-lxc-update` (normal, rollback, snapfail) and `molecule-custom-update` (normal, noop, rescue, dry_run, uptodate, per_step). The `molecule-custom-update` job installs `ansible-runner` and `pip install -e .` so `mol_run_flow.py` can import `proxmox_fleet`. The `ansible-lint` job excludes role task files that use dynamic `include_tasks` via `exclude_paths` in `.ansible-lint` (the `load-failure[not-found]` rule is unskippable).
+**CI** (`.github/workflows/ci.yml`): `yamllint`, `ansible-lint`, `syntax-check`, `unit-tests` (pytest), plus two molecule matrices — `molecule-lxc-update` (normal, rollback, snapfail) and `molecule-custom-update` (normal, noop, rescue, dry_run, uptodate, per_step). Both molecule jobs now install `ansible-runner` and `pip install -e .` so `mol_run_flow.py` can import `proxmox_fleet`. The `ansible-lint` job excludes role task files that use dynamic `include_tasks` via `exclude_paths` in `.ansible-lint` (the `load-failure[not-found]` rule is unskippable).
 
 ### Jinja2 / Ansible patterns
 

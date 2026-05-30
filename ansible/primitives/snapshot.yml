@@ -1,0 +1,35 @@
+---
+# Execution primitive: create or delete an LXC snapshot via the Proxmox API.
+# Runs on localhost (delegated) since the proxmox_snap module speaks the API
+# directly; no SSH to the node is needed for this operation.
+# Makes no decisions. Invoked by proxmox_fleet.executor.RunnerExecutor.snapshot().
+#
+# Params (extravars):
+#   lxc_id             Container VMID
+#   snap_state         "present" to create, "absent" to delete
+#   api_host           Proxmox node API IP (ansible_host of the node)
+#   api_user           PVE API user (e.g. root@pam)
+#   api_token_id       API token ID
+#   api_token_secret   API token secret
+- name: "snapshot primitive"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: "Manage LXC snapshot BEFORE_UPDATE_AUTO"
+      community.proxmox.proxmox_snap:
+        api_host: "{{ api_host }}"
+        api_user: "{{ api_user }}"
+        api_token_id: "{{ api_token_id }}"
+        api_token_secret: "{{ api_token_secret }}"
+        vmid: "{{ lxc_id }}"
+        snapname: "BEFORE_UPDATE_AUTO"
+        state: "{{ snap_state }}"
+      register: _snap
+
+    - name: "Return result"
+      ansible.builtin.set_stats:
+        data:
+          changed: "{{ _snap.changed | default(false) }}"
+          failed: "{{ _snap.failed | default(false) }}"
+        aggregate: false

@@ -119,6 +119,7 @@
 
 # ==========================================
 # PHASE 1: Update all tagged LXCs
+# Skipped when skip_phase_1=true (Python driver ran Phase 1 instead).
 # ==========================================
 - name: "Phase 1: Update All LXCs"
   hosts: proxmox_nodes
@@ -126,27 +127,53 @@
   gather_facts: no
   vars_files: [vars.yml]
   tasks:
-    - name: "Apply fleet-wide dry-run"
+    - name: "Run LXC updates"
+      when: not (skip_phase_1 | default(false) | bool)
+      block:
+        - name: "Apply fleet-wide dry-run"
+          set_fact:
+            lxc_dry_run: "{{ (fleet_dry_run | default(false) | bool) or (lxc_dry_run | default(false) | bool) }}"
+
+        - name: "Discover tagged LXCs"
+          shell: |
+            pct list | awk 'NR>1 {print $1}' | while read id; do
+              pct config "$id" 2>/dev/null \
+                | grep -qE '^tags:.*({{ lxc_tags | join("|") }})' && echo "$id"
+            done
+          register: lxc_list
+          check_mode: false
+          changed_when: false
+
+        - name: "Update LXCs"
+          include_role:
+            name: lxc_update
+          vars:
+            lxc_id: "{{ item }}"
+          loop: "{{ lxc_list.stdout_lines | difference(exclude_list | default([])) }}"
+          ignore_errors: "{{ lxc_continue_on_error | default(false) | bool }}"
+
+# When skip_phase_1=true the Python driver wrote fleet_lxc_data etc. to a
+# JSON file; load it into localhost facts here so Phases 1b–3 fleet-state-append
+# calls OR-join against the already-seeded fleet_changed/fleet_failed values.
+- name: "Merge Python lxc state into fleet"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  tasks:
+    - name: "Load Python lxc state"
+      include_vars:
+        file: "{{ fleet_lxc_state_path }}"
+        name: _pylxc
+      when: fleet_lxc_state_path is defined
+
+    - name: "Seed fleet lxc state from Python driver"
       set_fact:
-        lxc_dry_run: "{{ (fleet_dry_run | default(false) | bool) or (lxc_dry_run | default(false) | bool) }}"
-
-    - name: "Discover tagged LXCs"
-      shell: |
-        pct list | awk 'NR>1 {print $1}' | while read id; do
-          pct config "$id" 2>/dev/null \
-            | grep -qE '^tags:.*({{ lxc_tags | join("|") }})' && echo "$id"
-        done
-      register: lxc_list
-      check_mode: false
-      changed_when: false
-
-    - name: "Update LXCs"
-      include_role:
-        name: lxc_update
-      vars:
-        lxc_id: "{{ item }}"
-      loop: "{{ lxc_list.stdout_lines | difference(exclude_list | default([])) }}"
-      ignore_errors: "{{ lxc_continue_on_error | default(false) | bool }}"
+        fleet_lxc_data: "{{ _pylxc.fleet_lxc_data | default([]) }}"
+        fleet_changed: "{{ (fleet_changed | default(false)) or (_pylxc.fleet_changed | default(false)) }}"
+        fleet_failed: "{{ (fleet_failed | default(false)) or (_pylxc.fleet_failed | default(false)) }}"
+        fleet_error_log: "{{ (fleet_error_log | default([])) + (_pylxc.fleet_error_log | default([])) }}"
+        fleet_warning_log: "{{ (fleet_warning_log | default([])) + (_pylxc.fleet_warning_log | default([])) }}"
+      when: fleet_lxc_state_path is defined
 
 # ==========================================
 # PHASE 1b: VM Updates

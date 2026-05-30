@@ -1,7 +1,7 @@
 ---
-# Snapshot strategy with fake PVE creds → proxmox_snap returns changed=false →
-# lxc_snapshot_failed is set, a warning is recorded, and the update proceeds.
-- name: Create stub binaries for snapfail scenario
+# Snapshot strategy, but MolLxcExecutor is configured with --snap-fails:
+# snapshot() returns changed=False → warning recorded, update proceeds normally.
+- name: Prepare stubs for lxc_update_snapfail scenario
   hosts: localhost
   connection: local
   gather_facts: false
@@ -20,8 +20,10 @@
         - /tmp/mol_pct_start_called
         - /tmp/mol_pct_stop_called
         - /tmp/mol_pct_rollback_called
+        - /tmp/mol_snap_created
+        - /tmp/mol_fleet_state.json
 
-    - name: Write pct stub
+    - name: Write pct stub (running container, no update script)
       copy:
         dest: /tmp/mol_stubs/pct
         mode: '0755'
@@ -39,8 +41,8 @@
               ;;
             status) echo "status: running" ;;
             start) touch /tmp/mol_pct_start_called ;;
-            stop) touch /tmp/mol_pct_stop_called ;;
-            pull) exit 1 ;;
+            stop)  touch /tmp/mol_pct_stop_called ;;
+            pull)  exit 1 ;;
             exec)
               shift; shift
               CMD_STR="$*"
@@ -50,8 +52,22 @@
                 exit 1
               fi
               ;;
-            rollback) touch /tmp/mol_pct_rollback_called ;;
-            set) exit 0 ;;
+            rollback) touch /tmp/mol_pct_rollback_called; exit 0 ;;
+            set)    exit 0 ;;
             reboot) exit 0 ;;
-            delsnapshot) exit 0 ;;
           esac
+
+    - name: Install proxmox_fleet package for mol_run_flow.py
+      ansible.builtin.pip:
+        name: "{{ playbook_dir }}/../../../../"
+        editable: true
+        state: present
+      ignore_errors: yes
+
+    - name: Write minimal localhost inventory for RunnerExecutor
+      copy:
+        dest: /tmp/mol_hosts.ini
+        mode: '0644'
+        content: |
+          [all]
+          localhost ansible_connection=local ansible_python_interpreter={{ ansible_python_interpreter | default('/usr/bin/python3') }}
