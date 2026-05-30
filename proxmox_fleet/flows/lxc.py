@@ -256,8 +256,7 @@ def run_lxc_update(
             if not snap_taken:
                 outcome.warnings.append(WarningEntry(
                     host=lxc_id, task="Create snapshot",
-                    warning="proxmox_snap returned changed=false — snapshot may have failed; "
-                            "rollback will not be available",
+                    warning="snapshot failed — automatic rollback unavailable for this update",
                 ))
                 snapshot_failed = True
 
