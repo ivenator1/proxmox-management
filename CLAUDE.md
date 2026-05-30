@@ -54,6 +54,20 @@ fleet-update --use-lxc-flow --vars-file vars.yml               # full run via Py
 
 `hosts.ini` and `vars.yml` are gitignored (contain secrets/IPs). Copy from `.example` files to run locally.
 
+## Manager Setup (first time on Debian manager LXC)
+
+Debian's system Python is externally managed (PEP 668) — pip cannot install system-wide. Use a virtualenv:
+
+```bash
+apt install python3.13-venv          # or python3.X-venv matching your Python version
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .                     # installs proxmox_fleet + fleet-update CLI
+ansible-galaxy collection install community.proxmox community.general
+```
+
+Activate the venv at the start of each shell session: `source .venv/bin/activate`
+
 ## File Map
 
 ```

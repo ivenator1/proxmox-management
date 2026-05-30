@@ -23,6 +23,7 @@
       register: _shell
       changed_when: "{{ shell_changed_when | default(true) }}"
       ignore_errors: "{{ shell_ignore_errors | default(false) }}"
+      check_mode: false
 
     - name: "Return result to the control plane"
       ansible.builtin.set_stats:
@@ -32,3 +33,4 @@
           stderr: "{{ _shell.stderr | default('') }}"
           changed: "{{ _shell.changed | default(false) }}"
         aggregate: false
+      check_mode: false

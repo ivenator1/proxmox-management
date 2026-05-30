@@ -108,6 +108,8 @@ def _discover_lxcs(executor: Executor, settings: GlobalSettings) -> List[str]:
         f"then echo \"$vmid\"; fi; done"
     )
     res = executor.run_shell(cmd, changed_when=False)
+    if res.failed:
+        raise RuntimeError(f"discover_lxcs shell failed (rc={res.rc}): {res.stderr or '(no stderr)'}")
     raw_ids = [line.strip() for line in res.stdout.splitlines() if line.strip()]
     exclude = {str(x) for x in settings.exclude_list}
     return [lxc_id for lxc_id in raw_ids if lxc_id not in exclude]

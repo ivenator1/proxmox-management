@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
@@ -106,7 +107,7 @@ def invoke_primitive(
 
     runner = ansible_runner.run(
         playbook=f"ansible/primitives/{primitive}.yml",
-        inventory=inventory,
+        inventory=str(Path(inventory).resolve()),
         extravars=evars,
         private_data_dir=private_data_dir,
         project_dir=project_dir if project_dir is not None else os.getcwd(),

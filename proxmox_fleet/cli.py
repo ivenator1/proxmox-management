@@ -71,6 +71,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         settings = GlobalSettings.load(args.vars_file)
 
+        # Propagate CLI extravars that affect driver behaviour into settings.
+        if extravars.get("fleet_dry_run", "").lower() in ("true", "1", "yes"):
+            settings = settings.model_copy(update={"fleet_dry_run": True})
+
         if args.use_custom_flow:
             driver.run_custom_phase(
                 settings=settings,
@@ -107,6 +111,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         cmdline_parts.extend(["--limit", args.limit])
 
     runner = ansible_runner.run(
+        project_dir=os.getcwd(),
         playbook="fleet-update.yml",
         inventory=args.inventory,
         extravars=extravars,
