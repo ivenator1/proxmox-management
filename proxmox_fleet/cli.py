@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 from typing import List, Optional
 
 _CUSTOM_STATE_PATH = "/tmp/fleet_custom_state.json"
@@ -113,7 +114,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     runner = ansible_runner.run(
         project_dir=os.getcwd(),
         playbook="fleet-update.yml",
-        inventory=args.inventory,
+        inventory=str(Path(args.inventory).resolve()),
         extravars=extravars,
         cmdline=" ".join(cmdline_parts) or None,
     )
