@@ -55,6 +55,8 @@ def _harvest(runner: Any) -> PrimitiveResult:
                 stdout_chunks.append(res["stdout"])
         if event.get("event") in ("runner_on_failed", "runner_on_unreachable"):
             failed = True
+            if isinstance(res.get("stdout"), str):
+                stdout_chunks.append(res["stdout"])
             if isinstance(res.get("stderr"), str):
                 stderr_chunks.append(res["stderr"])
             if isinstance(res.get("msg"), str):

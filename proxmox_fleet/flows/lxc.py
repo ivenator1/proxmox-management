@@ -98,10 +98,13 @@ def _kuma_healthy(payload: Any, *, monitor_id: str) -> bool:
 def _discover_lxcs(executor: Executor, settings: GlobalSettings) -> List[str]:
     """List container VMIDs on the node that carry any of the configured fleet tags."""
     tag_regex = "|".join(settings.lxc_tags)
+    # Use if/fi so the while loop always exits 0 regardless of whether the
+    # last container's grep matched — a non-zero exit causes _harvest() to
+    # classify the task as failed and discard stdout.
     cmd = (
         f"pct list | awk 'NR>1 {{print $1}}' | while read id; do "
-        f"pct config \"$id\" 2>/dev/null "
-        f"| grep -qE '^tags:.*({tag_regex})' && echo \"$id\"; done"
+        f"if pct config \"$id\" 2>/dev/null | grep -qE '^tags:.*({tag_regex})'; "
+        f"then echo \"$id\"; fi; done"
     )
     res = executor.run_shell(cmd, changed_when=False)
     raw_ids = [line.strip() for line in res.stdout.splitlines() if line.strip()]
