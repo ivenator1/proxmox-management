@@ -26,6 +26,12 @@ doc — a later session should be able to resume from here without further conte
   primitives; tests inject a scripted fake. New flows take an `Executor`.
 - **Primitives** return values via `ansible.builtin.set_stats: { data: {...}, aggregate: false }`;
   `runner._harvest` reads `res['ansible_stats']['data']` into `PrimitiveResult.facts`.
+- **`invoke_primitive` CWD contract**: `ansible_runner.run()` is called with
+  `project_dir=os.getcwd()` so the subprocess CWD is the project root and the relative path
+  `ansible/primitives/<name>.yml` resolves correctly. Without this, ansible-runner creates a
+  temp dir and the playbook is never found. Every caller of `RunnerExecutor` must ensure
+  CWD is the project root before creating the executor — production CLI does this naturally;
+  `mol_run_flow.py` calls `os.chdir(_project_root)` at module load.
 - **Status parity**: every `tmp_*` status string is reproduced in `status.py` and locked by a
   test that mirrors the old Jinja test case-for-case (e.g. `test_status_custom.py` ↔
   `test_custom_report.py`). Do the same for lxc/vm/node.
@@ -34,6 +40,16 @@ doc — a later session should be able to resume from here without further conte
 - **Tests import plain Python** (no Jinja shim). Flows are tested with a fake executor +
   monkeypatched `http`. Keep the old Jinja-shim tests until the matching logic is the default,
   then delete them with `conftest.py` in Phase 5.
+- **Inventory parsing** (`proxmox_fleet/inventory.py`): use the manual line-by-line parser,
+  not `configparser` — `configparser` splits on the first `=` and mis-parses Ansible host
+  lines of the form `hostname key=val key=val …`.
+- **`FleetState.dump_for_ansible(path)`**: writes `fleet_*`-keyed JSON (reverse of `from_raw()`
+  alias map). The "Merge Python custom state" play in `fleet-update.yml` loads this file and
+  seeds `fleet_changed`/`fleet_failed` on localhost **before Phase 1**, so Phases 1–3
+  fleet-state-append calls OR-join against the already-seeded values rather than `false`.
+- **`GlobalSettings`** (`proxmox_fleet/models/settings.py`): pydantic model for `vars.yml`;
+  `extra="allow"` tolerates unknown keys. `load(path)` returns all defaults when the file is
+  missing — safe for `--check` runs with no secrets file.
 
 ## Commands
 ```bash
@@ -53,53 +69,91 @@ pytest tests/unit/ -v
 | 1 | pydantic `CustomConfig` + `FleetState` schemas | ✅ done (`0dad3b8`) |
 | 2-logic | `custom_update` decision trees → `status.py`/`changes.py` (+ parity tests) | ✅ done (`57ade9f`) |
 | 2-flow | `custom_update` orchestration → `flows/custom.py` + `steps.py` + `executor.py` + primitives | ✅ done (`d7d6308`) |
-| 2-wire | Driver runs the custom flow as default; molecule reworked; role YAML retired | ⬜ **next** |
-| 3 | `lxc_update` → `flows/lxc.py` + primitives; `tmp_app`/`tmp_os` ports | ⬜ |
+| 2-wire | Driver runs the custom flow behind `--use-custom-flow`; molecule reworked; retire pending real-run parity | 🔶 wired (`759f3ad`) |
+| 3 | `lxc_update` → `flows/lxc.py` + primitives; `tmp_app`/`tmp_os` ports | ⬜ **next** |
 | 4 | `vm_update`/`remote_host_update`/node + manager; serial reboot loop; window eval | ⬜ |
 | 5 | Briefing/history/notifiers in Python (byte-parity); split monolith; retire `conftest.py` + delete `.j2` | ⬜ |
 
-What exists now: `proxmox_fleet/{__init__,cli,__main__,runner,orchestration,http,steps,executor,status,changes}.py`,
-`proxmox_fleet/models/{config,state}.py`, `proxmox_fleet/flows/custom.py`,
-`ansible/primitives/{run_shell,reboot_host}.yml`, and tests
-`tests/unit/test_{config_model,state_model,orchestration,http,status_custom,steps,flow_custom}.py`.
-278 tests green, mypy clean. **The legacy roles + `fleet-update.yml` are untouched and still run.**
+What exists now: `proxmox_fleet/{__init__,cli,__main__,runner,orchestration,http,steps,executor,status,changes,deps,driver,inventory,window}.py`,
+`proxmox_fleet/models/{config,state,settings}.py`, `proxmox_fleet/flows/custom.py`,
+`ansible/primitives/{run_shell,reboot_host}.yml`, `roles/custom_update/molecule/mol_run_flow.py`,
+and tests `tests/unit/test_{config_model,state_model,orchestration,http,status_custom,steps,flow_custom,settings,deps,window,inventory,driver}.py`.
+338 tests green, mypy clean. The `--use-custom-flow` CLI flag routes Phase 0b through the Python
+driver; without it the legacy `custom_update` role still runs unchanged.
 
 ---
 
-## Phase 2-wire — make the custom flow the default (NEXT)
+## Phase 2-wire — implementation notes (🔶 wired, retire pending)
 
-Goal: route Phase 0b through `flows/custom.py` instead of the `custom_update` role, behind a
-flag, then retire the role.
+Goal was to route Phase 0b through `flows/custom.py` behind a flag, prove parity via molecule,
+then retire the role. The wiring is done; the retire step waits for a real `--check` run to
+confirm parity on live infrastructure.
 
-1. **`proxmox_fleet/driver.py`** — add a `run_custom_phase(settings, inventory)`:
-   - Read `[custom_hosts]` + per-host `custom_config`, `custom_overrides`, `depends_on`,
-     `maintenance_window` from inventory (parse `hosts.ini`/host_vars, or have a small
-     `inventory` primitive dump `hostvars` to JSON the driver reads).
-   - Validate Phase-0a dependency order via `deps.validate_depends_order()` (see Phase 4/5 —
-     port `_dep_problems` from `fleet-update.yml`); abort on problems.
-   - For each host **in dependency order** (serial — matches `serial: 1`): load+merge config
-     → `CustomConfig`; skip if outside `window.in_window(...)`; compute `dep_failed` from prior
-     failures; build `RunnerExecutor(host)`; call `run_custom_update(...)`; fold the
-     `CustomFlowOutcome` into a `FleetState` (record, changed, failed, error, warnings).
-   - Pass `kuma_url`, `kuma_retries`, `kuma_delay`, `custom_allow_reboot` from `vars.yml`
-     (introduce a `GlobalSettings` pydantic model for `vars.yml`).
-2. **Config loading** — load `configs/<name>.yml`, deep-merge `custom_overrides`
-   (`combine(recursive=true)` semantics — but in Python this is just a recursive dict merge;
-   note: list values REPLACE, matching the documented Ansible behaviour), then
-   `CustomConfig.model_validate`.
-3. **Wire fleet-update** — Phase 0b chooses driver-flow vs legacy role on a flag
-   (`use_custom_flow`, default false → flip to true once molecule passes). Simplest seam: the
-   `fleet-update` CLI runs the custom phase in Python and tells the playbook to skip its
-   Phase 0b (e.g. an extravar the play's `when:` honours), or the playbook calls out — pick
-   the lower-friction option when implementing.
-4. **Molecule** — rework `roles/custom_update/molecule/{normal,noop,rescue,dry_run,uptodate,per_step}`
-   to drive `flows/custom.py` with a fake/stubbed `run_shell` (or real shell stubs on
-   localhost). Keep the same six scenarios + assertions. Update `.github/workflows/ci.yml`
-   `molecule-custom-update` matrix accordingly (and `pip install -e . ansible-runner`).
-5. **Retire** — delete `roles/custom_update/tasks/*` and the role once molecule + a real
-   `--check` run match. Delete `tests/unit/test_custom_report.py` / `test_run_step.py` /
-   `test_custom_depends.py` (now covered by `test_status_custom.py`/`test_steps.py`/new deps test).
-6. **Rollback for this step**: keep the role + flag-off path until parity is proven.
+### What was built
+
+- **`proxmox_fleet/models/settings.py`** — `GlobalSettings` pydantic model for `vars.yml`;
+  `model_config = ConfigDict(extra="allow")` so unknown keys from `vars.yml` are tolerated.
+  `GlobalSettings.load(path)` silently uses all defaults when the file is missing.
+- **`proxmox_fleet/inventory.py`** — `load_custom_hosts()` parses `[custom_hosts]` from
+  `hosts.ini` and merges `host_vars/<host>.yml`. Uses manual line-by-line regex rather than
+  `configparser` — configparser splits on the first `=` which mis-parses
+  `hostname key=val key=val …` host lines (turns `hostname key` into the config key).
+- **`proxmox_fleet/deps.py`** — `validate_depends_order()` (port of Phase-0a `_dep_problems`)
+  and `dependency_failed()` (port of `_dep_failed`).
+- **`proxmox_fleet/window.py`** — `in_window()` (port of `tasks/check-window.yml`). Uses
+  `from zoneinfo import ZoneInfo` directly — the project requires Python ≥ 3.9 so the
+  `backports.zoneinfo` fallback is dead code and must not be added.
+- **`proxmox_fleet/driver.py`** — `run_custom_phase(settings, inventory, ...)`: loads hosts,
+  validates dep order (SystemExit on problems), serial loop with window gate → dep gate →
+  `run_custom_update()` → fold outcome into `FleetState`; calls
+  `state.dump_for_ansible(state_output_path)` at the end.
+- **`proxmox_fleet/models/state.py`** — added `dump_for_ansible(path)` which writes
+  `fleet_*`-keyed JSON (the reverse of `from_raw()`'s alias map) for the Ansible merge play.
+- **`proxmox_fleet/cli.py`** — `--use-custom-flow` + `--vars-file` flags. When set, calls
+  `driver.run_custom_phase()` then sets `skip_phase_0b=true` and `fleet_custom_state_path`
+  as extravars for the playbook.
+- **`fleet-update.yml`** — two surgical edits: (a) Phase 0b block gated on
+  `when: not (skip_phase_0b | default(false) | bool)`; (b) a "Merge Python custom state into
+  fleet" play inserted **between Phase 0b and Phase 1** so `fleet_changed`/`fleet_failed` are
+  seeded before Phases 1–3 run `fleet-state-append.yml` and OR-join against them.
+- **`roles/custom_update/molecule/mol_run_flow.py`** — shared converge helper. Loads config,
+  builds `RunnerExecutor(host, inventory=...)`, calls `run_custom_update()`, writes
+  `dump_for_ansible()` output. All six scenario `converge.yml` files drive this script.
+- **Six `prepare.yml`** files — added `pip install -e .` + write `/tmp/mol_hosts.ini` with
+  `ansible_connection=local`.
+- **`.github/workflows/ci.yml`** — `molecule-custom-update` job installs `ansible-runner` and
+  `pip install -e .` so `mol_run_flow.py` can import `proxmox_fleet` and `RunnerExecutor` works.
+
+### Key pitfalls discovered
+
+- **`invoke_primitive` must pass `project_dir`**: without an explicit `project_dir`, ansible-runner
+  creates a fresh `tempfile.mkdtemp()` as `private_data_dir` and looks for the playbook at
+  `<tempdir>/project/ansible/primitives/run_shell.yml` — which never exists. The fix is
+  `project_dir=os.getcwd()` in `ansible_runner.run()`; callers must ensure CWD is the project
+  root. `mol_run_flow.py` does `os.chdir(_project_root)` at module load; the production CLI runs
+  from the project directory by convention.
+- **Merge play timing**: loading the Python-produced fleet state in Phase 4 pre_tasks would cause
+  Phases 1–3 fleet-state-append calls to OR-join against `false`/`[]` (the Ansible-default
+  initial values), silently dropping the Python driver's `fleet_changed`/`fleet_failed` flags.
+  The merge play must come **before Phase 1**.
+- **Block naming for ansible-lint**: a `block:` task must have a `name:` and `when:` must appear
+  before `block:` in key order (`key-order[task]`/`name[missing]` rules).
+- **`types-PyYAML` stub**: mypy raises `import-untyped` for `import yaml` unless `types-PyYAML`
+  is in the dev extras.
+
+### Retire step (after real-run parity is confirmed)
+
+```bash
+# Run with the flag and compare results against a flag-off run on the same target:
+fleet-update --use-custom-flow --check -e fleet_dry_run=true
+fleet-update --check -e fleet_dry_run=true
+# Confirm fleet_custom_data, fleet_changed, fleet_failed match.
+
+# Then delete:
+rm -rf roles/custom_update/tasks/ roles/custom_update/defaults/
+rm tests/unit/test_custom_report.py tests/unit/test_run_step.py tests/unit/test_custom_depends.py
+# Flip --use-custom-flow to the unconditional default in cli.py and remove the flag.
+```
 
 ---
 
