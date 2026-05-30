@@ -173,7 +173,7 @@ def run_lxc_phase(
     Never raises for per-container failures — those become FAILED records.
     """
     nodes = inventory.load_proxmox_nodes(inventory_path)
-    dry_run = settings.fleet_dry_run or settings.lxc_dry_run
+    dry_run = check or settings.fleet_dry_run or settings.lxc_dry_run
     state = FleetState()
 
     for node_info in nodes:
