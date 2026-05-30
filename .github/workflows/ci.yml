@@ -82,8 +82,8 @@ jobs:
           - lxc_update_snapfail
     steps:
       - uses: actions/checkout@v4
-      - name: Install molecule and ansible
-        run: pip install molecule ansible
+      - name: Install molecule, ansible, proxmox_fleet, and ansible-runner
+        run: pip install molecule ansible ansible-runner && pip install -e .
       - name: Install collections
         run: ansible-galaxy collection install community.proxmox community.general
       - name: Run molecule scenario

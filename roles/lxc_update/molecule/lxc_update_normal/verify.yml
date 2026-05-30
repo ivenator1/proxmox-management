@@ -1,5 +1,5 @@
 ---
-- name: Verify — lxc_update normal
+- name: Verify — lxc_update normal (Python flow)
   hosts: localhost
   connection: local
   gather_facts: false

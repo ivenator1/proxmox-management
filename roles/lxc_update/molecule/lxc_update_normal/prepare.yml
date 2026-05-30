@@ -1,5 +1,10 @@
 ---
-- name: Create stub binaries for pct and vzdump
+# Stubs pct, vzdump for a happy-path run:
+#   - container running (no start needed)
+#   - pct pull fails (no /usr/bin/update → NO SCRIPT)
+#   - vzdump succeeds (backup_strategy=vzdump)
+#   - OS update: "0 upgraded" (nothing changed)
+- name: Prepare stubs and state for lxc_update_normal
   hosts: localhost
   connection: local
   gather_facts: false
@@ -17,9 +22,13 @@
       loop:
         - /tmp/mol_pct_start_called
         - /tmp/mol_pct_stop_called
-        - /tmp/mol_lxc_started
+        - /tmp/mol_pct_rollback_called
+        - /tmp/mol_vzdump_called
+        - /tmp/mol_snap_created
+        - /tmp/mol_snap_deleted
+        - /tmp/mol_fleet_state.json
 
-    - name: Write pct stub
+    - name: Write pct stub (running, no update script)
       copy:
         dest: /tmp/mol_stubs/pct
         mode: '0755'
@@ -45,7 +54,7 @@
               touch /tmp/mol_pct_stop_called
               ;;
             pull)
-              # Simulate no update script in container
+              # No update script in container
               exit 1
               ;;
             exec)
@@ -56,12 +65,15 @@
                 echo "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded."
               elif echo "$CMD_STR" | grep -q 'reboot-required'; then
                 exit 1
-              elif echo "$CMD_STR" | grep -q 'apk\|dnf\|upgrade'; then
-                echo "OK: 0 packages installed"
               fi
               ;;
             set) exit 0 ;;
-            reboot) exit 0 ;;
+            reboot) touch /tmp/mol_pct_reboot_called; exit 0 ;;
+            rollback) touch /tmp/mol_pct_rollback_called; exit 0 ;;
+            list)
+              echo "VMID  Status  Lock  Name"
+              echo "101   running       sonarr"
+              ;;
           esac
 
     - name: Write vzdump stub (success)
@@ -72,3 +84,18 @@
           #!/bin/bash
           touch /tmp/mol_vzdump_called
           exit 0
+
+    - name: Install proxmox_fleet package for mol_run_flow.py
+      ansible.builtin.pip:
+        name: "{{ playbook_dir }}/../../../../"
+        editable: true
+        state: present
+      ignore_errors: yes
+
+    - name: Write minimal localhost inventory for RunnerExecutor
+      copy:
+        dest: /tmp/mol_hosts.ini
+        mode: '0644'
+        content: |
+          [all]
+          localhost ansible_connection=local ansible_python_interpreter={{ ansible_python_interpreter | default('/usr/bin/python3') }}
