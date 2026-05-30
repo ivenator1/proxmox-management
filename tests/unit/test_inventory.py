@@ -1,7 +1,7 @@
-"""Tests for proxmox_fleet.inventory.load_custom_hosts."""
+"""Tests for proxmox_fleet.inventory.load_custom_hosts and load_proxmox_nodes."""
 import pytest
 
-from proxmox_fleet.inventory import load_custom_hosts
+from proxmox_fleet.inventory import load_custom_hosts, load_proxmox_nodes
 
 
 def _write_ini(tmp_path, content: str) -> str:
@@ -129,3 +129,43 @@ def test_ansible_host_defaults_to_name_when_absent(tmp_path):
     )
     specs = load_custom_hosts(path)
     assert specs[0].ansible_host == "myhost"
+
+
+# --- load_proxmox_nodes ---
+
+def test_proxmox_nodes_basic(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[proxmox_nodes]\n"
+        "pve-01 ansible_host=10.0.0.10\n"
+        "pve-02 ansible_host=10.0.0.20\n",
+    )
+    nodes = load_proxmox_nodes(path)
+    assert [n["name"] for n in nodes] == ["pve-01", "pve-02"]
+    assert nodes[0]["ansible_host"] == "10.0.0.10"
+
+
+def test_proxmox_nodes_vars_section_not_parsed_as_hosts(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[proxmox_nodes]\n"
+        "pve-01 ansible_host=10.0.0.10\n"
+        "[proxmox_nodes:vars]\n"
+        "ansible_user=root\n"
+        "ansible_ssh_private_key_file=~/.ssh/id_ed25519\n"
+        "ansible_python_interpreter=/usr/bin/python3\n",
+    )
+    nodes = load_proxmox_nodes(path)
+    assert len(nodes) == 1
+    assert nodes[0]["name"] == "pve-01"
+
+
+def test_proxmox_nodes_ansible_host_defaults_to_name(tmp_path):
+    path = _write_ini(tmp_path, "[proxmox_nodes]\npve-01\n")
+    nodes = load_proxmox_nodes(path)
+    assert nodes[0]["ansible_host"] == "pve-01"
+
+
+def test_proxmox_nodes_missing_section_returns_empty(tmp_path):
+    path = _write_ini(tmp_path, "[other_group]\nhost1\n")
+    assert load_proxmox_nodes(path) == []

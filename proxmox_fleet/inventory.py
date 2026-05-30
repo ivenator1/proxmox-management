@@ -68,8 +68,7 @@ def load_proxmox_nodes(
         if not line or line.startswith("#") or line.startswith(";"):
             continue
         if line.startswith("["):
-            section_name = line.strip("[]").split(":")[0]  # strip :vars, :children etc.
-            in_section = section_name == "proxmox_nodes"
+            in_section = line.strip("[]") == "proxmox_nodes"
             continue
         if not in_section:
             continue

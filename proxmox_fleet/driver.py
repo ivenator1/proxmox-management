@@ -181,11 +181,13 @@ def run_lxc_phase(
         api_host = node_info["ansible_host"]
 
         executor = RunnerExecutor(node_name, inventory=inventory_path, check=check)
+        # Discovery is read-only — never pass --check or pct list won't run remotely.
+        discovery_executor = RunnerExecutor(node_name, inventory=inventory_path, check=False)
 
         # Discover which LXCs are on this node (filters exclude_list)
         print(f"[{node_name}] discovering LXCs (first run loads Ansible — may take a moment)...")
         try:
-            lxc_ids = _discover_lxcs(executor, settings)
+            lxc_ids = _discover_lxcs(discovery_executor, settings)
         except Exception as exc:  # noqa: BLE001
             state.failed = True
             state.errors.append(ErrorEntry(
