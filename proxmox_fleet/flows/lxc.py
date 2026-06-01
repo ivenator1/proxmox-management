@@ -31,6 +31,10 @@ from proxmox_fleet.status import (
 )
 
 
+def _vprint(node: str, lxc_id: str, name: str, msg: str) -> None:
+    print(f"  [{node}/{lxc_id} {name}] {msg}")
+
+
 class HealthCheckError(RuntimeError):
     """Kuma health check timed out — triggers rescue/rollback."""
 
@@ -190,6 +194,9 @@ def run_lxc_update(
         )
         lxc_no_update_script = pull_res.rc != 0
 
+        if settings.lxc_verbose:
+            _vprint(node, lxc_id, name, f"script={'NONE (pull failed)' if lxc_no_update_script else 'found'}")
+
         if not lxc_no_update_script:
             grep_res = executor.run_shell(
                 f"grep -oP 'ct/\\K[^.]+(?=\\.sh)' {pull_dst} | head -1",
@@ -197,6 +204,9 @@ def run_lxc_update(
             )
             ct_script_name_raw = grep_res.stdout.strip()
             executor.run_shell(f"rm -f {pull_dst}", changed_when=False)
+
+            if settings.lxc_verbose:
+                _vprint(node, lxc_id, name, f"ct_script={ct_script_name_raw or 'NOT FOUND'}")
 
             if ct_script_name_raw:
                 ct_script_name = ct_script_name_raw
@@ -259,6 +269,8 @@ def run_lxc_update(
         if strategy in ("snapshot", "both") and lxc_id not in {str(x) for x in settings.snapshot_exclude_list}:
             snap_res = executor.snapshot(lxc_id, snap_state="present", **api_params)
             snap_taken = snap_res.changed
+            if settings.lxc_verbose:
+                _vprint(node, lxc_id, name, f"snapshot={'taken' if snap_taken else 'FAILED'}")
             if not snap_taken:
                 outcome.warnings.append(WarningEntry(
                     host=lxc_id, task="Create snapshot",
@@ -282,6 +294,9 @@ def run_lxc_update(
             os_res = executor.run_shell(os_cmd, ignore_errors=True)
             os_res_stdout = os_res.stdout
             os_failed = os_res.failed
+            if settings.lxc_verbose:
+                summary = (os_res.stdout or "").strip().replace("\n", " ")[:120]
+                _vprint(node, lxc_id, name, f"os_update: {'FAILED' if os_failed else 'ok'}  {summary}")
 
         # 3. dpkg hash before app update
         dpkg_before = ""
@@ -326,6 +341,9 @@ def run_lxc_update(
             app_res_stdout = app_res.stdout
             app_failed = app_res.failed
             app_changed = not app_res.failed  # tentative; overridden below by version/hash
+            if settings.lxc_verbose:
+                summary = (app_res.stdout or "").strip().replace("\n", " ")[:120]
+                _vprint(node, lxc_id, name, f"app_update: {'FAILED' if app_failed else 'ok'}  {summary}")
 
         # 6. dpkg hash after
         dpkg_after = ""
@@ -339,6 +357,9 @@ def run_lxc_update(
         ver_after = ""
         if ct_script_name and not lxc_no_update_script:
             ver_after = _read_version(executor, lxc_id, ct_script_name)
+            if settings.lxc_verbose:
+                dpkg_diff = "dpkg=changed" if dpkg_before != dpkg_after else "dpkg=same"
+                _vprint(node, lxc_id, name, f"ver: {ver_before!r} → {ver_after!r}  {dpkg_diff}")
 
         # 8. Scale down
         if needs_scale and run_cpu and run_ram:
