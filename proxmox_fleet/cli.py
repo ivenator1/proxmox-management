@@ -75,6 +75,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Propagate CLI extravars that affect driver behaviour into settings.
         if extravars.get("fleet_dry_run", "").lower() in ("true", "1", "yes"):
             settings = settings.model_copy(update={"fleet_dry_run": True})
+        if extravars.get("lxc_verbose", "").lower() in ("true", "1", "yes"):
+            settings = settings.model_copy(update={"lxc_verbose": True})
 
         if args.use_custom_flow:
             driver.run_custom_phase(
