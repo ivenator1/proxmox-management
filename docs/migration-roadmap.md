@@ -73,7 +73,8 @@ pytest tests/unit/ -v
 | 2-logic | `custom_update` decision trees → `status.py`/`changes.py` (+ parity tests) | ✅ done (`57ade9f`) |
 | 2-flow | `custom_update` orchestration → `flows/custom.py` + `steps.py` + `executor.py` + primitives | ✅ done (`d7d6308`) |
 | 2-wire | Driver runs the custom flow behind `--use-custom-flow`; molecule reworked; retire pending real-run parity | 🔶 wired (`759f3ad`) |
-| 3 | `lxc_update` → `flows/lxc.py` + primitives; `tmp_app`/`tmp_os` ports; molecule reworked | 🔶 wired (`6a30716`) |
+| 3 | `lxc_update` → `flows/lxc.py` + primitives; `tmp_app`/`tmp_os` ports; molecule reworked | 🔶 live-tested (`testing` branch) |
+| 3-retire | Delete legacy `lxc_update` role tasks/defaults; flip `--use-lxc-flow` to default | ⬜ pending speed parity |
 | 4 | `vm_update`/`remote_host_update`/node + manager; serial reboot loop; window eval | ⬜ **next** |
 | 5 | Briefing/history/notifiers in Python (byte-parity); split monolith; retire `conftest.py` + delete `.j2` | ⬜ |
 
@@ -242,6 +243,35 @@ rm tests/unit/test_report_tmp_app.py tests/unit/test_report_tmp_os.py \
    tests/unit/test_detect_regex.py tests/unit/test_introspect_regex.py
 # Flip --use-lxc-flow to the unconditional default in cli.py and remove the flag.
 ```
+
+### Live-run testing (2026-06-01, `testing` branch)
+
+Full live runs against 5 Proxmox nodes (ONeill, Carter, Tealc, Jackson, Hammond), 20 tagged LXCs.
+Testing environment: manager LXC CTID 121 on node 10.10.10.44, `/root/test/proxmox-management`.
+
+**Bugs fixed during testing:**
+- `[proxmox_nodes:vars]` parsed as host entries — `load_proxmox_nodes()` was stripping `:vars` suffix via `.split(":")[0]`, keeping `in_section=True` and treating `ansible_user=root` etc. as node names. Fixed to compare full section name.
+- Discovery shell (`pct list | awk 'NR>1 {print $1}' | while ...`) returning 0 containers — two root causes: (a) `awk`'s `$1` expanded by shell before awk saw it through extravars/Jinja2/shell quoting layers; fixed by replacing awk with `tail -n +2 | while read vmid rest`. (b) `grep -q ... && echo "$id"` exits rc=1 when last container doesn't match, causing `_harvest()` to discard stdout; fixed with `if/fi` so loop always exits 0.
+- Discovery running with `check=True` — shell commands don't execute remotely in check mode; fixed with a dedicated `discovery_executor` with `check=False`.
+- `ansible_runner.run()` in `cli.py` missing `project_dir` — relative `inventory="hosts.ini"` didn't resolve when ansible-runner used a tempdir, causing `proxmox_nodes` group to show "no hosts matched". Fixed with `inventory=str(Path(args.inventory).resolve())` (same as `invoke_primitive`).
+- `_harvest()` discarding stdout from failed tasks — added stdout collection from `runner_on_failed` events as defence-in-depth.
+- `project_dir` duplicated in `cli.py` after merge of parallel fix — removed duplicate.
+
+**Verified working:**
+- All 20 containers discovered and processed correctly across 5 nodes.
+- OS updates execute inside containers (`pct exec ... apt dist-upgrade`).
+- App update scripts (`/usr/bin/update`) run and produce output.
+- Version before/after comparison works — caught nginxproxymanager `2.14.0 → 2.15.0` update on Tealc/123.
+- `lxc_verbose=true` (`-e lxc_verbose=true`) prints per-step diagnostics: script name, snapshot result, os_update stdout, app_update stdout, ver before→after, dpkg diff.
+- Concurrent execution confirmed — output for multiple containers on the same node interleaves correctly.
+
+**Known gaps / open issues:**
+- **Python driver is slower than the legacy Ansible role** despite concurrent per-container execution. Root cause: each `executor.run_shell()` call spawns a new `ansible-runner` subprocess (~12–15 per container), each paying full Ansible framework load + new SSH connection cost. The legacy role is one long-running `ansible-playbook` with `pipelining=true` and one SSH connection per node reused across all tasks. See future TODO below.
+- **Snapshot "CT is locked (snapshot-delete)"** — Hammond/106 uptimekuma snapshot failed with this error. Caused by a Proxmox task lock from a prior snapshot-delete (from an earlier test run) still held when the new snapshot was attempted. No retry logic exists yet; the flow records a warning and continues without rollback capability.
+- **Containers with no version file** (`technitiumdns`, `plex`, `apt-cacher-ng`, `proxmox-backup-server`) — `ver: '' → ''`; change detection falls back to dpkg hash. This is correct behaviour per the status decision tree.
+
+**Future TODO — speed optimisation:**
+The per-`run_shell()` subprocess overhead is the primary bottleneck. Recommended approach: consolidate the ~15 individual primitive calls per container into 4–5 purpose-built multi-read primitives (e.g., one `introspect` primitive returning pct config + status + version file; one `post-update` primitive returning dpkg hash + version file). This keeps all decision logic in Python, maintains clean error attribution, and cuts subprocess spawns from ~15 to ~4–5 per container. Do NOT batch decision logic into shell scripts — that moves branching out of Python. Do NOT use direct SSH (loses Ansible inventory/SSH config integration). See memory `project_speed_todo.md` for full notes.
 
 ---
 
