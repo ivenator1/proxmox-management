@@ -58,6 +58,27 @@ def dpkg_hash_differs(before: str, after: str) -> bool:
     return bool(b and a and b != a)
 
 
+def pkg_changed(stdout: str, pkg_mgr: str) -> bool:
+    """True if the package manager output indicates packages were upgraded.
+
+    Python interprets raw stdout from the apt/dnf/apk upgrade command.
+    Works identically for dry-run (simulate) and real-run outputs since both
+    use the same output format. All decisions are here in Python.
+
+    pkg_mgr: 'apt' | 'dnf' | 'apk'
+    """
+    if not stdout:
+        return False
+    if pkg_mgr == "apt":
+        return "0 upgraded, 0 newly installed" not in stdout
+    if pkg_mgr == "dnf":
+        return "Nothing to do" not in stdout
+    if pkg_mgr == "apk":
+        return "0 upgraded, 0 installed, 0 removed" not in stdout
+    # Unknown package manager — assume changed when there is any output
+    return bool(stdout.strip())
+
+
 def custom_changed(
     *,
     changed_when_type: str = "version",

@@ -197,6 +197,94 @@ def lxc_should_report(app: str, os: str, *, dry_run: bool) -> bool:
     return bool(re.search(r"updated|failed", os_l))
 
 
+# ---------------------------------------------------------------------------
+# Phase 4: vm_update trees
+# ---------------------------------------------------------------------------
+
+
+def vm_status(
+    *,
+    pkg_changed: bool = False,
+    rebooted: bool = False,
+    dry_run: bool = False,
+    failed: bool = False,
+) -> str:
+    """Status string from roles/vm_update/tasks/report.yml.
+
+    Mirrors the 5-branch VM_STATUS tree in test_vm_report.py; parity locked
+    by test_status_vm.py which mirrors test_vm_report.py case-for-case.
+    """
+    if failed:
+        return "FAILED"
+    if dry_run:
+        return "WOULD UPDATE" if pkg_changed else "OK"
+    if rebooted:
+        return "UPDATED & REBOOTED"
+    if pkg_changed:
+        return "UPDATED"
+    return "OK"
+
+
+def vm_rescue_status(
+    *,
+    rollback_done: bool = False,
+    snapshot_failed: bool = False,
+) -> str:
+    """Rescue block status from roles/vm_update/tasks/main.yml.
+
+    Mirrors VM_RESCUE_STATUS in test_vm_report.py.
+    """
+    if rollback_done:
+        return "FAILED + ROLLED BACK"
+    if snapshot_failed:
+        return "FAILED (NO SNAPSHOT)"
+    return "FAILED"
+
+
+def vm_should_report(*, pkg_changed: bool, rebooted: bool, failed: bool) -> bool:
+    """The `when:` gate on the 'Append VM record' task in report.yml.
+
+    Mirrors: vm_pkg_res is failed or vm_pkg_res.changed or vm_reboot_action.changed
+    """
+    return failed or pkg_changed or rebooted
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: remote_host_update trees
+# ---------------------------------------------------------------------------
+
+
+def remote_status(
+    *,
+    pkg_changed: bool = False,
+    rebooted: bool = False,
+    dry_run: bool = False,
+    failed: bool = False,
+) -> str:
+    """Status string from roles/remote_host_update/tasks/report.yml.
+
+    Same shape as vm_status (remote has no snapshot so rescue is always
+    plain 'FAILED'). Parity locked by test_status_remote.py.
+    """
+    if failed:
+        return "FAILED"
+    if dry_run:
+        return "WOULD UPDATE" if pkg_changed else "OK"
+    if rebooted:
+        return "UPDATED & REBOOTED"
+    if pkg_changed:
+        return "UPDATED"
+    return "OK"
+
+
+def remote_should_report(*, pkg_changed: bool, rebooted: bool, failed: bool) -> bool:
+    """The `when:` gate on the 'Append remote host record' task in report.yml.
+
+    Mirrors: remote_pkg_res is failed or remote_pkg_res.changed or remote_reboot_action.changed
+    """
+    return failed or pkg_changed or rebooted
+
+
 def lxc_dry_run_status(
     *,
     gh_repo: str = "",

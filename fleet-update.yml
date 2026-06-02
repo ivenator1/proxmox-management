@@ -23,6 +23,7 @@
 
 # ==========================================
 # PHASE 0: Remote Host Updates
+# Skipped when skip_phase_0=true (Python driver ran Phase 0 instead).
 # ==========================================
 - name: "Phase 0: Remote Host Updates"
   hosts: remote_hosts
@@ -30,13 +31,39 @@
   gather_facts: yes
   vars_files: [vars.yml]
   tasks:
-    - name: "Apply fleet-wide dry-run"
-      set_fact:
-        remote_dry_run: "{{ (fleet_dry_run | default(false) | bool) or (remote_dry_run | default(false) | bool) }}"
+    - name: "Run remote host update"
+      when: not (skip_phase_0 | default(false) | bool)
+      block:
+        - name: "Apply fleet-wide dry-run"
+          set_fact:
+            remote_dry_run: "{{ (fleet_dry_run | default(false) | bool) or (remote_dry_run | default(false) | bool) }}"
 
-    - name: "Update remote host"
-      include_role:
-        name: remote_host_update
+        - name: "Update remote host"
+          include_role:
+            name: remote_host_update
+
+# When skip_phase_0=true the Python driver wrote fleet_remote_data etc. to a
+# JSON file; load it into localhost facts here so Phase 0a–4 fleet-state-append
+# calls OR-join against the already-seeded fleet_changed/fleet_failed values.
+- name: "Merge Python remote state into fleet"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  tasks:
+    - name: "Load Python remote state"
+      include_vars:
+        file: "{{ fleet_remote_state_path }}"
+        name: _pyremote
+      when: fleet_remote_state_path is defined
+
+    - name: "Seed fleet remote state from Python driver"
+      set_fact:
+        fleet_remote_data: "{{ _pyremote.fleet_remote_data | default([]) }}"
+        fleet_changed: "{{ (fleet_changed | default(false)) or (_pyremote.fleet_changed | default(false)) }}"
+        fleet_failed: "{{ (fleet_failed | default(false)) or (_pyremote.fleet_failed | default(false)) }}"
+        fleet_error_log: "{{ (fleet_error_log | default([])) + (_pyremote.fleet_error_log | default([])) }}"
+        fleet_warning_log: "{{ (fleet_warning_log | default([])) + (_pyremote.fleet_warning_log | default([])) }}"
+      when: fleet_remote_state_path is defined
 
 # ==========================================
 # PHASE 0a: Validate custom dependency ordering
@@ -177,6 +204,7 @@
 
 # ==========================================
 # PHASE 1b: VM Updates
+# Skipped when skip_phase_1b=true (Python driver ran Phase 1b instead).
 # ==========================================
 - name: "Phase 1b: VM Updates"
   hosts: proxmox_vms
@@ -184,13 +212,39 @@
   gather_facts: yes
   vars_files: [vars.yml]
   tasks:
-    - name: "Apply fleet-wide dry-run"
-      set_fact:
-        vm_dry_run: "{{ (fleet_dry_run | default(false) | bool) or (vm_dry_run | default(false) | bool) }}"
+    - name: "Run VM update"
+      when: not (skip_phase_1b | default(false) | bool)
+      block:
+        - name: "Apply fleet-wide dry-run"
+          set_fact:
+            vm_dry_run: "{{ (fleet_dry_run | default(false) | bool) or (vm_dry_run | default(false) | bool) }}"
 
-    - name: "Update VM"
-      include_role:
-        name: vm_update
+        - name: "Update VM"
+          include_role:
+            name: vm_update
+
+# When skip_phase_1b=true the Python driver wrote fleet_vm_data etc. to a
+# JSON file; load it into localhost facts here so Phases 2–4 fleet-state-append
+# calls OR-join against the already-seeded fleet_changed/fleet_failed values.
+- name: "Merge Python VM state into fleet"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  tasks:
+    - name: "Load Python VM state"
+      include_vars:
+        file: "{{ fleet_vm_state_path }}"
+        name: _pyvm
+      when: fleet_vm_state_path is defined
+
+    - name: "Seed fleet VM state from Python driver"
+      set_fact:
+        fleet_vm_data: "{{ _pyvm.fleet_vm_data | default([]) }}"
+        fleet_changed: "{{ (fleet_changed | default(false)) or (_pyvm.fleet_changed | default(false)) }}"
+        fleet_failed: "{{ (fleet_failed | default(false)) or (_pyvm.fleet_failed | default(false)) }}"
+        fleet_error_log: "{{ (fleet_error_log | default([])) + (_pyvm.fleet_error_log | default([])) }}"
+        fleet_warning_log: "{{ (fleet_warning_log | default([])) + (_pyvm.fleet_warning_log | default([])) }}"
+      when: fleet_vm_state_path is defined
 
 # ============================================
 # PHASE 2: Update Nodes and reboot if needed

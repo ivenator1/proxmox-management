@@ -46,6 +46,21 @@ class GlobalSettings(BaseModel):
     os_update_exclude_list: List[str] = Field(default_factory=list)
     snapshot_exclude_list: List[str] = Field(default_factory=list)
 
+    # vm_update phase settings
+    vm_dry_run: bool = False
+    vm_auto_reboot: bool = True
+    vm_backup_strategy: str = "snapshot"
+    vm_backup_storage: str = "local"
+    vm_kuma_map: Dict[str, Any] = Field(default_factory=dict)
+    vm_forks: int = 2
+
+    # remote_host_update phase settings
+    remote_dry_run: bool = False
+    remote_auto_reboot: bool = True
+    remote_pre_update_cmd: str = ""
+    remote_kuma_map: Dict[str, Any] = Field(default_factory=dict)
+    remote_forks: int = 5
+
     # Proxmox API credentials (for snapshot operations)
     pve_api_user: str = ""
     pve_api_token_id: str = ""
