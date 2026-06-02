@@ -58,6 +58,27 @@ def dpkg_hash_differs(before: str, after: str) -> bool:
     return bool(b and a and b != a)
 
 
+def vm_pkg_count(stdout: str, pkg_mgr: str) -> Optional[int]:
+    """Extract the number of upgraded packages from pkg manager output.
+
+    Works for both real-run and dry-run (-s / --assumeno / -s) output since all
+    three managers include a summary line in both modes. Returns None when the
+    pattern is absent (unsupported manager, or too noisy to parse).
+    """
+    if not stdout:
+        return None
+    if pkg_mgr == "apt":
+        m = re.search(r"(\d+) upgraded", stdout)
+        return int(m.group(1)) if m else None
+    if pkg_mgr == "dnf":
+        m = re.search(r"Upgrade\s+(\d+)\s+Packages?", stdout, re.IGNORECASE)
+        return int(m.group(1)) if m else None
+    if pkg_mgr == "apk":
+        count = len(re.findall(r"^Upgrading ", stdout, re.MULTILINE))
+        return count if count > 0 else None
+    return None
+
+
 def pkg_changed(stdout: str, pkg_mgr: str) -> bool:
     """True if the package manager output indicates packages were upgraded.
 

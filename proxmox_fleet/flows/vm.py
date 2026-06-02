@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import pkg_changed as _pkg_changed
+from proxmox_fleet.changes import vm_pkg_count as _vm_pkg_count
 from proxmox_fleet.executor import Executor
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import ErrorEntry, VmRecord, WarningEntry
@@ -150,6 +151,7 @@ def run_vm_update(
                 f"Package upgrade failed (rc={pkg_res.rc}): {pkg_res.stderr or pkg_res.stdout}"
             )
         changed = _pkg_changed(pkg_res.stdout, pkg_mgr)
+        pkg_count = _vm_pkg_count(pkg_res.stdout, pkg_mgr) if changed else None
 
         # ------------------------------------------------------------------
         # Reboot check (only when something actually changed, not dry-run)
@@ -194,7 +196,8 @@ def run_vm_update(
         outcome.changed = changed or rebooted
         if vm_should_report(pkg_changed=changed, rebooted=rebooted, failed=False):
             outcome.record = VmRecord(
-                node=node, vmid=vmid, name=inventory_hostname, status=status_str
+                node=node, vmid=vmid, name=inventory_hostname,
+                status=status_str, pkg_count=pkg_count,
             )
         return outcome
 

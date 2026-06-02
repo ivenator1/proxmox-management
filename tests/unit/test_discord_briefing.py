@@ -127,6 +127,26 @@ def test_vm_entry_shown(template):
     assert '  - my-vm (200) — UPDATED' in result
 
 
+def test_vm_pkg_count_shown(template):
+    result = render_briefing(
+        template,
+        fleet_node_data=[node()],
+        fleet_vm_data=[dict(node='pve-01', vmid='200', name='my-vm', status='UPDATED',
+                            pkg_count=5)],
+    )
+    assert '  - my-vm (200) — UPDATED (5 upgraded)' in result
+
+
+def test_vm_pkg_count_absent_when_none(template):
+    result = render_briefing(
+        template,
+        fleet_node_data=[node()],
+        fleet_vm_data=[dict(node='pve-01', vmid='200', name='my-vm', status='UPDATED',
+                            pkg_count=None)],
+    )
+    assert 'upgraded' not in result
+
+
 def test_lxc_subheading_shown(template):
     result = render_briefing(
         template,
