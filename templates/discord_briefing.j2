@@ -4,8 +4,8 @@
 {%- if n.node != 'Ansible-Manager' -%}
 {%- set node_lxcs = fleet_lxc_data | default([]) | selectattr('node', 'equalto', n.node) | list -%}
 {%- set node_vms = fleet_vm_data | default([]) | selectattr('node', 'equalto', n.node) | list -%}
-{%- for l in node_lxcs -%}{{ '\n' }}- {{ l.name }} ({{ l.id }}) — {{ l.app }}{% if l.os and l.os != 'None' %} | OS: {{ l.os }}{% endif %}{% if not l.snap %} *(no snap)*{% endif %}{%- endfor -%}
-{%- for v in node_vms -%}{{ '\n' }}- VM {{ v.vmid }} {{ v.name }} — {{ v.status }}{%- endfor -%}
+{%- if node_lxcs | length > 0 -%}{{ '\n' }}- LXC{%- for l in node_lxcs -%}{{ '\n' }}  - {{ l.name }} ({{ l.id }}) — {{ l.app }}{% if l.os and l.os != 'None' %} | OS: {{ l.os }}{% endif %}{% if not l.snap %} *(no snap)*{% endif %}{%- endfor -%}{%- endif -%}
+{%- if node_vms | length > 0 -%}{{ '\n' }}- VM{%- for v in node_vms -%}{{ '\n' }}  - {{ v.name }} ({{ v.vmid }}) — {{ v.status }}{%- endfor -%}{%- endif -%}
 {%- if node_lxcs | length == 0 and node_vms | length == 0 -%}{{ '\n' }}- *No container changes.*{%- endif -%}
 {%- endif -%}
 {%- endfor %}
