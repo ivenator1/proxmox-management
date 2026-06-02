@@ -36,6 +36,7 @@ class GlobalSettings(BaseModel):
     lxc_dry_run: bool = False
     lxc_auto_reboot: bool = True
     lxc_unattended: bool = True
+    lxc_verbose: bool = False
     lxc_backup_strategy: str = "snapshot"
     lxc_backup_storage: str = "local"
     lxc_tags: List[str] = Field(default_factory=lambda: ["community-script", "proxmox-helper-scripts"])
