@@ -151,7 +151,7 @@ def run_vm_update(
                 f"Package upgrade failed (rc={pkg_res.rc}): {pkg_res.stderr or pkg_res.stdout}"
             )
         changed = _pkg_changed(pkg_res.stdout, pkg_mgr)
-        pkg_count = _vm_pkg_count(pkg_res.stdout, pkg_mgr) if changed else None
+        pkg_count = _vm_pkg_count(pkg_res.stdout, pkg_mgr) if (changed and not dry_run) else None
 
         # ------------------------------------------------------------------
         # Reboot check (only when something actually changed, not dry-run)
