@@ -62,6 +62,13 @@ class GlobalSettings(BaseModel):
     remote_kuma_map: Dict[str, Any] = Field(default_factory=dict)
     remote_forks: int = 5
 
+    # node_update / manager phase settings (Phase 2 + Phase 3)
+    node_dry_run: bool = False
+    node_auto_reboot: bool = True
+    manager_lxc_id: str = ""
+    apt_proxy_ip: str = ""
+    apt_proxy_port: int = 3142
+
     # Proxmox API credentials (for snapshot operations)
     pve_api_user: str = ""
     pve_api_token_id: str = ""

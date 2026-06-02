@@ -246,8 +246,32 @@
         fleet_warning_log: "{{ (fleet_warning_log | default([])) + (_pyvm.fleet_warning_log | default([])) }}"
       when: fleet_vm_state_path is defined
 
+# When skip_phase_2=true the Python driver wrote fleet_node_data etc. to a JSON
+# file; load it into localhost facts here so Phase 4 fleet-state-append calls
+# OR-join against the already-seeded fleet_changed/fleet_failed values.
+- name: "Merge Python node state into fleet"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  tasks:
+    - name: "Load Python node state"
+      include_vars:
+        file: "{{ fleet_node_state_path }}"
+        name: _pynode
+      when: fleet_node_state_path is defined
+
+    - name: "Seed fleet node state from Python driver"
+      set_fact:
+        fleet_node_data: "{{ _pynode.fleet_node_data | default([]) }}"
+        fleet_changed: "{{ (fleet_changed | default(false)) or (_pynode.fleet_changed | default(false)) }}"
+        fleet_failed: "{{ (fleet_failed | default(false)) or (_pynode.fleet_failed | default(false)) }}"
+        fleet_error_log: "{{ (fleet_error_log | default([])) + (_pynode.fleet_error_log | default([])) }}"
+        fleet_warning_log: "{{ (fleet_warning_log | default([])) + (_pynode.fleet_warning_log | default([])) }}"
+      when: fleet_node_state_path is defined
+
 # ============================================
 # PHASE 2: Update Nodes and reboot if needed
+# Skipped when skip_phase_2=true (Python driver ran Phase 2 instead).
 # ============================================
 - name: "Phase 2: Node Updates & Reboots"
   hosts: proxmox_nodes
@@ -257,6 +281,7 @@
   vars_files: [vars.yml]
   tasks:
     - name: "Node Maintenance Block"
+      when: not (skip_phase_2 | default(false) | bool)
       block:
         - name: "Identify if this is the Manager Host"
           shell: "pct list | grep -q '^{{ manager_lxc_id }} ' && echo 'yes' || echo 'no'"
@@ -354,6 +379,7 @@
 
 # ==========================================
 # PHASE 3: MANAGER SELF-UPDATE (Local)
+# Skipped when skip_phase_3=true (Python driver ran Phase 3 instead).
 # ==========================================
 - name: "Phase 3: Manager Self-Update"
   hosts: localhost
@@ -361,27 +387,30 @@
   gather_facts: no
   vars_files: [vars.yml]
   tasks:
-    - name: "Update Manager OS Packages"
-      apt:
-        upgrade: dist
-        update_cache: yes
-        autoremove: yes
-      register: manager_apt
-      ignore_errors: yes
+    - name: "Manager Self-Update Block"
+      when: not (skip_phase_3 | default(false) | bool)
+      block:
+        - name: "Update Manager OS Packages"
+          apt:
+            upgrade: dist
+            update_cache: yes
+            autoremove: yes
+          register: manager_apt
+          ignore_errors: yes
 
-    - name: "Check if Manager Needs Reboot"
-      stat:
-        path: /var/run/reboot-required
-      register: manager_reboot_file
+        - name: "Check if Manager Needs Reboot"
+          stat:
+            path: /var/run/reboot-required
+          register: manager_reboot_file
 
-    - name: "Record Manager Status"
-      include_tasks: tasks/fleet-state-append.yml
-      vars:
-        fleet_record_type: manager
-        fleet_record_payload:
-          node: "Ansible-Manager"
-          status: "{{ 'UPDATED (MANUAL REBOOT REQ)' if manager_reboot_file.stat.exists else 'UPDATED' if manager_apt.changed else 'OK' }}"
-        fleet_record_changed: "{{ manager_apt.changed }}"
+        - name: "Record Manager Status"
+          include_tasks: tasks/fleet-state-append.yml
+          vars:
+            fleet_record_type: manager
+            fleet_record_payload:
+              node: "Ansible-Manager"
+              status: "{{ 'UPDATED (MANUAL REBOOT REQ)' if manager_reboot_file.stat.exists else 'UPDATED' if manager_apt.changed else 'OK' }}"
+            fleet_record_changed: "{{ manager_apt.changed }}"
 
 # ==========================================
 # PHASE 4: FINAL BRIEFING

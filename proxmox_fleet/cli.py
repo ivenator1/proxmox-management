@@ -27,6 +27,7 @@ _CUSTOM_STATE_PATH = "/tmp/fleet_custom_state.json"
 _LXC_STATE_PATH = "/tmp/fleet_lxc_state.json"
 _VM_STATE_PATH = "/tmp/fleet_vm_state.json"
 _REMOTE_STATE_PATH = "/tmp/fleet_remote_state.json"
+_NODE_STATE_PATH = "/tmp/fleet_node_state.json"
 
 
 def _parse_extra_vars(pairs: List[str]) -> dict:
@@ -71,6 +72,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Route Phase 0 (remote host updates) through flows/remote.py (Python driver) instead of the remote_host_update role.",
     )
     parser.add_argument(
+        "--use-node-flow",
+        action="store_true",
+        default=False,
+        help="Route Phase 2+3 (node OS update + manager self-update) through flows/node.py (Python driver).",
+    )
+    parser.add_argument(
         "--vars-file",
         default="vars.yml",
         help="Path to vars.yml used by --use-custom-flow / --use-lxc-flow to load GlobalSettings.",
@@ -79,8 +86,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     extravars = _parse_extra_vars(args.extra_vars)
 
-    # Phase 4a-wire: run Phase 0 (remote) or Phase 1b (VMs) in Python before the playbook.
-    if args.use_custom_flow or args.use_lxc_flow or args.use_vm_flow or args.use_remote_flow:
+    # Phase 4a/4b-wire: run Python flows before the playbook.
+    if (args.use_custom_flow or args.use_lxc_flow or args.use_vm_flow
+            or args.use_remote_flow or args.use_node_flow):
         from proxmox_fleet import driver  # lazy: avoids ansible-runner import in unit tests
         from proxmox_fleet.models.settings import GlobalSettings
 
@@ -135,6 +143,18 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             extravars["skip_phase_0"] = "true"
             extravars["fleet_remote_state_path"] = _REMOTE_STATE_PATH
+
+        # Phase 4b-wire: run Phase 2+3 (node OS + manager) in Python, then skip both blocks.
+        if args.use_node_flow:
+            driver.run_node_phase(
+                settings=settings,
+                inventory_path=args.inventory,
+                check=args.check,
+                state_output_path=_NODE_STATE_PATH,
+            )
+            extravars["skip_phase_2"] = "true"
+            extravars["skip_phase_3"] = "true"
+            extravars["fleet_node_state_path"] = _NODE_STATE_PATH
 
     try:
         import ansible_runner  # lazy: not needed for unit tests
