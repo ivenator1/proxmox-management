@@ -36,14 +36,14 @@ class RemoteFlowOutcome:
 def _detect_pkg_mgr(executor: Executor) -> str:
     """Detect the package manager via `which`. Returns 'apt', 'dnf', or 'apk'."""
     res = executor.run_shell(
-        "which apt-get 2>/dev/null && echo apt "
-        "|| which dnf 2>/dev/null && echo dnf "
-        "|| which apk 2>/dev/null && echo apk "
-        "|| echo unknown",
+        "if which apt-get 2>/dev/null; then echo apt; "
+        "elif which dnf 2>/dev/null; then echo dnf; "
+        "elif which apk 2>/dev/null; then echo apk; "
+        "else echo unknown; fi",
         changed_when=False,
         ignore_errors=True,
     )
-    for word in reversed(res.stdout.split()):
+    for word in res.stdout.split():
         if word in ("apt", "dnf", "apk"):
             return word
     return "apt"
