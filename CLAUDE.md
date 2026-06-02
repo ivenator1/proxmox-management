@@ -59,8 +59,12 @@ fleet-update --use-vm-flow --vars-file vars.yml                 # full run via P
 fleet-update --use-remote-flow --check -e fleet_dry_run=true   # dry-run via Python driver
 fleet-update --use-remote-flow --vars-file vars.yml             # full run via Python driver
 
+# Python driver — Phase 2+3 (node OS update + manager self-update) via Python
+fleet-update --use-node-flow --check -e fleet_dry_run=true   # dry-run via Python driver
+fleet-update --use-node-flow --vars-file vars.yml             # full run via Python driver
+
 # Run all Python-ported phases together (recommended once parity is confirmed)
-fleet-update --use-custom-flow --use-lxc-flow --use-vm-flow --use-remote-flow --check -e fleet_dry_run=true
+fleet-update --use-custom-flow --use-lxc-flow --use-vm-flow --use-remote-flow --use-node-flow --check -e fleet_dry_run=true
 ```
 
 `hosts.ini` and `vars.yml` are gitignored (contain secrets/IPs). Copy from `.example` files to run locally.
@@ -94,14 +98,15 @@ proxmox_fleet/
   models/
     config.py                           # CustomConfig pydantic schema (custom_update config files)
     state.py                            # FleetState + per-type records; dump_for_ansible() writes fleet_* JSON
-    settings.py                         # GlobalSettings pydantic model for vars.yml; load() returns defaults on missing file; includes LXC + PVE API fields
+    settings.py                         # GlobalSettings pydantic model for vars.yml; load() returns defaults on missing file; includes LXC, VM, remote, node/manager + PVE API fields
   flows/
     custom.py                           # run_custom_update() — the full custom flow (detect→backup→update→health→report)
     lxc.py                              # run_lxc_update() — the full LXC flow (introspect→detect→backup→update→health→report); try/except/finally = block/rescue/always
     vm.py                               # run_vm_update() — the full VM flow; two-executor pattern: executor=VM SSH, node_executor=Proxmox node SSH (for qm rollback/status)
     remote.py                           # run_remote_update() — the full remote host flow (pre_update_cmd→detect_pkg_mgr→upgrade→reboot→health→report); no snapshot/always block
+    node.py                             # run_node_update() + run_manager_update() — Phase 2+3; apt w/ 5 retries, robust reboot check, manager-host skip, proxy wait
   deps.py                               # validate_depends_order() + dependency_failed() — ports of Phase-0a Jinja logic
-  driver.py                             # run_custom_phase() + run_lxc_phase() — Phase 0a+0b and Phase 1 in Python
+  driver.py                             # run_custom_phase() + run_lxc_phase() + run_vm_phase() + run_remote_phase() + run_node_phase() — all update phases in Python
   executor.py                           # Executor protocol + RunnerExecutor; snapshot() added for proxmox_snap primitive
   http.py                               # Manager-local HTTP: get_json, poll_until, request, post_json
   inventory.py                          # load_custom_hosts() + load_proxmox_nodes() — line-by-line hosts.ini parsers
@@ -109,10 +114,10 @@ proxmox_fleet/
   orchestration.py                      # run_serial(), run_concurrent() — Python equivalents of serial/forks
   runner.py                             # invoke_primitive() — thin ansible-runner wrapper; passes project_dir=os.getcwd()
   steps.py                              # run_steps() — executes update_steps with per-step timeout + when gate
-  status.py                             # custom_status(), lxc_app_status(), lxc_os_status(), lxc_rescue_app_status(), lxc_dry_run_status(), lxc_should_report()
+  status.py                             # all status decision trees: custom_status(), lxc_*(), vm_status(), vm_rescue_status(), remote_status(), node_status(), manager_status()
   changes.py                            # change detection helpers; lxc_os_changed(), dpkg_hash_differs(), lxc_os_pkg_count()
   window.py                             # in_window() — port of tasks/check-window.yml using stdlib zoneinfo
-  cli.py                                # fleet-update CLI; --use-custom-flow (Phase 0b) and --use-lxc-flow (Phase 1) flags
+  cli.py                                # fleet-update CLI; --use-custom-flow / --use-lxc-flow / --use-vm-flow / --use-remote-flow / --use-node-flow flags
 tasks/
   fleet-state-append.yml                # Shared state accumulator — always use this, never inline set_fact+delegate
 templates/
@@ -334,12 +339,16 @@ The task order matters for correct attribution:
 - **`custom_update` config dir**: `load_config.yml` reads `{{ custom_config_dir | default(playbook_dir ~ '/configs') }}/<name>.yml`. Molecule sets `custom_config_dir: /tmp/mol_custom_<scenario>/configs` — do **not** try to override `playbook_dir` (it is a reserved magic variable and the override is silently ignored).
 - **Deferred Jinja in custom configs**: command strings are rendered eagerly (validation, combine, loop), so a step `command` cannot interpolate runtime facts like `custom_step_results`. `register` stashes stdout for use in a later step's `when:` only. `load_config` skips the `combine` when there are no `custom_overrides` to avoid prematurely rendering deferred `{{ }}`.
 - **`invoke_primitive` requires CWD = project root**: `ansible_runner.run()` is called with `project_dir=os.getcwd()`. Without an explicit `project_dir`, ansible-runner creates a fresh `tempfile.mkdtemp()` as `private_data_dir` and looks for the playbook at `<tempdir>/project/ansible/primitives/<name>.yml` — which never exists. The production CLI runs from the project directory; `mol_run_flow.py` calls `os.chdir(_project_root)` at module load to guarantee this for molecule runs.
-- **`FleetState.dump_for_ansible()` + merge-play timing**: the "Merge Python custom state" play in `fleet-update.yml` must come **between Phase 0b and Phase 1** — not in Phase 4 pre_tasks. Loading it later would let Phases 1–3 `fleet-state-append.yml` calls start from Ansible-default `fleet_changed=false`/`fleet_failed=false` and silently drop the Python driver's values via OR-join.
+- **`FleetState.dump_for_ansible()` + merge-play timing**: there are now **five** merge plays in `fleet-update.yml` — (a) remote state between Phase 0 and Phase 0a, (b) custom state between Phase 0b and Phase 1, (c) LXC state between Phase 1 and Phase 1b, (d) VM state between Phase 1b and Phase 2, (e) node state between the VM merge and Phase 2. Each must stay in its correct position — loading state after a later phase would OR-join against already-false flags and silently drop the Python driver's values.
 - **Inventory parser must not use `configparser`**: `configparser` splits on the first `=` and mis-parses Ansible host lines of the form `hostname key=val key=val …` (it produces key=`hostname key` and value=`val key=val …`). `proxmox_fleet/inventory.py` uses a manual regex parser instead.
 - **`--use-custom-flow` flag is temporary**: once a real `--check` run confirms parity, flip it to the unconditional default in `cli.py`, remove the flag, and delete the legacy `roles/custom_update/tasks/` files and Jinja-shim tests `test_custom_report.py`, `test_run_step.py`, `test_custom_depends.py`.
 - **`--use-lxc-flow` flag is temporary**: same retire step — confirm parity via `fleet-update --use-lxc-flow --check -e fleet_dry_run=true`, then flip to default and delete `roles/lxc_update/tasks/`, `roles/lxc_update/defaults/`, and six Jinja-shim tests (`test_report_tmp_app.py`, `test_report_tmp_os.py`, `test_report_when_condition.py`, `test_dry_check_status.py`, `test_detect_regex.py`, `test_introspect_regex.py`).
 - **`--use-vm-flow` flag is temporary**: confirm parity via `fleet-update --use-vm-flow --check -e fleet_dry_run=true`, then flip to default and delete `roles/vm_update/tasks/`, `roles/vm_update/defaults/`, `tests/unit/test_vm_report.py`.
 - **`--use-remote-flow` flag is temporary**: confirm parity via `fleet-update --use-remote-flow --check -e fleet_dry_run=true`, then flip to default and delete `roles/remote_host_update/tasks/`, `roles/remote_host_update/defaults/`.
+- **`--use-node-flow` flag is temporary**: confirm parity via `fleet-update --use-node-flow --check -e fleet_dry_run=true`, then flip to default in `cli.py` and remove the flag. No legacy role tasks to delete — Phase 2/3 were inline in the playbook. Gate `skip_phase_2/3` permanently to `true`, then remove the Phase 2/3 plays from `fleet-update.yml`.
+- **`run_shell.yml` has `check_mode: false`** on the shell task — the command **always executes** regardless of Ansible check mode. Python controls dry-run by passing either a simulate command (`apt-get -s`) or a real command; Ansible's `--check` flag is bypassed at the shell level. `reboot_host.yml` has the same `check_mode: false` for consistency; the node flow additionally guards the reboot call with `not dry_run` in Python so it never fires during dry-run regardless.
+- **`run_node_update` retry uses injectable `_sleep`**: `orchestration.retry(apt_fn, retries=5, delay=30.0, sleep=_sleep)`. Callers pass `_sleep=lambda s: None` in tests to avoid 150 s of wait. `run_node_phase()` in the driver doesn't pass `_sleep`, so real runs use `time.sleep`. Tests that call via `run_node_phase()` must monkeypatch `time.sleep` to keep fast.
+- **`vm_apt_res` register-overwrite bug in legacy `vm_update` role**: in dry-run mode (`vm_dry_run=True`), the "Simulate apt" task registers `vm_apt_res` with `changed=True`, but the skipped "Update VM packages (apt)" task (in the real-update block) also registers `vm_apt_res` with `{skipped: true, changed: false}`, overwriting the simulate result. This causes `vm_pkg_res.changed = False` in `report.yml` and the VM record is silently dropped from the Discord briefing. The Python driver (`--use-vm-flow`) is unaffected — it uses `run_shell` directly with no register overwrite.
 - **`executor.snapshot(vmid, *, snap_state, api_host, ...)` added for Phase 3**: invokes `snapshot.yml` (which runs `community.proxmox.proxmox_snap` on localhost). `api_host` must be the node's `ansible_host` IP — not the inventory name. `vmid` (not `lxc_id`) because the same primitive handles both LXC containers and QEMU VMs. Molecule overrides this with `MolLxcExecutor` (touch-file stub).
 - **Two-executor pattern for VMs** (Phase 4a): `run_vm_update()` takes `executor` (bound to the VM guest via SSH, for package upgrades) and `node_executor` (bound to the Proxmox node via SSH, for `qm rollback`/`qm status`). Using the wrong executor causes `qm` commands to SSH into the VM and fail silently.
 - **HA-aware VM node discovery** (Phase 4a): `driver.run_vm_phase()` calls `pvesh get /cluster/resources --type vm` on the first available Proxmox node to build a live `{vmid: (node, api_host)}` map. `pve_node` in inventory is only a fallback hint — it goes stale when HA migrates a VM.
@@ -374,11 +383,11 @@ The task order matters for correct attribution:
 |---|---|
 | `test_config_model.py` | `CustomConfig` model validation and defaults |
 | `test_state_model.py` | `FleetState` construction, `from_raw()` aliases, `dump_for_ansible()` |
-| `test_settings.py` | `GlobalSettings.load()`, field defaults, missing-file behaviour |
+| `test_settings.py` | `GlobalSettings.load()`, field defaults (including node/manager fields), missing-file behaviour |
 | `test_deps.py` | `validate_depends_order()` + `dependency_failed()` — mirrors `test_custom_depends.py` |
 | `test_window.py` | `in_window()` — mirrors `test_check_window.py` case-for-case |
 | `test_inventory.py` | `load_custom_hosts()` with `tmp_path` fixtures |
-| `test_driver.py` | `run_custom_phase()` with monkeypatched `RunnerExecutor`; dep-abort, window skip, dry-run propagation, state JSON output |
+| `test_driver.py` | `run_custom_phase()` + `run_node_phase()` with monkeypatched `RunnerExecutor`; dep-abort, window skip, dry-run propagation, abort-on-first-failure, state JSON output |
 | `test_orchestration.py` | `run_serial()` / `run_concurrent()` |
 | `test_http.py` | HTTP helpers with monkeypatched urllib |
 | `test_status_custom.py` | `custom_status()` — mirrors `test_custom_report.py` |
@@ -386,6 +395,12 @@ The task order matters for correct attribution:
 | `test_flow_custom.py` | `run_custom_update()` end-to-end with fake executor |
 | `test_status_lxc.py` | `lxc_app_status()`, `lxc_os_status()`, `lxc_rescue_app_status()`, `lxc_dry_run_status()`, `lxc_should_report()`, `parse_pct_config/status()`, `parse_ct_script()` — mirrors 6 existing Jinja test files |
 | `test_flow_lxc.py` | `run_lxc_update()` end-to-end with `ScriptedLxcExecutor` (snapshot stubbed) |
+| `test_status_vm.py` | `vm_status()`, `vm_rescue_status()`, `vm_should_report()` — mirrors `test_vm_report.py` |
+| `test_flow_vm.py` | `run_vm_update()` end-to-end with `ScriptedVmExecutor` + `ScriptedNodeExecutor` (two-executor pattern) |
+| `test_status_remote.py` | `remote_status()`, `remote_should_report()` |
+| `test_flow_remote.py` | `run_remote_update()` end-to-end with `ScriptedRemoteExecutor` |
+| `test_status_node.py` | `node_status()` (5 branches), `manager_status()` (3 branches), `node_should_report()` |
+| `test_flow_node.py` | `run_node_update()` + `run_manager_update()` with `ScriptedNodeExecutor`; retry, reboot, proxy wait, manager-host skip |
 
 `tests/conftest.py` implements Ansible-specific Jinja2 filters (`regex_search` list-return, `regex_replace`, `combine`, `intersect`) and tests (`failed`, `search`, `equalto`, `succeeded`) so templates render identically to Ansible. When writing new tests, use `render()` for string output and `render_native()` / `make_native_env()` (via `NativeEnvironment`) for Python objects.
 

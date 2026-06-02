@@ -82,17 +82,19 @@ pytest tests/unit/ -v
 | 2-wire | Driver runs the custom flow behind `--use-custom-flow`; molecule reworked; retire pending real-run parity | 🔶 wired (`759f3ad`) |
 | 3 | `lxc_update` → `flows/lxc.py` + primitives; `tmp_app`/`tmp_os` ports; molecule reworked | 🔶 live-tested (`testing` branch) |
 | 3-retire | Delete legacy `lxc_update` role tasks/defaults; flip `--use-lxc-flow` to default | ⬜ pending speed parity |
-| 4 | `vm_update`/`remote_host_update`/node + manager; serial reboot loop; window eval | ⬜ **next** |
+| 4a | `vm_update` + `remote_host_update` → `flows/vm.py` + `flows/remote.py`; `--use-vm-flow` / `--use-remote-flow` flags | 🔶 wired (`dde870e`) |
+| 4b | node OS update + manager self-update; serial reboot loop; `--use-node-flow` | 🔶 wired |
 | 5 | Briefing/history/notifiers in Python (byte-parity); split monolith; retire `conftest.py` + delete `.j2` | ⬜ |
 
 What exists now: `proxmox_fleet/{__init__,cli,__main__,runner,orchestration,http,steps,executor,status,changes,deps,driver,inventory,window,lxc_parse}.py`,
-`proxmox_fleet/models/{config,state,settings}.py`, `proxmox_fleet/flows/{custom,lxc,vm,remote}.py`,
+`proxmox_fleet/models/{config,state,settings}.py`, `proxmox_fleet/flows/{custom,lxc,vm,remote,node}.py`,
 `ansible/primitives/{run_shell,reboot_host,discover_lxcs,pct_config,pct_status,pct_start,pct_stop,pct_pull,snapshot,rollback,vzdump,lxc_os_update,lxc_app_update}.yml`,
 `roles/{custom_update,lxc_update}/molecule/mol_run_flow.py`,
-and tests `tests/unit/test_{config_model,state_model,orchestration,http,status_custom,steps,flow_custom,settings,deps,window,inventory,driver,status_lxc,flow_lxc,status_vm,status_remote,flow_vm,flow_remote}.py`.
-~500 tests green, mypy clean. `--use-custom-flow` routes Phase 0b, `--use-lxc-flow` routes Phase 1,
-`--use-vm-flow` routes Phase 1b, and `--use-remote-flow` routes Phase 0 through the Python driver;
-all flags keep the legacy Ansible role as the default until real-run parity is confirmed.
+and tests `tests/unit/test_{config_model,state_model,orchestration,http,status_custom,steps,flow_custom,settings,deps,window,inventory,driver,status_lxc,flow_lxc,status_vm,status_remote,flow_vm,flow_remote,status_node,flow_node}.py`.
+~541 tests green, mypy clean. `--use-custom-flow` routes Phase 0b, `--use-lxc-flow` routes Phase 1,
+`--use-vm-flow` routes Phase 1b, `--use-remote-flow` routes Phase 0, and `--use-node-flow` routes
+Phase 2+3 through the Python driver; all flags keep the legacy Ansible path as the default until
+real-run parity is confirmed.
 
 ---
 
@@ -357,17 +359,71 @@ rm tests/unit/test_vm_report.py
 
 ---
 
-## Phase 4b — node OS update + manager self-update (⬜ next)
+## Phase 4b — node OS update + manager self-update (🔶 wired, retire pending)
 
-Remaining from Phase 4:
-- **`flows/node.py`** ← Phase 2 of `fleet-update.yml`: serial node OS update + reboot. Replace
-  `serial: 1`/`any_errors_fatal` with `orchestration.run_serial(abort_on_error=True)`. Port
-  `node_status_str` → `status.py.node_status()`; port the manager-host skip
-  (`manager_lxc_id`) and manager self-update (Phase 3 playbook). Use `http.wait_for_port` for
-  the apt-proxy + post-reboot waits.
+Ports Phase 2 (node OS update, serial reboot loop) and Phase 3 (manager LXC self-update)
+from `fleet-update.yml` into Python flows. Behind `--use-node-flow` until real-run parity
+is confirmed.
 
-Follow the Phase 3 pattern: `try/except/finally`, outcome dataclass, `ScriptedExecutor` tests,
-`mol_run_flow.py`, flag behind `--use-node-flow` until real-run parity confirmed.
+### What was built
+
+- **`proxmox_fleet/flows/node.py`** — `run_node_update(node, executor, settings, *, dry_run)`
+  and `run_manager_update(executor, settings, *, dry_run)`. Full `try/except` mirroring
+  `block/rescue`: is_manager check → apt upgrade (5 retries via `orchestration.retry`) →
+  robust reboot check (reboot-required file OR kernel mismatch) → reboot (if not-manager,
+  not dry-run) → `http.wait_for_port` (apt proxy) + 15 s settle → `node_status()` /
+  `manager_status()`. Manager never reboots. `NodeFlowOutcome` dataclass.
+- **`proxmox_fleet/status.py`** — `node_status()` (5 branches, parity with Phase 2 Jinja),
+  `manager_status()` (3 branches, parity with Phase 3 ternary), `node_should_report()` (always
+  True — nodes always appear in the briefing, no idle suppression).
+- **`proxmox_fleet/models/settings.py`** — `manager_lxc_id`, `apt_proxy_ip`, `apt_proxy_port`,
+  `node_dry_run`, `node_auto_reboot` fields added.
+- **`proxmox_fleet/driver.py`** — `_fold_node_outcome()` + `run_node_phase()`: serial node loop
+  with abort-on-first-failure (any_errors_fatal equivalent), then manager update runs
+  unconditionally. Writes `/tmp/fleet_node_state.json`.
+- **`proxmox_fleet/cli.py`** — `--use-node-flow` flag. Calls `driver.run_node_phase()`, sets
+  `skip_phase_2=true`, `skip_phase_3=true`, `fleet_node_state_path` as extravars.
+- **`fleet-update.yml`** — three surgical edits: (a) "Merge Python node state" play inserted
+  between "Merge Python VM state" play and Phase 2; (b) Phase 2 "Node Maintenance Block" gated
+  on `not (skip_phase_2 | default(false) | bool)`; (c) Phase 3 tasks wrapped in "Manager
+  Self-Update Block" gated on `not (skip_phase_3 | default(false) | bool)`.
+- **Tests** — `test_status_node.py` (15) + `test_flow_node.py` (16) + driver tests in
+  `test_driver.py` (6 new: happy path, dry-run, abort-on-failure, empty inventory, state JSON keys)
+  + settings tests in `test_settings.py` (2 new: defaults + YAML load for all 5 new fields).
+  No molecule scenario needed — Phase 2/3 were inline in the playbook, not a role.
+- **`reboot_host.yml`** — `check_mode: false` added to the reboot task (matching `run_shell.yml`).
+  Python controls dry-run by choosing the command; Ansible check mode is bypassed at the primitive
+  level. The node flow additionally guards `executor.reboot()` with `not dry_run` so it never fires
+  during dry-run regardless.
+- **`vm_apt_res` register-overwrite bug** found during parity testing: legacy `vm_update` role
+  silently drops VMs from dry-run notifications because the skipped "Update VM packages" task
+  overwrites `vm_apt_res` with `{skipped: true, changed: false}`. Real runs are unaffected.
+  Python driver (`--use-vm-flow`) is immune. Documented in CLAUDE.md key non-obvious details.
+
+### Key pitfalls
+
+- **Retry uses `_sleep` injection**: `orchestration.retry` takes a `sleep` kwarg; `run_node_update`
+  accepts `_sleep` and threads it through so tests never block on the 30 s retry delay.
+- **Reboot detection uses stdout, not rc**: The robust reboot check outputs "reboot" or "ok" to
+  stdout. `reboot_needed = "reboot" in res.stdout`. Manager reboot check uses
+  `test -f /var/run/reboot-required && echo reboot || echo ok` — same stdout pattern.
+- **Manager abort does NOT stop Phase 3**: the driver `break` stops only the node loop;
+  `run_manager_update()` executes unconditionally after. Phase 3 is `ignore_errors` in Ansible
+  and is independent of Phase 2 failures.
+- **No new Ansible primitives**: node apt runs via existing `run_shell.yml`; reboot via
+  `reboot_host.yml`. PVE nodes are always Debian/apt — no pkg_mgr detection step needed.
+
+### Retire step (after real-run parity confirmed)
+
+```bash
+fleet-update --use-node-flow --check -e fleet_dry_run=true
+fleet-update --check -e fleet_dry_run=true
+# Confirm fleet_node_data, fleet_changed, fleet_failed match.
+
+# Then flip --use-node-flow to the unconditional default in cli.py and remove the flag.
+# No legacy role tasks to delete (Phase 2/3 were inline in the playbook).
+# Gate skip_phase_2/skip_phase_3 permanently to true, then remove Phase 2/3 plays.
+```
 
 ---
 

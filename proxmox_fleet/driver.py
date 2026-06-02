@@ -25,6 +25,7 @@ from proxmox_fleet import deps, inventory, window
 from proxmox_fleet.executor import RunnerExecutor
 from proxmox_fleet.flows.custom import run_custom_update
 from proxmox_fleet.flows.lxc import LxcFlowOutcome, _discover_lxcs, run_lxc_update
+from proxmox_fleet.flows.node import NodeFlowOutcome, run_manager_update, run_node_update
 from proxmox_fleet.flows.remote import RemoteFlowOutcome, run_remote_update
 from proxmox_fleet.flows.vm import VmFlowOutcome, run_vm_update
 from proxmox_fleet.inventory import HostSpec, RemoteHostSpec, VmSpec
@@ -432,6 +433,62 @@ def run_remote_phase(
                 host=host_name, task="run_remote_update", error=str(run_err)[:300]
             ))
             print(f"  [{host_name}] ERROR: {run_err}")
+
+    state.dump_for_ansible(state_output_path)
+    return state
+
+
+def _fold_node_outcome(state: FleetState, outcome: NodeFlowOutcome) -> None:
+    if outcome.record is not None:
+        state.node.append(outcome.record)
+    if outcome.changed:
+        state.changed = True
+    if outcome.failed:
+        state.failed = True
+    if outcome.error is not None:
+        state.errors.append(outcome.error)
+
+
+def run_node_phase(
+    *,
+    settings: GlobalSettings,
+    inventory_path: str = "hosts.ini",
+    check: bool = False,
+    state_output_path: Union[str, Path] = "/tmp/fleet_node_state.json",
+) -> FleetState:
+    """Run Phase 2 (node OS updates) + Phase 3 (manager self-update) via the Python driver.
+
+    Node processing is serial (one node at a time) and aborts on the first failure
+    — mirroring Ansible's ``any_errors_fatal: true`` / ``serial: 1``. The manager
+    self-update always runs regardless of node failures (Phase 3 is ``ignore_errors``
+    in the legacy playbook and is independent of Phase 2 outcomes).
+
+    Writes the resulting FleetState via dump_for_ansible() so fleet-update.yml can
+    seed fleet_node_data / fleet_changed / fleet_failed before Phase 4.
+
+    Never raises for per-node failures — those become FAILED records.
+    """
+    nodes = inventory.load_proxmox_nodes(inventory_path)
+    dry_run = check or settings.fleet_dry_run or settings.node_dry_run
+    state = FleetState()
+
+    # Phase 2: serial node loop — abort on first failure (any_errors_fatal equivalent).
+    for node_info in nodes:
+        node_name = node_info["name"]
+        executor = RunnerExecutor(node_name, inventory=inventory_path, check=check)
+        outcome = run_node_update(node_name, executor, settings, dry_run=dry_run)
+        _fold_node_outcome(state, outcome)
+        status = outcome.record.status if outcome.record else "?"
+        print(f"  [{node_name}] {status}")
+        if outcome.failed:
+            break  # abort remaining nodes; manager update still runs
+
+    # Phase 3: manager self-update always runs — independent of node failures.
+    manager_ex = RunnerExecutor("localhost", inventory=inventory_path, check=check)
+    manager_outcome = run_manager_update(manager_ex, settings, dry_run=dry_run)
+    _fold_node_outcome(state, manager_outcome)
+    mgr_status = manager_outcome.record.status if manager_outcome.record else "?"
+    print(f"  [Ansible-Manager] {mgr_status}")
 
     state.dump_for_ansible(state_output_path)
     return state

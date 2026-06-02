@@ -285,6 +285,52 @@ def remote_should_report(*, pkg_changed: bool, rebooted: bool, failed: bool) -> 
     return failed or pkg_changed or rebooted
 
 
+# ---------------------------------------------------------------------------
+# Phase 4b: node OS update + manager self-update trees
+# ---------------------------------------------------------------------------
+
+
+def node_status(
+    apt_changed: bool,
+    reboot_needed: bool,
+    rebooted: bool,
+    is_manager: bool,
+) -> str:
+    """Status string from Phase 2 of fleet-update.yml (node_status_str set_fact).
+
+    Parity with the Jinja decision tree (lines 317–322 of fleet-update.yml):
+      UPDATED & REBOOTED > UPDATED (MANUAL REBOOT REQ) > REBOOT FAILED > UPDATED > OK
+    REBOOT FAILED is logically unreachable in normal flow (a failed reboot goes to
+    rescue → FAILED) but kept for parity with the Jinja template.
+    """
+    if rebooted:
+        return "UPDATED & REBOOTED"
+    if reboot_needed and is_manager:
+        return "UPDATED (MANUAL REBOOT REQ)"
+    if reboot_needed and not is_manager:
+        return "REBOOT FAILED"
+    if apt_changed:
+        return "UPDATED"
+    return "OK"
+
+
+def manager_status(apt_changed: bool, reboot_needed: bool) -> str:
+    """Status string from Phase 3 of fleet-update.yml (Record Manager Status task).
+
+    Parity with: 'UPDATED (MANUAL REBOOT REQ)' if stat.exists else 'UPDATED' if apt.changed else 'OK'
+    """
+    if reboot_needed:
+        return "UPDATED (MANUAL REBOOT REQ)"
+    if apt_changed:
+        return "UPDATED"
+    return "OK"
+
+
+def node_should_report() -> bool:
+    """Every node and the manager always appears in the briefing — no idle suppression."""
+    return True
+
+
 def lxc_dry_run_status(
     *,
     gh_repo: str = "",

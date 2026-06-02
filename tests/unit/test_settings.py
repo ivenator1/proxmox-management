@@ -57,3 +57,29 @@ def test_load_configs_dir_override(tmp_path):
     f.write_text("configs_dir: /opt/fleet/configs\n")
     s = GlobalSettings.load(f)
     assert s.configs_dir == "/opt/fleet/configs"
+
+
+def test_node_field_defaults():
+    s = GlobalSettings()
+    assert s.manager_lxc_id == ""
+    assert s.apt_proxy_ip == ""
+    assert s.apt_proxy_port == 3142
+    assert s.node_dry_run is False
+    assert s.node_auto_reboot is True
+
+
+def test_node_fields_load_from_yaml(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text(
+        "manager_lxc_id: '121'\n"
+        "apt_proxy_ip: 10.0.0.5\n"
+        "apt_proxy_port: 3143\n"
+        "node_dry_run: true\n"
+        "node_auto_reboot: false\n"
+    )
+    s = GlobalSettings.load(f)
+    assert s.manager_lxc_id == "121"
+    assert s.apt_proxy_ip == "10.0.0.5"
+    assert s.apt_proxy_port == 3143
+    assert s.node_dry_run is True
+    assert s.node_auto_reboot is False

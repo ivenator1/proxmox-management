@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 import pytest
 import yaml
 
-from proxmox_fleet.driver import _deep_merge, run_custom_phase
+from proxmox_fleet.driver import _deep_merge, run_custom_phase, run_node_phase
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import FleetState
 from proxmox_fleet.runner import PrimitiveResult
@@ -29,8 +29,13 @@ def _fail(rc: int = 1) -> PrimitiveResult:
 class ScriptedExecutor:
     """Fake executor injected by tests."""
 
-    def __init__(self, script: Optional[Dict[str, List[PrimitiveResult]]] = None) -> None:
+    def __init__(
+        self,
+        script: Optional[Dict[str, List[PrimitiveResult]]] = None,
+        default: Optional[PrimitiveResult] = None,
+    ) -> None:
         self.script: Dict[str, List[PrimitiveResult]] = {k: list(v) for k, v in (script or {}).items()}
+        self.default = default if default is not None else _ok()
         self.commands: List[str] = []
         self.reboots = 0
 
@@ -38,7 +43,7 @@ class ScriptedExecutor:
         for key, queue in self.script.items():
             if key in command and queue:
                 return queue.pop(0)
-        return _ok()
+        return self.default
 
     def run_shell(self, command: str, **opts: Any) -> PrimitiveResult:
         self.commands.append(command)
@@ -266,6 +271,213 @@ def test_window_skip_outside_window(tmp_path, monkeypatch):
     assert state.custom == []
     assert executor.commands == []
 
+
+# --- run_node_phase helpers ---------------------------------------------------
+
+APT_UPGRADED = "3 upgraded, 0 newly installed, 0 to remove.\n"
+APT_NOOP = "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+NOT_MANAGER = _ok(stdout="1\n", changed=False)   # pct list grep → not manager
+NO_REBOOT = _ok(stdout="ok\n", changed=False)
+
+
+def _node_inventory(tmp_path: Path, node_lines: str) -> str:
+    p = tmp_path / "hosts.ini"
+    p.write_text(f"[proxmox_nodes]\n{node_lines}\n")
+    return str(p)
+
+
+def _node_settings(**kw) -> GlobalSettings:
+    return GlobalSettings(manager_lxc_id="121", **kw)
+
+
+class ScriptedNodeExecutor(ScriptedExecutor):
+    """ScriptedExecutor that also handles reboot() calls."""
+
+    def snapshot(self, *a, **kw):
+        raise AssertionError("snapshot should not be called for node phase")
+
+
+def _make_node_executor(script=None):
+    """Return an executor that answers the standard node-update command sequence."""
+    base = {
+        "pct list": [NOT_MANAGER],
+        "dist-upgrade": [_ok(stdout=APT_NOOP)],
+        "vmlinuz": [NO_REBOOT],
+    }
+    if script:
+        base.update(script)
+    return ScriptedNodeExecutor(base)
+
+
+# --- run_node_phase — happy path ---------------------------------------------
+
+def test_node_phase_all_ok_writes_state_json(tmp_path, monkeypatch):
+    """Two nodes, both idle → state JSON contains 2 node records + manager."""
+    inv = _node_inventory(tmp_path,
+        "pve-01 ansible_host=10.0.0.1\n"
+        "pve-02 ansible_host=10.0.0.2",
+    )
+    mgr_executor = ScriptedNodeExecutor({
+        "dist-upgrade": [_ok(stdout=APT_NOOP)],
+        "reboot-required": [_ok(stdout="ok\n", changed=False)],
+    })
+
+    def _fake_executor(host, **kw):
+        ex = mgr_executor if host == "localhost" else _make_node_executor()
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+
+    state_path = tmp_path / "out.json"
+    state = run_node_phase(
+        settings=_node_settings(),
+        inventory_path=inv,
+        check=False,
+        state_output_path=str(state_path),
+    )
+
+    assert state.failed is False
+    assert state.changed is False
+    # 2 nodes + 1 manager
+    assert len(state.node) == 3
+    assert all(r.status == "OK" for r in state.node)
+    assert state.node[-1].node == "Ansible-Manager"
+
+    raw = json.loads(state_path.read_text())
+    assert "fleet_node_data" in raw
+    assert len(raw["fleet_node_data"]) == 3
+    assert raw["fleet_changed"] is False
+
+
+def test_node_phase_state_json_has_fleet_keys(tmp_path, monkeypatch):
+    """dump_for_ansible() uses fleet_* key names, not short names."""
+    inv = _node_inventory(tmp_path, "pve-01 ansible_host=10.0.0.1")
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: _make_node_executor())
+
+    state_path = tmp_path / "out.json"
+    run_node_phase(settings=_node_settings(), inventory_path=inv,
+                   check=False, state_output_path=str(state_path))
+
+    raw = json.loads(state_path.read_text())
+    for key in ("fleet_node_data", "fleet_changed", "fleet_failed",
+                "fleet_error_log", "fleet_warning_log"):
+        assert key in raw, f"missing key: {key}"
+
+
+def test_node_phase_dry_run_propagated(tmp_path, monkeypatch):
+    """fleet_dry_run=True sends apt-get -s (not -y) to nodes."""
+    inv = _node_inventory(tmp_path, "pve-01 ansible_host=10.0.0.1")
+    executor = _make_node_executor()
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: executor)
+
+    run_node_phase(settings=_node_settings(fleet_dry_run=True), inventory_path=inv,
+                   check=False, state_output_path=str(tmp_path / "out.json"))
+
+    apt_cmds = [c for c in executor.commands if "dist-upgrade" in c]
+    assert apt_cmds, "expected an apt command"
+    assert all("-s" in c for c in apt_cmds), "dry-run should use apt-get -s"
+
+
+# --- run_node_phase — failure / abort ----------------------------------------
+
+def test_node_phase_failure_aborts_remaining_nodes(tmp_path, monkeypatch):
+    """First node fails → second node is not processed; manager still runs."""
+    monkeypatch.setattr("time.sleep", lambda s: None)  # skip retry delays
+
+    inv = _node_inventory(tmp_path,
+        "pve-01 ansible_host=10.0.0.1\n"
+        "pve-02 ansible_host=10.0.0.2",
+    )
+    # default=_fail() so every apt attempt fails, exhausting all retries.
+    fail_executor = ScriptedNodeExecutor({"pct list": [NOT_MANAGER]}, default=_fail())
+    pve02_executor = _make_node_executor()
+    mgr_executor = ScriptedNodeExecutor({
+        "dist-upgrade": [_ok(stdout=APT_NOOP)],
+        "reboot-required": [_ok(stdout="ok\n", changed=False)],
+    })
+
+    dispatch = {"pve-01": fail_executor, "pve-02": pve02_executor, "localhost": mgr_executor}
+
+    def _fake(host, **kw):
+        ex = dispatch.get(host, _make_node_executor())
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake)
+
+    state = run_node_phase(
+        settings=_node_settings(),
+        inventory_path=inv,
+        check=False,
+        state_output_path=str(tmp_path / "out.json"),
+    )
+
+    assert state.failed is True
+    assert len(state.errors) == 1
+
+    node_names = [r.node for r in state.node]
+    assert "pve-01" in node_names
+    assert "pve-02" not in node_names        # aborted
+    assert "Ansible-Manager" in node_names   # always runs
+
+    # pve-02 executor was never called.
+    assert pve02_executor.commands == []
+
+
+def test_node_phase_failure_recorded_in_state(tmp_path, monkeypatch):
+    """A failed node produces a FAILED record and sets fleet_failed."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    inv = _node_inventory(tmp_path, "pve-01 ansible_host=10.0.0.1")
+    fail_executor = ScriptedNodeExecutor({"pct list": [NOT_MANAGER]}, default=_fail())
+    mgr_executor = ScriptedNodeExecutor({
+        "dist-upgrade": [_ok(stdout=APT_NOOP)],
+        "reboot-required": [_ok(stdout="ok\n", changed=False)],
+    })
+    dispatch = {"pve-01": fail_executor, "localhost": mgr_executor}
+
+    def _fake(host, **kw):
+        ex = dispatch.get(host, _make_node_executor())
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake)
+
+    state_path = tmp_path / "out.json"
+    state = run_node_phase(settings=_node_settings(), inventory_path=inv,
+                           check=False, state_output_path=str(state_path))
+
+    assert state.failed is True
+    failed = [r for r in state.node if r.node == "pve-01"]
+    assert len(failed) == 1
+    assert failed[0].status == "FAILED"
+
+    raw = json.loads(state_path.read_text())
+    assert raw["fleet_failed"] is True
+
+
+def test_node_phase_empty_inventory_still_runs_manager(tmp_path, monkeypatch):
+    """No [proxmox_nodes] entries → only manager record in state."""
+    inv = _node_inventory(tmp_path, "")  # empty group
+    mgr_executor = ScriptedNodeExecutor({
+        "dist-upgrade": [_ok(stdout=APT_NOOP)],
+        "reboot-required": [_ok(stdout="ok\n", changed=False)],
+    })
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: mgr_executor)
+
+    state = run_node_phase(settings=_node_settings(), inventory_path=inv,
+                           check=False, state_output_path=str(tmp_path / "out.json"))
+
+    assert state.failed is False
+    assert len(state.node) == 1
+    assert state.node[0].node == "Ansible-Manager"
+
+
+# --- run_custom_phase (existing) -----------------------------------------------
 
 def test_dep_failed_propagates_to_next_host(tmp_path, monkeypatch):
     inv = _write_inventory(
