@@ -12,7 +12,12 @@ from typing import Any, Dict, List, Optional
 import pytest
 import yaml
 
-from proxmox_fleet.driver import _deep_merge, run_custom_phase, run_node_phase
+from proxmox_fleet.driver import (
+    _deep_merge,
+    run_custom_phase,
+    run_node_phase,
+    run_notify_phase,
+)
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import FleetState
 from proxmox_fleet.runner import PrimitiveResult
@@ -515,3 +520,97 @@ def test_dep_failed_propagates_to_next_host(tmp_path, monkeypatch):
     # app-01 should have a warning (dep skip), not a FAILED record.
     assert any("dependency" in w.warning.lower() for w in state.warnings)
     assert "do-app" not in executor.commands
+
+
+# --------------------------------------------------------------------------- #
+# run_notify_phase — Phase 4 (briefing / history / notifiers)
+# --------------------------------------------------------------------------- #
+
+def _notify_state(**kw) -> FleetState:
+    return FleetState.from_raw(kw)
+
+
+def _patch_notifiers(monkeypatch):
+    """Capture dispatch / ping_deadmans calls made by the driver."""
+    calls: Dict[str, List[Any]] = {"dispatch": [], "ping": []}
+    monkeypatch.setattr(
+        "proxmox_fleet.driver.notifiers.dispatch",
+        lambda nl, **kw: calls["dispatch"].append((nl, kw)),
+    )
+    monkeypatch.setattr(
+        "proxmox_fleet.driver.notifiers.ping_deadmans",
+        lambda url, **kw: calls["ping"].append((url, kw)),
+    )
+    return calls
+
+
+def test_notify_phase_dispatches_and_writes_history(tmp_path, monkeypatch):
+    calls = _patch_notifiers(monkeypatch)
+    state = _notify_state(
+        fleet_changed=True,
+        fleet_node_data=[{"node": "pve-01", "status": "OK"}],
+        fleet_lxc_data=[{"node": "pve-01", "name": "sonarr", "id": "101",
+                         "app": "Updated: v4.0 → v4.1", "os": "OK", "snap": True}],
+    )
+    settings = GlobalSettings(
+        discord_webhook="https://d/hook",
+        fleet_history_dir=str(tmp_path),
+        fleet_deadmans_url="https://hc.io/abc",
+    )
+
+    body = run_notify_phase(settings=settings, state=state)
+
+    # dispatched once, to the synthesized discord notifier, with the rendered body
+    assert len(calls["dispatch"]) == 1
+    notifier_list, kw = calls["dispatch"][0]
+    assert notifier_list == [{"type": "discord", "enabled": True, "webhook": "https://d/hook"}]
+    assert kw["body"] == body
+    assert kw["title"] == "✅ Briefing: All Systems Clear"
+    assert kw["color"] == 3066993
+
+    # dead-man pinged
+    assert calls["ping"] == [("https://hc.io/abc", {"failed": False})]
+
+    # history written, carrying the exact briefing body
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["briefing"] == body
+    assert "sonarr" in latest["briefing"]
+
+
+def test_notify_phase_suppressed_when_idle_but_history_still_written(tmp_path, monkeypatch):
+    calls = _patch_notifiers(monkeypatch)
+    state = _notify_state()  # nothing changed/failed
+    settings = GlobalSettings(discord_webhook="https://d/hook", fleet_history_dir=str(tmp_path))
+
+    body = run_notify_phase(settings=settings, state=state)
+
+    assert calls["dispatch"] == []  # should_notify is False
+    # history still records the (empty) briefing
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["briefing"] == body
+
+
+def test_notify_phase_force_notify_overrides_idle(tmp_path, monkeypatch):
+    calls = _patch_notifiers(monkeypatch)
+    settings = GlobalSettings(discord_webhook="https://d/hook",
+                              fleet_history_dir=str(tmp_path), force_notify=True)
+    run_notify_phase(settings=settings, state=_notify_state())
+    assert len(calls["dispatch"]) == 1
+
+
+def test_notify_phase_history_disabled(tmp_path, monkeypatch):
+    _patch_notifiers(monkeypatch)
+    settings = GlobalSettings(fleet_history_enabled=False, fleet_history_dir=str(tmp_path))
+    run_notify_phase(settings=settings, state=_notify_state(fleet_changed=True))
+    assert not (tmp_path / "latest.json").exists()
+
+
+def test_notify_phase_failed_state_titles(tmp_path, monkeypatch):
+    calls = _patch_notifiers(monkeypatch)
+    settings = GlobalSettings(discord_webhook="https://d/hook", fleet_history_dir=str(tmp_path))
+    run_notify_phase(settings=settings, state=_notify_state(fleet_failed=True))
+    _, kw = calls["dispatch"][0]
+    assert kw["title"] == "⚠️ Briefing: Failures Detected"
+    assert kw["ntfy_title"] == "Fleet Update: Failures Detected"
+    assert kw["color"] == 15158332
+    assert calls["ping"][0][1] == {"failed": True}

@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import yaml
 
-from proxmox_fleet import deps, inventory, window
+from proxmox_fleet import briefing, deps, history, inventory, notifiers, window
 from proxmox_fleet.executor import RunnerExecutor
 from proxmox_fleet.flows.custom import run_custom_update
 from proxmox_fleet.flows.lxc import LxcFlowOutcome, _discover_lxcs, run_lxc_update
@@ -492,3 +492,51 @@ def run_node_phase(
 
     state.dump_for_ansible(state_output_path)
     return state
+
+
+def run_notify_phase(
+    *,
+    settings: GlobalSettings,
+    state: FleetState,
+    check: bool = False,
+) -> str:
+    """Run Phase 4 (final briefing) via the Python driver.
+
+    Consumes the *merged* FleetState (all phases), renders the briefing body
+    once, then: dispatches it to the resolved notifiers when ``should_notify``
+    holds; records the run history (carrying the rendered body) when history is
+    enabled; and pings the dead-man's-switch. The body is rendered
+    unconditionally so the history file captures the message even when
+    notification is suppressed.
+
+    Returns the rendered briefing body (handy for tests / logging). Never raises
+    — notification/history failures must not abort the run.
+    """
+    body = briefing.prepare_body(state)
+    failed = state.failed
+
+    if briefing.should_notify(
+        force_notify=settings.force_notify,
+        dry_run=settings.fleet_dry_run,
+        changed=state.changed,
+        failed=failed,
+    ):
+        notifiers.dispatch(
+            notifiers.resolve_notifiers(settings),
+            title=briefing.briefing_title(failed),
+            ntfy_title=briefing.ntfy_title(failed),
+            body=body,
+            color=briefing.discord_color(failed),
+            failed=failed,
+        )
+
+    if settings.fleet_history_enabled:
+        history.write_history(
+            state,
+            history_dir=settings.fleet_history_dir,
+            keep=settings.fleet_history_keep,
+            briefing=body,
+        )
+
+    notifiers.ping_deadmans(settings.fleet_deadmans_url, failed=failed)
+    return body

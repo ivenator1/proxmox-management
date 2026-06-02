@@ -7,7 +7,7 @@ running with defaults, which is fine for --check runs).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -73,6 +73,17 @@ class GlobalSettings(BaseModel):
     pve_api_user: str = ""
     pve_api_token_id: str = ""
     pve_api_token_secret: str = ""
+
+    # Phase 4 — briefing / history / notifiers
+    # notifiers defaults to None (not []) so an unset value is distinguishable
+    # from an explicit empty list, matching the Ansible `notifiers is defined` shim.
+    notifiers: Optional[List[Dict[str, Any]]] = None
+    discord_webhook: str = ""
+    fleet_deadmans_url: str = ""
+    fleet_history_enabled: bool = True
+    fleet_history_dir: str = "/var/log/fleet-update"
+    fleet_history_keep: int = 30
+    force_notify: bool = False
 
     @classmethod
     def load(cls, path: Union[str, Path] = "vars.yml") -> "GlobalSettings":

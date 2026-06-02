@@ -84,9 +84,9 @@ pytest tests/unit/ -v
 | 3-retire | Delete legacy `lxc_update` role tasks/defaults; flip `--use-lxc-flow` to default | ⬜ pending speed parity |
 | 4a | `vm_update` + `remote_host_update` → `flows/vm.py` + `flows/remote.py`; `--use-vm-flow` / `--use-remote-flow` flags | 🔶 wired (`dde870e`) |
 | 4b | node OS update + manager self-update; serial reboot loop; `--use-node-flow` | 🔶 wired |
-| 5 | Briefing/history/notifiers in Python (byte-parity); split monolith; retire `conftest.py` + delete `.j2` | ⬜ |
+| 5 | Briefing/history/notifiers in Python (byte-parity, golden-test gated); `--use-notify-flow`; retire `conftest.py`/`.j2` + split monolith pending parity | 🔶 wired |
 
-What exists now: `proxmox_fleet/{__init__,cli,__main__,runner,orchestration,http,steps,executor,status,changes,deps,driver,inventory,window,lxc_parse}.py`,
+What exists now: `proxmox_fleet/{__init__,cli,__main__,runner,orchestration,http,steps,executor,status,changes,deps,driver,inventory,window,lxc_parse,briefing,history,notifiers}.py`,
 `proxmox_fleet/models/{config,state,settings}.py`, `proxmox_fleet/flows/{custom,lxc,vm,remote,node}.py`,
 `ansible/primitives/{run_shell,reboot_host,discover_lxcs,pct_config,pct_status,pct_start,pct_stop,pct_pull,snapshot,rollback,vzdump,lxc_os_update,lxc_app_update}.yml`,
 `roles/{custom_update,lxc_update}/molecule/mol_run_flow.py`,
@@ -427,26 +427,67 @@ fleet-update --check -e fleet_dry_run=true
 
 ---
 
-## Phase 5 — briefing / history / notifiers; retire the shim
+## Phase 5 — briefing / history / notifiers (🔶 wired, retire pending)
 
-- **`briefing.py.render_briefing(state: FleetState) -> str`** ← `templates/discord_briefing.j2`.
-  **BYTE-FOR-BYTE PARITY IS NON-NEGOTIABLE**: reproduce `\n`/`\n\n` separators, `**bold**`,
-  `*(no snap)*`, `— ` em-dashes, section order, the `OS:` `None`-guard, the idle
-  `*No container changes.*` line. Keep `| trim | truncate(4000, False, '\n...')` applied by the
-  driver. Golden test seeded from the CURRENT render (capture via `test_discord_briefing.py`'s
-  shim BEFORE deleting it). No spacing/markdown change without explicit approval.
-- **History** ← `tasks/persist-history.yml`: driver writes `run-<UTC-ts>.json` + `latest.json`
-  and prunes to `fleet_history_keep` with stdlib `json.dump`/`pathlib`. No copy/file/shell.
-- **`notifiers.py`** ← `tasks/notify.yml` + Phase-4 `set_fact` (title/colour/`_ntfy_title`/
-  `_should_notify` + back-compat `discord_webhook` shim). Discord/ntfy POST + dead-man ping via
-  `http.post_json`/`http.request` (manager-local). Mirror `test_notify.py`,
-  `test_persist_history.py`.
-- **Split the monolith** (the Phase-0 seam, do it here if not earlier): per-phase playbooks the
-  driver invokes in order, then the driver becomes the orchestrator end to end and
-  `fleet-update.yml` is removed.
-- **Retire the shim**: delete `tests/conftest.py`'s Ansible-Jinja re-implementation + parity
-  tests; delete `discord_briefing.j2`. Port `test_fleet_state_append_logic.py` (state assembly →
-  `models/state.py`).
+Phase 4 (the final briefing) is ported to Python behind `--use-notify-flow`. The notify
+phase runs **after** the playbook because it consumes the *merged* fleet state, not a single
+phase's output: when the flag is set, `cli.py` adds `skip_phase_4=true` +
+`fleet_final_state_path` extravars; the playbook's Phase 4 then dumps the merged `fleet_*`
+facts to JSON instead of briefing; after `ansible_runner.run()` returns, `cli.py` loads that
+JSON into a `FleetState` and calls `driver.run_notify_phase()`.
+
+### What was built
+
+- **`proxmox_fleet/briefing.py`** — `render_briefing(state) -> str` (byte-parity port of
+  `templates/discord_briefing.j2`), `prepare_body()` (`strip()` + `truncate(4000, False,
+  '\n...')`), `briefing_title()` / `ntfy_title()` / `discord_color()` / `should_notify()`
+  (ports of the Phase-4 `set_fact`). No trailing newline — Jinja's
+  `keep_trailing_newline=False` strips the template's final `\n` (matched in the golden test).
+- **`proxmox_fleet/history.py`** — `build_run_summary()` + `write_history()` (port of
+  `tasks/persist-history.yml`). **New `briefing` field** records the exact rendered Discord
+  body in `run-<ts>.json` + `latest.json`. `json.dump(indent=4, sort_keys=True)` ≈
+  `to_nice_json`; prune by lexical timestamp sort.
+- **`proxmox_fleet/notifiers.py`** — `resolve_notifiers()` (back-compat `discord_webhook`
+  shim; `settings.notifiers` is `Optional` and defaults to `None` so an explicit `[]` is
+  distinguishable from unset), `dispatch()` (Discord embed via `http.post_json`; ntfy via
+  `http.request` with the same header logic as `notify.yml`), `ping_deadmans()`. All errors
+  swallowed (mirrors `ignore_errors: yes`).
+- **`proxmox_fleet/driver.py`** — `run_notify_phase(settings, state, *, check)`: renders the
+  body once, dispatches when `should_notify`, writes history (carrying the body) when enabled,
+  pings the dead-man. Body is rendered unconditionally so history records it even when
+  notification is suppressed.
+- **`proxmox_fleet/models/settings.py`** — Phase-4 fields added: `notifiers` (Optional),
+  `discord_webhook`, `fleet_deadmans_url`, `fleet_history_enabled/dir/keep`, `force_notify`.
+- **`proxmox_fleet/cli.py`** — `--use-notify-flow` flag; folds `-e force_notify=true` into
+  settings; dumps/loads `/tmp/fleet_final_state.json`; notify runs regardless of playbook rc
+  (a failure briefing must fire on failure), gated on the dump existing.
+- **`fleet-update.yml`** — Phase 4 wrapped in a `when: not skip_phase_4` block + a
+  `when: skip_phase_4` "Dump merged fleet state" task.
+- **Tests** — `test_briefing.py` (behavioural + a **golden parity** test rendering the same
+  fixtures through both the Jinja shim and `render_briefing()` byte-for-byte),
+  `test_history.py`, `test_notifiers.py`, + `run_notify_phase` cases in `test_driver.py`.
+
+### Retire step (after real-run parity is confirmed, and once the other four flows are default)
+
+```bash
+fleet-update --use-notify-flow --check -e fleet_dry_run=true -e force_notify=true
+# Compare the posted Discord/ntfy body byte-for-byte against a flag-off run.
+
+# Then:
+# - Flip --use-notify-flow to the unconditional default in cli.py and remove the flag.
+# - Delete templates/discord_briefing.j2, tasks/notify.yml, tasks/persist-history.yml.
+# - Delete tests/conftest.py's Jinja shim + the parity tests that import it
+#   (test_discord_briefing.py, test_notify.py, test_persist_history.py, and the remaining
+#    test_*_report.py / regex shims listed per-phase above).
+# - Port tests/integration/test_fleet_state_append_logic.py into tests/unit/test_state_model.py.
+# - Collapse the Phase 4 plays out of fleet-update.yml (endgame monolith split).
+```
+
+### Split the monolith (endgame)
+
+Per-phase playbooks the driver invokes in order, then the driver becomes the orchestrator end
+to end and `fleet-update.yml` is removed. Do this only once all flows (incl. notify) are the
+unconditional default.
 
 ---
 

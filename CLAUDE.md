@@ -63,8 +63,11 @@ fleet-update --use-remote-flow --vars-file vars.yml             # full run via P
 fleet-update --use-node-flow --check -e fleet_dry_run=true   # dry-run via Python driver
 fleet-update --use-node-flow --vars-file vars.yml             # full run via Python driver
 
+# Python driver — Phase 4 (briefing + history + notifiers) via Python instead of playbook Phase 4
+fleet-update --use-notify-flow --check -e fleet_dry_run=true -e force_notify=true  # render+notify via Python
+
 # Run all Python-ported phases together (recommended once parity is confirmed)
-fleet-update --use-custom-flow --use-lxc-flow --use-vm-flow --use-remote-flow --use-node-flow --check -e fleet_dry_run=true
+fleet-update --use-custom-flow --use-lxc-flow --use-vm-flow --use-remote-flow --use-node-flow --use-notify-flow --check -e fleet_dry_run=true
 ```
 
 `hosts.ini` and `vars.yml` are gitignored (contain secrets/IPs). Copy from `.example` files to run locally.
@@ -106,7 +109,7 @@ proxmox_fleet/
     remote.py                           # run_remote_update() — the full remote host flow (pre_update_cmd→detect_pkg_mgr→upgrade→reboot→health→report); no snapshot/always block
     node.py                             # run_node_update() + run_manager_update() — Phase 2+3; apt w/ 5 retries, robust reboot check, manager-host skip, proxy wait
   deps.py                               # validate_depends_order() + dependency_failed() — ports of Phase-0a Jinja logic
-  driver.py                             # run_custom_phase() + run_lxc_phase() + run_vm_phase() + run_remote_phase() + run_node_phase() — all update phases in Python
+  driver.py                             # run_custom_phase() + run_lxc_phase() + run_vm_phase() + run_remote_phase() + run_node_phase() + run_notify_phase() — all phases in Python
   executor.py                           # Executor protocol + RunnerExecutor; snapshot() added for proxmox_snap primitive
   http.py                               # Manager-local HTTP: get_json, poll_until, request, post_json
   inventory.py                          # load_custom_hosts() + load_proxmox_nodes() — line-by-line hosts.ini parsers
@@ -117,7 +120,10 @@ proxmox_fleet/
   status.py                             # all status decision trees: custom_status(), lxc_*(), vm_status(), vm_rescue_status(), remote_status(), node_status(), manager_status()
   changes.py                            # change detection helpers; lxc_os_changed(), dpkg_hash_differs(), lxc_os_pkg_count()
   window.py                             # in_window() — port of tasks/check-window.yml using stdlib zoneinfo
-  cli.py                                # fleet-update CLI; --use-custom-flow / --use-lxc-flow / --use-vm-flow / --use-remote-flow / --use-node-flow flags
+  briefing.py                           # render_briefing() byte-parity port of discord_briefing.j2 + prepare_body/title/color/should_notify
+  history.py                            # build_run_summary() + write_history() — port of persist-history.yml; records rendered briefing body
+  notifiers.py                          # resolve_notifiers() + dispatch() (discord/ntfy) + ping_deadmans() — port of notify.yml + Phase-4 shim
+  cli.py                                # fleet-update CLI; --use-custom-flow / --use-lxc-flow / --use-vm-flow / --use-remote-flow / --use-node-flow / --use-notify-flow flags
 tasks/
   fleet-state-append.yml                # Shared state accumulator — always use this, never inline set_fact+delegate
 templates/
@@ -222,7 +228,7 @@ roles/
 | *(merge vm)* | localhost | Load Python driver output into `fleet_vm_data` (active when `fleet_vm_state_path` is defined) |
 | Phase 2 | `proxmox_nodes` | PVE node OS update + sequential reboot (`serial: 1`, `any_errors_fatal: true`) |
 | Phase 3 | localhost | Manager container self-update |
-| Phase 4 | localhost | Persist run history → dispatch notifiers → dead-man's-switch ping |
+| Phase 4 | localhost | Persist run history → dispatch notifiers → dead-man's-switch ping (skipped when `skip_phase_4=true`; the Python `--use-notify-flow` then dumps merged state + runs `driver.run_notify_phase()` after the playbook) |
 
 Each phase ORs the master `fleet_dry_run` into its role's dry flag via an eager `set_fact` (no self-reference recursion); `fleet_dry_run` also forces a notification.
 
@@ -346,6 +352,9 @@ The task order matters for correct attribution:
 - **`--use-vm-flow` flag is temporary**: confirm parity via `fleet-update --use-vm-flow --check -e fleet_dry_run=true`, then flip to default and delete `roles/vm_update/tasks/`, `roles/vm_update/defaults/`, `tests/unit/test_vm_report.py`.
 - **`--use-remote-flow` flag is temporary**: confirm parity via `fleet-update --use-remote-flow --check -e fleet_dry_run=true`, then flip to default and delete `roles/remote_host_update/tasks/`, `roles/remote_host_update/defaults/`.
 - **`--use-node-flow` flag is temporary**: confirm parity via `fleet-update --use-node-flow --check -e fleet_dry_run=true`, then flip to default in `cli.py` and remove the flag. No legacy role tasks to delete — Phase 2/3 were inline in the playbook. Gate `skip_phase_2/3` permanently to `true`, then remove the Phase 2/3 plays from `fleet-update.yml`.
+- **`--use-notify-flow` flag is temporary**: unlike the other flows, the Python notify phase runs **after** the playbook (it needs the *merged* fleet state). When set, `cli.py` adds `skip_phase_4=true` + `fleet_final_state_path`; the playbook's Phase 4 dumps the merged `fleet_*` facts to JSON (the `when: skip_phase_4` "Dump merged fleet state" task) instead of briefing; `cli.py` then loads that JSON into a `FleetState` and calls `driver.run_notify_phase()` regardless of playbook rc (a failure briefing must fire on failure), gated on the dump existing. Confirm byte-parity via `fleet-update --use-notify-flow --check -e fleet_dry_run=true -e force_notify=true` vs a flag-off run, then flip to default in `cli.py`, remove the flag, delete `templates/discord_briefing.j2` + `tasks/notify.yml` + `tasks/persist-history.yml`, and (once the Jinja shim has no other users) delete `tests/conftest.py` + the parity shim tests. Parity is also locked by the **golden test** in `test_briefing.py`.
+- **Briefing byte-parity — no trailing newline**: `render_briefing()` must NOT emit a trailing `\n`. The Jinja env's `keep_trailing_newline=False` (default) strips `discord_briefing.j2`'s final source newline, so the golden test compares against output with no trailing newline. `prepare_body()` applies `.strip()` + a port of Jinja's `truncate(4000, killwords=False, end='\n...', leeway=5)` — match the algorithm exactly (return unchanged when `len <= 4005`).
+- **`settings.notifiers` is `Optional[...]` defaulting to `None`**: this preserves the Ansible `notifiers is defined` distinction — an explicit `notifiers: []` in `vars.yml` means "no notifiers" and must NOT fall back to synthesizing one from `discord_webhook`; only an *unset* (`None`) value triggers the back-compat shim.
 - **`run_shell.yml` has `check_mode: false`** on the shell task — the command **always executes** regardless of Ansible check mode. Python controls dry-run by passing either a simulate command (`apt-get -s`) or a real command; Ansible's `--check` flag is bypassed at the shell level. `reboot_host.yml` has the same `check_mode: false` for consistency; the node flow additionally guards the reboot call with `not dry_run` in Python so it never fires during dry-run regardless.
 - **`run_node_update` retry uses injectable `_sleep`**: `orchestration.retry(apt_fn, retries=5, delay=30.0, sleep=_sleep)`. Callers pass `_sleep=lambda s: None` in tests to avoid 150 s of wait. `run_node_phase()` in the driver doesn't pass `_sleep`, so real runs use `time.sleep`. Tests that call via `run_node_phase()` must monkeypatch `time.sleep` to keep fast.
 - **`vm_apt_res` register-overwrite bug in legacy `vm_update` role**: in dry-run mode (`vm_dry_run=True`), the "Simulate apt" task registers `vm_apt_res` with `changed=True`, but the skipped "Update VM packages (apt)" task (in the real-update block) also registers `vm_apt_res` with `{skipped: true, changed: false}`, overwriting the simulate result. This causes `vm_pkg_res.changed = False` in `report.yml` and the VM record is silently dropped from the Discord briefing. The Python driver (`--use-vm-flow`) is unaffected — it uses `run_shell` directly with no register overwrite.
@@ -401,6 +410,9 @@ The task order matters for correct attribution:
 | `test_flow_remote.py` | `run_remote_update()` end-to-end with `ScriptedRemoteExecutor` |
 | `test_status_node.py` | `node_status()` (5 branches), `manager_status()` (3 branches), `node_should_report()` |
 | `test_flow_node.py` | `run_node_update()` + `run_manager_update()` with `ScriptedNodeExecutor`; retry, reboot, proxy wait, manager-host skip |
+| `test_briefing.py` | `render_briefing()` behavioural cases + a **golden parity** test asserting byte-equality with the live `discord_briefing.j2` via the Jinja shim; `prepare_body`/title/color/`should_notify` |
+| `test_history.py` | `build_run_summary()` counts + the `briefing` field; `write_history()` write/prune/`latest.json` — mirrors `test_persist_history.py` |
+| `test_notifiers.py` | `resolve_notifiers()` shim, `dispatch()` discord/ntfy payloads + headers, `ping_deadmans()` `/fail` suffix — mirrors `test_notify.py` |
 
 `tests/conftest.py` implements Ansible-specific Jinja2 filters (`regex_search` list-return, `regex_replace`, `combine`, `intersect`) and tests (`failed`, `search`, `equalto`, `succeeded`) so templates render identically to Ansible. When writing new tests, use `render()` for string output and `render_native()` / `make_native_env()` (via `NativeEnvironment`) for Python objects.
 

@@ -28,6 +28,7 @@ _LXC_STATE_PATH = "/tmp/fleet_lxc_state.json"
 _VM_STATE_PATH = "/tmp/fleet_vm_state.json"
 _REMOTE_STATE_PATH = "/tmp/fleet_remote_state.json"
 _NODE_STATE_PATH = "/tmp/fleet_node_state.json"
+_FINAL_STATE_PATH = "/tmp/fleet_final_state.json"
 
 
 def _parse_extra_vars(pairs: List[str]) -> dict:
@@ -78,6 +79,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Route Phase 2+3 (node OS update + manager self-update) through flows/node.py (Python driver).",
     )
     parser.add_argument(
+        "--use-notify-flow",
+        action="store_true",
+        default=False,
+        help="Route Phase 4 (briefing/history/notifiers) through Python instead of the playbook's Phase 4.",
+    )
+    parser.add_argument(
         "--vars-file",
         default="vars.yml",
         help="Path to vars.yml used by --use-custom-flow / --use-lxc-flow to load GlobalSettings.",
@@ -85,10 +92,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     extravars = _parse_extra_vars(args.extra_vars)
+    settings = None
 
-    # Phase 4a/4b-wire: run Python flows before the playbook.
+    # Phase 2/3/4-wire: run Python flows before the playbook (notify runs after).
     if (args.use_custom_flow or args.use_lxc_flow or args.use_vm_flow
-            or args.use_remote_flow or args.use_node_flow):
+            or args.use_remote_flow or args.use_node_flow or args.use_notify_flow):
         from proxmox_fleet import driver  # lazy: avoids ansible-runner import in unit tests
         from proxmox_fleet.models.settings import GlobalSettings
 
@@ -99,6 +107,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             settings = settings.model_copy(update={"fleet_dry_run": True})
         if extravars.get("lxc_verbose", "").lower() in ("true", "1", "yes"):
             settings = settings.model_copy(update={"lxc_verbose": True})
+        if extravars.get("force_notify", "").lower() in ("true", "1", "yes"):
+            settings = settings.model_copy(update={"force_notify": True})
+
+        # Phase 4-wire: tell the playbook to dump merged state instead of running
+        # its own Phase 4. The Python notify phase runs AFTER ansible-runner returns.
+        if args.use_notify_flow:
+            extravars["skip_phase_4"] = "true"
+            extravars["fleet_final_state_path"] = _FINAL_STATE_PATH
+            # Drop any stale dump so a playbook that aborts before Phase 4 doesn't
+            # cause us to notify on last run's state.
+            Path(_FINAL_STATE_PATH).unlink(missing_ok=True)
 
         if args.use_custom_flow:
             driver.run_custom_phase(
@@ -176,7 +195,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         extravars=extravars,
         cmdline=" ".join(cmdline_parts) or None,
     )
-    return runner.rc if runner.rc is not None else 1
+    rc = runner.rc if runner.rc is not None else 1
+
+    # Phase 4-wire: render briefing / persist history / notify in Python, using
+    # the merged fleet state the playbook dumped. Runs regardless of rc (the whole
+    # point of a failure briefing is to fire on failure), gated on the dump existing.
+    if args.use_notify_flow and Path(_FINAL_STATE_PATH).exists():
+        from proxmox_fleet import driver  # lazy: avoids ansible-runner import in unit tests
+        from proxmox_fleet.models.settings import GlobalSettings
+        from proxmox_fleet.models.state import FleetState
+
+        notify_settings = settings if settings is not None else GlobalSettings.load(args.vars_file)
+        state = FleetState.load(_FINAL_STATE_PATH)
+        driver.run_notify_phase(settings=notify_settings, state=state, check=args.check)
+
+    return rc
 
 
 if __name__ == "__main__":
