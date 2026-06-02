@@ -24,8 +24,13 @@ doc — a later session should be able to resume from here without further conte
 - **Executor boundary** (`proxmox_fleet/executor.py`): a flow is bound to one host and
   calls `run_shell` (target), `run_local` (manager), `reboot`, `snapshot` (proxmox API, delegated
   to localhost inside the primitive). `RunnerExecutor` invokes primitives; tests inject a scripted
-  fake. New flows take an `Executor`. Phase 3 added `snapshot(lxc_id, *, snap_state, api_host, …)`;
-  `api_host` must be the node's `ansible_host` IP, not the inventory name.
+  fake. New flows take an `Executor`. Phase 3 added `snapshot(vmid, *, snap_state, api_host, …)`;
+  `api_host` must be the node's `ansible_host` IP, not the inventory name. `vmid` (not `lxc_id`)
+  because `community.proxmox.proxmox_snap` handles both LXC containers and QEMU VMs.
+  Phase 4a added a **two-executor pattern** for VMs: `executor` bound to the VM guest (SSH, for
+  package upgrades), `node_executor` bound to the Proxmox node (SSH, for `qm rollback`/`qm status`).
+  The driver resolves the current node via `pvesh get /cluster/resources` so HA migrations are
+  handled automatically — `pve_node` in inventory is only a fallback hint.
 - **Primitives** return values via `ansible.builtin.set_stats: { data: {...}, aggregate: false }`;
   `runner._harvest` reads `res['ansible_stats']['data']` into `PrimitiveResult.facts`.
 - **`invoke_primitive` CWD contract**: `ansible_runner.run()` is called with
@@ -46,10 +51,12 @@ doc — a later session should be able to resume from here without further conte
   not `configparser` — `configparser` splits on the first `=` and mis-parses Ansible host
   lines of the form `hostname key=val key=val …`.
 - **`FleetState.dump_for_ansible(path)`**: writes `fleet_*`-keyed JSON (reverse of `from_raw()`
-  alias map). There are now two merge plays in `fleet-update.yml`: (a) "Merge Python custom state"
-  between Phase 0b and Phase 1, (b) "Merge Python lxc state" between Phase 1 and Phase 1b. Both
-  gate on `is defined` for their respective `fleet_*_state_path` extravar. Each must stay in its
-  correct position — loading lxc state after Phase 1b would OR-join against already-false flags.
+  alias map). There are now four merge plays in `fleet-update.yml`: (a) "Merge Python remote state"
+  between Phase 0 and Phase 0a, (b) "Merge Python custom state" between Phase 0b and Phase 1,
+  (c) "Merge Python lxc state" between Phase 1 and Phase 1b, (d) "Merge Python VM state" between
+  Phase 1b and Phase 2. All gate on `is defined` for their respective `fleet_*_state_path` extravar.
+  Each must stay in its correct position — loading state after a later phase would OR-join against
+  already-false flags.
 - **`GlobalSettings`** (`proxmox_fleet/models/settings.py`): pydantic model for `vars.yml`;
   `extra="allow"` tolerates unknown keys. `load(path)` returns all defaults when the file is
   missing — safe for `--check` runs with no secrets file.
@@ -74,7 +81,7 @@ pytest tests/unit/ -v
 | 2-flow | `custom_update` orchestration → `flows/custom.py` + `steps.py` + `executor.py` + primitives | ✅ done (`d7d6308`) |
 | 2-wire | Driver runs the custom flow behind `--use-custom-flow`; molecule reworked; retire pending real-run parity | 🔶 wired (`759f3ad`) |
 | 3 | `lxc_update` → `flows/lxc.py` + primitives; `tmp_app`/`tmp_os` ports; molecule reworked | 🔶 wired (`6a30716`) |
-| 4a | `vm_update` + `remote_host_update` → `flows/vm.py` + `flows/remote.py`; `--use-vm-flow` / `--use-remote-flow` flags | 🔶 wired |
+| 4a | `vm_update` + `remote_host_update` → `flows/vm.py` + `flows/remote.py`; `--use-vm-flow` / `--use-remote-flow` flags | 🔶 wired (`dde870e`) |
 | 4b | node OS update + manager self-update; serial reboot loop; `--use-node-flow` | ⬜ **next** |
 | 5 | Briefing/history/notifiers in Python (byte-parity); split monolith; retire `conftest.py` + delete `.j2` | ⬜ |
 
@@ -82,9 +89,10 @@ What exists now: `proxmox_fleet/{__init__,cli,__main__,runner,orchestration,http
 `proxmox_fleet/models/{config,state,settings}.py`, `proxmox_fleet/flows/{custom,lxc,vm,remote}.py`,
 `ansible/primitives/{run_shell,reboot_host,discover_lxcs,pct_config,pct_status,pct_start,pct_stop,pct_pull,snapshot,rollback,vzdump,lxc_os_update,lxc_app_update}.yml`,
 `roles/{custom_update,lxc_update}/molecule/mol_run_flow.py`,
-and tests `tests/unit/test_{config_model,state_model,orchestration,http,status_custom,steps,flow_custom,settings,deps,window,inventory,driver,status_lxc,flow_lxc}.py`.
-442 tests green, mypy clean. `--use-custom-flow` routes Phase 0b and `--use-lxc-flow` routes Phase 1
-through the Python driver; both flags keep the legacy Ansible role as the default until real-run parity is confirmed.
+and tests `tests/unit/test_{config_model,state_model,orchestration,http,status_custom,steps,flow_custom,settings,deps,window,inventory,driver,status_lxc,flow_lxc,status_vm,status_remote,flow_vm,flow_remote}.py`.
+~500 tests green, mypy clean. `--use-custom-flow` routes Phase 0b, `--use-lxc-flow` routes Phase 1,
+`--use-vm-flow` routes Phase 1b, and `--use-remote-flow` routes Phase 0 through the Python driver;
+all flags keep the legacy Ansible role as the default until real-run parity is confirmed.
 
 ---
 
@@ -246,28 +254,91 @@ rm tests/unit/test_report_tmp_app.py tests/unit/test_report_tmp_os.py \
 
 ---
 
-## Phase 4 — vm / remote / node / manager
+## Phase 4a — vm_update + remote_host_update (🔶 wired, retire pending)
 
-Already done (landed in Phase 2-wire): `window.py.in_window()` ← `tasks/check-window.yml`;
-`deps.py` — `validate_depends_order()` + `dependency_failed()`. Both have plain-Python parity
-tests (`test_window.py`, `test_deps.py`) and are wired into `run_custom_phase()` already.
+Move `roles/vm_update/tasks/*` and `roles/remote_host_update/tasks/*` into `flows/vm.py` and
+`flows/remote.py`. The per-VM `block/rescue/always` becomes Python `try/except/finally`.
 
-Remaining:
-- **`flows/vm.py`** ← `roles/vm_update` (qm snapshot→update→health→rescue→delete snapshot).
-  Status → `status.py.vm_status()` + rescue rollback string (mirror `test_vm_report.py`).
-  Primitives: `qm_snapshot.yml`, `qm_rollback.yml`, `apt_upgrade.yml`.
-- **`flows/remote.py`** ← `roles/remote_host_update` (apt/dnf/apk + reboot-check; no snapshot,
-  no `always`). `status.py.remote_status()`.
+### What was built
+
+- **`proxmox_fleet/flows/vm.py`** — `run_vm_update(node, vmid, inventory_hostname, executor,
+  node_executor, settings, *, dry_run, api_host) -> VmFlowOutcome`. Full `try/except/finally`:
+  backup (vzdump / snapshot) → detect pkg mgr → upgrade → reboot check → health check → report /
+  rescue (`qm rollback` via `node_executor` if snapshot taken; `rollback_done` set only when
+  rollback succeeds AND `qm status` confirms "running") / always (delete snapshot).
+  `pkg_count` extracted from upgrade stdout and stored on `VmRecord` for the briefing.
+- **`proxmox_fleet/flows/remote.py`** — `run_remote_update(hostname, executor, settings, *,
+  dry_run, pre_update_cmd) -> RemoteFlowOutcome`. Simpler — no snapshot, no always block.
+  Rescue records plain `FAILED`.
+- **`proxmox_fleet/changes.py`** — `vm_pkg_count(stdout, pkg_mgr)` added: extracts upgraded
+  package count from apt (`N upgraded`), dnf (`Upgrade N Packages`), and apk (`Upgrading ` lines).
+- **`proxmox_fleet/models/state.py`** — `VmRecord.pkg_count: Optional[int]` added.
+- **`proxmox_fleet/models/settings.py`** — vm_* and remote_* fields added (matching role defaults).
+- **`proxmox_fleet/inventory.py`** — `load_proxmox_vms()` and `load_remote_hosts()` added.
+- **`proxmox_fleet/status.py`** — `vm_status()`, `vm_rescue_status()`, `vm_should_report()`,
+  `remote_status()`, `remote_rescue_status()`, `remote_should_report()` added.
+- **`proxmox_fleet/driver.py`** — `run_vm_phase()` and `run_remote_phase()` added. VM phase
+  runs `pvesh get /cluster/resources` once per phase on the first available node to discover
+  current VM locations — live cluster state wins over static `pve_node` inventory hint.
+- **`proxmox_fleet/cli.py`** — `--use-vm-flow` (routes Phase 1b; sets `skip_phase_1b=true` +
+  `fleet_vm_state_path`) and `--use-remote-flow` (routes Phase 0; sets `skip_phase_0=true` +
+  `fleet_remote_state_path`) flags added.
+- **`fleet-update.yml`** — four surgical edits: Phase 0 gated on `skip_phase_0`; "Merge Python
+  remote state" play inserted after Phase 0; Phase 1b gated on `skip_phase_1b`; "Merge Python VM
+  state" play inserted after Phase 1b.
+- **`templates/discord_briefing.j2`** — LXC and VM items now grouped under `- LXC` / `- VM`
+  sub-headings per node; VM format aligned with LXC style (`name (id) — status`); `pkg_count`
+  shown on real runs (`UPDATED (3 upgraded)`), suppressed on dry-runs.
+- **Tests** — `test_status_vm.py` (16), `test_status_remote.py` (12), `test_flow_vm.py` (14),
+  `test_flow_remote.py` (13) added.
+
+### Key pitfalls discovered
+
+- **`&&`/`||` bash precedence bug** in package manager detection: `which apt-get && echo apt || which dnf && echo dnf`
+  has equal-precedence operators — on a Debian system all three `echo` branches fire, `reversed()`
+  scan returns `apk`, and `apk -s upgrade` fails silently. Fix: use `if/elif/else` syntax.
+- **`node_executor` for `qm` commands**: `qm rollback` and `qm status` must run on the Proxmox
+  node, not the VM guest. Using a single executor for both caused rollback to SSH into the VM and
+  fail. The driver creates separate `vm_ex` and `node_ex` executors; flow tests assert `qm` commands
+  never appear in `vm_ex.commands`.
+- **`rollback_done` truthfulness**: only set `rollback_done=True` when `qm rollback` succeeds AND
+  `qm status` confirms "running". Checking only the rollback command exit code produces false
+  "FAILED + ROLLED BACK" entries when the VM is still coming up.
+- **HA migration**: `pve_node` in inventory goes stale when HA migrates a VM. The driver calls
+  `pvesh get /cluster/resources --type vm` once per phase to build a live `{vmid: (node, api_host)}`
+  map. Falls back to inventory `pve_node` when pvesh is unavailable (standalone nodes).
+- **`pkg_count` suppressed in dry-run**: `apt-get -s` reports "N upgraded" for pending packages,
+  not actually-upgraded packages. Showing `(29 upgraded)` on `WOULD UPDATE` was misleading.
+  `pkg_count` is only populated when `changed and not dry_run`.
+
+### Retire step (after real-run parity is confirmed)
+
+```bash
+# Run with the flags and compare results against a flag-off run on the same target:
+fleet-update --use-vm-flow --use-remote-flow --check -e fleet_dry_run=true
+fleet-update --check -e fleet_dry_run=true
+# Confirm fleet_vm_data, fleet_remote_data, fleet_changed, fleet_failed match.
+
+# Then delete:
+rm -rf roles/vm_update/tasks/ roles/vm_update/defaults/
+rm -rf roles/remote_host_update/tasks/ roles/remote_host_update/defaults/
+rm tests/unit/test_vm_report.py
+# Flip --use-vm-flow / --use-remote-flow to unconditional defaults in cli.py and remove the flags.
+```
+
+---
+
+## Phase 4b — node OS update + manager self-update (⬜ next)
+
+Remaining from Phase 4:
 - **`flows/node.py`** ← Phase 2 of `fleet-update.yml`: serial node OS update + reboot. Replace
   `serial: 1`/`any_errors_fatal` with `orchestration.run_serial(abort_on_error=True)`. Port
   `node_status_str` → `status.py.node_status()`; port the manager-host skip
   (`manager_lxc_id`) and manager self-update (Phase 3 playbook). Use `http.wait_for_port` for
   the apt-proxy + post-reboot waits.
 
-For each flow, follow the Phase 3 pattern exactly: `try/except/finally`, `LxcFlowOutcome`-style
-dataclass outcome, `ScriptedExecutor` tests, molecule `mol_run_flow.py`, parity test vs. the
-existing Jinja test, flag behind `--use-vm-flow` / `--use-remote-flow` / `--use-node-flow` until
-real-run parity confirmed.
+Follow the Phase 3 pattern: `try/except/finally`, outcome dataclass, `ScriptedExecutor` tests,
+`mol_run_flow.py`, flag behind `--use-node-flow` until real-run parity confirmed.
 
 ---
 
