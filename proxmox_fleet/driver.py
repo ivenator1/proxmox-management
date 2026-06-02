@@ -14,9 +14,10 @@ Conventions:
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import yaml
 
@@ -24,7 +25,9 @@ from proxmox_fleet import deps, inventory, window
 from proxmox_fleet.executor import RunnerExecutor
 from proxmox_fleet.flows.custom import run_custom_update
 from proxmox_fleet.flows.lxc import LxcFlowOutcome, _discover_lxcs, run_lxc_update
-from proxmox_fleet.inventory import HostSpec
+from proxmox_fleet.flows.remote import RemoteFlowOutcome, run_remote_update
+from proxmox_fleet.flows.vm import VmFlowOutcome, run_vm_update
+from proxmox_fleet.inventory import HostSpec, RemoteHostSpec, VmSpec
 from proxmox_fleet.models.config import CustomConfig
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import ErrorEntry, FleetState
@@ -228,6 +231,207 @@ def run_lxc_phase(
                     error=str(run_err)[:300],
                 ))
                 print(f"  [{node_name}/{lxc_id}] ERROR: {run_err}")
+
+    state.dump_for_ansible(state_output_path)
+    return state
+
+
+def _discover_vm_locations(
+    nodes: List[Dict[str, str]],
+    *,
+    inventory_path: str,
+) -> Dict[str, Tuple[str, str]]:
+    """Query the Proxmox cluster for current VM locations via pvesh over SSH.
+
+    Runs ``pvesh get /cluster/resources --type vm`` on the first available node.
+    Returns {vmid_str: (node_name, ansible_host_ip)}.
+    Returns an empty dict on any failure (caller falls back to pve_node hint).
+
+    Rationale: pvesh reuses the existing SSH executor pattern, adds no new
+    SSL/auth surface, and runs as root so no API token is needed.
+    """
+    if not nodes:
+        return {}
+
+    nodes_map = {n["name"]: n["ansible_host"] for n in nodes}
+    # Use the first node — cluster resources are visible from any member.
+    first_node = nodes[0]["name"]
+    # check=False: discovery is read-only and must run even in dry-run mode.
+    disc_executor = RunnerExecutor(first_node, inventory=inventory_path, check=False)
+
+    try:
+        res = disc_executor.run_shell(
+            "pvesh get /cluster/resources --type vm --output-format json 2>/dev/null",
+            changed_when=False,
+            ignore_errors=True,
+        )
+        if res.failed or not res.stdout.strip():
+            return {}
+        resources = json.loads(res.stdout)
+        result: Dict[str, Tuple[str, str]] = {}
+        for item in (resources if isinstance(resources, list) else []):
+            vmid = str(item.get("vmid", ""))
+            node_name = str(item.get("node", ""))
+            if vmid and node_name:
+                result[vmid] = (node_name, nodes_map.get(node_name, node_name))
+        return result
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _fold_vm_outcome(state: FleetState, vm_name: str, outcome: VmFlowOutcome) -> None:
+    if outcome.record is not None:
+        state.vm.append(outcome.record)
+    if outcome.changed:
+        state.changed = True
+    if outcome.failed:
+        state.failed = True
+    if outcome.error is not None:
+        state.errors.append(outcome.error)
+    state.warnings.extend(outcome.warnings)
+
+
+def run_vm_phase(
+    *,
+    settings: GlobalSettings,
+    inventory_path: str = "hosts.ini",
+    check: bool = False,
+    state_output_path: Union[str, Path] = "/tmp/fleet_vm_state.json",
+) -> FleetState:
+    """Run Phase 1b (QEMU VM updates) via the Python driver.
+
+    Loads all VMs from inventory, runs them concurrently (max_workers=vm_forks),
+    and writes the resulting FleetState so fleet-update.yml can merge it before
+    Phase 2.
+
+    Never raises for per-VM failures — those become FAILED records.
+    """
+    vms = inventory.load_proxmox_vms(inventory_path)
+    nodes = inventory.load_proxmox_nodes(inventory_path)
+    nodes_map = {n["name"]: n["ansible_host"] for n in nodes}
+
+    dry_run = check or settings.fleet_dry_run or settings.vm_dry_run
+    state = FleetState()
+
+    # Discover VM locations once up-front via pvesh. Live cluster state always
+    # wins over static pve_node inventory hints — pve_node is only a fallback
+    # for non-cluster / non-HA setups where discovery is unavailable.
+    vm_locations = _discover_vm_locations(nodes, inventory_path=inventory_path)
+    if vm_locations:
+        print(f"[vm phase] discovered {len(vm_locations)} VM location(s) from cluster")
+    else:
+        print("[vm phase] cluster discovery unavailable — using pve_node inventory hints")
+
+    def _run_one(vm_spec: VmSpec) -> VmFlowOutcome:
+        # Maintenance window gate
+        if vm_spec.maintenance_window is not None:
+            if not window.in_window(vm_spec.maintenance_window, force=settings.force_window):
+                return VmFlowOutcome()  # silently skipped
+
+        # Prefer live cluster location; fall back to inventory hint.
+        if vm_spec.vmid in vm_locations:
+            node_name, api_host = vm_locations[vm_spec.vmid]
+        elif vm_spec.pve_node:
+            node_name = vm_spec.pve_node
+            api_host = nodes_map.get(node_name, node_name)
+        else:
+            raise RuntimeError(
+                f"Cannot determine node for vmid {vm_spec.vmid} ({vm_spec.name}): "
+                "cluster discovery failed and no pve_node set in inventory"
+            )
+
+        vm_ex = RunnerExecutor(vm_spec.name, inventory=inventory_path, check=check)
+        node_ex = RunnerExecutor(node_name, inventory=inventory_path, check=check)
+        return run_vm_update(
+            node_name, vm_spec.vmid, vm_spec.name, vm_ex, node_ex, settings,
+            dry_run=dry_run, api_host=api_host,
+        )
+
+    results = run_concurrent(vms, _run_one, max_workers=settings.vm_forks)
+
+    for vm_spec, outcome, run_err in results:
+        vm_name = vm_spec.name if isinstance(vm_spec, VmSpec) else str(vm_spec)
+        if outcome is not None:
+            _fold_vm_outcome(state, vm_name, outcome)
+            rec = outcome.record
+            if rec is not None:
+                status = "FAILED" if outcome.failed else rec.status
+                print(f"  [{vm_name}] {status}")
+            else:
+                print(f"  [{vm_name}] idle (no changes)")
+        elif run_err is not None:
+            state.failed = True
+            state.errors.append(ErrorEntry(
+                host=vm_name, task="run_vm_update", error=str(run_err)[:300]
+            ))
+            print(f"  [{vm_name}] ERROR: {run_err}")
+
+    state.dump_for_ansible(state_output_path)
+    return state
+
+
+def _fold_remote_outcome(
+    state: FleetState, host_name: str, outcome: RemoteFlowOutcome
+) -> None:
+    if outcome.record is not None:
+        state.remote.append(outcome.record)
+    if outcome.changed:
+        state.changed = True
+    if outcome.failed:
+        state.failed = True
+    if outcome.error is not None:
+        state.errors.append(outcome.error)
+    state.warnings.extend(outcome.warnings)
+
+
+def run_remote_phase(
+    *,
+    settings: GlobalSettings,
+    inventory_path: str = "hosts.ini",
+    check: bool = False,
+    state_output_path: Union[str, Path] = "/tmp/fleet_remote_state.json",
+) -> FleetState:
+    """Run Phase 0 (remote host updates) via the Python driver.
+
+    Loads all [remote_hosts] from inventory, runs them concurrently
+    (max_workers=remote_forks), and writes the resulting FleetState so
+    fleet-update.yml can merge it before Phase 0a.
+
+    Never raises for per-host failures — those become FAILED records.
+    """
+    hosts = inventory.load_remote_hosts(inventory_path)
+    dry_run = check or settings.fleet_dry_run or settings.remote_dry_run
+    state = FleetState()
+
+    def _run_one(spec: RemoteHostSpec) -> RemoteFlowOutcome:
+        # Maintenance window gate
+        if spec.maintenance_window is not None:
+            if not window.in_window(spec.maintenance_window, force=settings.force_window):
+                return RemoteFlowOutcome()  # silently skipped
+
+        ex = RunnerExecutor(spec.name, inventory=inventory_path, check=check)
+        return run_remote_update(
+            spec.name, ex, settings, dry_run=dry_run, pre_update_cmd=spec.pre_update_cmd
+        )
+
+    results = run_concurrent(hosts, _run_one, max_workers=settings.remote_forks)
+
+    for spec, outcome, run_err in results:
+        host_name = spec.name if isinstance(spec, RemoteHostSpec) else str(spec)
+        if outcome is not None:
+            _fold_remote_outcome(state, host_name, outcome)
+            rec = outcome.record
+            if rec is not None:
+                status = "FAILED" if outcome.failed else rec.status
+                print(f"  [{host_name}] {status}")
+            else:
+                print(f"  [{host_name}] idle (no changes)")
+        elif run_err is not None:
+            state.failed = True
+            state.errors.append(ErrorEntry(
+                host=host_name, task="run_remote_update", error=str(run_err)[:300]
+            ))
+            print(f"  [{host_name}] ERROR: {run_err}")
 
     state.dump_for_ansible(state_output_path)
     return state

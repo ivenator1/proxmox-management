@@ -87,6 +87,129 @@ def load_proxmox_nodes(
     return nodes
 
 
+@dataclass
+class VmSpec:
+    """All driver-relevant data for one [proxmox_vms] entry."""
+
+    name: str           # inventory hostname
+    ansible_host: str   # SSH reachable IP
+    vmid: str           # PVE VM ID (e.g. "200")
+    pve_node: str       # inventory hostname of the Proxmox node that owns this VM
+    maintenance_window: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class RemoteHostSpec:
+    """All driver-relevant data for one [remote_hosts] entry."""
+
+    name: str           # inventory hostname
+    ansible_host: str   # SSH reachable IP
+    maintenance_window: Optional[Dict[str, Any]] = None
+    pre_update_cmd: str = ""
+
+
+def load_proxmox_vms(
+    inventory_path: str = "hosts.ini",
+    *,
+    host_vars_dir: str = "host_vars",
+) -> List[VmSpec]:
+    """Parse ``[proxmox_vms]`` from *inventory_path* and merge per-host vars.
+
+    Returns hosts in inventory-file order. ``vmid`` and ``pve_node`` are
+    expected as inline vars on the host line (matches the example inventory).
+    A missing ``[proxmox_vms]`` section returns an empty list without error.
+    """
+    hvdir = Path(host_vars_dir)
+    specs: List[VmSpec] = []
+    in_section = False
+
+    try:
+        lines = Path(inventory_path).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+
+        if line.startswith("["):
+            section_name = line.strip("[]")
+            in_section = section_name == "proxmox_vms"
+            continue
+
+        if not in_section:
+            continue
+
+        m = _HOST_LINE.match(line)
+        if not m:
+            continue
+
+        name = m.group(1)
+        inline = _parse_inline_vars(m.group(2))
+        host_vars = _load_host_vars(name, hvdir)
+
+        specs.append(VmSpec(
+            name=name,
+            ansible_host=str(inline.get("ansible_host", host_vars.get("ansible_host", name))),
+            vmid=str(inline.get("vmid", host_vars.get("vmid", ""))),
+            pve_node=str(inline.get("pve_node", host_vars.get("pve_node", ""))),
+            maintenance_window=host_vars.get("maintenance_window"),
+        ))
+
+    return specs
+
+
+def load_remote_hosts(
+    inventory_path: str = "hosts.ini",
+    *,
+    host_vars_dir: str = "host_vars",
+) -> List[RemoteHostSpec]:
+    """Parse ``[remote_hosts]`` from *inventory_path* and merge per-host vars.
+
+    Returns hosts in inventory-file order. A missing ``[remote_hosts]`` section
+    returns an empty list without error.
+    """
+    hvdir = Path(host_vars_dir)
+    specs: List[RemoteHostSpec] = []
+    in_section = False
+
+    try:
+        lines = Path(inventory_path).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+
+        if line.startswith("["):
+            section_name = line.strip("[]")
+            in_section = section_name == "remote_hosts"
+            continue
+
+        if not in_section:
+            continue
+
+        m = _HOST_LINE.match(line)
+        if not m:
+            continue
+
+        name = m.group(1)
+        inline = _parse_inline_vars(m.group(2))
+        host_vars = _load_host_vars(name, hvdir)
+
+        specs.append(RemoteHostSpec(
+            name=name,
+            ansible_host=str(inline.get("ansible_host", host_vars.get("ansible_host", name))),
+            maintenance_window=host_vars.get("maintenance_window"),
+            pre_update_cmd=str(host_vars.get("pre_update_cmd", "")),
+        ))
+
+    return specs
+
+
 def load_custom_hosts(
     inventory_path: str = "hosts.ini",
     *,

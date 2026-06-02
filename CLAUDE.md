@@ -50,6 +50,17 @@ fleet-update --use-custom-flow --vars-file vars.yml            # full run via Py
 # Python driver — Phase 1 (LXC updates) via Python instead of lxc_update role
 fleet-update --use-lxc-flow --check -e fleet_dry_run=true     # dry-run via Python driver
 fleet-update --use-lxc-flow --vars-file vars.yml               # full run via Python driver
+
+# Python driver — Phase 1b (VM updates) via Python instead of vm_update role
+fleet-update --use-vm-flow --check -e fleet_dry_run=true       # dry-run via Python driver
+fleet-update --use-vm-flow --vars-file vars.yml                 # full run via Python driver
+
+# Python driver — Phase 0 (remote host updates) via Python instead of remote_host_update role
+fleet-update --use-remote-flow --check -e fleet_dry_run=true   # dry-run via Python driver
+fleet-update --use-remote-flow --vars-file vars.yml             # full run via Python driver
+
+# Run all Python-ported phases together (recommended once parity is confirmed)
+fleet-update --use-custom-flow --use-lxc-flow --use-vm-flow --use-remote-flow --check -e fleet_dry_run=true
 ```
 
 `hosts.ini` and `vars.yml` are gitignored (contain secrets/IPs). Copy from `.example` files to run locally.
@@ -87,6 +98,8 @@ proxmox_fleet/
   flows/
     custom.py                           # run_custom_update() — the full custom flow (detect→backup→update→health→report)
     lxc.py                              # run_lxc_update() — the full LXC flow (introspect→detect→backup→update→health→report); try/except/finally = block/rescue/always
+    vm.py                               # run_vm_update() — the full VM flow; two-executor pattern: executor=VM SSH, node_executor=Proxmox node SSH (for qm rollback/status)
+    remote.py                           # run_remote_update() — the full remote host flow (pre_update_cmd→detect_pkg_mgr→upgrade→reboot→health→report); no snapshot/always block
   deps.py                               # validate_depends_order() + dependency_failed() — ports of Phase-0a Jinja logic
   driver.py                             # run_custom_phase() + run_lxc_phase() — Phase 0a+0b and Phase 1 in Python
   executor.py                           # Executor protocol + RunnerExecutor; snapshot() added for proxmox_snap primitive
@@ -193,12 +206,15 @@ roles/
 | Phase | Hosts | Purpose |
 |---|---|---|
 | Pre-Flight | localhost | Verify apt-cacher-ng proxy is reachable |
-| Phase 0 | `remote_hosts` | Non-Proxmox hosts via `remote_host_update` role |
+| Phase 0 | `remote_hosts` | Non-Proxmox hosts via `remote_host_update` role (skipped when `skip_phase_0=true`) |
+| *(merge remote)* | localhost | Load Python driver output into `fleet_remote_data`/`fleet_changed`/`fleet_failed` (active when `fleet_remote_state_path` is defined) |
 | Phase 0a | localhost | Validate `custom_hosts` `depends_on` ordering (fail loud on missing/after) |
 | Phase 0b | `custom_hosts` | Non-standard systems via `custom_update` role (skipped when `skip_phase_0b=true`) |
-| *(merge)* | localhost | Load Python driver output into `fleet_custom_data`/`fleet_changed`/`fleet_failed` (active when `fleet_custom_state_path` is defined) |
-| Phase 1 | `proxmox_nodes` | Tag-filtered LXC discovery + `lxc_update` role per container |
-| Phase 1b | `proxmox_vms` | QEMU VMs via `vm_update` role |
+| *(merge custom)* | localhost | Load Python driver output into `fleet_custom_data`/`fleet_changed`/`fleet_failed` (active when `fleet_custom_state_path` is defined) |
+| Phase 1 | `proxmox_nodes` | Tag-filtered LXC discovery + `lxc_update` role per container (skipped when `skip_phase_1=true`) |
+| *(merge lxc)* | localhost | Load Python driver output into `fleet_lxc_data` (active when `fleet_lxc_state_path` is defined) |
+| Phase 1b | `proxmox_vms` | QEMU VMs via `vm_update` role (skipped when `skip_phase_1b=true`) |
+| *(merge vm)* | localhost | Load Python driver output into `fleet_vm_data` (active when `fleet_vm_state_path` is defined) |
 | Phase 2 | `proxmox_nodes` | PVE node OS update + sequential reboot (`serial: 1`, `any_errors_fatal: true`) |
 | Phase 3 | localhost | Manager container self-update |
 | Phase 4 | localhost | Persist run history → dispatch notifiers → dead-man's-switch ping |
@@ -322,7 +338,12 @@ The task order matters for correct attribution:
 - **Inventory parser must not use `configparser`**: `configparser` splits on the first `=` and mis-parses Ansible host lines of the form `hostname key=val key=val …` (it produces key=`hostname key` and value=`val key=val …`). `proxmox_fleet/inventory.py` uses a manual regex parser instead.
 - **`--use-custom-flow` flag is temporary**: once a real `--check` run confirms parity, flip it to the unconditional default in `cli.py`, remove the flag, and delete the legacy `roles/custom_update/tasks/` files and Jinja-shim tests `test_custom_report.py`, `test_run_step.py`, `test_custom_depends.py`.
 - **`--use-lxc-flow` flag is temporary**: same retire step — confirm parity via `fleet-update --use-lxc-flow --check -e fleet_dry_run=true`, then flip to default and delete `roles/lxc_update/tasks/`, `roles/lxc_update/defaults/`, and six Jinja-shim tests (`test_report_tmp_app.py`, `test_report_tmp_os.py`, `test_report_when_condition.py`, `test_dry_check_status.py`, `test_detect_regex.py`, `test_introspect_regex.py`).
-- **`executor.snapshot(lxc_id, *, snap_state, api_host, ...)` added for Phase 3**: invokes `snapshot.yml` (which runs `community.proxmox.proxmox_snap` on localhost). `api_host` must be the node's `ansible_host` IP — not the inventory name. Molecule overrides this with `MolLxcExecutor` (touch-file stub).
+- **`--use-vm-flow` flag is temporary**: confirm parity via `fleet-update --use-vm-flow --check -e fleet_dry_run=true`, then flip to default and delete `roles/vm_update/tasks/`, `roles/vm_update/defaults/`, `tests/unit/test_vm_report.py`.
+- **`--use-remote-flow` flag is temporary**: confirm parity via `fleet-update --use-remote-flow --check -e fleet_dry_run=true`, then flip to default and delete `roles/remote_host_update/tasks/`, `roles/remote_host_update/defaults/`.
+- **`executor.snapshot(vmid, *, snap_state, api_host, ...)` added for Phase 3**: invokes `snapshot.yml` (which runs `community.proxmox.proxmox_snap` on localhost). `api_host` must be the node's `ansible_host` IP — not the inventory name. `vmid` (not `lxc_id`) because the same primitive handles both LXC containers and QEMU VMs. Molecule overrides this with `MolLxcExecutor` (touch-file stub).
+- **Two-executor pattern for VMs** (Phase 4a): `run_vm_update()` takes `executor` (bound to the VM guest via SSH, for package upgrades) and `node_executor` (bound to the Proxmox node via SSH, for `qm rollback`/`qm status`). Using the wrong executor causes `qm` commands to SSH into the VM and fail silently.
+- **HA-aware VM node discovery** (Phase 4a): `driver.run_vm_phase()` calls `pvesh get /cluster/resources --type vm` on the first available Proxmox node to build a live `{vmid: (node, api_host)}` map. `pve_node` in inventory is only a fallback hint — it goes stale when HA migrates a VM.
+- **Package manager detection uses `if/elif/else`**: `&&`/`||` chains with equal precedence cause all branches to fire on Debian systems (right-hand side of `&&` runs when left succeeds, right-hand side of `||` is skipped — but the next `&&` in the chain still runs). Always use `if which apt-get ...; then echo apt; elif which dnf ...; then echo dnf; fi` for unambiguous detection.
 - **`lxc_parse.py` owns all regex extraction**: `parse_pct_config()`, `parse_pct_status()`, `parse_ct_script()`. Patterns are verbatim from `test_introspect_regex.py` and `test_detect_regex.py` — if a pattern changes, update both the parser and its parity test.
 
 ### Testing infrastructure

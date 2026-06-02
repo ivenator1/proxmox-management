@@ -1,11 +1,12 @@
 ---
-# Execution primitive: create or delete an LXC snapshot via the Proxmox API.
-# Runs on localhost (delegated) since the proxmox_snap module speaks the API
-# directly; no SSH to the node is needed for this operation.
+# Execution primitive: create or delete a snapshot (LXC or VM) via the Proxmox
+# API. community.proxmox.proxmox_snap is vmid-agnostic — it handles both
+# LXC containers and QEMU VMs. Runs on localhost since the module speaks the
+# API directly; no SSH to the node is needed.
 # Makes no decisions. Invoked by proxmox_fleet.executor.RunnerExecutor.snapshot().
 #
 # Params (extravars):
-#   lxc_id             Container VMID
+#   vmid               Container or VM VMID
 #   snap_state         "present" to create, "absent" to delete
 #   api_host           Proxmox node API IP (ansible_host of the node)
 #   api_user           PVE API user (e.g. root@pam)
@@ -16,13 +17,13 @@
   connection: local
   gather_facts: false
   tasks:
-    - name: "Manage LXC snapshot BEFORE_UPDATE_AUTO"
+    - name: "Manage snapshot BEFORE_UPDATE_AUTO"
       community.proxmox.proxmox_snap:
         api_host: "{{ api_host }}"
         api_user: "{{ api_user }}"
         api_token_id: "{{ api_token_id }}"
         api_token_secret: "{{ api_token_secret }}"
-        vmid: "{{ lxc_id }}"
+        vmid: "{{ vmid }}"
         snapname: "BEFORE_UPDATE_AUTO"
         state: "{{ snap_state }}"
       register: _snap
