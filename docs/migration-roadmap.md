@@ -91,7 +91,7 @@ What exists now: `proxmox_fleet/{__init__,cli,__main__,runner,orchestration,http
 `ansible/primitives/{run_shell,reboot_host,discover_lxcs,pct_config,pct_status,pct_start,pct_stop,pct_pull,snapshot,rollback,vzdump,lxc_os_update,lxc_app_update}.yml`,
 `roles/{custom_update,lxc_update}/molecule/mol_run_flow.py`,
 and tests `tests/unit/test_{config_model,state_model,orchestration,http,status_custom,steps,flow_custom,settings,deps,window,inventory,driver,status_lxc,flow_lxc,status_vm,status_remote,flow_vm,flow_remote,status_node,flow_node}.py`.
-~533 tests green, mypy clean. `--use-custom-flow` routes Phase 0b, `--use-lxc-flow` routes Phase 1,
+~541 tests green, mypy clean. `--use-custom-flow` routes Phase 0b, `--use-lxc-flow` routes Phase 1,
 `--use-vm-flow` routes Phase 1b, `--use-remote-flow` routes Phase 0, and `--use-node-flow` routes
 Phase 2+3 through the Python driver; all flags keep the legacy Ansible path as the default until
 real-run parity is confirmed.
@@ -387,8 +387,18 @@ is confirmed.
   between "Merge Python VM state" play and Phase 2; (b) Phase 2 "Node Maintenance Block" gated
   on `not (skip_phase_2 | default(false) | bool)`; (c) Phase 3 tasks wrapped in "Manager
   Self-Update Block" gated on `not (skip_phase_3 | default(false) | bool)`.
-- **Tests** — `test_status_node.py` (15 tests) + `test_flow_node.py` (16 tests). No molecule
-  scenario needed — Phase 2/3 were inline in the playbook, not a role.
+- **Tests** — `test_status_node.py` (15) + `test_flow_node.py` (16) + driver tests in
+  `test_driver.py` (6 new: happy path, dry-run, abort-on-failure, empty inventory, state JSON keys)
+  + settings tests in `test_settings.py` (2 new: defaults + YAML load for all 5 new fields).
+  No molecule scenario needed — Phase 2/3 were inline in the playbook, not a role.
+- **`reboot_host.yml`** — `check_mode: false` added to the reboot task (matching `run_shell.yml`).
+  Python controls dry-run by choosing the command; Ansible check mode is bypassed at the primitive
+  level. The node flow additionally guards `executor.reboot()` with `not dry_run` so it never fires
+  during dry-run regardless.
+- **`vm_apt_res` register-overwrite bug** found during parity testing: legacy `vm_update` role
+  silently drops VMs from dry-run notifications because the skipped "Update VM packages" task
+  overwrites `vm_apt_res` with `{skipped: true, changed: false}`. Real runs are unaffected.
+  Python driver (`--use-vm-flow`) is immune. Documented in CLAUDE.md key non-obvious details.
 
 ### Key pitfalls
 
