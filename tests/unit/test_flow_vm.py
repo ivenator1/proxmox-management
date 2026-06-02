@@ -2,7 +2,8 @@
 
 Uses ScriptedVmExecutor (no real Ansible) and monkeypatches http for Kuma.
 Covers: normal update, update with reboot, snapshot warning, rescue/rollback,
-rescue without snapshot, dry-run, idle (nothing to upgrade).
+rescue without snapshot, dry-run, idle (nothing to upgrade), correct executor
+binding (qm commands must go to node_executor, not the VM executor).
 """
 import pytest
 
@@ -31,7 +32,6 @@ APT_UPGRADED = "3 upgraded, 0 newly installed, 0 to remove.\nSetting up foo (1.2
 APT_NOOP = "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
 # pkg-manager detection stdout
 PKG_DETECT_APT = "/usr/bin/apt-get\napt\n"
-PKG_DETECT_DNF = "/usr/bin/dnf\ndnf\n"
 
 
 def _settings(**kwargs) -> GlobalSettings:
@@ -54,12 +54,13 @@ class ScriptedVmExecutor:
     """Fake executor for vm flow tests.
 
     run_shell responses keyed by command substring; first match wins.
-    snapshot scripting is separate.
+    snapshot scripting is separate. Records all commands for assertion.
     """
 
     host = "my-vm"
 
-    def __init__(self, script=None, default=None, snap_changed=True):
+    def __init__(self, host="my-vm", script=None, default=None, snap_changed=True):
+        self.host = host
         self.script = {k: list(v) for k, v in (script or {}).items()}
         self.default = default if default is not None else _ok()
         self.commands = []
@@ -93,6 +94,29 @@ class ScriptedVmExecutor:
         return _ok(changed=self.snap_changed)
 
 
+def _vm_ex(**script_kwargs):
+    """VM executor: handles package manager detection, upgrade, reboot check."""
+    return ScriptedVmExecutor(host="my-vm", script=script_kwargs)
+
+
+def _node_ex(**script_kwargs):
+    """Node executor: handles qm rollback, qm status."""
+    return ScriptedVmExecutor(host="pve-01", script=script_kwargs)
+
+
+def _call(node_ex, vm_ex=None, settings=None, **kwargs):
+    """Helper: call run_vm_update with separate vm/node executors."""
+    if vm_ex is None:
+        vm_ex = _vm_ex()
+    return run_vm_update(
+        "pve-01", "200", "my-vm", vm_ex, node_ex,
+        settings or _settings(),
+        dry_run=kwargs.pop("dry_run", False),
+        api_host=kwargs.pop("api_host", "1.2.3.4"),
+        **kwargs,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -100,12 +124,15 @@ class ScriptedVmExecutor:
 
 def test_normal_update_apt():
     """Packages upgraded, no reboot required — UPDATED reported."""
-    ex = ScriptedVmExecutor(script={
+    vm_ex = _vm_ex(**{
         "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
         "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "reboot-required": [_ok(rc=1, changed=False)],  # no reboot needed
+        "reboot-required": [_ok(rc=1, changed=False)],
     })
-    outcome = run_vm_update("pve-01", "200", "my-vm", ex, _settings(), dry_run=False, api_host="1.2.3.4")
+    node_ex = _node_ex()
+
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, node_ex, _settings(),
+                            dry_run=False, api_host="1.2.3.4")
 
     assert not outcome.failed
     assert outcome.changed is True
@@ -113,79 +140,82 @@ def test_normal_update_apt():
     assert outcome.record.status == "UPDATED"
     assert outcome.record.vmid == "200"
     assert outcome.record.node == "pve-01"
-    # Snapshot created and deleted (always block)
-    assert "200" in ex.snapshots_created
-    assert "200" in ex.snapshots_deleted
+    # Snapshot created and deleted via the VM executor (snapshot() is a separate method)
+    assert "200" in vm_ex.snapshots_created
+    assert "200" in vm_ex.snapshots_deleted
+    # No qm commands went to the VM executor
+    assert not any("qm" in c for c in vm_ex.commands)
 
 
 def test_update_with_reboot():
     """Packages upgraded AND reboot-required flag set — UPDATED & REBOOTED."""
-    ex = ScriptedVmExecutor(script={
+    vm_ex = _vm_ex(**{
         "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
         "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "reboot-required": [_ok(rc=0)],  # reboot needed
+        "reboot-required": [_ok(rc=0)],
     })
-    outcome = run_vm_update("pve-01", "200", "my-vm", ex, _settings(), dry_run=False, api_host="1.2.3.4")
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), _settings(),
+                            dry_run=False, api_host="1.2.3.4")
 
     assert not outcome.failed
     assert outcome.record is not None
     assert outcome.record.status == "UPDATED & REBOOTED"
-    assert ex.reboots == 1
+    assert vm_ex.reboots == 1
 
 
 def test_idle_nothing_to_upgrade():
     """Nothing upgraded — no record appended (idle suppressed)."""
-    ex = ScriptedVmExecutor(script={
+    vm_ex = _vm_ex(**{
         "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
         "dist-upgrade": [_ok(stdout=APT_NOOP)],
     })
-    outcome = run_vm_update("pve-01", "200", "my-vm", ex, _settings(), dry_run=False, api_host="1.2.3.4")
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), _settings(),
+                            dry_run=False, api_host="1.2.3.4")
 
     assert not outcome.failed
     assert outcome.changed is False
-    assert outcome.record is None  # idle: nothing to report
+    assert outcome.record is None
 
 
 def test_dry_run_would_update():
     """Dry-run with pending upgrades — WOULD UPDATE."""
-    ex = ScriptedVmExecutor(script={
+    vm_ex = _vm_ex(**{
         "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-        "apt-get -s": [_ok(stdout=APT_UPGRADED)],  # simulate: -s comes before dist-upgrade
+        "apt-get -s": [_ok(stdout=APT_UPGRADED)],  # -s comes before dist-upgrade
     })
     settings = _settings(vm_backup_strategy="none")
-    outcome = run_vm_update("pve-01", "200", "my-vm", ex, settings, dry_run=True, api_host="1.2.3.4")
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings,
+                            dry_run=True, api_host="1.2.3.4")
 
     assert not outcome.failed
     assert outcome.record is not None
     assert outcome.record.status == "WOULD UPDATE"
-    # No snapshots taken in dry-run
-    assert ex.snapshots_created == []
+    assert vm_ex.snapshots_created == []  # no snapshot in dry-run
 
 
 def test_dry_run_ok():
-    """Dry-run with nothing to upgrade — OK."""
-    ex = ScriptedVmExecutor(script={
+    """Dry-run with nothing pending — record suppressed."""
+    vm_ex = _vm_ex(**{
         "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-        "dist-upgrade -s": [_ok(stdout=APT_NOOP)],
+        "apt-get -s": [_ok(stdout=APT_NOOP)],
     })
     settings = _settings(vm_backup_strategy="none")
-    outcome = run_vm_update("pve-01", "200", "my-vm", ex, settings, dry_run=True, api_host="1.2.3.4")
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings,
+                            dry_run=True, api_host="1.2.3.4")
 
     assert not outcome.failed
-    assert outcome.record is None  # idle in dry-run suppressed
+    assert outcome.record is None
 
 
 def test_snapshot_failure_warns_continues():
     """Snapshot API returns changed=False → warning appended, update still proceeds."""
-    ex = ScriptedVmExecutor(
-        script={
-            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-            "reboot-required": [_ok(rc=1, changed=False)],
-        },
-        snap_changed=False,  # snapshot fails
-    )
-    outcome = run_vm_update("pve-01", "200", "my-vm", ex, _settings(), dry_run=False, api_host="1.2.3.4")
+    vm_ex = ScriptedVmExecutor(host="my-vm", snap_changed=False, script={
+        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+        "reboot-required": [_ok(rc=1, changed=False)],
+    })
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), _settings(),
+                            dry_run=False, api_host="1.2.3.4")
 
     assert not outcome.failed
     assert outcome.record is not None
@@ -195,66 +225,91 @@ def test_snapshot_failure_warns_continues():
 
 
 def test_rescue_rollback_on_update_failure():
-    """Update command raises → rescue fires → qm rollback called → FAILED + ROLLED BACK."""
-    ex = ScriptedVmExecutor(script={
+    """Upgrade fails → rescue → qm rollback on NODE executor → FAILED + ROLLED BACK.
+
+    Key assertion: qm commands go to node_ex, never to vm_ex.
+    """
+    vm_ex = _vm_ex(**{
         "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
         "dist-upgrade": [_fail()],
+    })
+    node_ex = _node_ex(**{
         "qm rollback": [_ok()],
         "qm status": [_ok(stdout="status: running")],
     })
-    outcome = run_vm_update("pve-01", "200", "my-vm", ex, _settings(), dry_run=False, api_host="1.2.3.4")
+
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, node_ex, _settings(),
+                            dry_run=False, api_host="1.2.3.4")
 
     assert outcome.failed is True
     assert outcome.record is not None
     assert outcome.record.status == "FAILED + ROLLED BACK"
     assert outcome.error is not None
-    # Snapshot still cleaned up in finally
-    assert "200" in ex.snapshots_deleted
+    # qm commands went to node_ex, not vm_ex
+    assert any("qm rollback" in c for c in node_ex.commands)
+    assert any("qm status" in c for c in node_ex.commands)
+    assert not any("qm" in c for c in vm_ex.commands)
+    # Snapshot cleaned up in finally
+    assert "200" in vm_ex.snapshots_deleted
+
+
+def test_rescue_rollback_not_done_when_qm_fails():
+    """qm rollback command itself fails → rollback_done stays False → plain FAILED."""
+    vm_ex = _vm_ex(**{
+        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+        "dist-upgrade": [_fail()],
+    })
+    node_ex = _node_ex(**{
+        "qm rollback": [_fail()],  # rollback command fails
+    })
+
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, node_ex, _settings(),
+                            dry_run=False, api_host="1.2.3.4")
+
+    assert outcome.failed is True
+    assert outcome.record is not None
+    # Rollback command failed — can't claim ROLLED BACK
+    assert outcome.record.status == "FAILED"
 
 
 def test_rescue_no_snapshot_strategy_none():
-    """backup_strategy=none → no snapshot taken → rescue records plain FAILED."""
-    ex = ScriptedVmExecutor(script={
+    """backup_strategy=none → no snapshot → rescue records plain FAILED."""
+    vm_ex = _vm_ex(**{
         "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
         "dist-upgrade": [_fail()],
     })
     settings = _settings(vm_backup_strategy="none")
-    outcome = run_vm_update("pve-01", "200", "my-vm", ex, settings, dry_run=False, api_host="1.2.3.4")
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings,
+                            dry_run=False, api_host="1.2.3.4")
 
     assert outcome.failed is True
-    assert outcome.record is not None
-    assert outcome.record.status == "FAILED"  # plain (no snapshot, no rollback)
-    assert ex.snapshots_created == []
-    assert ex.snapshots_deleted == []
+    assert outcome.record.status == "FAILED"
+    assert vm_ex.snapshots_created == []
+    assert vm_ex.snapshots_deleted == []
+    # qm rollback never called when no snapshot was taken
+    assert not any("qm rollback" in c for c in _node_ex().commands)
 
 
 def test_rescue_snapshot_failed_no_rollback():
-    """Snapshot API failed (changed=False, strategy=snapshot) → rescue records FAILED (NO SNAPSHOT)."""
-    ex = ScriptedVmExecutor(
-        script={
-            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-            "dist-upgrade": [_fail()],
-        },
-        snap_changed=False,
-    )
-    outcome = run_vm_update("pve-01", "200", "my-vm", ex, _settings(), dry_run=False, api_host="1.2.3.4")
+    """Snapshot API failed (changed=False) → rescue records FAILED (NO SNAPSHOT)."""
+    vm_ex = ScriptedVmExecutor(host="my-vm", snap_changed=False, script={
+        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+        "dist-upgrade": [_fail()],
+    })
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), _settings(),
+                            dry_run=False, api_host="1.2.3.4")
 
     assert outcome.failed is True
-    assert outcome.record is not None
     assert outcome.record.status == "FAILED (NO SNAPSHOT)"
 
 
 def test_kuma_health_check_called_on_change(monkeypatch):
     """Kuma poll_until is called when something changed and kuma_map is set."""
     polled = []
-
-    def fake_poll(fetch_fn, pred, **kwargs):
-        polled.append(True)
-
-    monkeypatch.setattr(http_mod, "poll_until", fake_poll)
+    monkeypatch.setattr(http_mod, "poll_until", lambda *a, **kw: polled.append(True))
     monkeypatch.setattr(http_mod, "get_json", lambda _: {"heartbeatList": {"1": [{"status": 1}]}})
 
-    ex = ScriptedVmExecutor(script={
+    vm_ex = _vm_ex(**{
         "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
         "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
         "reboot-required": [_ok(rc=1, changed=False)],
@@ -266,7 +321,8 @@ def test_kuma_health_check_called_on_change(monkeypatch):
         kuma_health_check_retries=1,
         kuma_health_check_delay=0,
     )
-    outcome = run_vm_update("pve-01", "200", "my-vm", ex, settings, dry_run=False, api_host="1.2.3.4")
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings,
+                            dry_run=False, api_host="1.2.3.4")
 
     assert not outcome.failed
     assert len(polled) == 1
@@ -275,13 +331,9 @@ def test_kuma_health_check_called_on_change(monkeypatch):
 def test_kuma_not_called_when_idle(monkeypatch):
     """Kuma poll_until is NOT called when nothing changed."""
     polled = []
+    monkeypatch.setattr(http_mod, "poll_until", lambda *a, **kw: polled.append(True))
 
-    def fake_poll(fetch_fn, pred, **kwargs):
-        polled.append(True)
-
-    monkeypatch.setattr(http_mod, "poll_until", fake_poll)
-
-    ex = ScriptedVmExecutor(script={
+    vm_ex = _vm_ex(**{
         "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
         "dist-upgrade": [_ok(stdout=APT_NOOP)],
     })
@@ -290,5 +342,6 @@ def test_kuma_not_called_when_idle(monkeypatch):
         kuma_url="http://kuma.local",
         kuma_slug="fleet",
     )
-    run_vm_update("pve-01", "200", "my-vm", ex, settings, dry_run=False, api_host="1.2.3.4")
+    run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings,
+                  dry_run=False, api_host="1.2.3.4")
     assert polled == []

@@ -78,6 +78,7 @@ def run_vm_update(
     vmid: str,
     inventory_hostname: str,
     executor: Executor,
+    node_executor: Executor,
     settings: GlobalSettings,
     *,
     dry_run: bool = False,
@@ -90,7 +91,11 @@ def run_vm_update(
         node:               Proxmox node inventory hostname (used in VmRecord.node).
         vmid:               VM ID string (e.g. "200").
         inventory_hostname: VM's inventory hostname for Kuma map lookups.
-        executor:           Bound to the VM host (SSH-reachable); uses run_shell.
+        executor:           Bound to the VM (SSH); used for package upgrades only.
+        node_executor:      Bound to the Proxmox node (SSH); used for qm commands
+                            (rollback, status). Must reflect the VM's *current* node
+                            — the driver resolves this via cluster discovery so HA
+                            migrations are handled correctly.
         settings:           GlobalSettings from vars.yml.
         dry_run:            When True, simulate upgrade but apply no changes.
         api_host:           The node's ansible_host IP for Proxmox API (snapshot).
@@ -197,25 +202,29 @@ def run_vm_update(
 
     except Exception as exc:  # noqa: BLE001 - mirror Ansible rescue catch-all
         # ------------------------------------------------------------------
-        # Rescue — rollback if snapshot was taken
+        # Rescue — rollback if snapshot was taken.
+        # node_executor (bound to the Proxmox node) is used here — qm commands
+        # must run on the node, not the VM guest. rollback_done is set only when
+        # the rollback command succeeds AND qm status confirms the VM is running.
         # ------------------------------------------------------------------
         failed_task = getattr(exc, "step_name", type(exc).__name__)
 
         if snap_taken:
             try:
-                executor.run_shell(
+                rb = node_executor.run_shell(
                     f"qm rollback {vmid} BEFORE_UPDATE_AUTO",
                     ignore_errors=True,
                 )
-                # Poll until VM is running again (up to 12 × 10 s)
-                for _ in range(12):
-                    time.sleep(10)
-                    chk = executor.run_shell(
-                        f"qm status {vmid}", changed_when=False, ignore_errors=True
-                    )
-                    if "running" in chk.stdout:
-                        break
-                rollback_done = True
+                if not rb.failed:
+                    # Poll until VM is running again (up to 12 × 10 s)
+                    for _ in range(12):
+                        time.sleep(10)
+                        chk = node_executor.run_shell(
+                            f"qm status {vmid}", changed_when=False, ignore_errors=True
+                        )
+                        if "running" in chk.stdout:
+                            rollback_done = True
+                            break
             except Exception:  # noqa: BLE001
                 pass
 

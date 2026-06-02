@@ -14,9 +14,10 @@ Conventions:
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import yaml
 
@@ -235,6 +236,49 @@ def run_lxc_phase(
     return state
 
 
+def _discover_vm_locations(
+    nodes: List[Dict[str, str]],
+    *,
+    inventory_path: str,
+) -> Dict[str, Tuple[str, str]]:
+    """Query the Proxmox cluster for current VM locations via pvesh over SSH.
+
+    Runs ``pvesh get /cluster/resources --type vm`` on the first available node.
+    Returns {vmid_str: (node_name, ansible_host_ip)}.
+    Returns an empty dict on any failure (caller falls back to pve_node hint).
+
+    Rationale: pvesh reuses the existing SSH executor pattern, adds no new
+    SSL/auth surface, and runs as root so no API token is needed.
+    """
+    if not nodes:
+        return {}
+
+    nodes_map = {n["name"]: n["ansible_host"] for n in nodes}
+    # Use the first node — cluster resources are visible from any member.
+    first_node = nodes[0]["name"]
+    # check=False: discovery is read-only and must run even in dry-run mode.
+    disc_executor = RunnerExecutor(first_node, inventory=inventory_path, check=False)
+
+    try:
+        res = disc_executor.run_shell(
+            "pvesh get /cluster/resources --type vm --output-format json 2>/dev/null",
+            changed_when=False,
+            ignore_errors=True,
+        )
+        if res.failed or not res.stdout.strip():
+            return {}
+        resources = json.loads(res.stdout)
+        result: Dict[str, Tuple[str, str]] = {}
+        for item in (resources if isinstance(resources, list) else []):
+            vmid = str(item.get("vmid", ""))
+            node_name = str(item.get("node", ""))
+            if vmid and node_name:
+                result[vmid] = (node_name, nodes_map.get(node_name, node_name))
+        return result
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _fold_vm_outcome(state: FleetState, vm_name: str, outcome: VmFlowOutcome) -> None:
     if outcome.record is not None:
         state.vm.append(outcome.record)
@@ -269,16 +313,37 @@ def run_vm_phase(
     dry_run = check or settings.fleet_dry_run or settings.vm_dry_run
     state = FleetState()
 
+    # Discover VM locations once up-front via pvesh. Live cluster state always
+    # wins over static pve_node inventory hints — pve_node is only a fallback
+    # for non-cluster / non-HA setups where discovery is unavailable.
+    vm_locations = _discover_vm_locations(nodes, inventory_path=inventory_path)
+    if vm_locations:
+        print(f"[vm phase] discovered {len(vm_locations)} VM location(s) from cluster")
+    else:
+        print("[vm phase] cluster discovery unavailable — using pve_node inventory hints")
+
     def _run_one(vm_spec: VmSpec) -> VmFlowOutcome:
         # Maintenance window gate
         if vm_spec.maintenance_window is not None:
             if not window.in_window(vm_spec.maintenance_window, force=settings.force_window):
                 return VmFlowOutcome()  # silently skipped
 
-        api_host = nodes_map.get(vm_spec.pve_node, vm_spec.pve_node)
-        ex = RunnerExecutor(vm_spec.name, inventory=inventory_path, check=check)
+        # Prefer live cluster location; fall back to inventory hint.
+        if vm_spec.vmid in vm_locations:
+            node_name, api_host = vm_locations[vm_spec.vmid]
+        elif vm_spec.pve_node:
+            node_name = vm_spec.pve_node
+            api_host = nodes_map.get(node_name, node_name)
+        else:
+            raise RuntimeError(
+                f"Cannot determine node for vmid {vm_spec.vmid} ({vm_spec.name}): "
+                "cluster discovery failed and no pve_node set in inventory"
+            )
+
+        vm_ex = RunnerExecutor(vm_spec.name, inventory=inventory_path, check=check)
+        node_ex = RunnerExecutor(node_name, inventory=inventory_path, check=check)
         return run_vm_update(
-            vm_spec.pve_node, vm_spec.vmid, vm_spec.name, ex, settings,
+            node_name, vm_spec.vmid, vm_spec.name, vm_ex, node_ex, settings,
             dry_run=dry_run, api_host=api_host,
         )
 
