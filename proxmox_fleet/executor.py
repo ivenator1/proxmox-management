@@ -8,7 +8,8 @@ reboot_host primitives via ansible-runner; tests supply a fake.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Protocol
+import time
+from typing import Any, Callable, Dict, Optional, Protocol
 
 from proxmox_fleet.runner import PrimitiveResult, invoke_primitive
 
@@ -144,3 +145,35 @@ def _merge_facts(result: PrimitiveResult) -> PrimitiveResult:
         result.changed = bool(facts["changed"])
     result.failed = result.failed or result.rc != 0
     return result
+
+
+def snapshot_with_retry(
+    executor: Executor,
+    vmid: str,
+    *,
+    snap_state: str,
+    retries: int = 3,
+    delay: float = 15.0,
+    _sleep: Callable[[float], None] = time.sleep,
+    **api_params: Any,
+) -> PrimitiveResult:
+    """Retry executor.snapshot() to handle transient PVE task locks ('CT is locked').
+
+    Uses `until=changed` for create (present) and `until=not failed` for delete
+    (absent). Returns a failed PrimitiveResult after exhausting all retries rather
+    than raising, so callers can apply their existing warning/fallback logic.
+    """
+    from proxmox_fleet import orchestration
+
+    predicate = (lambda r: r.changed) if snap_state == "present" else (lambda r: not r.failed)
+    try:
+        return orchestration.retry(
+            lambda: executor.snapshot(vmid, snap_state=snap_state, **api_params),
+            retries=retries,
+            delay=delay,
+            until=predicate,
+            exceptions=(),
+            sleep=_sleep,
+        )
+    except RuntimeError:
+        return PrimitiveResult(rc=1, stdout="", stderr="", changed=False, failed=True, facts={})

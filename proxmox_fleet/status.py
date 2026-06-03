@@ -13,6 +13,8 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+from proxmox_fleet.changes import dpkg_hash_differs
+
 
 def _reboot_suffix(reboot_done: bool) -> str:
     return " + Rebooted" if reboot_done else ""
@@ -121,10 +123,10 @@ def lxc_app_status(
             return "OK"
 
         # dpkg-hash comparison
-        db = dpkg_before.strip()
-        da = dpkg_after.strip()
-        if db and da:
-            return "UPDATED" if db != da else "OK"
+        if dpkg_hash_differs(dpkg_before, dpkg_after):
+            return "UPDATED"
+        if dpkg_before.strip() and dpkg_after.strip():
+            return "OK"
 
         # No version data, no hash data — non-apt OS or silent run
         return "UPDATED"

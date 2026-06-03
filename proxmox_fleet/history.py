@@ -17,8 +17,8 @@ from proxmox_fleet.models.state import FleetState
 
 
 def _ts_now() -> str:
-    """UTC timestamp matching the legacy ``date -u +%Y%m%dT%H%M%SZ``."""
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    """UTC timestamp with microsecond precision to avoid same-second collisions."""
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def build_run_summary(

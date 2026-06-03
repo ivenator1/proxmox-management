@@ -5,9 +5,10 @@ file write/prune behaviour, and the new ``briefing`` field that records the exac
 Discord message body.
 """
 import json
+import re
 
 from proxmox_fleet import briefing
-from proxmox_fleet.history import build_run_summary, write_history
+from proxmox_fleet.history import _ts_now, build_run_summary, write_history
 from proxmox_fleet.models.state import FleetState
 
 
@@ -103,3 +104,9 @@ def test_default_timestamp_used(tmp_path):
     assert run_file.name.startswith("run-") and run_file.name.endswith("Z.json")
     data = json.loads(run_file.read_text())
     assert data["timestamp"].endswith("Z")
+
+
+def test_ts_now_includes_microseconds():
+    ts = _ts_now()
+    # Format: YYYYMMDDTHHMMSSffffffZ (6 microsecond digits between seconds and Z)
+    assert re.match(r"^\d{8}T\d{6}\d{6}Z$", ts), f"unexpected format: {ts}"

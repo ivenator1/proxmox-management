@@ -94,10 +94,11 @@ def test_maintenance_window_from_host_vars(tmp_path):
         "maintenance_window:\n  days: [Sat, Sun]\n  start: '02:00'\n  end: '04:00'\n  tz: UTC\n",
     )
     specs = load_custom_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))
+    from proxmox_fleet.models.config import MaintenanceWindow
     mw = specs[0].maintenance_window
-    assert mw is not None
-    assert mw["days"] == ["Sat", "Sun"]
-    assert mw["start"] == "02:00"
+    assert isinstance(mw, MaintenanceWindow)
+    assert mw.days == ["Sat", "Sun"]
+    assert mw.start == "02:00"
 
 
 def test_custom_overrides_from_host_vars(tmp_path):
@@ -238,7 +239,7 @@ def test_remote_hosts_inline_and_host_vars(tmp_path):
     assert hosts[0].name == "web-01"
     assert hosts[0].ansible_host == "10.0.0.40"
     assert hosts[0].pre_update_cmd == "systemctl stop app"
-    assert hosts[0].maintenance_window["start"] == "01:00"
+    assert hosts[0].maintenance_window.start == "01:00"
 
 
 def test_remote_hosts_order_preserved(tmp_path):

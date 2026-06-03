@@ -125,6 +125,29 @@ def test_tz_defaults_to_utc():
     assert result_no_tz == result_utc is True
 
 
+def test_tz_aware_now_in_different_tz_is_converted():
+    # UTC midnight (00:00 UTC) = 20:00 US Eastern (America/New_York, UTC-4 in summer).
+    # A window of 19:00-21:00 America/New_York: inside when converted, outside in raw UTC.
+    now_utc_midnight = datetime(2024, 7, 20, 0, 0, 0, tzinfo=timezone.utc)  # Sat 00:00 UTC = Fri 20:00 ET
+    assert in_window(
+        {"start": "19:00", "end": "21:00", "tz": "America/New_York"},
+        now=now_utc_midnight,
+    ) is True  # 20:00 ET is inside 19:00-21:00
+    assert in_window(
+        {"start": "19:00", "end": "21:00", "tz": "UTC"},
+        now=now_utc_midnight,
+    ) is False  # 00:00 UTC is outside 19:00-21:00
+
+
+def test_maintenance_window_model_accepted_by_in_window():
+    from proxmox_fleet.models.config import MaintenanceWindow
+    mw = MaintenanceWindow(days=["Sat"], start="02:00", end="04:00", tz="UTC")
+    now = _dt(5, "03:00")  # Saturday 03:00 UTC — inside the window
+    assert in_window(mw, now=now) is True
+    now_outside = _dt(5, "06:00")  # Saturday 06:00 UTC — outside
+    assert in_window(mw, now=now_outside) is False
+
+
 def test_invalid_tz_falls_back_to_utc():
     now = _dt(5, "03:00")
     assert in_window({"days": ["Sat"], "start": "02:00", "end": "04:00", "tz": "Not/A/Zone"}, now=now) is True

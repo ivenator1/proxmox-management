@@ -7,12 +7,14 @@ defined by the existing ``test_check_window.py`` Jinja-shim tests; the new
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from zoneinfo import ZoneInfo
+
+from proxmox_fleet.models.config import MaintenanceWindow
 
 
 def in_window(
-    window: Dict[str, Any],
+    window: Union[MaintenanceWindow, Dict[str, Any]],
     *,
     now: Optional[datetime] = None,
     force: bool = False,
@@ -31,6 +33,9 @@ def in_window(
     if force:
         return True
 
+    if isinstance(window, MaintenanceWindow):
+        window = window.model_dump()
+
     tz_name: str = window.get("tz", "UTC") or "UTC"
     try:
         tz = ZoneInfo(tz_name)
@@ -41,6 +46,8 @@ def in_window(
         now = datetime.now(tz=tz)
     elif now.tzinfo is None:
         now = now.replace(tzinfo=tz)
+    else:
+        now = now.astimezone(tz)
 
     # Day check — absent days key means any day is allowed.
     days: Optional[List[str]] = window.get("days")

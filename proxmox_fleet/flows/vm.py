@@ -15,12 +15,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import pkg_changed as _pkg_changed
 from proxmox_fleet.changes import vm_pkg_count as _vm_pkg_count
-from proxmox_fleet.executor import Executor
+from proxmox_fleet.executor import Executor, snapshot_with_retry
 from proxmox_fleet.flows._pkg import detect_pkg_mgr, kuma_healthy, upgrade_cmd
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import ErrorEntry, VmRecord, WarningEntry
@@ -71,7 +71,7 @@ def run_vm_update(
     rollback_done = False
     outcome = VmFlowOutcome()
 
-    api_params: Dict[str, str] = {
+    api_params: Dict[str, Any] = {
         "api_host": api_host,
         "api_user": settings.pve_api_user,
         "api_token_id": settings.pve_api_token_id,
@@ -92,7 +92,7 @@ def run_vm_update(
                 executor.run_shell(vzdump_cmd)
 
             if strategy in ("snapshot", "both"):
-                snap_res = executor.snapshot(vmid, snap_state="present", **api_params)
+                snap_res = snapshot_with_retry(executor, vmid, snap_state="present", **api_params)
                 snap_taken = snap_res.changed
                 if not snap_taken:
                     outcome.warnings.append(WarningEntry(
@@ -212,7 +212,4 @@ def run_vm_update(
         # Always — delete snapshot
         # ------------------------------------------------------------------
         if snap_taken:
-            try:
-                executor.snapshot(vmid, snap_state="absent", **api_params)
-            except Exception:  # noqa: BLE001
-                pass
+            snapshot_with_retry(executor, vmid, snap_state="absent", **api_params)

@@ -18,9 +18,9 @@ from typing import Any, Dict, List, Optional
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import lxc_os_changed, lxc_os_pkg_count
-from proxmox_fleet.executor import Executor
+from proxmox_fleet.executor import Executor, snapshot_with_retry
 from proxmox_fleet.flows._pkg import kuma_healthy
-from proxmox_fleet.lxc_parse import parse_ct_script, parse_pct_config, parse_pct_status
+from proxmox_fleet.lxc_parse import parse_ct_script, parse_pct_config, parse_pct_status, script_name_from_update
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import ErrorEntry, LxcRecord, WarningEntry
 from proxmox_fleet.status import (
@@ -181,7 +181,7 @@ def run_lxc_update(
     rollback_done = False
     outcome = LxcFlowOutcome()
 
-    api_params: Dict[str, str] = {
+    api_params: Dict[str, Any] = {
         "api_host": api_host,
         "api_user": settings.pve_api_user,
         "api_token_id": settings.pve_api_token_id,
@@ -205,11 +205,8 @@ def run_lxc_update(
             _vprint(node, lxc_id, name, f"script={'NONE (pull failed)' if lxc_no_update_script else 'found'}")
 
         if not lxc_no_update_script:
-            grep_res = executor.run_shell(
-                f"grep -oP 'ct/\\K[^.]+(?=\\.sh)' {pull_dst} | head -1",
-                changed_when=False,
-            )
-            ct_script_name_raw = grep_res.stdout.strip()
+            cat_res = executor.run_shell(f"cat {pull_dst}", changed_when=False)
+            ct_script_name_raw = script_name_from_update(cat_res.stdout) or ""
             executor.run_shell(f"rm -f {pull_dst}", changed_when=False)
 
             if settings.lxc_verbose:
@@ -274,7 +271,7 @@ def run_lxc_update(
             executor.run_shell(vzdump_cmd)  # fail hard — no ignore_errors
 
         if strategy in ("snapshot", "both") and lxc_id not in {str(x) for x in settings.snapshot_exclude_list}:
-            snap_res = executor.snapshot(lxc_id, snap_state="present", **api_params)
+            snap_res = snapshot_with_retry(executor, lxc_id, snap_state="present", **api_params)
             snap_taken = snap_res.changed
             if settings.lxc_verbose:
                 _vprint(node, lxc_id, name, f"snapshot={'taken' if snap_taken else 'FAILED'}")
@@ -482,10 +479,7 @@ def run_lxc_update(
         # Always — delete snapshot; stop container if it was stopped before
         # ------------------------------------------------------------------
         if snap_taken:
-            try:
-                executor.snapshot(lxc_id, snap_state="absent", **api_params)
-            except Exception:  # noqa: BLE001 - cleanup errors ignored
-                pass
+            snapshot_with_retry(executor, lxc_id, snap_state="absent", **api_params)
 
         if was_stopped and not rollback_done and not is_template:
             try:

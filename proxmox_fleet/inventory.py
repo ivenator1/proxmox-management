@@ -16,6 +16,8 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import yaml
 
+from proxmox_fleet.models.config import MaintenanceWindow
+
 # Matches: hostname  key=value key=value …
 _HOST_LINE = re.compile(r"^(\S+)\s*(.*)")
 # Matches individual key=value pairs in the remainder of a host line.
@@ -30,7 +32,7 @@ class HostSpec:
     ansible_host: str
     custom_config: str
     depends_on: List[str] = field(default_factory=list)
-    maintenance_window: Optional[Dict[str, Any]] = None
+    maintenance_window: Optional[MaintenanceWindow] = None
     custom_overrides: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -107,7 +109,7 @@ class VmSpec:
     ansible_host: str   # SSH reachable IP
     vmid: str           # PVE VM ID (e.g. "200")
     pve_node: str       # inventory hostname of the Proxmox node that owns this VM
-    maintenance_window: Optional[Dict[str, Any]] = None
+    maintenance_window: Optional[MaintenanceWindow] = None
 
 
 @dataclass
@@ -116,7 +118,7 @@ class RemoteHostSpec:
 
     name: str           # inventory hostname
     ansible_host: str   # SSH reachable IP
-    maintenance_window: Optional[Dict[str, Any]] = None
+    maintenance_window: Optional[MaintenanceWindow] = None
     pre_update_cmd: str = ""
 
 
@@ -135,12 +137,13 @@ def load_proxmox_vms(
     specs: List[VmSpec] = []
     for name, inline in _iter_section(inventory_path, "proxmox_vms"):
         host_vars = _load_host_vars(name, hvdir)
+        raw_mw = host_vars.get("maintenance_window")
         specs.append(VmSpec(
             name=name,
             ansible_host=str(inline.get("ansible_host", host_vars.get("ansible_host", name))),
             vmid=str(inline.get("vmid", host_vars.get("vmid", ""))),
             pve_node=str(inline.get("pve_node", host_vars.get("pve_node", ""))),
-            maintenance_window=host_vars.get("maintenance_window"),
+            maintenance_window=MaintenanceWindow(**raw_mw) if isinstance(raw_mw, dict) else None,
         ))
     return specs
 
@@ -159,10 +162,11 @@ def load_remote_hosts(
     specs: List[RemoteHostSpec] = []
     for name, inline in _iter_section(inventory_path, "remote_hosts"):
         host_vars = _load_host_vars(name, hvdir)
+        raw_mw = host_vars.get("maintenance_window")
         specs.append(RemoteHostSpec(
             name=name,
             ansible_host=str(inline.get("ansible_host", host_vars.get("ansible_host", name))),
-            maintenance_window=host_vars.get("maintenance_window"),
+            maintenance_window=MaintenanceWindow(**raw_mw) if isinstance(raw_mw, dict) else None,
             pre_update_cmd=str(host_vars.get("pre_update_cmd", "")),
         ))
     return specs
@@ -183,13 +187,14 @@ def load_custom_hosts(
     specs: List[HostSpec] = []
     for name, inline in _iter_section(inventory_path, "custom_hosts"):
         host_vars = _load_host_vars(name, hvdir)
+        raw_mw = host_vars.get("maintenance_window")
         specs.append(
             HostSpec(
                 name=name,
                 ansible_host=str(inline.get("ansible_host", host_vars.get("ansible_host", name))),
                 custom_config=inline.get("custom_config", host_vars.get("custom_config", "")),
                 depends_on=host_vars.get("depends_on", []),
-                maintenance_window=host_vars.get("maintenance_window"),
+                maintenance_window=MaintenanceWindow(**raw_mw) if isinstance(raw_mw, dict) else None,
                 custom_overrides=host_vars.get("custom_overrides", {}),
             )
         )

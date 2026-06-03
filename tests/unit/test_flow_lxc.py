@@ -100,7 +100,7 @@ def _exec_normal(ver_before="1.0", ver_after="1.1", os_stdout="2 upgraded, 0 new
         "pct config": [_ok(stdout=PCT_CONFIG_RUNNING)],
         "pct status": [_ok(stdout=PCT_STATUS_RUNNING)],
         "pct pull": [_ok(rc=0, stdout="", changed=False)],
-        "grep": [_ok(stdout="sonarr")],
+        "cat /tmp/ansible_update_": [_ok(stdout="source ct/sonarr.sh", changed=False)],
         "rm -f": [_ok(changed=False)],
         # version reads (before and after)
         "cat ~/.sonarr": [_ok(stdout=ver_before), _ok(stdout=ver_after)],
@@ -162,7 +162,7 @@ def test_dry_run(monkeypatch):
         "pct config": [_ok(stdout=PCT_CONFIG_RUNNING)],
         "pct status": [_ok(stdout=PCT_STATUS_RUNNING)],
         "pct pull": [_ok(rc=0, changed=False)],
-        "grep": [_ok(stdout="sonarr")],
+        "cat /tmp/ansible_update_": [_ok(stdout="source ct/sonarr.sh", changed=False)],
         "rm -f": [_ok(changed=False)],
         "cat ~/.sonarr": [_ok(stdout="1.4")],
     })
@@ -233,7 +233,7 @@ def test_snapshot_rollback_on_failure(monkeypatch):
         "pct config": [_ok(stdout=PCT_CONFIG_RUNNING)],
         "pct status": [_ok(stdout=PCT_STATUS_RUNNING)],
         "pct pull": [_ok(rc=0, changed=False)],
-        "grep": [_ok(stdout="sonarr")],
+        "cat /tmp/ansible_update_": [_ok(stdout="source ct/sonarr.sh", changed=False)],
         "rm -f": [_ok(changed=False)],
         "cat ~/.sonarr": [_ok(stdout="1.0")],
         "dpkg-query": [_ok(stdout="hash  -\n", changed=False)],
@@ -262,7 +262,7 @@ def test_no_rollback_without_snapshot(monkeypatch):
         "pct config": [_ok(stdout=PCT_CONFIG_RUNNING)],
         "pct status": [_ok(stdout=PCT_STATUS_RUNNING)],
         "pct pull": [_ok(rc=0, changed=False)],
-        "grep": [_ok(stdout="sonarr")],
+        "cat /tmp/ansible_update_": [_ok(stdout="source ct/sonarr.sh", changed=False)],
         "rm -f": [_ok(changed=False)],
         "cat ~/.sonarr": [_ok(stdout="1.0")],
         "dpkg-query": [_ok(stdout="hash  -\n", changed=False)],
@@ -310,7 +310,7 @@ def test_vzdump_failure_triggers_rescue(monkeypatch):
         "pct config": [_ok(stdout=PCT_CONFIG_RUNNING)],
         "pct status": [_ok(stdout=PCT_STATUS_RUNNING)],
         "pct pull": [_ok(rc=0, changed=False)],
-        "grep": [_ok(stdout="sonarr")],
+        "cat /tmp/ansible_update_": [_ok(stdout="source ct/sonarr.sh", changed=False)],
         "rm -f": [_ok(changed=False)],
     })
     settings = _settings(lxc_backup_strategy="vzdump")
@@ -412,7 +412,7 @@ def test_dpkg_hash_detects_change(monkeypatch):
         "pct config": [_ok(stdout=PCT_CONFIG_RUNNING)],
         "pct status": [_ok(stdout=PCT_STATUS_RUNNING)],
         "pct pull": [_ok(rc=0, changed=False)],
-        "grep": [_ok(stdout="sonarr")],
+        "cat /tmp/ansible_update_": [_ok(stdout="source ct/sonarr.sh", changed=False)],
         "rm -f": [_ok(changed=False)],
         # No version file → empty reads (version fallback to dpkg hash)
         "cat ~/.sonarr": [_ok(stdout=""), _ok(stdout="")],
@@ -442,7 +442,7 @@ def test_alpine_version_read_uses_ash(monkeypatch):
         "pct config": [_ok(stdout=PCT_CONFIG_ALPINE)],
         "pct status": [_ok(stdout=PCT_STATUS_RUNNING)],
         "pct pull": [_ok(rc=0, changed=False)],
-        "grep": [_ok(stdout="sonarr")],
+        "cat /tmp/ansible_update_": [_ok(stdout="source ct/sonarr.sh", changed=False)],
         "rm -f": [_ok(changed=False)],
         "cat ~/.sonarr": [_ok(stdout="1.0"), _ok(stdout="1.1")],
         # alpine OS update uses apk
@@ -491,7 +491,7 @@ def test_reboot_suffix_in_os_status(monkeypatch):
         "pct config": [_ok(stdout=PCT_CONFIG_RUNNING)],
         "pct status": [_ok(stdout=PCT_STATUS_RUNNING)],
         "pct pull": [_ok(rc=0, changed=False)],
-        "grep": [_ok(stdout="sonarr")],
+        "cat /tmp/ansible_update_": [_ok(stdout="source ct/sonarr.sh", changed=False)],
         "rm -f": [_ok(changed=False)],
         # version reads
         "cat ~/.sonarr": [_ok(stdout="1.0"), _ok(stdout="1.1")],
@@ -508,3 +508,50 @@ def test_reboot_suffix_in_os_status(monkeypatch):
     out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10")
     assert out.record is not None
     assert "Rebooted" in out.record.os
+
+
+# ---------------------------------------------------------------------------
+# snapshot_with_retry
+# ---------------------------------------------------------------------------
+
+_API = {"api_host": "1.2.3.4", "api_user": "root@pam", "api_token_id": "tok", "api_token_secret": "sec"}
+
+
+class _QueueSnapshotEx:
+    """Minimal executor whose snapshot() dequeues pre-scripted results."""
+    host = "pve-01"
+
+    def __init__(self, results):
+        self._queue = list(results)
+        self.calls: list[str] = []
+
+    def snapshot(self, vmid, *, snap_state, **kw):
+        self.calls.append(snap_state)
+        return self._queue.pop(0)
+
+
+def test_snapshot_with_retry_succeeds_after_two_failures():
+    from proxmox_fleet.executor import snapshot_with_retry
+    ex = _QueueSnapshotEx([
+        PrimitiveResult(rc=1, failed=True, changed=False, stdout="CT is locked"),
+        PrimitiveResult(rc=1, failed=True, changed=False, stdout="CT is locked"),
+        _ok(changed=True),
+    ])
+    result = snapshot_with_retry(ex, "101", snap_state="present", **_API,
+                                 retries=3, _sleep=lambda s: None)
+    assert result.changed is True
+    assert len(ex.calls) == 3
+
+
+def test_snapshot_with_retry_returns_failed_after_exhaustion():
+    from proxmox_fleet.executor import snapshot_with_retry
+    ex = _QueueSnapshotEx([
+        PrimitiveResult(rc=1, failed=True, changed=False, stdout="CT is locked"),
+        PrimitiveResult(rc=1, failed=True, changed=False, stdout="CT is locked"),
+        PrimitiveResult(rc=1, failed=True, changed=False, stdout="CT is locked"),
+    ])
+    result = snapshot_with_retry(ex, "101", snap_state="present", **_API,
+                                 retries=2, _sleep=lambda s: None)
+    assert result.failed is True
+    assert result.changed is False
+    assert len(ex.calls) == 3  # initial + 2 retries
