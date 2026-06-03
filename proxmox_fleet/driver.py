@@ -1,16 +1,18 @@
-"""Python driver for Phase 0a + 0b — custom system updates.
+"""The fleet driver — the Python orchestrator and per-phase runners.
 
-Replaces the Ansible ``custom_update`` role and fleet-update.yml Phase 0a/0b
-logic. Invoked by ``cli.py`` when ``--use-custom-flow`` is set; the playbook
-is told to skip its Phase 0b via the ``skip_phase_0b=true`` extravar.
+``run_fleet()`` is the entrypoint ``cli.py`` calls: it runs the pre-flight
+proxy check and every phase in order (remote → custom → lxc → vm →
+node+manager → notify), merging each phase's :class:`FleetState` into one
+fleet-wide state. The per-phase ``run_*_phase()`` helpers can also be called
+individually (used by tests and the molecule harness).
 
 Conventions:
 - All decisions are here in Python; Ansible executes only via RunnerExecutor.
 - deep_merge: dict values recurse, list values REPLACE — matching
   ``combine(recursive=true)`` documented Ansible behaviour.
-- State is returned as a FleetState and also written to a JSON file via
-  dump_for_ansible() so fleet-update.yml can seed localhost facts before
-  Phases 1–3 run their fleet-state-append.yml accumulations.
+- Each phase returns a FleetState; ``_merge_state()`` folds them together
+  (the in-Python replacement for the old "Merge Python … state" plays). The
+  ``state_output_path`` arg still dumps per-phase JSON when set, for tooling.
 """
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import yaml
 
-from proxmox_fleet import briefing, deps, history, inventory, notifiers, window
+from proxmox_fleet import briefing, deps, history, http, inventory, notifiers, window
 from proxmox_fleet.executor import RunnerExecutor
 from proxmox_fleet.flows.custom import run_custom_update
 from proxmox_fleet.flows.lxc import LxcFlowOutcome, _discover_lxcs, run_lxc_update
@@ -64,7 +66,7 @@ def run_custom_phase(
     inventory_path: str = "hosts.ini",
     extra_vars: Optional[Dict[str, Any]] = None,
     check: bool = False,
-    state_output_path: Union[str, Path] = "/tmp/fleet_custom_state.json",
+    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_custom_state.json",
 ) -> FleetState:
     """Run Phase 0a dependency validation + Phase 0b custom host updates.
 
@@ -137,7 +139,8 @@ def run_custom_phase(
             state.errors.append(outcome.error)
         state.warnings.extend(outcome.warnings)
 
-    state.dump_for_ansible(state_output_path)
+    if state_output_path is not None:
+        state.dump_for_ansible(state_output_path)
     return state
 
 
@@ -163,7 +166,7 @@ def run_lxc_phase(
     settings: GlobalSettings,
     inventory_path: str = "hosts.ini",
     check: bool = False,
-    state_output_path: Union[str, Path] = "/tmp/fleet_lxc_state.json",
+    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_lxc_state.json",
 ) -> FleetState:
     """Run Phase 1 (LXC container updates) via the Python driver.
 
@@ -233,7 +236,8 @@ def run_lxc_phase(
                 ))
                 print(f"  [{node_name}/{lxc_id}] ERROR: {run_err}")
 
-    state.dump_for_ansible(state_output_path)
+    if state_output_path is not None:
+        state.dump_for_ansible(state_output_path)
     return state
 
 
@@ -297,7 +301,7 @@ def run_vm_phase(
     settings: GlobalSettings,
     inventory_path: str = "hosts.ini",
     check: bool = False,
-    state_output_path: Union[str, Path] = "/tmp/fleet_vm_state.json",
+    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_vm_state.json",
 ) -> FleetState:
     """Run Phase 1b (QEMU VM updates) via the Python driver.
 
@@ -367,7 +371,8 @@ def run_vm_phase(
             ))
             print(f"  [{vm_name}] ERROR: {run_err}")
 
-    state.dump_for_ansible(state_output_path)
+    if state_output_path is not None:
+        state.dump_for_ansible(state_output_path)
     return state
 
 
@@ -390,7 +395,7 @@ def run_remote_phase(
     settings: GlobalSettings,
     inventory_path: str = "hosts.ini",
     check: bool = False,
-    state_output_path: Union[str, Path] = "/tmp/fleet_remote_state.json",
+    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_remote_state.json",
 ) -> FleetState:
     """Run Phase 0 (remote host updates) via the Python driver.
 
@@ -434,7 +439,8 @@ def run_remote_phase(
             ))
             print(f"  [{host_name}] ERROR: {run_err}")
 
-    state.dump_for_ansible(state_output_path)
+    if state_output_path is not None:
+        state.dump_for_ansible(state_output_path)
     return state
 
 
@@ -454,7 +460,7 @@ def run_node_phase(
     settings: GlobalSettings,
     inventory_path: str = "hosts.ini",
     check: bool = False,
-    state_output_path: Union[str, Path] = "/tmp/fleet_node_state.json",
+    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_node_state.json",
 ) -> FleetState:
     """Run Phase 2 (node OS updates) + Phase 3 (manager self-update) via the Python driver.
 
@@ -490,7 +496,8 @@ def run_node_phase(
     mgr_status = manager_outcome.record.status if manager_outcome.record else "?"
     print(f"  [Ansible-Manager] {mgr_status}")
 
-    state.dump_for_ansible(state_output_path)
+    if state_output_path is not None:
+        state.dump_for_ansible(state_output_path)
     return state
 
 
@@ -540,3 +547,71 @@ def run_notify_phase(
 
     notifiers.ping_deadmans(settings.fleet_deadmans_url, failed=failed)
     return body
+
+
+def _merge_state(dst: FleetState, src: FleetState) -> None:
+    """Fold one phase's FleetState into the running fleet-wide state.
+
+    The in-Python equivalent of the old fleet-update.yml "Merge Python … state"
+    plays: record lists concatenate, the changed/failed flags OR-join, and the
+    error/warning logs accumulate.
+    """
+    dst.lxc.extend(src.lxc)
+    dst.vm.extend(src.vm)
+    dst.remote.extend(src.remote)
+    dst.node.extend(src.node)
+    dst.custom.extend(src.custom)
+    dst.errors.extend(src.errors)
+    dst.warnings.extend(src.warnings)
+    dst.changed = dst.changed or src.changed
+    dst.failed = dst.failed or src.failed
+
+
+def run_fleet(
+    *,
+    settings: GlobalSettings,
+    inventory_path: str = "hosts.ini",
+    check: bool = False,
+    extra_vars: Optional[Dict[str, Any]] = None,
+) -> int:
+    """End-to-end fleet update — the Python orchestrator that replaces fleet-update.yml.
+
+    Runs the pre-flight apt-proxy check, then every phase in order
+    (remote → custom → lxc → vm → node+manager), merging each phase's FleetState
+    into one fleet-wide state, then renders/dispatches the final briefing.
+
+    Returns a process exit code: 1 if any phase recorded a failure, else 0.
+    Raises SystemExit(1) on a pre-flight proxy failure or a custom dependency-order
+    problem (both fail-loud, mirroring the legacy playbook).
+    """
+    ev = extra_vars or {}
+
+    # Pre-flight: the apt-cacher-ng proxy must be reachable or the whole run aborts
+    # (port of the "Verify Apt-Cacher-NG is Online" / "Halt if Proxy is Offline" play).
+    if settings.apt_proxy_ip:
+        try:
+            http.wait_for_port(settings.apt_proxy_ip, settings.apt_proxy_port, timeout=30)
+        except (TimeoutError, OSError):
+            print(
+                f"CRITICAL: Apt Proxy ({settings.apt_proxy_ip}) is unreachable. "
+                "Aborting fleet update.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
+    state = FleetState()
+    _merge_state(state, run_remote_phase(
+        settings=settings, inventory_path=inventory_path, check=check, state_output_path=None))
+    _merge_state(state, run_custom_phase(
+        settings=settings, inventory_path=inventory_path, extra_vars=ev, check=check,
+        state_output_path=None))
+    _merge_state(state, run_lxc_phase(
+        settings=settings, inventory_path=inventory_path, check=check, state_output_path=None))
+    _merge_state(state, run_vm_phase(
+        settings=settings, inventory_path=inventory_path, check=check, state_output_path=None))
+    _merge_state(state, run_node_phase(
+        settings=settings, inventory_path=inventory_path, check=check, state_output_path=None))
+
+    run_notify_phase(settings=settings, state=state, check=check)
+
+    return 1 if state.failed else 0

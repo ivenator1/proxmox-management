@@ -12,9 +12,12 @@ from typing import Any, Dict, List, Optional
 import pytest
 import yaml
 
+import proxmox_fleet.driver as driver_mod
 from proxmox_fleet.driver import (
     _deep_merge,
+    _merge_state,
     run_custom_phase,
+    run_fleet,
     run_node_phase,
     run_notify_phase,
 )
@@ -614,3 +617,80 @@ def test_notify_phase_failed_state_titles(tmp_path, monkeypatch):
     assert kw["ntfy_title"] == "Fleet Update: Failures Detected"
     assert kw["color"] == 15158332
     assert calls["ping"][0][1] == {"failed": True}
+
+
+# --- _merge_state -------------------------------------------------------------
+
+def test_merge_state_concatenates_and_or_joins():
+    dst = FleetState.from_raw({
+        "fleet_lxc_data": [{"node": "n1", "name": "a", "id": "1", "app": "OK"}],
+        "fleet_changed": True,
+        "fleet_failed": False,
+        "fleet_error_log": [{"host": "h1", "task": "t", "error": "e"}],
+    })
+    src = FleetState.from_raw({
+        "fleet_lxc_data": [{"node": "n2", "name": "b", "id": "2", "app": "OK"}],
+        "fleet_vm_data": [{"node": "n2", "vmid": "9", "name": "vm", "status": "OK"}],
+        "fleet_changed": False,
+        "fleet_failed": True,
+        "fleet_warning_log": [{"host": "h2", "task": "u", "warning": "w"}],
+    })
+    _merge_state(dst, src)
+    assert [r.id for r in dst.lxc] == ["1", "2"]
+    assert [r.vmid for r in dst.vm] == ["9"]
+    assert dst.changed is True   # True or False
+    assert dst.failed is True    # False or True
+    assert len(dst.errors) == 1 and len(dst.warnings) == 1
+
+
+# --- run_fleet orchestrator ---------------------------------------------------
+
+def _stub_phases(monkeypatch, *, remote=None, custom=None, lxc=None, vm=None, node=None):
+    def mk(state):
+        def _fn(**kwargs):
+            return state if state is not None else FleetState()
+        return _fn
+    monkeypatch.setattr(driver_mod, "run_remote_phase", mk(remote))
+    monkeypatch.setattr(driver_mod, "run_custom_phase", mk(custom))
+    monkeypatch.setattr(driver_mod, "run_lxc_phase", mk(lxc))
+    monkeypatch.setattr(driver_mod, "run_vm_phase", mk(vm))
+    monkeypatch.setattr(driver_mod, "run_node_phase", mk(node))
+
+
+def test_run_fleet_merges_all_phases(monkeypatch):
+    captured = {}
+
+    def _notify(*, settings, state, check=False):
+        captured["state"] = state
+        return "body"
+
+    monkeypatch.setattr(driver_mod, "run_notify_phase", _notify)
+    _stub_phases(
+        monkeypatch,
+        remote=FleetState.from_raw({"fleet_remote_data": [{"host": "r", "status": "OK"}]}),
+        node=FleetState.from_raw({"fleet_node_data": [{"node": "n", "status": "OK"}]}),
+    )
+    settings = GlobalSettings(apt_proxy_ip="")  # skip pre-flight
+    rc = run_fleet(settings=settings, inventory_path="x", check=True)
+    assert rc == 0
+    assert len(captured["state"].remote) == 1
+    assert len(captured["state"].node) == 1
+
+
+def test_run_fleet_returns_1_on_failure(monkeypatch):
+    monkeypatch.setattr(driver_mod, "run_notify_phase", lambda **kw: "body")
+    _stub_phases(monkeypatch, lxc=FleetState.from_raw({"fleet_failed": True}))
+    rc = run_fleet(settings=GlobalSettings(apt_proxy_ip=""), inventory_path="x")
+    assert rc == 1
+
+
+def test_run_fleet_preflight_abort(monkeypatch):
+    def _boom(host, port, **kw):
+        raise TimeoutError("nope")
+
+    monkeypatch.setattr(driver_mod.http, "wait_for_port", _boom)
+    monkeypatch.setattr(driver_mod, "run_notify_phase", lambda **kw: "body")
+    _stub_phases(monkeypatch)
+    with pytest.raises(SystemExit):
+        run_fleet(settings=GlobalSettings(apt_proxy_ip="10.0.0.1", apt_proxy_port=3142),
+                  inventory_path="x")

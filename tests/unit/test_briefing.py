@@ -1,12 +1,14 @@
 """Tests for proxmox_fleet.briefing — the Python port of discord_briefing.j2.
 
 Two layers:
-1. Behavioural cases mirroring tests/unit/test_discord_briefing.py against
+1. Behavioural cases mirroring the retired discord_briefing.j2 tests against
    ``render_briefing(FleetState(...))``.
-2. A GOLDEN parity test that renders the same fixtures through BOTH the surviving
-   Jinja shim (the live .j2) and ``render_briefing()`` and asserts byte-equality.
-   This locks parity so the template can be retired without changing the bytes.
+2. A GOLDEN parity test that compares ``render_briefing()`` against a captured
+   fixture (tests/unit/data/briefing_golden.json). The fixture was seeded from
+   the live discord_briefing.j2 render before the template was retired, so it
+   locks the exact bytes that used to go to Discord.
 """
+import json
 import pathlib
 
 import pytest
@@ -20,9 +22,8 @@ from proxmox_fleet.briefing import (
     should_notify,
 )
 from proxmox_fleet.models.state import FleetState
-from tests.conftest import make_jinja2_env
 
-TEMPLATE_PATH = pathlib.Path(__file__).parent.parent.parent / "templates" / "discord_briefing.j2"
+GOLDEN_PATH = pathlib.Path(__file__).parent / "data" / "briefing_golden.json"
 
 
 def _state(**kw) -> FleetState:
@@ -201,7 +202,7 @@ def test_prepare_body_truncates_to_4000():
 
 
 # --------------------------------------------------------------------------- #
-# GOLDEN parity test — render_briefing == discord_briefing.j2, byte-for-byte
+# GOLDEN parity test — render_briefing == captured discord_briefing.j2 bytes
 # --------------------------------------------------------------------------- #
 
 _GOLDEN_SCENARIOS = {
@@ -237,22 +238,21 @@ _GOLDEN_SCENARIOS = {
 
 
 @pytest.fixture(scope="module")
-def jinja_template():
-    env = make_jinja2_env()
-    env.loader = None
-    return env.from_string(TEMPLATE_PATH.read_text())
+def golden():
+    return json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
 
 
-def _shim_render(template, scenario: dict) -> str:
-    defaults = dict(fleet_node_data=[], fleet_lxc_data=[], fleet_vm_data=[],
-                    fleet_remote_data=[], fleet_custom_data=[], fleet_error_log=[],
-                    fleet_warning_log=[])
-    return template.render(**{**defaults, **scenario})
+def test_golden_covers_all_scenarios(golden):
+    # Guard against a scenario being added here but not captured in the fixture.
+    assert set(golden) == set(_GOLDEN_SCENARIOS), (
+        "briefing_golden.json is out of sync with _GOLDEN_SCENARIOS — regenerate it"
+    )
 
 
 @pytest.mark.parametrize("name", list(_GOLDEN_SCENARIOS))
-def test_golden_parity_with_jinja_template(jinja_template, name):
+def test_golden_parity_with_captured_template(golden, name):
     scenario = _GOLDEN_SCENARIOS[name]
-    expected = _shim_render(jinja_template, scenario)
     actual = render_briefing(FleetState.from_raw(scenario))
-    assert actual == expected, f"briefing render diverged from .j2 for scenario {name!r}"
+    assert actual == golden[name], (
+        f"briefing render diverged from captured .j2 bytes for scenario {name!r}"
+    )

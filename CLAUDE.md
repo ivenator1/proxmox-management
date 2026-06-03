@@ -4,70 +4,37 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
+The Ansible→Python migration is **complete**: `fleet-update` (→ `driver.run_fleet()`) is
+the only entrypoint. There is no `fleet-update.yml` playbook and no `--use-*-flow` flags —
+Ansible runs only as the execution primitives in `ansible/primitives/*.yml`.
+
 ```bash
-# Syntax check (no PVE infrastructure needed)
-ansible-playbook fleet-update.yml --syntax-check
-
-# Dry run — no changes, forces Discord notification
-ansible-playbook fleet-update.yml --check -e "force_notify=true"
-
-# Version comparison only (no updates applied)
-ansible-playbook fleet-update.yml -e "lxc_dry_run=true force_notify=true"
-
-# Full run against one node only
-ansible-playbook fleet-update.yml --limit pve-01
+# Fleet-wide dry-run (no changes), forces a Discord/ntfy notification
+fleet-update --check -e fleet_dry_run=true -e force_notify=true
 
 # Full run with forced notification
-ansible-playbook fleet-update.yml -e "force_notify=true"
+fleet-update -e force_notify=true
 
-# Install required collections
+# Install required collections (for the primitives + molecule)
 ansible-galaxy collection install community.proxmox community.general
 
-# Jinja2 unit tests (no Ansible or PVE needed)
-pip install -r tests/requirements.txt
+# Python unit tests (no Ansible or PVE needed)
+pip install -e '.[dev]'        # includes types-PyYAML, mypy, pytest, pydantic
 pytest tests/unit/ -v
-pytest tests/unit/test_report_tmp_app.py -v    # single file
-pytest tests/unit/ -k "test_version_updated"   # single test
+pytest tests/unit/test_briefing.py -v          # single file
+pytest tests/unit/ -k "run_fleet"              # single test
 
 # Python type checking
-pip install -e '.[dev]'        # includes types-PyYAML, mypy, pytest, pydantic
 python -m mypy proxmox_fleet/
 
 # Static analysis
 yamllint .
-ansible-lint fleet-update.yml
+ansible-lint ansible/primitives/
 
-# Molecule scenario (runs against localhost via stub pct/vzdump scripts)
-cd roles/lxc_update && molecule test -s lxc_update_normal
-cd roles/lxc_update && molecule test -s lxc_update_rollback
+# Molecule scenarios (drive the Python flows via stub pct/vzdump scripts, against localhost)
+cd roles/lxc_update && molecule test -s lxc_update_normal      # normal | rollback | snapfail
 cd roles/lxc_update && molecule converge -s lxc_update_normal  # converge only, no verify/destroy
-cd roles/custom_update && molecule test -s custom_update_normal  # Python flow via RunnerExecutor
-
-# Python driver — Phase 0b via Python instead of custom_update role
-fleet-update --use-custom-flow --check -e fleet_dry_run=true   # dry-run via Python driver
-fleet-update --use-custom-flow --vars-file vars.yml            # full run via Python driver
-
-# Python driver — Phase 1 (LXC updates) via Python instead of lxc_update role
-fleet-update --use-lxc-flow --check -e fleet_dry_run=true     # dry-run via Python driver
-fleet-update --use-lxc-flow --vars-file vars.yml               # full run via Python driver
-
-# Python driver — Phase 1b (VM updates) via Python instead of vm_update role
-fleet-update --use-vm-flow --check -e fleet_dry_run=true       # dry-run via Python driver
-fleet-update --use-vm-flow --vars-file vars.yml                 # full run via Python driver
-
-# Python driver — Phase 0 (remote host updates) via Python instead of remote_host_update role
-fleet-update --use-remote-flow --check -e fleet_dry_run=true   # dry-run via Python driver
-fleet-update --use-remote-flow --vars-file vars.yml             # full run via Python driver
-
-# Python driver — Phase 2+3 (node OS update + manager self-update) via Python
-fleet-update --use-node-flow --check -e fleet_dry_run=true   # dry-run via Python driver
-fleet-update --use-node-flow --vars-file vars.yml             # full run via Python driver
-
-# Python driver — Phase 4 (briefing + history + notifiers) via Python instead of playbook Phase 4
-fleet-update --use-notify-flow --check -e fleet_dry_run=true -e force_notify=true  # render+notify via Python
-
-# Run all Python-ported phases together (recommended once parity is confirmed)
-fleet-update --use-custom-flow --use-lxc-flow --use-vm-flow --use-remote-flow --use-node-flow --use-notify-flow --check -e fleet_dry_run=true
+cd roles/custom_update && molecule test -s custom_update_normal  # custom flow via RunnerExecutor
 ```
 
 `hosts.ini` and `vars.yml` are gitignored (contain secrets/IPs). Copy from `.example` files to run locally.
@@ -89,14 +56,13 @@ Activate the venv at the start of each shell session: `source .venv/bin/activate
 ## File Map
 
 ```
-fleet-update.yml                        # Main playbook — 7 phases + "Merge Python state" play between 0b and 1
 ansible.cfg                             # forks=20, pipelining=true, inventory=./hosts.ini
 vars.yml / vars.yml.example             # Secrets + behaviour flags (gitignored; copy from .example)
 hosts.ini / hosts.ini.example           # Inventory (gitignored; copy from .example)
-.ansible-lint                           # profile: moderate; excludes role task files that use {{ role_path }} includes
+.ansible-lint                           # profile: moderate; targets ansible/primitives/ (name[casing] demoted to warning)
 .yamllint.yml                           # extends: default; line-length warning at 160
-.github/workflows/ci.yml                # yamllint, ansible-lint, syntax-check, unit-tests, + molecule matrices (lxc, custom)
-pyproject.toml                          # package config; [dev] extras include types-PyYAML for mypy
+.github/workflows/ci.yml                # yamllint, ansible-lint (primitives), syntax-check (primitives), unit-tests, mypy, + molecule matrices (lxc, custom)
+pyproject.toml                          # package config; fleet-update entrypoint; [dev] extras include types-PyYAML for mypy
 proxmox_fleet/
   models/
     config.py                           # CustomConfig pydantic schema (custom_update config files)
@@ -109,7 +75,7 @@ proxmox_fleet/
     remote.py                           # run_remote_update() — the full remote host flow (pre_update_cmd→detect_pkg_mgr→upgrade→reboot→health→report); no snapshot/always block
     node.py                             # run_node_update() + run_manager_update() — Phase 2+3; apt w/ 5 retries, robust reboot check, manager-host skip, proxy wait
   deps.py                               # validate_depends_order() + dependency_failed() — ports of Phase-0a Jinja logic
-  driver.py                             # run_custom_phase() + run_lxc_phase() + run_vm_phase() + run_remote_phase() + run_node_phase() + run_notify_phase() — all phases in Python
+  driver.py                             # run_fleet() end-to-end orchestrator (pre-flight → all phases → _merge_state → notify) + per-phase run_*_phase() helpers
   executor.py                           # Executor protocol + RunnerExecutor; snapshot() added for proxmox_snap primitive
   http.py                               # Manager-local HTTP: get_json, poll_until, request, post_json
   inventory.py                          # load_custom_hosts() + load_proxmox_nodes() — line-by-line hosts.ini parsers
@@ -123,11 +89,7 @@ proxmox_fleet/
   briefing.py                           # render_briefing() byte-parity port of discord_briefing.j2 + prepare_body/title/color/should_notify
   history.py                            # build_run_summary() + write_history() — port of persist-history.yml; records rendered briefing body
   notifiers.py                          # resolve_notifiers() + dispatch() (discord/ntfy) + ping_deadmans() — port of notify.yml + Phase-4 shim
-  cli.py                                # fleet-update CLI; --use-custom-flow / --use-lxc-flow / --use-vm-flow / --use-remote-flow / --use-node-flow / --use-notify-flow flags
-tasks/
-  fleet-state-append.yml                # Shared state accumulator — always use this, never inline set_fact+delegate
-templates/
-  discord_briefing.j2                   # Discord embed body — renders fleet_*_data lists into markdown
+  cli.py                                # fleet-update CLI — parses --check / -e / --inventory / --vars-file, then calls driver.run_fleet()
 config_templates/
   custom_system.yml.example             # Fully-commented schema template — copy to configs/<name>.yml
 configs/
@@ -147,100 +109,57 @@ ansible/
     lxc_os_update.yml                   # OS upgrade inside container (pct exec)
     lxc_app_update.yml                  # /usr/bin/update with /tmp/.nc/clear trick + resource scaling
 tests/
-  requirements.txt                      # pytest, jinja2, pyyaml — all that's needed for Jinja-shim unit tests
-  conftest.py                           # Ansible-compatible Jinja2 env: regex_search (list return), bool, failed/search tests
-  unit/                                 # 442 pytest tests; no Ansible or PVE required
-  integration/
-    test_fleet_state_append.yml         # Standalone ansible-playbook test for delegate_to+delegate_facts accumulation
-roles/
-  lxc_update/
-    defaults/main.yml                   # Default values for all lxc_* vars + kuma_health_check_retries/delay
-    tasks/
-      main.yml                          # Orchestrator: introspect → block(detect→backup→dry_check|update→health_check→report) → rescue(rollback) → always
-      introspect.yml                    # pct config + pct status; starts stopped containers; sets lxc_name, lxc_os, lxc_is_running, lxc_was_stopped
-      detect.yml                        # Pulls /usr/bin/update, extracts ct script name, fetches .sh from GitHub, parses resource requirements
-      backup.yml                        # vzdump and/or snapshot (BEFORE_UPDATE_AUTO) based on lxc_backup_strategy
-      dry_check.yml                     # Reads installed version + fetches latest GitHub release; sets dry_run_status
-      update.yml                        # OS update first, dpkg hash before/after community script, ver before/after, reboot if needed
-      health_check.yml                  # Polls Uptime Kuma; failure → rescue (no ignore_errors); retries/delay are vars
-      report.yml                        # Builds tmp_app/tmp_os strings; appends LXC record (skips idle containers)
-    molecule/
-      mol_run_flow.py                   # Shared converge helper: builds MolLxcExecutor (snapshot stubbed), calls run_lxc_update(), writes dump_for_ansible() JSON
-      lxc_update_normal/                # Running container, vzdump backup, no update script → NO SCRIPT
-      lxc_update_template/              # pct config returns template:1 → all tasks skipped (legacy role)
-      lxc_update_stopped/               # pct status:stopped → start → update → stop in always block (legacy role)
-      lxc_update_dry_run/               # lxc_dry_run=true → only dry_check runs (legacy role)
-      lxc_update_rescue/                # vzdump stub exits 1 → rescue fires (legacy role)
-      lxc_update_rollback/              # Kuma unreachable, no snapshot → FAILED (no rollback)
-      lxc_update_snapfail/              # snapshot() returns changed=False → warning, update continues
-  vm_update/
-    defaults/main.yml                   # Default values for vm_* vars
-    tasks/
-      main.yml                          # Orchestrator: block(snapshot→update→health_check→report) → rescue → always(delete snapshot)
-      snapshot.yml                      # Creates BEFORE_UPDATE_AUTO snapshot via PVE API
-      update.yml                        # apt/dnf/apk upgrade + reboot check
-      health_check.yml                  # Polls Uptime Kuma (vm_kuma_map)
-      report.yml                        # Appends VM record to fleet_vm_data
-    molecule/default/                   # Runs role in check_mode against localhost; no PVE needed
-  remote_host_update/
-    defaults/main.yml                   # Default values for remote_* vars
-    tasks/
-      main.yml                          # Orchestrator: block(update→health_check→report) → rescue (no always block — no snapshots)
-      update.yml                        # apt/dnf/apk upgrade + reboot check
-      health_check.yml                  # Polls Uptime Kuma (remote_kuma_map)
-      report.yml                        # Appends remote host record to fleet_remote_data
-    molecule/default/                   # Runs role in check_mode against localhost; no PVE needed
-  custom_update/
-    defaults/main.yml                   # custom_dry_run, custom_allow_reboot, custom_kuma_map, kuma health check vars (legacy path)
-    tasks/
-      main.yml                          # Orchestrator: load_config → block(detect→backup→update→health_check→report) → rescue(rollback_command)
-      load_config.yml                   # include_vars configs/{{ custom_config }}.yml → combine custom_overrides → custom_cfg
-      detect.yml                        # version_command (before); latest_version via GitHub API or command (delegated to localhost)
-      backup.yml                        # backup_command if defined
-      update.yml                        # loop update_steps; version_command (after); changed_when command; reboot if cfg.reboot
-      health_check.yml                  # kuma | command | http | none; failure → rescue (no ignore_errors)
-      report.yml                        # tmp_custom decision tree; appends fleet_custom_data (skips idle)
-    molecule/
-      mol_run_flow.py                   # Shared converge helper: loads config, builds RunnerExecutor, calls run_custom_update(), writes dump_for_ansible() JSON
-      custom_update_normal/             # Version changes 1.0 → 1.1; "Updated: 1.0 → 1.1" recorded
-      custom_update_noop/               # Version unchanged; record suppressed (idle)
-      custom_update_rescue/             # Update step exits 1; rollback_command runs; fleet_failed=True
-      custom_update_dry_run/            # custom_dry_run=true; detect only; "dry-run: X → Y" recorded
-      custom_update_uptodate/           # update_only_if_outdated=true; version matches; update steps skipped
-      custom_update_per_step/           # per-step when: gate referencing steps.NAME stdout
+  requirements.txt                      # pytest, pyyaml — all that's needed for the plain-Python unit tests
+  unit/                                 # pytest tests; no Ansible or PVE required
+    data/briefing_golden.json           # Captured discord_briefing.j2 bytes — locks render_briefing() parity
+roles/                                  # Molecule scenarios ONLY — each drives a Python flow via mol_run_flow.py
+  lxc_update/molecule/
+    mol_run_flow.py                     # Converge helper: builds MolLxcExecutor (snapshot stubbed), calls run_lxc_update(), dumps JSON
+    lxc_update_normal/                  # Running container, vzdump backup, no update script → NO SCRIPT
+    lxc_update_rollback/                # Kuma unreachable, no snapshot → FAILED (no rollback)
+    lxc_update_snapfail/                # snapshot() returns changed=False → warning, update continues
+  custom_update/molecule/
+    mol_run_flow.py                     # Converge helper: loads config, builds RunnerExecutor, calls run_custom_update(), dumps JSON
+    custom_update_normal/               # Version changes 1.0 → 1.1; "Updated: 1.0 → 1.1" recorded
+    custom_update_noop/                 # Version unchanged; record suppressed (idle)
+    custom_update_rescue/               # Update step exits 1; rollback_command runs; fleet_failed=True
+    custom_update_dry_run/              # custom_dry_run=true; detect only; "dry-run: X → Y" recorded
+    custom_update_uptodate/             # update_only_if_outdated=true; version matches; update steps skipped
+    custom_update_per_step/             # per-step when: gate referencing steps.NAME stdout
 ```
 
 ## Architecture
 
-### Play order in `fleet-update.yml`
+### Phase order in `driver.run_fleet()`
 
-| Phase | Hosts | Purpose |
+`fleet-update` → `driver.run_fleet()` runs these in order, threading one in-memory
+`FleetState` through (`_merge_state()` folds each phase's returned state in — the
+in-Python replacement for the old "Merge Python state" plays):
+
+| Phase | Target | Purpose |
 |---|---|---|
-| Pre-Flight | localhost | Verify apt-cacher-ng proxy is reachable |
-| Phase 0 | `remote_hosts` | Non-Proxmox hosts via `remote_host_update` role (skipped when `skip_phase_0=true`) |
-| *(merge remote)* | localhost | Load Python driver output into `fleet_remote_data`/`fleet_changed`/`fleet_failed` (active when `fleet_remote_state_path` is defined) |
-| Phase 0a | localhost | Validate `custom_hosts` `depends_on` ordering (fail loud on missing/after) |
-| Phase 0b | `custom_hosts` | Non-standard systems via `custom_update` role (skipped when `skip_phase_0b=true`) |
-| *(merge custom)* | localhost | Load Python driver output into `fleet_custom_data`/`fleet_changed`/`fleet_failed` (active when `fleet_custom_state_path` is defined) |
-| Phase 1 | `proxmox_nodes` | Tag-filtered LXC discovery + `lxc_update` role per container (skipped when `skip_phase_1=true`) |
-| *(merge lxc)* | localhost | Load Python driver output into `fleet_lxc_data` (active when `fleet_lxc_state_path` is defined) |
-| Phase 1b | `proxmox_vms` | QEMU VMs via `vm_update` role (skipped when `skip_phase_1b=true`) |
-| *(merge vm)* | localhost | Load Python driver output into `fleet_vm_data` (active when `fleet_vm_state_path` is defined) |
-| Phase 2 | `proxmox_nodes` | PVE node OS update + sequential reboot (`serial: 1`, `any_errors_fatal: true`) |
-| Phase 3 | localhost | Manager container self-update |
-| Phase 4 | localhost | Persist run history → dispatch notifiers → dead-man's-switch ping (skipped when `skip_phase_4=true`; the Python `--use-notify-flow` then dumps merged state + runs `driver.run_notify_phase()` after the playbook) |
+| Pre-Flight | manager | `http.wait_for_port()` on the apt-cacher-ng proxy; `SystemExit(1)` if unreachable |
+| Phase 0 | `remote_hosts` | `run_remote_phase()` → `flows/remote.py` per host (concurrent, `remote_forks`) |
+| Phase 0a/0b | `custom_hosts` | `run_custom_phase()` — validates `depends_on` order (fail loud), then `flows/custom.py` serially |
+| Phase 1 | `proxmox_nodes` | `run_lxc_phase()` — tag-filtered discovery + `flows/lxc.py` per container (concurrent, `lxc_forks`) |
+| Phase 1b | `proxmox_vms` | `run_vm_phase()` — pvesh HA location discovery + `flows/vm.py` per VM (concurrent, `vm_forks`) |
+| Phase 2 | `proxmox_nodes` | `run_node_phase()` — serial node OS update + reboot (abort-on-first-failure) |
+| Phase 3 | manager | manager self-update (runs unconditionally, even after a node failure) |
+| Phase 4 | manager | `run_notify_phase()` — render briefing once → dispatch notifiers → write history → dead-man ping |
 
-Each phase ORs the master `fleet_dry_run` into its role's dry flag via an eager `set_fact` (no self-reference recursion); `fleet_dry_run` also forces a notification.
-
-**`--use-custom-flow` CLI flag**: when set, `cli.py` calls `driver.run_custom_phase()` before the playbook, writes `/tmp/fleet_custom_state.json`, and passes `skip_phase_0b=true` + `fleet_custom_state_path` as extravars. Phase 0b is skipped; the merge play loads the JSON and seeds `fleet_changed`/`fleet_failed` **before Phase 1** so the downstream `fleet-state-append.yml` calls OR-join correctly. Without the flag the legacy `custom_update` role runs unchanged.
-
-**`--use-lxc-flow` CLI flag**: same pattern for Phase 1. `cli.py` calls `driver.run_lxc_phase()`, writes `/tmp/fleet_lxc_state.json`, passes `skip_phase_1=true` + `fleet_lxc_state_path`. A "Merge Python lxc state" play (between the custom merge play and Phase 1b) seeds `fleet_lxc_data`/`fleet_changed`/`fleet_failed`. Without the flag the legacy `lxc_update` role runs unchanged.
+`run_fleet()` returns exit code 1 if any phase recorded a failure, else 0. Each phase's
+dry-run flag is `check or fleet_dry_run or <phase>_dry_run`; `fleet_dry_run` also forces a
+notification (`briefing.should_notify`).
 
 ### State accumulation pattern
 
-All fleet state lives as facts on `localhost` across plays. Every role and play appends to it via `tasks/fleet-state-append.yml` using `delegate_to: localhost` + `delegate_facts: true` + `check_mode: no`. The five state lists are `fleet_lxc_data`, `fleet_vm_data`, `fleet_remote_data`, `fleet_node_data`, and `fleet_custom_data`. `fleet_changed`, `fleet_failed`, `fleet_error_log` (`list[{host, task, error}]`), and `fleet_warning_log` (`list[{host, task, warning}]`, non-fatal) are also maintained here.
-
-Do not write `set_fact` + `delegate_to: localhost` blocks directly — always call `tasks/fleet-state-append.yml` instead. A warning-only call passes `fleet_record_type: warning` + `fleet_warning_detail` (no list matches, so only the warning is appended).
+Each `flows/*` call returns a per-host outcome; each `run_*_phase()` folds those into a
+`FleetState` (the `_fold_*_outcome()` helpers); `run_fleet()` then `_merge_state()`s the
+per-phase states into one. The state lists are `lxc`, `vm`, `remote`, `node`, `custom`,
+with `changed`/`failed` flags and `errors`/`warnings` logs (`models/state.py`). The
+`run_*_phase()` helpers can still `dump_for_ansible()` a phase's state to JSON when given a
+`state_output_path` (used by tooling / molecule); `run_fleet()` passes `None` and merges
+in-memory.
 
 ### Phase 4 subsystems
 

@@ -71,30 +71,33 @@ pytest tests/unit/ -v
 
 ---
 
-## Status
+## Status — ✅ migration complete
+
+The hybrid migration is finished. **`driver.run_fleet()` is the end-to-end orchestrator**
+the `fleet-update` CLI calls; the legacy `fleet-update.yml` monolith, the `roles/*/tasks`
++ `defaults`, the `tasks/*.yml` helpers, `templates/discord_briefing.j2`, and the
+`tests/conftest.py` Jinja shim have all been removed. Ansible survives only as the
+single-purpose execution primitives in `ansible/primitives/*.yml`. The implementation
+notes below are retained as historical record.
 
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Package skeleton, runner, orchestration, http, cli, CI (mypy + pip install -e .) | ✅ done (`0dad3b8`) |
 | 1 | pydantic `CustomConfig` + `FleetState` schemas | ✅ done (`0dad3b8`) |
-| 2-logic | `custom_update` decision trees → `status.py`/`changes.py` (+ parity tests) | ✅ done (`57ade9f`) |
-| 2-flow | `custom_update` orchestration → `flows/custom.py` + `steps.py` + `executor.py` + primitives | ✅ done (`d7d6308`) |
-| 2-wire | Driver runs the custom flow behind `--use-custom-flow`; molecule reworked; retire pending real-run parity | 🔶 wired (`759f3ad`) |
-| 3 | `lxc_update` → `flows/lxc.py` + primitives; `tmp_app`/`tmp_os` ports; molecule reworked | 🔶 live-tested (`testing` branch) |
-| 3-retire | Delete legacy `lxc_update` role tasks/defaults; flip `--use-lxc-flow` to default | ⬜ pending speed parity |
-| 4a | `vm_update` + `remote_host_update` → `flows/vm.py` + `flows/remote.py`; `--use-vm-flow` / `--use-remote-flow` flags | 🔶 wired (`dde870e`) |
-| 4b | node OS update + manager self-update; serial reboot loop; `--use-node-flow` | 🔶 wired |
-| 5 | Briefing/history/notifiers in Python (byte-parity, golden-test gated); `--use-notify-flow`; retire `conftest.py`/`.j2` + split monolith pending parity | 🔶 wired |
+| 2 | `custom_update` → `flows/custom.py` (+ `status.py`/`changes.py`); default; legacy role + shim tests deleted | ✅ done |
+| 3 | `lxc_update` → `flows/lxc.py` + primitives; default; legacy role + shim tests deleted | ✅ done |
+| 4a | `vm_update` + `remote_host_update` → `flows/{vm,remote}.py`; default; legacy roles deleted | ✅ done |
+| 4b | node OS update + manager self-update → `flows/node.py`; default | ✅ done |
+| 5 | Briefing/history/notifiers in Python (byte-parity, golden-test gated); monolith removed; `conftest.py` + `.j2` deleted | ✅ done |
 
 What exists now: `proxmox_fleet/{__init__,cli,__main__,runner,orchestration,http,steps,executor,status,changes,deps,driver,inventory,window,lxc_parse,briefing,history,notifiers}.py`,
 `proxmox_fleet/models/{config,state,settings}.py`, `proxmox_fleet/flows/{custom,lxc,vm,remote,node}.py`,
 `ansible/primitives/{run_shell,reboot_host,discover_lxcs,pct_config,pct_status,pct_start,pct_stop,pct_pull,snapshot,rollback,vzdump,lxc_os_update,lxc_app_update}.yml`,
-`roles/{custom_update,lxc_update}/molecule/mol_run_flow.py`,
-and tests `tests/unit/test_{config_model,state_model,orchestration,http,status_custom,steps,flow_custom,settings,deps,window,inventory,driver,status_lxc,flow_lxc,status_vm,status_remote,flow_vm,flow_remote,status_node,flow_node}.py`.
-~541 tests green, mypy clean. `--use-custom-flow` routes Phase 0b, `--use-lxc-flow` routes Phase 1,
-`--use-vm-flow` routes Phase 1b, `--use-remote-flow` routes Phase 0, and `--use-node-flow` routes
-Phase 2+3 through the Python driver; all flags keep the legacy Ansible path as the default until
-real-run parity is confirmed.
+`roles/{custom_update,lxc_update}/molecule/mol_run_flow.py` (flow-driven molecule scenarios only).
+The CLI is just `fleet-update [--check] [-e key=val ...]` → `driver.run_fleet()`; the `--use-*-flow`
+flags and the per-phase merge plays are gone. ~420 plain-Python tests green, mypy clean. The
+golden briefing parity is now locked by `tests/unit/data/briefing_golden.json` (captured from the
+retired `.j2`) rather than the live Jinja shim.
 
 ---
 

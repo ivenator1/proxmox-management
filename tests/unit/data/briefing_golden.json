@@ -1,0 +1,16 @@
+{
+  "empty": "",
+  "one_node_idle": "**pve-01: (OK)**\n- *No container changes.*",
+  "lxc_updated": "**pve-01: (OK)**\n- LXC\n  - sonarr (101) — Updated: v4.0 → v4.1 | OS: OK",
+  "lxc_os_none": "**pve-01: (OK)**\n- LXC\n  - sonarr (101) — Updated: v4.0 → v4.1",
+  "lxc_no_snap": "**pve-01: (OK)**\n- LXC\n  - sonarr (101) — Updated: v4.0 → v4.1 | OS: OK *(no snap)*",
+  "vm_pkg": "**pve-01: (OK)**\n- VM\n  - my-vm (200) — UPDATED (5 upgraded)",
+  "vm_no_pkg": "**pve-01: (OK)**\n- VM\n  - my-vm (200) — UPDATED",
+  "manager": "**Ansible-Manager: (OK)**",
+  "remote": "\n\n**Remote Hosts**\n- srv — UPDATED & REBOOTED",
+  "custom": "\n\n**Custom Systems**\n- **Gitea** (nas) — Updated: 1.20 → 1.21",
+  "errors": "\n\n**Error Log:**\n- **pve-01/lxc-101** failed at `App update`: `denied`",
+  "warnings": "\n\n**⚠️ Warnings**\n- **h** at `Snap`: snapshot failed",
+  "multi_node": "**pve-01: (OK)**\n- LXC\n  - sonarr (101) — Updated: v4.0 → v4.1 | OS: OK\n\n**pve-02: (OK)**\n- LXC\n  - radarr (102) — Updated: v4.0 → v4.1 | OS: OK *(no snap)*",
+  "everything": "**pve-01: (OK)**\n- LXC\n  - sonarr (101) — Updated: v4.0 → v4.1 | OS: OK\n- VM\n  - my-vm (200) — UPDATED (3 upgraded)\n\n**pve-02: (REBOOTED)**\n- LXC\n  - radarr (102) — Updated: v4.0 → v4.1 *(no snap)*\n\n**Ansible-Manager: (OK)**\n\n**Remote Hosts**\n- srv — OK\n\n**Custom Systems**\n- **Gitea** (nas) — OK\n\n**Error Log:**\n- **x** failed at `t`: `e`\n\n**⚠️ Warnings**\n- **y** at `u`: w"
+}

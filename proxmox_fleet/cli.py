@@ -1,34 +1,18 @@
-"""``fleet-update`` entrypoint.
+"""``fleet-update`` entrypoint — the Python control plane.
 
-Phase 0 scope: a behaviour-preserving wrapper. By default it runs the existing
-``fleet-update.yml`` monolith via ansible-runner, so the new entrypoint is a
-drop-in for ``ansible-playbook fleet-update.yml``. Later phases move each phase's
-logic into ``proxmox_fleet.flows`` and reduce the YAML to execution primitives.
+The driver owns the whole run end-to-end: ``driver.run_fleet()`` performs the
+pre-flight apt-proxy check, executes every phase (remote → custom → lxc → vm →
+node+manager) via the typed flows, and renders/dispatches the final briefing.
+Ansible is invoked only as single-purpose execution primitives through
+``RunnerExecutor`` (which needs ``ansible-runner`` installed).
 
-Phase 2-wire: ``--use-custom-flow`` routes Phase 0b through the Python driver
-before handing off to the playbook (with skip_phase_0b=true so the Ansible
-role is not also executed).
-
-Phase 3-wire: ``--use-lxc-flow`` routes Phase 1 (LXC updates) through the
-Python driver (skip_phase_1=true tells the playbook to skip its Phase 1 block).
-
-Both imports are lazy so unit tests never need ansible-runner.
+Imports are lazy so unit tests never need ansible-runner.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
-import sys
-from pathlib import Path
 from typing import List, Optional
-
-_CUSTOM_STATE_PATH = "/tmp/fleet_custom_state.json"
-_LXC_STATE_PATH = "/tmp/fleet_lxc_state.json"
-_VM_STATE_PATH = "/tmp/fleet_vm_state.json"
-_REMOTE_STATE_PATH = "/tmp/fleet_remote_state.json"
-_NODE_STATE_PATH = "/tmp/fleet_node_state.json"
-_FINAL_STATE_PATH = "/tmp/fleet_final_state.json"
 
 
 def _parse_extra_vars(pairs: List[str]) -> dict:
@@ -41,175 +25,47 @@ def _parse_extra_vars(pairs: List[str]) -> dict:
     return out
 
 
+def _is_true(val: str) -> bool:
+    return val.lower() in ("true", "1", "yes")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(prog="fleet-update", description="Proxmox fleet updater (Python control plane).")
+    parser = argparse.ArgumentParser(
+        prog="fleet-update",
+        description="Proxmox fleet updater (Python control plane).",
+    )
     parser.add_argument("--check", action="store_true", help="dry run (no changes).")
-    parser.add_argument("--limit", default=None, help="limit execution to a host/group.")
     parser.add_argument("-e", "--extra-vars", action="append", default=[], metavar="KEY=VALUE",
-                        help="extra vars passed through to the play(s).")
+                        help="extra vars (e.g. fleet_dry_run=true, force_notify=true).")
     parser.add_argument("--inventory", default="hosts.ini", help="inventory path.")
-    parser.add_argument(
-        "--use-custom-flow",
-        action="store_true",
-        default=False,
-        help="Route Phase 0b through flows/custom.py (Python driver) instead of the custom_update role.",
-    )
-    parser.add_argument(
-        "--use-lxc-flow",
-        action="store_true",
-        default=False,
-        help="Route Phase 1 (LXC updates) through flows/lxc.py (Python driver) instead of the lxc_update role.",
-    )
-    parser.add_argument(
-        "--use-vm-flow",
-        action="store_true",
-        default=False,
-        help="Route Phase 1b (VM updates) through flows/vm.py (Python driver) instead of the vm_update role.",
-    )
-    parser.add_argument(
-        "--use-remote-flow",
-        action="store_true",
-        default=False,
-        help="Route Phase 0 (remote host updates) through flows/remote.py (Python driver) instead of the remote_host_update role.",
-    )
-    parser.add_argument(
-        "--use-node-flow",
-        action="store_true",
-        default=False,
-        help="Route Phase 2+3 (node OS update + manager self-update) through flows/node.py (Python driver).",
-    )
-    parser.add_argument(
-        "--use-notify-flow",
-        action="store_true",
-        default=False,
-        help="Route Phase 4 (briefing/history/notifiers) through Python instead of the playbook's Phase 4.",
-    )
-    parser.add_argument(
-        "--vars-file",
-        default="vars.yml",
-        help="Path to vars.yml used by --use-custom-flow / --use-lxc-flow to load GlobalSettings.",
-    )
+    parser.add_argument("--vars-file", default="vars.yml",
+                        help="path to vars.yml used to load GlobalSettings.")
     args = parser.parse_args(argv)
 
     extravars = _parse_extra_vars(args.extra_vars)
-    settings = None
-
-    # Phase 2/3/4-wire: run Python flows before the playbook (notify runs after).
-    if (args.use_custom_flow or args.use_lxc_flow or args.use_vm_flow
-            or args.use_remote_flow or args.use_node_flow or args.use_notify_flow):
-        from proxmox_fleet import driver  # lazy: avoids ansible-runner import in unit tests
-        from proxmox_fleet.models.settings import GlobalSettings
-
-        settings = GlobalSettings.load(args.vars_file)
-
-        # Propagate CLI extravars that affect driver behaviour into settings.
-        if extravars.get("fleet_dry_run", "").lower() in ("true", "1", "yes"):
-            settings = settings.model_copy(update={"fleet_dry_run": True})
-        if extravars.get("lxc_verbose", "").lower() in ("true", "1", "yes"):
-            settings = settings.model_copy(update={"lxc_verbose": True})
-        if extravars.get("force_notify", "").lower() in ("true", "1", "yes"):
-            settings = settings.model_copy(update={"force_notify": True})
-
-        # Phase 4-wire: tell the playbook to dump merged state instead of running
-        # its own Phase 4. The Python notify phase runs AFTER ansible-runner returns.
-        if args.use_notify_flow:
-            extravars["skip_phase_4"] = "true"
-            extravars["fleet_final_state_path"] = _FINAL_STATE_PATH
-            # Drop any stale dump so a playbook that aborts before Phase 4 doesn't
-            # cause us to notify on last run's state.
-            Path(_FINAL_STATE_PATH).unlink(missing_ok=True)
-
-        if args.use_custom_flow:
-            driver.run_custom_phase(
-                settings=settings,
-                inventory_path=args.inventory,
-                extra_vars=extravars,
-                check=args.check,
-                state_output_path=_CUSTOM_STATE_PATH,
-            )
-            extravars["skip_phase_0b"] = "true"
-            extravars["fleet_custom_state_path"] = _CUSTOM_STATE_PATH
-
-        # Phase 3-wire: run Phase 1 (LXC) in Python, then tell the playbook to skip it.
-        if args.use_lxc_flow:
-            driver.run_lxc_phase(
-                settings=settings,
-                inventory_path=args.inventory,
-                check=args.check,
-                state_output_path=_LXC_STATE_PATH,
-            )
-            extravars["skip_phase_1"] = "true"
-            extravars["fleet_lxc_state_path"] = _LXC_STATE_PATH
-
-        # Phase 4a-wire: run Phase 1b (VMs) in Python, then skip the playbook block.
-        if args.use_vm_flow:
-            driver.run_vm_phase(
-                settings=settings,
-                inventory_path=args.inventory,
-                check=args.check,
-                state_output_path=_VM_STATE_PATH,
-            )
-            extravars["skip_phase_1b"] = "true"
-            extravars["fleet_vm_state_path"] = _VM_STATE_PATH
-
-        # Phase 4a-wire: run Phase 0 (remote hosts) in Python, then skip the playbook block.
-        if args.use_remote_flow:
-            driver.run_remote_phase(
-                settings=settings,
-                inventory_path=args.inventory,
-                check=args.check,
-                state_output_path=_REMOTE_STATE_PATH,
-            )
-            extravars["skip_phase_0"] = "true"
-            extravars["fleet_remote_state_path"] = _REMOTE_STATE_PATH
-
-        # Phase 4b-wire: run Phase 2+3 (node OS + manager) in Python, then skip both blocks.
-        if args.use_node_flow:
-            driver.run_node_phase(
-                settings=settings,
-                inventory_path=args.inventory,
-                check=args.check,
-                state_output_path=_NODE_STATE_PATH,
-            )
-            extravars["skip_phase_2"] = "true"
-            extravars["skip_phase_3"] = "true"
-            extravars["fleet_node_state_path"] = _NODE_STATE_PATH
 
     try:
-        import ansible_runner  # lazy: not needed for unit tests
-    except ImportError:
-        print("ansible-runner is not installed. Install with: pip install 'proxmox-fleet[runner]'",
-              file=sys.stderr)
-        return 2
-
-    cmdline_parts: List[str] = []
-    if args.check:
-        cmdline_parts.append("--check")
-    if args.limit:
-        cmdline_parts.extend(["--limit", args.limit])
-
-    runner = ansible_runner.run(
-        project_dir=os.getcwd(),
-        playbook="fleet-update.yml",
-        inventory=str(Path(args.inventory).resolve()),
-        extravars=extravars,
-        cmdline=" ".join(cmdline_parts) or None,
-    )
-    rc = runner.rc if runner.rc is not None else 1
-
-    # Phase 4-wire: render briefing / persist history / notify in Python, using
-    # the merged fleet state the playbook dumped. Runs regardless of rc (the whole
-    # point of a failure briefing is to fire on failure), gated on the dump existing.
-    if args.use_notify_flow and Path(_FINAL_STATE_PATH).exists():
-        from proxmox_fleet import driver  # lazy: avoids ansible-runner import in unit tests
+        from proxmox_fleet import driver
         from proxmox_fleet.models.settings import GlobalSettings
-        from proxmox_fleet.models.state import FleetState
+    except ImportError as exc:  # pragma: no cover - defensive
+        raise SystemExit(f"failed to import the driver: {exc}")
 
-        notify_settings = settings if settings is not None else GlobalSettings.load(args.vars_file)
-        state = FleetState.load(_FINAL_STATE_PATH)
-        driver.run_notify_phase(settings=notify_settings, state=state, check=args.check)
+    settings = GlobalSettings.load(args.vars_file)
 
-    return rc
+    # Propagate CLI extravars that affect driver behaviour into settings.
+    if _is_true(extravars.get("fleet_dry_run", "")):
+        settings = settings.model_copy(update={"fleet_dry_run": True})
+    if _is_true(extravars.get("lxc_verbose", "")):
+        settings = settings.model_copy(update={"lxc_verbose": True})
+    if _is_true(extravars.get("force_notify", "")):
+        settings = settings.model_copy(update={"force_notify": True})
+
+    return driver.run_fleet(
+        settings=settings,
+        inventory_path=args.inventory,
+        check=args.check,
+        extra_vars=extravars,
+    )
 
 
 if __name__ == "__main__":
