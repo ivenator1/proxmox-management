@@ -6,11 +6,9 @@ health check, dry-run, was_stopped handling, resource scaling, and status string
 """
 import time
 
-import pytest
 
 from proxmox_fleet import http as http_mod
-from proxmox_fleet.flows import lxc as flow_mod
-from proxmox_fleet.flows.lxc import LxcFlowOutcome, run_lxc_update
+from proxmox_fleet.flows.lxc import run_lxc_update
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.runner import PrimitiveResult
 
@@ -30,6 +28,7 @@ def _fail(rc=1, stderr="boom"):
 
 PCT_CONFIG_RUNNING = "hostname: sonarr\nostype: debian\n"
 PCT_CONFIG_TEMPLATE = "hostname: sonarr\nostype: debian\ntemplate: 1\n"
+PCT_CONFIG_ALPINE = "hostname: sonarr\nostype: alpine\n"
 PCT_STATUS_RUNNING = "status: running"
 PCT_STATUS_STOPPED = "status: stopped"
 
@@ -369,7 +368,7 @@ def test_was_stopped_start_and_stop(monkeypatch):
         "reboot-required": [_fail(rc=1)],
         "pct stop": [_ok(changed=True)],
     })
-    out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
+    run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
     assert any("pct start" in c for c in ex.commands)
     assert any("pct stop" in c for c in ex.commands)
 
@@ -428,6 +427,52 @@ def test_dpkg_hash_detects_change(monkeypatch):
     out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
     assert out.record is not None
     assert out.record.app == "UPDATED"
+
+
+# ---------------------------------------------------------------------------
+# A1 — Alpine containers read versions with ash, not bash
+# ---------------------------------------------------------------------------
+
+
+def test_alpine_version_read_uses_ash(monkeypatch):
+    """Regression: ~/.scriptname must be read with `ash` on Alpine (no bash)."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = ScriptedLxcExecutor(script={
+        "pct config": [_ok(stdout=PCT_CONFIG_ALPINE)],
+        "pct status": [_ok(stdout=PCT_STATUS_RUNNING)],
+        "pct pull": [_ok(rc=0, changed=False)],
+        "grep": [_ok(stdout="sonarr")],
+        "rm -f": [_ok(changed=False)],
+        "cat ~/.sonarr": [_ok(stdout="1.0"), _ok(stdout="1.1")],
+        # alpine OS update uses apk
+        "apk": [_ok(stdout="OK: upgraded", changed=True)],
+        "reboot-required": [_fail(rc=1)],
+    })
+    out = run_lxc_update("pve-01", "101", ex, _settings(lxc_backup_strategy="none"),
+                         api_host="192.168.1.10")
+    version_reads = [c for c in ex.commands if "cat ~/.sonarr" in c]
+    assert version_reads, "expected at least one version read"
+    assert all("-- ash -c" in c for c in version_reads), \
+        f"Alpine version reads must use ash, got: {version_reads}"
+    assert all("-- bash -c" not in c for c in version_reads)
+    assert out.record is not None
+
+
+# ---------------------------------------------------------------------------
+# A2 — OS update / dpkg-hash commands pin LC_ALL=C (locale-independent parsing)
+# ---------------------------------------------------------------------------
+
+
+def test_os_and_dpkg_commands_pin_locale(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal(ver_before="1.0", ver_after="1.1")
+    run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
+    apt_cmds = [c for c in ex.commands if "apt-get" in c]
+    dpkg_cmds = [c for c in ex.commands if "dpkg-query" in c]
+    assert apt_cmds and all("LC_ALL=C" in c for c in apt_cmds)
+    assert dpkg_cmds and all("LC_ALL=C" in c for c in dpkg_cmds)
 
 
 # ---------------------------------------------------------------------------

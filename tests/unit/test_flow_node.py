@@ -5,10 +5,9 @@ Uses ScriptedNodeExecutor (no real Ansible) and monkeypatches http.wait_for_port
 Covers: normal update, reboot, manager-host skip, idle, rescue, dry-run,
 apt retry, proxy wait, manager update variants.
 """
-import pytest
 
 from proxmox_fleet import http as http_mod
-from proxmox_fleet.flows.node import NodeFlowOutcome, run_manager_update, run_node_update
+from proxmox_fleet.flows.node import run_manager_update, run_node_update
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.runner import PrimitiveResult
 

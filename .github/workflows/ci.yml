@@ -68,6 +68,16 @@ jobs:
       - name: Run mypy
         run: python -m mypy proxmox_fleet/
 
+  lint-python:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ruff
+        run: pip install ruff
+      - name: Run ruff
+        run: ruff check proxmox_fleet/ tests/
+
   molecule-lxc-update:
     name: Molecule — lxc_update ${{ matrix.scenario }}
     runs-on: ubuntu-latest

@@ -3,7 +3,6 @@
 No existing Jinja shim exists for remote status; these tests are derived directly
 from the YAML source and lock the Python implementation.
 """
-import pytest
 
 from proxmox_fleet.status import remote_should_report, remote_status
 

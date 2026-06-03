@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import yaml
 
@@ -47,43 +47,55 @@ def _load_host_vars(host: str, host_vars_dir: Path) -> Dict[str, Any]:
     return {}
 
 
-def load_proxmox_nodes(
-    inventory_path: str = "hosts.ini",
-) -> List[Dict[str, str]]:
-    """Parse ``[proxmox_nodes]`` from *inventory_path*.
+def _iter_section(inventory_path: str, section: str) -> Iterator[Tuple[str, Dict[str, str]]]:
+    """Yield ``(host_name, inline_vars)`` for each host line in ``[section]``.
 
-    Returns a list of ``{name, ansible_host}`` dicts in inventory order.
-    ansible_host falls back to the node name if not set inline or in host_vars.
+    Comment/blank lines are skipped; a missing file or missing section yields
+    nothing. Hosts are yielded in inventory-file order (the Phase 0a ordering
+    guarantee for custom_hosts). This is the single source of section parsing —
+    each loader merges host_vars on top of the inline vars it returns.
     """
-    nodes: List[Dict[str, str]] = []
-    in_section = False
-
     try:
         lines = Path(inventory_path).read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
-        return []
+        return
 
+    in_section = False
     for raw in lines:
         line = raw.strip()
         if not line or line.startswith("#") or line.startswith(";"):
             continue
         if line.startswith("["):
-            in_section = line.strip("[]") == "proxmox_nodes"
+            in_section = line.strip("[]") == section
             continue
         if not in_section:
             continue
-
         m = _HOST_LINE.match(line)
         if not m:
             continue
+        yield m.group(1), _parse_inline_vars(m.group(2))
 
-        name = m.group(1)
-        inline = _parse_inline_vars(m.group(2))
+
+def load_proxmox_nodes(
+    inventory_path: str = "hosts.ini",
+    *,
+    host_vars_dir: str = "host_vars",
+) -> List[Dict[str, str]]:
+    """Parse ``[proxmox_nodes]`` from *inventory_path* and merge per-host vars.
+
+    Returns a list of ``{name, ansible_host}`` dicts in inventory order.
+    ansible_host resolution order: inline var → host_vars/<node>.yml → node name.
+    Merging host_vars matters because ``ansible_host`` becomes the snapshot API
+    ``api_host`` (which must be an IP, not the inventory name).
+    """
+    hvdir = Path(host_vars_dir)
+    nodes: List[Dict[str, str]] = []
+    for name, inline in _iter_section(inventory_path, "proxmox_nodes"):
+        host_vars = _load_host_vars(name, hvdir)
         nodes.append({
             "name": name,
-            "ansible_host": inline.get("ansible_host", name),
+            "ansible_host": str(inline.get("ansible_host", host_vars.get("ansible_host", name))),
         })
-
     return nodes
 
 
@@ -121,34 +133,8 @@ def load_proxmox_vms(
     """
     hvdir = Path(host_vars_dir)
     specs: List[VmSpec] = []
-    in_section = False
-
-    try:
-        lines = Path(inventory_path).read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
-
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#") or line.startswith(";"):
-            continue
-
-        if line.startswith("["):
-            section_name = line.strip("[]")
-            in_section = section_name == "proxmox_vms"
-            continue
-
-        if not in_section:
-            continue
-
-        m = _HOST_LINE.match(line)
-        if not m:
-            continue
-
-        name = m.group(1)
-        inline = _parse_inline_vars(m.group(2))
+    for name, inline in _iter_section(inventory_path, "proxmox_vms"):
         host_vars = _load_host_vars(name, hvdir)
-
         specs.append(VmSpec(
             name=name,
             ansible_host=str(inline.get("ansible_host", host_vars.get("ansible_host", name))),
@@ -156,7 +142,6 @@ def load_proxmox_vms(
             pve_node=str(inline.get("pve_node", host_vars.get("pve_node", ""))),
             maintenance_window=host_vars.get("maintenance_window"),
         ))
-
     return specs
 
 
@@ -172,41 +157,14 @@ def load_remote_hosts(
     """
     hvdir = Path(host_vars_dir)
     specs: List[RemoteHostSpec] = []
-    in_section = False
-
-    try:
-        lines = Path(inventory_path).read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
-
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#") or line.startswith(";"):
-            continue
-
-        if line.startswith("["):
-            section_name = line.strip("[]")
-            in_section = section_name == "remote_hosts"
-            continue
-
-        if not in_section:
-            continue
-
-        m = _HOST_LINE.match(line)
-        if not m:
-            continue
-
-        name = m.group(1)
-        inline = _parse_inline_vars(m.group(2))
+    for name, inline in _iter_section(inventory_path, "remote_hosts"):
         host_vars = _load_host_vars(name, hvdir)
-
         specs.append(RemoteHostSpec(
             name=name,
             ansible_host=str(inline.get("ansible_host", host_vars.get("ansible_host", name))),
             maintenance_window=host_vars.get("maintenance_window"),
             pre_update_cmd=str(host_vars.get("pre_update_cmd", "")),
         ))
-
     return specs
 
 
@@ -223,34 +181,8 @@ def load_custom_hosts(
     """
     hvdir = Path(host_vars_dir)
     specs: List[HostSpec] = []
-    in_section = False
-
-    try:
-        lines = Path(inventory_path).read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
-
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#") or line.startswith(";"):
-            continue
-
-        if line.startswith("["):
-            section_name = line.strip("[]")
-            in_section = section_name == "custom_hosts"
-            continue
-
-        if not in_section:
-            continue
-
-        m = _HOST_LINE.match(line)
-        if not m:
-            continue
-
-        name = m.group(1)
-        inline = _parse_inline_vars(m.group(2))
+    for name, inline in _iter_section(inventory_path, "custom_hosts"):
         host_vars = _load_host_vars(name, hvdir)
-
         specs.append(
             HostSpec(
                 name=name,
@@ -261,5 +193,4 @@ def load_custom_hosts(
                 custom_overrides=host_vars.get("custom_overrides", {}),
             )
         )
-
     return specs

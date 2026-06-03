@@ -22,22 +22,16 @@ from typing import Callable, Optional
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import pkg_changed as _pkg_changed
 from proxmox_fleet.executor import Executor
+from proxmox_fleet.flows._pkg import upgrade_cmd
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import ErrorEntry, NodeRecord
 from proxmox_fleet.orchestration import retry
 from proxmox_fleet.status import manager_status, node_status
 
-# Apt commands: nodes are always Debian/apt — no pkg_mgr detection step needed.
-_APT_UPGRADE = (
-    "DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
-    "DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y --autoremove"
-)
-_APT_DRY = (
-    "DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
-    "DEBIAN_FRONTEND=noninteractive apt-get -s dist-upgrade"
-)
+# Nodes are always Debian/apt — no pkg_mgr detection step needed; the apt
+# upgrade command (incl. LC_ALL=C locale pin) is shared with the other flows.
 
-# Mirrors the "Robust Reboot Check" shell block in Phase 2 of fleet-update.yml.
+# Mirrors the "Robust Reboot Check" shell block (Phase 2 node OS update).
 _REBOOT_CHECK = (
     "RUNNING=$(uname -r); "
     "LATEST=$(ls -1 /boot/vmlinuz-* | sort -V | tail -n1 | sed 's|.*vmlinuz-||'); "
@@ -91,7 +85,7 @@ def run_node_update(
         # ------------------------------------------------------------------
         # Apt upgrade (5 retries, 30 s delay — mirrors Ansible retries/delay)
         # ------------------------------------------------------------------
-        apt_cmd = _APT_DRY if dry_run else _APT_UPGRADE
+        apt_cmd = upgrade_cmd("apt", dry_run=dry_run)
 
         def _apt() -> str:
             res = executor.run_shell(apt_cmd, ignore_errors=True)
@@ -163,7 +157,7 @@ def run_manager_update(
         # ------------------------------------------------------------------
         # Apt upgrade (ignore_errors — Phase 3 continues even if apt fails)
         # ------------------------------------------------------------------
-        apt_cmd = _APT_DRY if dry_run else _APT_UPGRADE
+        apt_cmd = upgrade_cmd("apt", dry_run=dry_run)
         res = executor.run_shell(apt_cmd, ignore_errors=True)
         # Only count as changed when apt actually succeeded
         apt_changed = (not res.failed) and _pkg_changed(res.stdout, "apt")

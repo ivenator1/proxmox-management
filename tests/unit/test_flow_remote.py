@@ -4,10 +4,9 @@ Uses ScriptedRemoteExecutor (no real Ansible) and monkeypatches http for Kuma.
 Covers: apt/dnf/apk detection, normal update, reboot, rescue, dry-run,
 pre_update_cmd, idle suppression, Kuma gating.
 """
-import pytest
 
 from proxmox_fleet import http as http_mod
-from proxmox_fleet.flows.remote import RemoteFlowOutcome, run_remote_update
+from proxmox_fleet.flows.remote import run_remote_update
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.runner import PrimitiveResult
 

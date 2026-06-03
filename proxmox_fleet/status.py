@@ -296,12 +296,12 @@ def node_status(
     rebooted: bool,
     is_manager: bool,
 ) -> str:
-    """Status string from Phase 2 of fleet-update.yml (node_status_str set_fact).
+    """Node OS-update status string (Phase 2; ports the old node_status_str set_fact).
 
-    Parity with the Jinja decision tree (lines 317–322 of fleet-update.yml):
+    Decision-tree priority:
       UPDATED & REBOOTED > UPDATED (MANUAL REBOOT REQ) > REBOOT FAILED > UPDATED > OK
     REBOOT FAILED is logically unreachable in normal flow (a failed reboot goes to
-    rescue → FAILED) but kept for parity with the Jinja template.
+    rescue → FAILED) but kept for parity with the original template.
     """
     if rebooted:
         return "UPDATED & REBOOTED"

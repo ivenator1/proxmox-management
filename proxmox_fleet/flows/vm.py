@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import pkg_changed as _pkg_changed
 from proxmox_fleet.changes import vm_pkg_count as _vm_pkg_count
 from proxmox_fleet.executor import Executor
+from proxmox_fleet.flows._pkg import detect_pkg_mgr, kuma_healthy, upgrade_cmd
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import ErrorEntry, VmRecord, WarningEntry
 from proxmox_fleet.status import vm_rescue_status, vm_should_report, vm_status
@@ -35,41 +36,6 @@ class VmFlowOutcome:
     failed: bool = False
     error: Optional[ErrorEntry] = None
     warnings: List[WarningEntry] = field(default_factory=list)
-
-
-def _detect_pkg_mgr(executor: Executor) -> str:
-    """Detect the package manager via `which`. Returns 'apt', 'dnf', or 'apk'."""
-    res = executor.run_shell(
-        "if which apt-get 2>/dev/null; then echo apt; "
-        "elif which dnf 2>/dev/null; then echo dnf; "
-        "elif which apk 2>/dev/null; then echo apk; "
-        "else echo unknown; fi",
-        changed_when=False,
-        ignore_errors=True,
-    )
-    for word in res.stdout.split():
-        if word in ("apt", "dnf", "apk"):
-            return word
-    return "apt"  # safe fallback for Debian-family VMs
-
-
-def _upgrade_cmd(pkg_mgr: str, *, dry_run: bool) -> str:
-    """Build the upgrade command. Python decides simulate vs. real — Ansible executes."""
-    if pkg_mgr == "apt":
-        prefix = "DEBIAN_FRONTEND=noninteractive"
-        if dry_run:
-            return f"{prefix} apt-get update -qq && {prefix} apt-get -s dist-upgrade"
-        return f"{prefix} apt-get update -qq && {prefix} apt-get dist-upgrade -y --autoremove"
-    if pkg_mgr == "dnf":
-        return "dnf upgrade --assumeno" if dry_run else "dnf upgrade -y"
-    if pkg_mgr == "apk":
-        return "apk -s upgrade" if dry_run else "apk -U upgrade"
-    raise RuntimeError(f"Unknown package manager: {pkg_mgr!r}")
-
-
-def _kuma_healthy(payload: Any, *, monitor_id: str) -> bool:
-    beats = (payload or {}).get("heartbeatList", {}).get(monitor_id, [])
-    return bool(beats) and beats[-1].get("status") == 1
 
 
 def run_vm_update(
@@ -139,13 +105,12 @@ def run_vm_update(
         # ------------------------------------------------------------------
         # Detect package manager (Python decides, Ansible executes)
         # ------------------------------------------------------------------
-        pkg_mgr = _detect_pkg_mgr(executor)
+        pkg_mgr = detect_pkg_mgr(executor)
 
         # ------------------------------------------------------------------
         # Upgrade
         # ------------------------------------------------------------------
-        upgrade_cmd = _upgrade_cmd(pkg_mgr, dry_run=dry_run)
-        pkg_res = executor.run_shell(upgrade_cmd, ignore_errors=True)
+        pkg_res = executor.run_shell(upgrade_cmd(pkg_mgr, dry_run=dry_run), ignore_errors=True)
         if pkg_res.failed and not dry_run:
             raise RuntimeError(
                 f"Package upgrade failed (rc={pkg_res.rc}): {pkg_res.stderr or pkg_res.stdout}"
@@ -178,7 +143,7 @@ def run_vm_update(
             try:
                 http_mod.poll_until(
                     lambda: http_mod.get_json(kuma_url),
-                    lambda p: _kuma_healthy(p, monitor_id=kuma_id),
+                    lambda p: kuma_healthy(p, monitor_id=kuma_id),
                     retries=settings.kuma_health_check_retries,
                     delay=settings.kuma_health_check_delay,
                 )

@@ -17,9 +17,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from proxmox_fleet import http as http_mod
-from proxmox_fleet.changes import dpkg_hash_differs, lxc_os_changed, lxc_os_pkg_count
+from proxmox_fleet.changes import lxc_os_changed, lxc_os_pkg_count
 from proxmox_fleet.executor import Executor
-from proxmox_fleet.lxc_parse import parse_ct_script, parse_pct_config, parse_pct_status, script_name_from_update
+from proxmox_fleet.flows._pkg import kuma_healthy
+from proxmox_fleet.lxc_parse import parse_ct_script, parse_pct_config, parse_pct_status
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import ErrorEntry, LxcRecord, WarningEntry
 from proxmox_fleet.status import (
@@ -60,43 +61,49 @@ def _build_shell(lxc_os: str) -> str:
 
 
 def _os_update_cmd(lxc_id: str, lxc_os: str) -> str:
-    """Build the OS package upgrade command for this container."""
+    """Build the OS package upgrade command for this container.
+
+    ``LC_ALL=C`` pins the locale so lxc_os_changed() sees canonical apt/apk/dnf
+    summary lines regardless of the container's configured locale.
+    """
     if lxc_os in ("debian", "ubuntu", "devuan"):
         return (
             f"pct exec {lxc_id} -- bash -c "
-            f"'apt-get update && apt-get -y dist-upgrade'"
+            f"'LC_ALL=C apt-get update && LC_ALL=C apt-get -y dist-upgrade'"
         )
     if lxc_os == "alpine":
-        return f"pct exec {lxc_id} -- ash -c 'apk -U upgrade'"
+        return f"pct exec {lxc_id} -- ash -c 'LC_ALL=C apk -U upgrade'"
     # fedora / arch / other
     return (
         f"pct exec {lxc_id} -- bash -c "
-        f"'dnf -y upgrade || pacman -Syyu --noconfirm'"
+        f"'LC_ALL=C dnf -y upgrade || LC_ALL=C pacman -Syyu --noconfirm'"
     )
 
 
 def _dpkg_hash_cmd(lxc_id: str, lxc_os: str) -> str:
-    """Build the command to capture a hash of the installed package set."""
+    """Build the command to capture a hash of the installed package set.
+
+    ``LC_ALL=C`` makes the ``sort`` order locale-independent so the hash is
+    stable across runs (and across hosts with different locales).
+    """
     if lxc_os == "alpine":
-        return f"pct exec {lxc_id} -- ash -c 'apk info -v 2>/dev/null | sort | md5sum'"
+        return f"pct exec {lxc_id} -- ash -c 'LC_ALL=C apk info -v 2>/dev/null | LC_ALL=C sort | md5sum'"
     if lxc_os in ("debian", "ubuntu", "devuan"):
-        return f"pct exec {lxc_id} -- bash -c 'dpkg-query -W 2>/dev/null | sort | md5sum'"
+        return f"pct exec {lxc_id} -- bash -c 'LC_ALL=C dpkg-query -W 2>/dev/null | LC_ALL=C sort | md5sum'"
     return ""  # non-apt OS: skip hash
 
 
-def _read_version(executor: Executor, lxc_id: str, script_name: str) -> str:
-    """Read the installed app version from ~/.scriptname inside the container."""
+def _read_version(executor: Executor, lxc_id: str, script_name: str, os_type: str) -> str:
+    """Read the installed app version from ~/.scriptname inside the container.
+
+    Uses the OS-appropriate shell (``ash`` on Alpine, else ``bash``) — Alpine
+    containers frequently ship no bash, so a hardcoded bash read returns empty.
+    """
     safe = script_name.lower().replace("-", "")
-    shell = _build_shell("")  # default bash; we don't have os_type here but script_name is fine
+    shell = _build_shell(os_type)
     cmd = f"pct exec {lxc_id} -- {shell} -c 'cat ~/.{safe} 2>/dev/null || echo \"\"'"
     res = executor.run_shell(cmd, changed_when=False)
     return res.stdout.strip()
-
-
-def _kuma_healthy(payload: Any, *, monitor_id: str) -> bool:
-    """Predicate for poll_until: check if the Kuma monitor shows status=1."""
-    beats = (payload or {}).get("heartbeatList", {}).get(monitor_id, [])
-    return bool(beats) and beats[-1].get("status") == 1
 
 
 def _discover_lxcs(executor: Executor, settings: GlobalSettings) -> List[str]:
@@ -233,7 +240,7 @@ def run_lxc_update(
             fetch_ok = True
 
             if ct_script_name and gh_repo:
-                installed_ver = _read_version(executor, lxc_id, ct_script_name)
+                installed_ver = _read_version(executor, lxc_id, ct_script_name, lxc_os)
                 try:
                     data = http_mod.get_json(
                         f"https://api.github.com/repos/{gh_repo}/releases/latest",
@@ -284,7 +291,7 @@ def run_lxc_update(
         # 1. Read pre-update version
         ver_before = ""
         if ct_script_name and not lxc_no_update_script:
-            ver_before = _read_version(executor, lxc_id, ct_script_name)
+            ver_before = _read_version(executor, lxc_id, ct_script_name, lxc_os)
 
         # 2. OS update (skip if excluded)
         os_res_stdout = ""
@@ -320,7 +327,6 @@ def run_lxc_update(
             )
 
         # 5. App update
-        app_res_stdout = ""
         app_failed = False
         app_changed = False
 
@@ -338,7 +344,6 @@ def run_lxc_update(
                 f"/usr/bin/update'"
             )
             app_res = executor.run_shell(app_cmd, ignore_errors=True)
-            app_res_stdout = app_res.stdout
             app_failed = app_res.failed
             app_changed = not app_res.failed  # tentative; overridden below by version/hash
             if settings.lxc_verbose:
@@ -356,7 +361,7 @@ def run_lxc_update(
         # 7. Read post-update version
         ver_after = ""
         if ct_script_name and not lxc_no_update_script:
-            ver_after = _read_version(executor, lxc_id, ct_script_name)
+            ver_after = _read_version(executor, lxc_id, ct_script_name, lxc_os)
             if settings.lxc_verbose:
                 dpkg_diff = "dpkg=changed" if dpkg_before != dpkg_after else "dpkg=same"
                 _vprint(node, lxc_id, name, f"ver: {ver_before!r} → {ver_after!r}  {dpkg_diff}")
@@ -406,7 +411,7 @@ def run_lxc_update(
             try:
                 http_mod.poll_until(
                     lambda: http_mod.get_json(kuma_url),
-                    lambda p: _kuma_healthy(p, monitor_id=kuma_id),
+                    lambda p: kuma_healthy(p, monitor_id=kuma_id),
                     retries=settings.kuma_health_check_retries,
                     delay=settings.kuma_health_check_delay,
                 )

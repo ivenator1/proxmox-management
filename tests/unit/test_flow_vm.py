@@ -5,10 +5,9 @@ Covers: normal update, update with reboot, snapshot warning, rescue/rollback,
 rescue without snapshot, dry-run, idle (nothing to upgrade), correct executor
 binding (qm commands must go to node_executor, not the VM executor).
 """
-import pytest
 
 from proxmox_fleet import http as http_mod
-from proxmox_fleet.flows.vm import VmFlowOutcome, run_vm_update
+from proxmox_fleet.flows.vm import run_vm_update
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.runner import PrimitiveResult
 
