@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class GlobalSettings(BaseModel):
@@ -84,6 +84,18 @@ class GlobalSettings(BaseModel):
     fleet_history_dir: str = "/var/log/fleet-update"
     fleet_history_keep: int = 30
     force_notify: bool = False
+
+    @field_validator("lxc_kuma_map", "vm_kuma_map", "remote_kuma_map", mode="before")
+    @classmethod
+    def _stringify_kuma_keys(cls, value: Any) -> Any:
+        """Coerce kuma-map keys to str so integer vmids in vars.yml are accepted.
+
+        YAML writes ``lxc_kuma_map: {101: 5}`` with an int key, which would
+        otherwise fail validation (the field is ``Dict[str, Any]``).
+        """
+        if isinstance(value, dict):
+            return {str(k): v for k, v in value.items()}
+        return value
 
     @classmethod
     def load(cls, path: Union[str, Path] = "vars.yml") -> "GlobalSettings":

@@ -37,6 +37,23 @@ def test_day_not_matched():
     assert in_window({"days": ["Sat", "Sun"]}, now=now) is False
 
 
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("weekday,abbrev", [
+    (0, "Mon"), (1, "Tue"), (2, "Wed"), (3, "Thu"),
+    (4, "Fri"), (5, "Sat"), (6, "Sun"),
+])
+def test_weekday_abbreviation_is_locale_independent(weekday, abbrev):
+    """Each ISO weekday matches its fixed English abbreviation regardless of the
+    process locale (we no longer rely on locale-sensitive strftime('%a'))."""
+    now = _dt(weekday, "03:00")
+    assert in_window({"days": [abbrev], "start": "00:00", "end": "23:59"}, now=now) is True
+    # And a different day's abbreviation does not match.
+    other = "Mon" if abbrev != "Mon" else "Tue"
+    assert in_window({"days": [other], "start": "00:00", "end": "23:59"}, now=now) is False
+
+
 # --- time matching (normal window) ---
 
 def test_time_inside_normal_window():

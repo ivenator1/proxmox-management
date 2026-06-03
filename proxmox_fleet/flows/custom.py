@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import custom_changed, is_outdated
 from proxmox_fleet.executor import Executor
+from proxmox_fleet.flows._pkg import kuma_healthy
 from proxmox_fleet.models.config import CustomConfig
 from proxmox_fleet.models.state import CustomRecord, ErrorEntry, WarningEntry
 from proxmox_fleet.status import custom_should_report, custom_status
@@ -79,13 +80,14 @@ def _run_health_check(
     hc = config.health_check
     if hc.type == "kuma":
         url = f"{kuma_url}/api/status-page/heartbeat/{hc.kuma_slug}"
-
-        def healthy(payload: Any) -> bool:
-            beats = (payload or {}).get("heartbeatList", {}).get(str(hc.kuma_monitor_id), [])
-            return bool(beats) and beats[-1].get("status") == 1
+        monitor_id = str(hc.kuma_monitor_id)
 
         try:
-            http_mod.poll_until(lambda: http_mod.get_json(url), healthy, retries=retries, delay=delay)
+            http_mod.poll_until(
+                lambda: http_mod.get_json(url),
+                lambda p: kuma_healthy(p, monitor_id=monitor_id),
+                retries=retries, delay=delay,
+            )
         except Exception as exc:  # noqa: BLE001
             raise HealthCheckError(f"kuma health check failed: {exc}") from exc
 

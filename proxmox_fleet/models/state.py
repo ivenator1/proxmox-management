@@ -112,8 +112,9 @@ class FleetState(BaseModel):
             json.dump(self.model_dump(), fh, indent=2, ensure_ascii=False)
 
     def dump_for_ansible(self, path: Union[str, Path]) -> None:
-        """Write with fleet_* key names so include_vars in fleet-update.yml
-        populates the same localhost facts that fleet-state-append.yml uses."""
+        """Write with fleet_* key names so an Ansible play can include_vars the
+        JSON as localhost facts. Consumed by the molecule harness' verify.yml
+        (mol_run_flow.py writes it; verify.yml asserts on fleet_lxc_data etc.)."""
         alias = {
             "lxc": "fleet_lxc_data",
             "vm": "fleet_vm_data",

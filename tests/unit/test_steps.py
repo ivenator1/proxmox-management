@@ -148,6 +148,35 @@ def test_run_steps_retries_until_success():
     assert ex.commands.count("flaky") == 2
 
 
+def test_run_steps_honors_delay_between_failed_retries():
+    """A failed retry waits `delay` seconds (injected sleep keeps the test fast)."""
+    slept = []
+    ex = RecordingExecutor(script={"flaky": [_fail(), _ok(stdout="done")]})
+    steps = [UpdateStep(name="flaky", command="flaky", retries=2, delay=7, register="r")]
+    run_steps(steps, ex, sleep=slept.append)
+    # One sleep of 7s between the two attempts; no trailing sleep after success.
+    assert slept == [7]
+
+
+def test_run_steps_no_delay_on_first_attempt_success():
+    slept = []
+    ex = RecordingExecutor(script={"ok-cmd": [_ok(stdout="done")]})
+    steps = [UpdateStep(name="s", command="ok-cmd", retries=3, delay=9)]
+    run_steps(steps, ex, sleep=slept.append)
+    assert slept == []  # never failed → never slept
+
+
+def test_run_steps_no_delay_after_final_failed_attempt():
+    """No wasted sleep after the last attempt before raising StepError."""
+    slept = []
+    ex = RecordingExecutor(script={"bad": [_fail(), _fail()]})
+    steps = [UpdateStep(name="bad", command="bad", retries=2, delay=5)]
+    with pytest.raises(StepError):
+        run_steps(steps, ex, sleep=slept.append)
+    # Two attempts → exactly one inter-attempt sleep, none after the last.
+    assert slept == [5]
+
+
 def test_run_steps_wraps_timeout():
     ex = RecordingExecutor()
     run_steps([UpdateStep(name="s", command="task", timeout=30)], ex)
