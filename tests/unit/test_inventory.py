@@ -1,5 +1,4 @@
 """Tests for proxmox_fleet.inventory loaders (custom/nodes/vms/remote)."""
-import pytest
 
 from proxmox_fleet.inventory import (
     load_custom_hosts,

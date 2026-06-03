@@ -6,11 +6,9 @@ health check, dry-run, was_stopped handling, resource scaling, and status string
 """
 import time
 
-import pytest
 
 from proxmox_fleet import http as http_mod
-from proxmox_fleet.flows import lxc as flow_mod
-from proxmox_fleet.flows.lxc import LxcFlowOutcome, run_lxc_update
+from proxmox_fleet.flows.lxc import run_lxc_update
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.runner import PrimitiveResult
 
@@ -370,7 +368,7 @@ def test_was_stopped_start_and_stop(monkeypatch):
         "reboot-required": [_fail(rc=1)],
         "pct stop": [_ok(changed=True)],
     })
-    out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
+    run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
     assert any("pct start" in c for c in ex.commands)
     assert any("pct stop" in c for c in ex.commands)
 

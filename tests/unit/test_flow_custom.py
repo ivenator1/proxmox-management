@@ -4,7 +4,6 @@ Uses a scripted fake executor (no real Ansible) and monkeypatches http for the
 GitHub/Kuma calls. Asserts the control flow: rescue/rollback, health gating,
 dependency skip, dry-run, outdated gate, and byte-parity status strings.
 """
-import pytest
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.flows import custom as flow

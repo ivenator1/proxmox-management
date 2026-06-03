@@ -14,7 +14,6 @@ Each test section mirrors its Jinja counterpart case-for-case:
   dpkg_hash_differs()    ← dpkg hash comparison in update.yml
 """
 
-import pytest
 
 from proxmox_fleet.changes import dpkg_hash_differs, lxc_os_changed, lxc_os_pkg_count
 from proxmox_fleet.lxc_parse import parse_ct_script, parse_pct_config, parse_pct_status

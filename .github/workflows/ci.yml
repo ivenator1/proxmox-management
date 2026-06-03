@@ -76,7 +76,7 @@ jobs:
       - name: Install ruff
         run: pip install ruff
       - name: Run ruff
-        run: ruff check proxmox_fleet/
+        run: ruff check proxmox_fleet/ tests/
 
   molecule-lxc-update:
     name: Molecule — lxc_update ${{ matrix.scenario }}

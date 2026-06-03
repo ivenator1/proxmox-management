@@ -1,5 +1,4 @@
 """Tests for proxmox_fleet.models.settings.GlobalSettings."""
-import pytest
 
 from proxmox_fleet.models.settings import GlobalSettings
 

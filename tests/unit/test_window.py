@@ -1,13 +1,14 @@
 """Tests for proxmox_fleet.window.in_window — mirrors test_check_window.py
 case-for-case using plain Python (no Jinja shim).
 """
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from proxmox_fleet.window import in_window
 
 # Helper: build a datetime with a fixed HH:MM on a specific weekday.
 # weekday: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
-from datetime import timedelta, timezone
 
 _UTC = timezone.utc
 
@@ -35,9 +36,6 @@ def test_day_ok_case_sensitive_match():
 def test_day_not_matched():
     now = _dt(0, "03:00")  # Monday
     assert in_window({"days": ["Sat", "Sun"]}, now=now) is False
-
-
-import pytest  # noqa: E402
 
 
 @pytest.mark.parametrize("weekday,abbrev", [
