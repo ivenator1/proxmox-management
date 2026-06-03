@@ -161,6 +161,29 @@ with `changed`/`failed` flags and `errors`/`warnings` logs (`models/state.py`). 
 `state_output_path` (used by tooling / molecule); `run_fleet()` passes `None` and merges
 in-memory.
 
+### Unwired / not-yet-implemented features
+
+Present in the tree but **not** wired into the running flows — intended features, not dead
+code. Don't delete them as cruft; wire them in or extend. Full backlog + suggested
+approaches live in `docs/migration-roadmap.md` → "Post-migration backlog".
+
+- **Most `ansible/primitives/*.yml` are not invoked yet.** Only `run_shell`, `reboot_host`,
+  and `snapshot` are called by `executor.py`. The other ten (`pct_config`, `pct_status`,
+  `pct_start`, `pct_stop`, `pct_pull`, `rollback`, `vzdump`, `lxc_os_update`,
+  `lxc_app_update`, `discover_lxcs`) exist as the intended execution layer, but the flows
+  currently inline equivalent shell via `run_shell`. Wiring them in — ideally as batched
+  multi-read primitives — is the planned speed optimisation: each inline `run_shell` is its
+  own `ansible-runner` subprocess (~15 per container).
+- **`models/config.MaintenanceWindow`** is defined + exported but unused — windows flow as
+  raw dicts into `window.in_window`. Wire it into `inventory.py` parsing for validation, or
+  remove.
+- **`lxc_parse.script_name_from_update()`** is unused — `flows/lxc.py` greps the ct-script
+  name on the node instead. Either parse in Python (pull file → parse) or remove.
+- **`changes.dpkg_hash_differs()`** is unused — `status.lxc_app_status()` inlines the same
+  comparison. Route through the helper for one source of truth, or remove.
+- **No snapshot-lock retry:** a lingering PVE task lock makes `executor.snapshot()` fail; the
+  flow warns and continues without rollback. No `orchestration.retry()` wrapper yet.
+
 ### Phase 4 subsystems
 
 - **Notifiers** (`tasks/notify.yml`): the briefing is rendered **once** from `discord_briefing.j2` into `_briefing_body` and fanned out to a `notifiers` list (types `discord`, `ntfy`). Back-compat: if `notifiers` is unset but `discord_webhook` is, a single Discord notifier is synthesized. ntfy reuses the same body verbatim; only the transport envelope differs.
