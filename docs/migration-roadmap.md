@@ -494,6 +494,71 @@ unconditional default.
 
 ---
 
+## Post-migration backlog — found but not yet implemented
+
+Items discovered after the migration "completed": present in the tree but **not
+wired into the running flows**, or known gaps with no code yet. None are bugs in
+current behaviour — they are unfinished features / consistency work. Do not
+delete them as "dead code"; wire them in or extend. Listed roughly by value.
+
+### 1. Execution primitives not wired into the flows (architecture gap)
+The guiding principle is "Ansible = single-purpose execution primitives, Python =
+all logic." Today only **three** primitives are actually invoked
+(`run_shell`, `reboot_host`, `snapshot` — see `executor.py`). The other ten —
+`pct_config`, `pct_status`, `pct_start`, `pct_stop`, `pct_pull`, `rollback`,
+`vzdump`, `lxc_os_update`, `lxc_app_update`, `discover_lxcs` — exist under
+`ansible/primitives/` but the flows reimplement each inline as a `run_shell`
+string (e.g. `flows/lxc.py` builds `pct config {id}`, `vzdump …`, `pct rollback …`
+directly). They are intended building blocks, not dead code.
+- **Why it matters:** ties directly to the speed work below — each inline
+  `run_shell` is a separate `ansible-runner` subprocess (~15 per container).
+- **Suggested approach:** fold the ~15 inline calls per container into 4–5
+  purpose-built multi-action primitives (one `introspect` returning pct
+  config+status+version file; one `post-update` returning dpkg hash+version),
+  invoked via `invoke_primitive`. Keep all branching in Python. This is the same
+  work as "Future TODO — speed optimisation" under Phase 3.
+
+### 2. `MaintenanceWindow` model is defined but unwired
+`models/config.py` defines and exports `MaintenanceWindow`, but maintenance
+windows travel through the code as raw `dict`s (`inventory.*Spec.maintenance_window:
+Optional[Dict]`, consumed by `window.in_window(dict)`). The typed model is never
+instantiated.
+- **Suggested approach:** parse inventory `maintenance_window` into a
+  `MaintenanceWindow` in `inventory.py` (validation + typo-catching) and have
+  `window.in_window` accept the model. Or drop the model if raw dicts are preferred.
+
+### 3. `lxc_parse.script_name_from_update()` is unused
+A Python parser that extracts the community-script name from `/usr/bin/update`
+content. `flows/lxc.py` instead greps for it **on the node**
+(`grep -oP 'ct/\K[^.]+(?=\.sh)'`).
+- **Suggested approach (consistent with "logic in Python"):** `pct pull` the file
+  to the manager and parse with `script_name_from_update()`, dropping the
+  node-side grep. Or remove the function.
+
+### 4. `changes.dpkg_hash_differs()` is unused
+The dpkg-hash comparison is inlined inside `status.lxc_app_status()`. The helper
+duplicates that logic and is exercised only by its own test.
+- **Suggested approach:** route `lxc_app_status` through `dpkg_hash_differs()` so
+  there is one source of truth, or remove the helper.
+
+### 5. Snapshot lock retry (known gap from live testing)
+A Proxmox task lock left by a prior snapshot-delete can make the next snapshot
+create/delete fail ("CT is locked (snapshot-delete)"). The flow records a warning
+and continues **without rollback capability** — there is no retry.
+- **Suggested approach:** wrap `executor.snapshot()` create/delete in
+  `orchestration.retry()` with a short backoff that treats "is locked" as retryable.
+
+### Minor / nice-to-have
+- **`window.in_window` and tz-aware `now`:** an aware `now` passed in a *different*
+  tz is not converted to the window's tz (only a naive `now` is localised). Real
+  runs use `now=None` (correct); only matters for callers passing a foreign-tz
+  datetime. Fix with `now = now.astimezone(tz)`.
+- **`history.write_history` filename granularity:** `run-<ts>.json` uses second
+  precision, so two runs in the same second overwrite each other. Add sub-second
+  precision or a uniqueness suffix if that ever becomes reachable.
+
+---
+
 ## Definition of done
 - Python owns ALL logic (sequencing, gating, rescue/rollback, retries, serial, dependency order,
   window eval, status trees, change/outdated detection, briefing, config + state schemas);

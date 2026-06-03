@@ -61,7 +61,7 @@ vars.yml / vars.yml.example             # Secrets + behaviour flags (gitignored;
 hosts.ini / hosts.ini.example           # Inventory (gitignored; copy from .example)
 .ansible-lint                           # profile: moderate; targets ansible/primitives/ (name[casing] demoted to warning)
 .yamllint.yml                           # extends: default; line-length warning at 160
-.github/workflows/ci.yml                # yamllint, ansible-lint (primitives), syntax-check (primitives), unit-tests, mypy, + molecule matrices (lxc, custom)
+.github/workflows/ci.yml                # yamllint, ansible-lint (primitives), syntax-check (primitives), unit-tests, mypy, ruff, + molecule matrices (lxc, custom)
 pyproject.toml                          # package config; fleet-update entrypoint; [dev] extras include types-PyYAML for mypy
 proxmox_fleet/
   models/
@@ -69,6 +69,7 @@ proxmox_fleet/
     state.py                            # FleetState + per-type records; dump_for_ansible() writes fleet_* JSON
     settings.py                         # GlobalSettings pydantic model for vars.yml; load() returns defaults on missing file; includes LXC, VM, remote, node/manager + PVE API fields
   flows/
+    _pkg.py                             # shared pkg-manager helpers: detect_pkg_mgr(), upgrade_cmd() (LC_ALL=C-pinned), kuma_healthy()
     custom.py                           # run_custom_update() — the full custom flow (detect→backup→update→health→report)
     lxc.py                              # run_lxc_update() — the full LXC flow (introspect→detect→backup→update→health→report); try/except/finally = block/rescue/always
     vm.py                               # run_vm_update() — the full VM flow; two-executor pattern: executor=VM SSH, node_executor=Proxmox node SSH (for qm rollback/status)
@@ -78,7 +79,7 @@ proxmox_fleet/
   driver.py                             # run_fleet() end-to-end orchestrator (pre-flight → all phases → _merge_state → notify) + per-phase run_*_phase() helpers
   executor.py                           # Executor protocol + RunnerExecutor; snapshot() added for proxmox_snap primitive
   http.py                               # Manager-local HTTP: get_json, poll_until, request, post_json
-  inventory.py                          # load_custom_hosts() + load_proxmox_nodes() — line-by-line hosts.ini parsers
+  inventory.py                          # _iter_section() + load_custom_hosts/proxmox_nodes/proxmox_vms/remote_hosts() — manual hosts.ini parsers (+ host_vars merge)
   lxc_parse.py                          # parse_pct_config(), parse_pct_status(), parse_ct_script() — regex helpers for lxc flow
   orchestration.py                      # run_serial(), run_concurrent() — Python equivalents of serial/forks
   runner.py                             # invoke_primitive() — thin ansible-runner wrapper; passes project_dir=os.getcwd()
@@ -154,194 +155,186 @@ notification (`briefing.should_notify`).
 ### State accumulation pattern
 
 Each `flows/*` call returns a per-host outcome; each `run_*_phase()` folds those into a
-`FleetState` (the `_fold_*_outcome()` helpers); `run_fleet()` then `_merge_state()`s the
+`FleetState` (the single `_fold_outcome(state, outcome, bucket)` helper); `run_fleet()` then `_merge_state()`s the
 per-phase states into one. The state lists are `lxc`, `vm`, `remote`, `node`, `custom`,
 with `changed`/`failed` flags and `errors`/`warnings` logs (`models/state.py`). The
 `run_*_phase()` helpers can still `dump_for_ansible()` a phase's state to JSON when given a
 `state_output_path` (used by tooling / molecule); `run_fleet()` passes `None` and merges
 in-memory.
 
+### Unwired / not-yet-implemented features
+
+Present in the tree but **not** wired into the running flows — intended features, not dead
+code. Don't delete them as cruft; wire them in or extend. Full backlog + suggested
+approaches live in `docs/migration-roadmap.md` → "Post-migration backlog".
+
+- **Most `ansible/primitives/*.yml` are not invoked yet.** Only `run_shell`, `reboot_host`,
+  and `snapshot` are called by `executor.py`. The other ten (`pct_config`, `pct_status`,
+  `pct_start`, `pct_stop`, `pct_pull`, `rollback`, `vzdump`, `lxc_os_update`,
+  `lxc_app_update`, `discover_lxcs`) exist as the intended execution layer, but the flows
+  currently inline equivalent shell via `run_shell`. Wiring them in — ideally as batched
+  multi-read primitives — is the planned speed optimisation: each inline `run_shell` is its
+  own `ansible-runner` subprocess (~15 per container).
+- **`models/config.MaintenanceWindow`** is defined + exported but unused — windows flow as
+  raw dicts into `window.in_window`. Wire it into `inventory.py` parsing for validation, or
+  remove.
+- **`lxc_parse.script_name_from_update()`** is unused — `flows/lxc.py` greps the ct-script
+  name on the node instead. Either parse in Python (pull file → parse) or remove.
+- **`changes.dpkg_hash_differs()`** is unused — `status.lxc_app_status()` inlines the same
+  comparison. Route through the helper for one source of truth, or remove.
+- **No snapshot-lock retry:** a lingering PVE task lock makes `executor.snapshot()` fail; the
+  flow warns and continues without rollback. No `orchestration.retry()` wrapper yet.
+
 ### Phase 4 subsystems
 
-- **Notifiers** (`tasks/notify.yml`): the briefing is rendered **once** from `discord_briefing.j2` into `_briefing_body` and fanned out to a `notifiers` list (types `discord`, `ntfy`). Back-compat: if `notifiers` is unset but `discord_webhook` is, a single Discord notifier is synthesized. ntfy reuses the same body verbatim; only the transport envelope differs.
-- **Run history** (`tasks/persist-history.yml`): writes `run-<UTC-ts>.json` + `latest.json` to `fleet_history_dir`, pruned to `fleet_history_keep`. Gated on `fleet_history_enabled`.
-- **Dead-man's-switch**: pings `fleet_deadmans_url` (`/fail` on failure) so its absence alerts when the orchestrator stops running.
+`driver.run_notify_phase()` consumes the merged `FleetState` and drives all three:
+
+- **Notifiers** (`notifiers.py` + `briefing.py`): `briefing.prepare_body()` renders the body **once**; `notifiers.dispatch()` fans it out to a `notifiers` list (types `discord`, `ntfy`). Back-compat (`resolve_notifiers()`): if `settings.notifiers` is unset (`None`) but `discord_webhook` is set, a single Discord notifier is synthesized; an explicit `[]` means "no notifiers". ntfy reuses the same body verbatim; only the transport envelope differs.
+- **Run history** (`history.py`): `write_history()` writes `run-<UTC-ts>.json` + `latest.json` to `fleet_history_dir`, pruned to `fleet_history_keep`, and records the rendered briefing body. Gated on `fleet_history_enabled`.
+- **Dead-man's-switch** (`notifiers.ping_deadmans()`): pings `fleet_deadmans_url` (`/fail` on failure) so its absence alerts when the orchestrator stops running.
 
 ### Cross-cutting subsystems
 
-- **Snapshot-only rollback + warnings**: LXC and VM roles roll back via snapshot (`pct/qm rollback BEFORE_UPDATE_AUTO`) only when the snapshot was actually taken (`*_snap_res.changed`). A failed snapshot records a non-fatal warning and continues; rescue app/status string is `FAILED (NO SNAPSHOT)` vs `FAILED + ROLLED BACK` vs `FAILED`. `lxc_backup_strategy: both` / `vm_backup_strategy: both` take a simultaneous vzdump (never used for restore).
-- **Fleet-wide dry-run**: `-e fleet_dry_run=true` puts every role in simulate mode. VM/remote use a dedicated `check_mode: yes` simulate task and report `WOULD UPDATE`/`OK`.
-- **Maintenance windows** (`tasks/check-window.yml`): inventory hosts (remote/vm/custom) with a `maintenance_window` dict are silently skipped outside the window; `force_window=true` bypasses.
+- **Snapshot-only rollback + warnings**: the LXC and VM flows roll back via snapshot (`pct/qm rollback BEFORE_UPDATE_AUTO`) only when the snapshot was actually taken (`snap_taken`, i.e. the snapshot primitive returned `changed=True`). A failed snapshot records a non-fatal warning and continues; rescue app/status string is `FAILED (NO SNAPSHOT)` vs `FAILED + ROLLED BACK` vs `FAILED` (see `status.lxc_rescue_app_status` / `vm_rescue_status`). `lxc_backup_strategy: both` / `vm_backup_strategy: both` take a simultaneous vzdump (never used for restore).
+- **Fleet-wide dry-run**: `-e fleet_dry_run=true` (or `--check`, or a per-phase `<phase>_dry_run`) puts every flow in simulate mode — Python builds a simulate command (`apt-get -s` / `dnf --assumeno` / `apk -s`) and reports `WOULD UPDATE`/`OK`. `fleet_dry_run` also forces a notification.
+- **Maintenance windows** (`window.in_window`): inventory hosts (remote/vm/custom) with a `maintenance_window` dict are silently skipped outside the window; `force_window=true` (or `-e force_window=true`) bypasses. Evaluated per-host in the `run_*_phase()` helpers before the flow runs.
 
-### Role structure (`roles/lxc_update/`)
+### Flow structure (`flows/lxc.py`)
 
-`tasks/main.yml` is the orchestrator:
-- `introspect.yml` runs **outside** the block (fail loud if `pct config` fails)
-- Inside the block: `detect.yml` → `backup.yml` → `dry_check.yml` or `update.yml` → `health_check.yml` → `report.yml`
-- Rescue block captures `ansible_failed_task.name` and `ansible_failed_result.stderr` as the **first** `set_fact` before anything else (subsequent tasks reset these vars), then calls `fleet-state-append.yml`
-- Rescue block: capture failure → attempt `pct rollback BEFORE_UPDATE_AUTO` (only if `snap_res.changed`) → wait for container → set `lxc_rollback_done: true` → fleet-state-append with `FAILED + ROLLED BACK` or `FAILED`
-- Always block: delete snapshot (only if `snap_res.changed`), stop container if `lxc_was_stopped` **and** `not lxc_rollback_done` (rollback restores the container, so don't stop it again)
+`run_lxc_update()` is a single function whose `try/except/finally` reproduces the old
+`block/rescue/always`:
+- **Introspect runs outside the `try`** (fail loud if `pct config` fails): parse name/os_type/template via `lxc_parse`, read status, start the container if it was stopped.
+- **`try` body:** detect (pull `/usr/bin/update`, parse ct script, fetch GitHub ct script) → dry-check (version compare only) → backup (vzdump and/or snapshot) → update → health check → report.
+- **`except` (rescue):** capture the failing step → `pct rollback BEFORE_UPDATE_AUTO` only if `snap_taken` → poll until running → set `rollback_done` → record `FAILED + ROLLED BACK` / `FAILED (NO SNAPSHOT)` / `FAILED`.
+- **`finally` (always):** delete the snapshot (only if `snap_taken`); stop the container if `was_stopped` **and** `not rollback_done` (a rollback restores the container, so don't stop it again).
 
-`vm_update` and `remote_host_update` follow the same block/rescue/always pattern. `remote_host_update` has no always block (no snapshots to clean up).
+`run_vm_update()` and `run_remote_update()` follow the same try/except/finally shape. `run_remote_update()` has no `finally` (no snapshots to clean up). Per-host outcomes are folded into the `FleetState` by `driver._fold_outcome()`.
 
-### `custom_update` role structure
+### `custom_update` flow (`flows/custom.py` + `driver.run_custom_phase`)
 
-`tasks/main.yml` orchestrator:
-- `load_config.yml` runs **outside** the block (fail loud on bad config) — loads `configs/{{ custom_config }}.yml` and merges `custom_overrides` (from inventory) into `custom_cfg`
-- Inside the block: `detect.yml` → `backup.yml` (if `backup_command` defined and not dry-run) → `update.yml` (if not dry-run) → `health_check.yml` (if `health_check.type != none` and not dry-run) → `report.yml`
-- Rescue block: capture failure → run `rollback_command` (ignore_errors) → fleet-state-append `FAILED`
-- No always block (v1 — no snapshot to clean up)
+- **Config load is outside the flow** (fail loud on bad config): `driver._load_config()` reads `configs/<name>.yml` (`settings.configs_dir`), deep-merges `custom_overrides` from host_vars, and validates via the `CustomConfig` pydantic model.
+- **Flow body:** detect (`version_command` + latest-version lookup) → backup (if `backup_command`) → `steps.run_steps()` → change detection → reboot → health check → report.
+- **`except` (rescue):** run `rollback_command` (errors ignored) → record `FAILED`. No `finally` (v1 — no snapshot).
 
 **`custom_config` inventory var**: each host in `[custom_hosts]` must have `custom_config=<name>` pointing to `configs/<name>.yml`. Optionally set `custom_overrides: {...}` in host_vars to deep-merge over the config file.
 
-**Config files**: `configs/*.yml` is gitignored. Commit `configs/*.yml.example` as templates. Real configs live only on the Ansible manager. See `config_templates/custom_system.yml.example` for the full schema.
+**Config files**: `configs/*.yml` is gitignored. Commit `configs/*.yml.example` as templates. Real configs live only on the manager. See `config_templates/custom_system.yml.example` for the full schema.
 
-**`tmp_custom` decision tree in `report.yml`** (custom_update):
-- `custom_dry_run=true` → `dry-run: <before> → <latest>`
+**`custom_status()` decision tree** (`status.py`):
+- `dry_run=true` → `dry-run: <before> → <latest>`
+- `update_only_if_outdated` and already current → `OK (up to date)`
 - `changed_when.type == always` → `Updated [+ Rebooted]`
-- `changed_when.type == command`, exit 0 → `Updated [+ Rebooted]`
-- `changed_when.type == command`, exit non-0 → `OK`
-- `changed_when.type == version` (default), before/after differ → `Updated: X → Y [+ Rebooted]`
-- `changed_when.type == version`, before/after same → `OK`
-- No version data (no `version_command`) → `Updated [+ Rebooted]` (fallback)
+- `changed_when.type == command`, exit 0 → `Updated [+ Rebooted]`; exit non-0 → `OK`
+- `changed_when.type == version` (default), before/after differ → `Updated: X → Y [+ Rebooted]`; same → `OK`
+- No version data → `Updated [+ Rebooted]` (fallback)
 
-### `update.yml` task order and change detection
+### LXC update sequence and change detection (`flows/lxc.py`)
 
-The task order matters for correct attribution:
-1. Read `lxc_ver_before`
-2. OS update (`apt dist-upgrade` / `apk upgrade`) — runs **first** so OS packages get credited to the OS line, not the app line
-3. Read `dpkg_hash_before` — md5sum of `dpkg-query -W` (package→version pairs) after OS update, before community script
-4. Scale up resources (if `needs_resource_scale`)
-5. Community script (`app_update_res`)
-6. Read `dpkg_hash_after` — same query; if hash matches `dpkg_hash_before`, nothing was installed
-7. Read `lxc_ver_after`
+Step order matters for correct attribution:
+1. Read `ver_before` (`cat ~/.<script>` via the OS-appropriate shell)
+2. OS update (`_os_update_cmd`, `LC_ALL=C` apt/apk/dnf) — **first** so OS packages credit the OS line, not the app line
+3. Read `dpkg_before` — `LC_ALL=C dpkg-query -W | sort | md5sum` (`_dpkg_hash_cmd`)
+4. Scale up resources if `needs_resource_scale`
+5. App update (`/usr/bin/update` with the `/tmp/.nc/clear` trick + `PHS_SILENT` when `lxc_unattended`)
+6. Read `dpkg_after` — same query; equal to `dpkg_before` ⇒ nothing installed
+7. Read `ver_after`
 8. Scale down → reboot check
 
-**`tmp_app` decision tree in `report.yml`** (in priority order):
-- Version files differ → `Updated: X → Y`
-- Version files both non-empty and equal → `OK` (confirmed no app change)
-- dpkg hash differs → `UPDATED` (packages changed, no version file)
-- dpkg hash matches → `OK` (nothing installed, no version file)
-- No hash data (non-apt OS) → `UPDATED` (fallback)
-- `app_update_res.changed` is false → `OK`
+**`lxc_app_status()` decision tree** (`status.py`, priority order): version files differ → `Updated: X → Y`; both non-empty & equal → `OK`; dpkg hash differs → `UPDATED`; dpkg hash matches → `OK`; no hash data (non-apt OS) → `UPDATED` (fallback); `app_changed` false → `OK`.
 
-**Why dpkg hash instead of stdout parsing:** `PHS_SILENT=1` (set by `lxc_unattended: true`) routes apt's stdout to `/dev/null` inside community scripts, so keywords like `0 upgraded, 0 newly installed` never appear in `app_update_res.stdout`. The dpkg hash is a direct query, immune to output suppression.
+**Why dpkg hash instead of stdout parsing:** `PHS_SILENT=1` (set by `lxc_unattended: true`) routes apt's stdout to `/dev/null` inside community scripts, so `0 upgraded, 0 newly installed` never appears in the app-update stdout. The dpkg hash is a direct query, immune to output suppression. (`LC_ALL=C` keeps both the hash sort order and the OS-update keyword parsing locale-independent.)
 
-### `detect.yml` flow and version file convention
+### Detect flow and version-file convention (`flows/lxc.py`)
 
-`detect.yml` does three things in sequence:
-1. `pct pull {lxc_id} /usr/bin/update /tmp/ansible_update_{lxc_id}` — extracts the community-scripts update script from the container
-2. Greps the script for `ct/NAME.sh` to get the ct script name (e.g. `sonarr`); sets `lxc_no_update_script: true` if not found
-3. Fetches `https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/{name}.sh` (delegated to localhost) — parses `var_cpu`/`var_ram` for build resources, and `pct set $CTID -cores/-memory` for run resources
+The detect section, in sequence:
+1. `pct pull {lxc_id} /usr/bin/update /tmp/ansible_update_{lxc_id}` — extracts the community-scripts update script. `pull` failing ⇒ `lxc_no_update_script=True`.
+2. `grep -oP 'ct/\K[^.]+(?=\.sh)'` **on the node** to get the ct script name (e.g. `sonarr`). (A Python parser `lxc_parse.script_name_from_update()` exists for this but is not wired in — see "Unwired / not-yet-implemented features".)
+3. Fetch `https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/{name}.sh` via `http.request` **on the manager** (PVE nodes may lack outbound HTTPS) — `lxc_parse.parse_ct_script()` reads `var_cpu`/`var_ram` (build resources) and `pct set $CTID -cores/-memory` (run resources).
 
-**Version files**: community-scripts store the installed app version at `~/.{scriptname}` inside the container (e.g. `~/.sonarr` contains `4.0.17.2952`). `update.yml` reads this before and after the update as `lxc_ver_before`/`lxc_ver_after`. `dry_check.yml` reads it as `installed_ver` and compares against the latest GitHub release.
+**Version files**: community-scripts store the installed app version at `~/.{scriptname}` inside the container (e.g. `~/.sonarr` → `4.0.17.2952`). `_read_version()` reads it before/after the update; the dry-check path reads it and compares against the latest GitHub release tag.
 
-**Resource scaling**: when `lxc_build_cpu > lxc_run_cpu`, `needs_resource_scale` is true — `update.yml` scales the container up before the update script runs and back down after.
+**Resource scaling**: when build CPU > run CPU, `needs_resource_scale` is true — the flow scales the container up before the update script and back down after.
 
 ### Uptime Kuma integration
 
-`health_check.yml` (all three roles) polls `{kuma_url}/api/status-page/heartbeat/{kuma_slug}` and waits for the mapped monitor to show status `1`. It only fires when `lxc_id` (or equivalent) is in `lxc_kuma_map` (or `vm_kuma_map`/`remote_kuma_map`) **and** something actually changed. Kuma credentials and maps are in `vars.yml`.
+All flows poll `{kuma_url}/api/status-page/heartbeat/{kuma_slug}` via `http.poll_until` with the `_pkg.kuma_healthy` predicate and wait for the mapped monitor to show status `1`. It only fires when the host id is in `lxc_kuma_map` (or `vm_kuma_map`/`remote_kuma_map`) **and** something actually changed. A timeout raises and triggers the flow's rescue (and snapshot rollback if a snapshot was taken). Retries/delay come from `kuma_health_check_retries` (default 5) / `kuma_health_check_delay` (default 30s). Kuma map keys are coerced to `str` at settings load, so integer vmids in `vars.yml` work. Credentials/maps are in `vars.yml`.
 
 ### Key non-obvious details
 
 - **Tag-based LXC discovery** (Phase 1): only LXCs tagged `community-script` or `proxmox-helper-scripts` in PVE are processed. Untagged containers are never touched. Tags must be set in PVE UI → Container → Options → Tags.
-- **`include_role` not `import_role`**: roles are called in a loop; `import_role` is static (parse-time) and cannot be used inside loops.
-- **URI calls in `detect.yml` are delegated to localhost**: PVE nodes may not have outbound HTTPS to GitHub. The Ansible manager always does.
-- **`pve_node` inventory var** (VM inventory): must match the PVE node's **inventory hostname** (not its IP) — it is used as a key into `hostvars` for the snapshot API call: `hostvars[pve_node]['ansible_host']`.
+- **GitHub HTTPS runs on the manager**: ct-script and release lookups go through `http.request`/`http.get_json` on the manager (`urllib`), never on the PVE node — nodes may lack outbound HTTPS.
+- **`pve_node` inventory var** is only a fallback hint: `driver.run_vm_phase()` discovers the live VM→node map via `pvesh get /cluster/resources` so HA migrations are handled; `pve_node` is used only when discovery is unavailable.
 - **PBS is transparent**: setting `lxc_backup_storage` to a PBS storage name routes `vzdump` to PBS automatically — no special code path.
 - **`[proxmox_vms]`, `[remote_hosts]`, and `[custom_hosts]` must exist** in `hosts.ini` even if empty (just the group header). Ansible raises "no hosts matched" otherwise.
 - **`custom_config` is a required per-host inventory var** for `[custom_hosts]` — set it in hosts.ini or host_vars. The role will fail loudly if it's missing (include_vars will not find the file).
 - **Node reboot is skipped** when `manager_lxc_id` runs on that node — rebooting the node would kill the manager mid-run.
-- **Discord `check_mode: no`**: the URI task has this so `--check` runs still produce a notification when `force_notify=true`.
 - **`lxc_backup_strategy`** is a four-value enum: `snapshot | vzdump | both | none` — not boolean flags.
-- **`/tmp/.nc/clear` trick** in `update.yml`: overrides the `clear` shell command with a no-op so community-scripts update output isn't wiped from Ansible's stdout capture.
-- **Snapshot name is fixed**: always `BEFORE_UPDATE_AUTO`. The `always:` cleanup hardcodes this name — changing it in `backup.yml` without also changing `main.yml` would leave orphaned snapshots.
-- **`report.yml` skips idle containers**: the `when:` condition only appends a record when something changed or failed. Fully up-to-date containers with nothing to do produce no Discord entry.
-- **`lxc_continue_on_error`**: when `true`, Phase 1 uses `ignore_errors: yes` on the LXC loop, so a single failing container doesn't abort the rest of the node's containers.
-- **`health_check.yml` no longer has `ignore_errors: yes`** in `lxc_update` — Kuma failure now triggers the rescue block (and snapshot rollback if a snapshot was taken). Retries and delay are controlled by `kuma_health_check_retries` (default 5) and `kuma_health_check_delay` (default 30s), which molecule scenarios can override to 1/1 for fast tests.
-- **Rollback only fires when `snap_res.changed`** — if `lxc_backup_strategy: none` or the snapshot API call failed (both result in `snap_res.changed=false`), the rescue skips rollback and just records `FAILED`.
-- **Auto-rollback covers snapshots only, never vzdump**: a `vzdump`-only strategy produces a backup archive but `snap_res` is never set, so a failed update is **not** automatically restored — only `FAILED` is recorded. Restore vzdump archives manually. Use `snapshot` or `both` if you want automatic rollback.
-- **`custom_update` config dir**: `load_config.yml` reads `{{ custom_config_dir | default(playbook_dir ~ '/configs') }}/<name>.yml`. Molecule sets `custom_config_dir: /tmp/mol_custom_<scenario>/configs` — do **not** try to override `playbook_dir` (it is a reserved magic variable and the override is silently ignored).
-- **Deferred Jinja in custom configs**: command strings are rendered eagerly (validation, combine, loop), so a step `command` cannot interpolate runtime facts like `custom_step_results`. `register` stashes stdout for use in a later step's `when:` only. `load_config` skips the `combine` when there are no `custom_overrides` to avoid prematurely rendering deferred `{{ }}`.
+- **`/tmp/.nc/clear` trick** (`flows/lxc.py` app-update command): overrides the `clear` shell command with a no-op so community-scripts update output isn't wiped from the stdout capture.
+- **Snapshot name is fixed**: always `BEFORE_UPDATE_AUTO`. The `finally`-block cleanup hardcodes this name — changing it where the snapshot is created without also changing the cleanup/rollback would leave orphaned snapshots.
+- **Idle containers are suppressed** (`status.lxc_should_report`): a record is appended only when something changed or failed. Fully up-to-date containers produce no Discord entry.
+- **`lxc_continue_on_error`**: Phase 1 runs containers concurrently per node (`run_concurrent`, `lxc_forks`); one failing container becomes a FAILED record and never aborts the others.
+- **Kuma failure triggers rescue**: a health-check timeout raises (and rolls back if a snapshot was taken). Retries/delay come from `kuma_health_check_retries` (default 5) / `kuma_health_check_delay` (default 30s), which molecule overrides to 1/0 for fast tests.
+- **Rollback only fires when `snap_taken`** — if `lxc_backup_strategy: none` or the snapshot primitive returned `changed=False`, the rescue skips rollback and just records `FAILED` (the latter records `FAILED (NO SNAPSHOT)`).
+- **Auto-rollback covers snapshots only, never vzdump**: a `vzdump`-only strategy produces a backup archive but no snapshot, so a failed update is **not** automatically restored — only `FAILED` is recorded. Restore vzdump archives manually. Use `snapshot` or `both` for automatic rollback.
+- **`custom_update` config dir**: `driver._load_config()` reads `<configs_dir>/<name>.yml` where `configs_dir` defaults to `configs` (override via `settings.configs_dir`). Molecule points it at a temp dir.
+- **Custom-config commands are opaque strings**: `CustomConfig` validates them as literals and never renders them. `steps.run_steps()` resolves only `{{ steps.NAME }}` refs in Python at run time (the eager-templating fix); every other `{{ }}` is left for the shell/Ansible. `register` stashes a step's stdout for a later step's `when:`.
 - **`invoke_primitive` requires CWD = project root**: `ansible_runner.run()` is called with `project_dir=os.getcwd()`. Without an explicit `project_dir`, ansible-runner creates a fresh `tempfile.mkdtemp()` as `private_data_dir` and looks for the playbook at `<tempdir>/project/ansible/primitives/<name>.yml` — which never exists. The production CLI runs from the project directory; `mol_run_flow.py` calls `os.chdir(_project_root)` at module load to guarantee this for molecule runs.
-- **`FleetState.dump_for_ansible()` + merge-play timing**: there are now **five** merge plays in `fleet-update.yml` — (a) remote state between Phase 0 and Phase 0a, (b) custom state between Phase 0b and Phase 1, (c) LXC state between Phase 1 and Phase 1b, (d) VM state between Phase 1b and Phase 2, (e) node state between the VM merge and Phase 2. Each must stay in its correct position — loading state after a later phase would OR-join against already-false flags and silently drop the Python driver's values.
-- **Inventory parser must not use `configparser`**: `configparser` splits on the first `=` and mis-parses Ansible host lines of the form `hostname key=val key=val …` (it produces key=`hostname key` and value=`val key=val …`). `proxmox_fleet/inventory.py` uses a manual regex parser instead.
-- **`--use-custom-flow` flag is temporary**: once a real `--check` run confirms parity, flip it to the unconditional default in `cli.py`, remove the flag, and delete the legacy `roles/custom_update/tasks/` files and Jinja-shim tests `test_custom_report.py`, `test_run_step.py`, `test_custom_depends.py`.
-- **`--use-lxc-flow` flag is temporary**: same retire step — confirm parity via `fleet-update --use-lxc-flow --check -e fleet_dry_run=true`, then flip to default and delete `roles/lxc_update/tasks/`, `roles/lxc_update/defaults/`, and six Jinja-shim tests (`test_report_tmp_app.py`, `test_report_tmp_os.py`, `test_report_when_condition.py`, `test_dry_check_status.py`, `test_detect_regex.py`, `test_introspect_regex.py`).
-- **`--use-vm-flow` flag is temporary**: confirm parity via `fleet-update --use-vm-flow --check -e fleet_dry_run=true`, then flip to default and delete `roles/vm_update/tasks/`, `roles/vm_update/defaults/`, `tests/unit/test_vm_report.py`.
-- **`--use-remote-flow` flag is temporary**: confirm parity via `fleet-update --use-remote-flow --check -e fleet_dry_run=true`, then flip to default and delete `roles/remote_host_update/tasks/`, `roles/remote_host_update/defaults/`.
-- **`--use-node-flow` flag is temporary**: confirm parity via `fleet-update --use-node-flow --check -e fleet_dry_run=true`, then flip to default in `cli.py` and remove the flag. No legacy role tasks to delete — Phase 2/3 were inline in the playbook. Gate `skip_phase_2/3` permanently to `true`, then remove the Phase 2/3 plays from `fleet-update.yml`.
-- **`--use-notify-flow` flag is temporary**: unlike the other flows, the Python notify phase runs **after** the playbook (it needs the *merged* fleet state). When set, `cli.py` adds `skip_phase_4=true` + `fleet_final_state_path`; the playbook's Phase 4 dumps the merged `fleet_*` facts to JSON (the `when: skip_phase_4` "Dump merged fleet state" task) instead of briefing; `cli.py` then loads that JSON into a `FleetState` and calls `driver.run_notify_phase()` regardless of playbook rc (a failure briefing must fire on failure), gated on the dump existing. Confirm byte-parity via `fleet-update --use-notify-flow --check -e fleet_dry_run=true -e force_notify=true` vs a flag-off run, then flip to default in `cli.py`, remove the flag, delete `templates/discord_briefing.j2` + `tasks/notify.yml` + `tasks/persist-history.yml`, and (once the Jinja shim has no other users) delete `tests/conftest.py` + the parity shim tests. Parity is also locked by the **golden test** in `test_briefing.py`.
-- **Briefing byte-parity — no trailing newline**: `render_briefing()` must NOT emit a trailing `\n`. The Jinja env's `keep_trailing_newline=False` (default) strips `discord_briefing.j2`'s final source newline, so the golden test compares against output with no trailing newline. `prepare_body()` applies `.strip()` + a port of Jinja's `truncate(4000, killwords=False, end='\n...', leeway=5)` — match the algorithm exactly (return unchanged when `len <= 4005`).
+- **State merge is in-memory** (`driver._merge_state`): `run_fleet()` threads one `FleetState` through every phase and OR-joins `changed`/`failed`, concatenating record lists. The per-phase `dump_for_ansible()` JSON (fleet_*-keyed, reverse of `from_raw()`) is **only** for tooling and the molecule `verify.yml` (`mol_run_flow.py` writes it, `verify.yml` `include_vars` it); `run_fleet()` passes `state_output_path=None`.
+- **Inventory parser must not use `configparser`**: `configparser` splits on the first `=` and mis-parses Ansible host lines of the form `hostname key=val key=val …` (it produces key=`hostname key` and value=`val key=val …`). `proxmox_fleet/inventory.py` uses a manual regex parser (`_iter_section`) instead, and merges `host_vars/<host>.yml` for every group (including `proxmox_nodes`, so a node's `ansible_host` IP can live in host_vars).
+- **Package/locale commands pin `LC_ALL=C`** (`flows/_pkg.upgrade_cmd` + `flows/lxc._os_update_cmd`/`_dpkg_hash_cmd`): change detection greps English apt/apk/dnf summary lines, so the locale must be forced or a non-English host reports "changed" on every run. `window.in_window` likewise uses a fixed weekday list, not locale-sensitive `strftime('%a')`.
+- **Shared pkg helpers** live in `flows/_pkg.py` (`detect_pkg_mgr`, `upgrade_cmd`, `kuma_healthy`) — used by the vm/remote/lxc/custom/node flows. Don't re-copy them into a flow.
+- **Alpine uses `ash`**: `flows/lxc._read_version` (and the OS-update command) pick `ash` for `ostype: alpine`, else `bash` — Alpine containers often have no bash.
+- **Briefing byte-parity — no trailing newline**: `render_briefing()` must NOT emit a trailing `\n` (the golden fixture in `tests/unit/data/briefing_golden.json`, captured from the retired `discord_briefing.j2`, has none). `prepare_body()` applies `.strip()` + a port of Jinja's `truncate(4000, killwords=False, end='\n...', leeway=5)` — match the algorithm exactly (return unchanged when `len <= 4005`).
 - **`settings.notifiers` is `Optional[...]` defaulting to `None`**: this preserves the Ansible `notifiers is defined` distinction — an explicit `notifiers: []` in `vars.yml` means "no notifiers" and must NOT fall back to synthesizing one from `discord_webhook`; only an *unset* (`None`) value triggers the back-compat shim.
 - **`run_shell.yml` has `check_mode: false`** on the shell task — the command **always executes** regardless of Ansible check mode. Python controls dry-run by passing either a simulate command (`apt-get -s`) or a real command; Ansible's `--check` flag is bypassed at the shell level. `reboot_host.yml` has the same `check_mode: false` for consistency; the node flow additionally guards the reboot call with `not dry_run` in Python so it never fires during dry-run regardless.
-- **`run_node_update` retry uses injectable `_sleep`**: `orchestration.retry(apt_fn, retries=5, delay=30.0, sleep=_sleep)`. Callers pass `_sleep=lambda s: None` in tests to avoid 150 s of wait. `run_node_phase()` in the driver doesn't pass `_sleep`, so real runs use `time.sleep`. Tests that call via `run_node_phase()` must monkeypatch `time.sleep` to keep fast.
-- **`vm_apt_res` register-overwrite bug in legacy `vm_update` role**: in dry-run mode (`vm_dry_run=True`), the "Simulate apt" task registers `vm_apt_res` with `changed=True`, but the skipped "Update VM packages (apt)" task (in the real-update block) also registers `vm_apt_res` with `{skipped: true, changed: false}`, overwriting the simulate result. This causes `vm_pkg_res.changed = False` in `report.yml` and the VM record is silently dropped from the Discord briefing. The Python driver (`--use-vm-flow`) is unaffected — it uses `run_shell` directly with no register overwrite.
-- **`executor.snapshot(vmid, *, snap_state, api_host, ...)` added for Phase 3**: invokes `snapshot.yml` (which runs `community.proxmox.proxmox_snap` on localhost). `api_host` must be the node's `ansible_host` IP — not the inventory name. `vmid` (not `lxc_id`) because the same primitive handles both LXC containers and QEMU VMs. Molecule overrides this with `MolLxcExecutor` (touch-file stub).
+- **`run_node_update` retry uses injectable `_sleep`**: `orchestration.retry(apt_fn, retries=5, delay=30.0, sleep=_sleep)`. Callers pass `_sleep=lambda s: None` in tests to avoid 150 s of wait. `run_node_phase()` in the driver doesn't pass `_sleep`, so real runs use `time.sleep`. Tests that call via `run_node_phase()` must monkeypatch `time.sleep` to keep fast. `steps.run_steps()` has the same injectable `sleep` for honouring a step's `delay` between failed retries.
+- **`executor.snapshot(vmid, *, snap_state, api_host, ...)`**: invokes `snapshot.yml` (which runs `community.proxmox.proxmox_snap` on localhost, ignoring the executor's host binding). `api_host` must be the node's `ansible_host` IP — not the inventory name. `vmid` (not `lxc_id`) because the same primitive handles both LXC containers and QEMU VMs. Molecule overrides this with `MolLxcExecutor` (touch-file stub).
 - **Two-executor pattern for VMs** (Phase 4a): `run_vm_update()` takes `executor` (bound to the VM guest via SSH, for package upgrades) and `node_executor` (bound to the Proxmox node via SSH, for `qm rollback`/`qm status`). Using the wrong executor causes `qm` commands to SSH into the VM and fail silently.
 - **HA-aware VM node discovery** (Phase 4a): `driver.run_vm_phase()` calls `pvesh get /cluster/resources --type vm` on the first available Proxmox node to build a live `{vmid: (node, api_host)}` map. `pve_node` in inventory is only a fallback hint — it goes stale when HA migrates a VM.
 - **Package manager detection uses `if/elif/else`**: `&&`/`||` chains with equal precedence cause all branches to fire on Debian systems (right-hand side of `&&` runs when left succeeds, right-hand side of `||` is skipped — but the next `&&` in the chain still runs). Always use `if which apt-get ...; then echo apt; elif which dnf ...; then echo dnf; fi` for unambiguous detection.
-- **`lxc_parse.py` owns all regex extraction**: `parse_pct_config()`, `parse_pct_status()`, `parse_ct_script()`. Patterns are verbatim from `test_introspect_regex.py` and `test_detect_regex.py` — if a pattern changes, update both the parser and its parity test.
+- **`lxc_parse.py` owns all regex extraction**: `parse_pct_config()`, `parse_pct_status()`, `parse_ct_script()` (+ the unused `script_name_from_update()`). Parity is locked by `tests/unit/test_status_lxc.py` — if a pattern changes, update both the parser and its test.
 
 ### Testing infrastructure
 
-**Jinja2 unit tests** (Jinja shim — `tests/unit/`) exercise the conditional logic inside role task files without Ansible or PVE:
-
-| File | What it covers |
-|---|---|
-| `test_report_tmp_app.py` | 11-branch `tmp_app` + rollback rescue app string |
-| `test_report_tmp_os.py` | `tmp_os` expression + the `None`-guard in the payload |
-| `test_report_when_condition.py` | The `when:` gate that suppresses idle `OK`/`OK` containers |
-| `test_dry_check_status.py` | `dry_run_status` branches in `dry_check.yml` |
-| `test_detect_regex.py` | `regex_search` patterns in `detect.yml` and `needs_resource_scale` |
-| `test_discord_briefing.py` | Full `discord_briefing.j2` including Custom Systems section |
-| `test_fleet_state_append_logic.py` | `set_fact` expressions in `tasks/fleet-state-append.yml` including `fleet_custom_data` |
-| `test_introspect_regex.py` | `pct config` output parsing in `introspect.yml` |
-| `test_custom_report.py` | `tmp_custom` tree + `custom_changed` + `custom_is_outdated` (Tier 5) |
-| `test_vm_report.py` | VM success status tree, rescue rollback string, dry-run `WOULD UPDATE` |
-| `test_notify.py` | notifier back-compat shim + ntfy header construction |
-| `test_persist_history.py` | run-summary count assembly |
-| `test_run_step.py` | per-step `timeout` command wrapping |
-| `test_check_window.py` | maintenance-window day/time/wrap/force logic |
-| `test_custom_depends.py` | Phase 0a dependency-order validator + runtime `_dep_failed` gate |
-
-**Plain-Python unit tests** (no Jinja shim — `tests/unit/`) test the typed Python modules directly:
+Tests are **plain Python** (`tests/unit/`) — no Ansible, no PVE, no Jinja shim (the old
+`tests/conftest.py` Jinja filters and the `test_*_report.py`/`*_regex.py`/`test_discord_briefing.py`
+shim tests were deleted with the roles). Flows are tested with a per-flow scripted fake executor
+and monkeypatched `http`; status/parse/helper functions are tested directly. `ruff` and `mypy`
+run clean over `proxmox_fleet/` (and `ruff` over `tests/` too).
 
 | File | What it covers |
 |---|---|
 | `test_config_model.py` | `CustomConfig` model validation and defaults |
 | `test_state_model.py` | `FleetState` construction, `from_raw()` aliases, `dump_for_ansible()` |
-| `test_settings.py` | `GlobalSettings.load()`, field defaults (including node/manager fields), missing-file behaviour |
-| `test_deps.py` | `validate_depends_order()` + `dependency_failed()` — mirrors `test_custom_depends.py` |
-| `test_window.py` | `in_window()` — mirrors `test_check_window.py` case-for-case |
-| `test_inventory.py` | `load_custom_hosts()` with `tmp_path` fixtures |
-| `test_driver.py` | `run_custom_phase()` + `run_node_phase()` with monkeypatched `RunnerExecutor`; dep-abort, window skip, dry-run propagation, abort-on-first-failure, state JSON output |
-| `test_orchestration.py` | `run_serial()` / `run_concurrent()` |
+| `test_settings.py` | `GlobalSettings.load()`, field defaults (node/manager), missing-file, integer kuma-map key coercion |
+| `test_deps.py` | `validate_depends_order()` + `dependency_failed()` |
+| `test_window.py` | `in_window()` day/time/wrap/force + locale-independent weekday mapping |
+| `test_inventory.py` | `load_custom_hosts/proxmox_nodes/proxmox_vms/remote_hosts()` with `tmp_path`; inline-vs-host_vars precedence (incl. node `ansible_host` from host_vars) |
+| `test_pkg.py` | `detect_pkg_mgr()` (apt/dnf/apk/fallback), `upgrade_cmd()` per-mgr + `LC_ALL=C` pin, `kuma_healthy()` |
+| `test_driver.py` | `run_*_phase()` with monkeypatched `RunnerExecutor`; dep-abort, window skip, dry-run propagation, abort-on-first-failure, state JSON output |
+| `test_orchestration.py` | `run_serial()` / `run_concurrent()` / `retry()` |
 | `test_http.py` | HTTP helpers with monkeypatched urllib |
-| `test_status_custom.py` | `custom_status()` — mirrors `test_custom_report.py` |
-| `test_steps.py` | `run_steps()` — mirrors `test_run_step.py` |
+| `test_status_custom.py` | `custom_status()` decision tree |
+| `test_steps.py` | `run_steps()` interpolation, `when` gating, `timeout` wrap, retries + injected `delay` sleep |
 | `test_flow_custom.py` | `run_custom_update()` end-to-end with fake executor |
-| `test_status_lxc.py` | `lxc_app_status()`, `lxc_os_status()`, `lxc_rescue_app_status()`, `lxc_dry_run_status()`, `lxc_should_report()`, `parse_pct_config/status()`, `parse_ct_script()` — mirrors 6 existing Jinja test files |
-| `test_flow_lxc.py` | `run_lxc_update()` end-to-end with `ScriptedLxcExecutor` (snapshot stubbed) |
-| `test_status_vm.py` | `vm_status()`, `vm_rescue_status()`, `vm_should_report()` — mirrors `test_vm_report.py` |
+| `test_status_lxc.py` | `lxc_app_status/os_status/rescue_app_status/dry_run_status/should_report`, `parse_pct_config/status`, `parse_ct_script`, `dpkg_hash_differs` |
+| `test_flow_lxc.py` | `run_lxc_update()` end-to-end with `ScriptedLxcExecutor`; Alpine `ash` version read; `LC_ALL=C` on OS/dpkg commands |
+| `test_status_vm.py` | `vm_status()`, `vm_rescue_status()`, `vm_should_report()` |
 | `test_flow_vm.py` | `run_vm_update()` end-to-end with `ScriptedVmExecutor` + `ScriptedNodeExecutor` (two-executor pattern) |
 | `test_status_remote.py` | `remote_status()`, `remote_should_report()` |
 | `test_flow_remote.py` | `run_remote_update()` end-to-end with `ScriptedRemoteExecutor` |
 | `test_status_node.py` | `node_status()` (5 branches), `manager_status()` (3 branches), `node_should_report()` |
 | `test_flow_node.py` | `run_node_update()` + `run_manager_update()` with `ScriptedNodeExecutor`; retry, reboot, proxy wait, manager-host skip |
-| `test_briefing.py` | `render_briefing()` behavioural cases + a **golden parity** test asserting byte-equality with the live `discord_briefing.j2` via the Jinja shim; `prepare_body`/title/color/`should_notify` |
-| `test_history.py` | `build_run_summary()` counts + the `briefing` field; `write_history()` write/prune/`latest.json` — mirrors `test_persist_history.py` |
-| `test_notifiers.py` | `resolve_notifiers()` shim, `dispatch()` discord/ntfy payloads + headers, `ping_deadmans()` `/fail` suffix — mirrors `test_notify.py` |
+| `test_briefing.py` | `render_briefing()` behavioural cases + a **golden parity** test asserting byte-equality with `tests/unit/data/briefing_golden.json` (captured from the retired `.j2`); `prepare_body`/title/color/`should_notify` |
+| `test_history.py` | `build_run_summary()` counts + the `briefing` field; `write_history()` write/prune/`latest.json` |
+| `test_notifiers.py` | `resolve_notifiers()` shim, `dispatch()` discord/ntfy payloads + headers, `ping_deadmans()` `/fail` suffix |
 
-`tests/conftest.py` implements Ansible-specific Jinja2 filters (`regex_search` list-return, `regex_replace`, `combine`, `intersect`) and tests (`failed`, `search`, `equalto`, `succeeded`) so templates render identically to Ansible. When writing new tests, use `render()` for string output and `render_native()` / `make_native_env()` (via `NativeEnvironment`) for Python objects.
+**Scripted fake executors**: each flow test defines a `Scripted*Executor` (in its own test file) whose `run_shell` returns queued `PrimitiveResult`s matched by command substring, records `.commands`, and stubs `snapshot()`/`reboot()`. There is no shared `conftest.py`.
 
-**Molecule scenarios** (`roles/lxc_update/molecule/`) — the three CI-active scenarios (`normal`, `rollback`, `snapfail`) now drive `mol_run_flow.py` which builds a `MolLxcExecutor` and calls `run_lxc_update()` directly (same Python→ansible-runner→stub-shell stack as custom_update). The four non-CI scenarios (`template`, `stopped`, `dry_run`, `rescue`) still use the legacy role. **`roles/custom_update/molecule/`** scenarios all drive `mol_run_flow.py` → `run_custom_update()`. Each scenario's `converge.yml` invokes `mol_run_flow.py` with `ansible.builtin.command`; `verify.yml` loads the `dump_for_ansible()` JSON with `include_vars`. Idempotency checking is disabled for all scenarios — backup and update operations are intentionally non-idempotent.
+**Molecule scenarios** drive the Python flows, not roles. `roles/lxc_update/molecule/` has three CI scenarios (`normal`, `rollback`, `snapfail`) whose `converge.yml` runs `mol_run_flow.py` → `MolLxcExecutor` (touch-file snapshot stub) → `run_lxc_update()`. `roles/custom_update/molecule/` has six (`normal`, `noop`, `rescue`, `dry_run`, `uptodate`, `per_step`) → `run_custom_update()`. `verify.yml` loads the `dump_for_ansible()` JSON with `include_vars`. (`roles/` now contains **only** these molecule harnesses — no role tasks/defaults.) Idempotency is disabled — backup/update are intentionally non-idempotent.
 
-**CI** (`.github/workflows/ci.yml`): `yamllint`, `ansible-lint`, `syntax-check`, `unit-tests` (pytest), plus two molecule matrices — `molecule-lxc-update` (normal, rollback, snapfail) and `molecule-custom-update` (normal, noop, rescue, dry_run, uptodate, per_step). Both molecule jobs now install `ansible-runner` and `pip install -e .` so `mol_run_flow.py` can import `proxmox_fleet`. The `ansible-lint` job excludes role task files that use dynamic `include_tasks` via `exclude_paths` in `.ansible-lint` (the `load-failure[not-found]` rule is unskippable).
+**CI** (`.github/workflows/ci.yml`): `yamllint`, `ansible-lint` (primitives), `syntax-check` (primitives), `unit-tests` (pytest), `mypy`, `ruff` (`proxmox_fleet/ tests/`), plus two molecule matrices — `molecule-lxc-update` (normal, rollback, snapfail) and `molecule-custom-update` (normal, noop, rescue, dry_run, uptodate, per_step). Both molecule jobs install `ansible-runner` + `pip install -e .` so `mol_run_flow.py` can import `proxmox_fleet`.
 
-### Jinja2 / Ansible patterns
+### Briefing output constraints (`briefing.py`)
 
-- **`regex_search` with capture groups**: always use `(value | regex_search('pattern', '\\1') or [''])[0]`. Never use `| first` — `regex_search` returns Python `None` (not Jinja2 `Undefined`) on no match, so `| default([])` does not help and `| first` on `None` crashes.
-- **Empty `>-` block → Python `None`**: a `set_fact` using a `>-` YAML block scalar whose Jinja2 evaluates to an empty string stores `None`, not `""`. Guard downstream with `{{ '' if var is none else var | trim }}`. The `discord_briefing.j2` OS field and `report.yml` `os:` payload both use this pattern.
-- **Explicit `{{ '\n' }}` for newlines in templates**: do not rely on template-source newlines when `{%- -%}` tags are present — they strip adjacent whitespace including newlines. Use `{{ '\n' }}` (or `{{ '\n\n' }}` for blank lines) as explicit output that cannot be stripped by control-tag whitespace rules.
-- **Discord embed markdown**: embed descriptions support `**bold**`, `*italic*`, `` `code` ``, `- ` bullet lists, and `\n` newlines. They do **not** support `>` blockquotes or `#` headers (those work only in regular messages, not webhook embeds).
+The briefing is now rendered in Python (`render_briefing`), not Jinja, but the **Discord embed markdown** constraints still apply: embed descriptions support `**bold**`, `*italic*`, `` `code` ``, `- ` bullet lists, and `\n` newlines; they do **not** support `>` blockquotes or `#` headers (those work only in regular messages, not webhook embeds). Byte-parity with the retired template is locked by the golden test (see "Briefing byte-parity" above).
