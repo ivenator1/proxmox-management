@@ -8,8 +8,11 @@ ansible_ssh_private_key_file=~/.ssh/id_ed25519
 ansible_python_interpreter=/usr/bin/python3
 
 # QEMU VMs managed by Proxmox (SSH-reachable).
-# vmid must match the VM ID in PVE. pve_node must match the inventory hostname
-# of the PVE node that owns this VM (used to look up the PVE API host).
+# vmid must match the VM ID in PVE.
+# pve_node is an optional fallback hint for non-cluster / non-HA setups. When
+# the Python driver runs, it queries the Proxmox cluster via pvesh to find
+# each VM's current node — HA migrations are handled automatically. pve_node
+# is only used when cluster discovery is unavailable (e.g. standalone node).
 # Leave the group empty (just the header) if you have no VMs.
 [proxmox_vms]
 # my-vm  ansible_host=10.10.10.50  vmid=200  pve_node=pve-01

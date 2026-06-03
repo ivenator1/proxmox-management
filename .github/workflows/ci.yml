@@ -3,9 +3,9 @@ name: CI
 
 "on":
   push:
-    branches: [main]
+    branches: [main, testing]
   pull_request:
-    branches: [main]
+    branches: [main, testing]
 
 jobs:
   lint-yaml:
@@ -27,10 +27,8 @@ jobs:
         run: pip install ansible-lint
       - name: Install collections
         run: ansible-galaxy collection install community.proxmox community.general
-      - name: Create stub vars.yml for linting
-        run: cp vars.yml.example vars.yml
       - name: Run ansible-lint
-        run: ansible-lint fleet-update.yml
+        run: ansible-lint ansible/primitives/
 
   syntax-check:
     name: syntax-check
@@ -41,12 +39,12 @@ jobs:
         run: pip install ansible
       - name: Install collections
         run: ansible-galaxy collection install community.proxmox community.general
-      - name: Create stub inventory and vars
+      - name: Syntax check execution primitives
         run: |
-          cp vars.yml.example vars.yml
-          cp hosts.ini.example hosts.ini
-      - name: Syntax check
-        run: ansible-playbook fleet-update.yml --syntax-check
+          for f in ansible/primitives/*.yml; do
+            echo "== $f =="
+            ansible-playbook "$f" --syntax-check -i localhost,
+          done
 
   unit-tests:
     name: Python unit tests

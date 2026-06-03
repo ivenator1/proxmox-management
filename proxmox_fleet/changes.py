@@ -58,6 +58,48 @@ def dpkg_hash_differs(before: str, after: str) -> bool:
     return bool(b and a and b != a)
 
 
+def vm_pkg_count(stdout: str, pkg_mgr: str) -> Optional[int]:
+    """Extract the number of upgraded packages from pkg manager output.
+
+    Works for both real-run and dry-run (-s / --assumeno / -s) output since all
+    three managers include a summary line in both modes. Returns None when the
+    pattern is absent (unsupported manager, or too noisy to parse).
+    """
+    if not stdout:
+        return None
+    if pkg_mgr == "apt":
+        m = re.search(r"(\d+) upgraded", stdout)
+        return int(m.group(1)) if m else None
+    if pkg_mgr == "dnf":
+        m = re.search(r"Upgrade\s+(\d+)\s+Packages?", stdout, re.IGNORECASE)
+        return int(m.group(1)) if m else None
+    if pkg_mgr == "apk":
+        count = len(re.findall(r"^Upgrading ", stdout, re.MULTILINE))
+        return count if count > 0 else None
+    return None
+
+
+def pkg_changed(stdout: str, pkg_mgr: str) -> bool:
+    """True if the package manager output indicates packages were upgraded.
+
+    Python interprets raw stdout from the apt/dnf/apk upgrade command.
+    Works identically for dry-run (simulate) and real-run outputs since both
+    use the same output format. All decisions are here in Python.
+
+    pkg_mgr: 'apt' | 'dnf' | 'apk'
+    """
+    if not stdout:
+        return False
+    if pkg_mgr == "apt":
+        return "0 upgraded, 0 newly installed" not in stdout
+    if pkg_mgr == "dnf":
+        return "Nothing to do" not in stdout
+    if pkg_mgr == "apk":
+        return "0 upgraded, 0 installed, 0 removed" not in stdout
+    # Unknown package manager — assume changed when there is any output
+    return bool(stdout.strip())
+
+
 def custom_changed(
     *,
     changed_when_type: str = "version",

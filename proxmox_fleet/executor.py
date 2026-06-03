@@ -36,7 +36,7 @@ class Executor(Protocol):
 
     def snapshot(
         self,
-        lxc_id: str,
+        vmid: str,
         *,
         snap_state: str,
         api_host: str,
@@ -47,6 +47,7 @@ class Executor(Protocol):
         """Create (snap_state='present') or delete (snap_state='absent') a snapshot.
 
         Uses snapshot.yml which invokes community.proxmox.proxmox_snap on localhost.
+        Works for both LXC containers and QEMU VMs (the Proxmox API is vmid-agnostic).
         api_host must be the node's ansible_host IP (not the inventory name).
         """
         ...
@@ -98,7 +99,7 @@ class RunnerExecutor:
 
     def snapshot(
         self,
-        lxc_id: str,
+        vmid: str,
         *,
         snap_state: str,
         api_host: str,
@@ -110,7 +111,7 @@ class RunnerExecutor:
             "snapshot",
             inventory=self.inventory,
             extravars={
-                "lxc_id": lxc_id,
+                "vmid": vmid,
                 "snap_state": snap_state,
                 "api_host": api_host,
                 "api_user": api_user,

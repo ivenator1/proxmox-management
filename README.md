@@ -24,18 +24,20 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 * **Accurate Change Detection:** OS packages are updated before the community script runs, so each line is correctly attributed. For apps without a version file, a `dpkg-query` package-state hash is taken before and after the community script — if it matches, the container is silent even if the script produced output. This prevents false-positive "UPDATED" reports caused by `PHS_SILENT=1` suppressing apt's stdout inside community scripts.
 * **Consolidated Reporting:** Aggregates results from every node and container into exactly one Discord notification, with a structured error log showing which host, which task, and what the error was.
 
-## 🐍 Python Control Plane (migration in progress)
-A typed-Python "brain" (`proxmox_fleet/`) is being introduced to own all decision
-logic, config/state schemas, and reporting, while Ansible is reduced to a catalogue
-of single-purpose execution primitives. The migration is phased and the existing
-`ansible-playbook fleet-update.yml` keeps working throughout.
+## 🐍 Python Control Plane
+A typed-Python "brain" (`proxmox_fleet/`) owns all decision logic, config/state
+schemas, orchestration, and reporting; Ansible is reduced to a catalogue of
+single-purpose execution primitives (`ansible/primitives/*.yml`) invoked through
+`ansible-runner`. The `fleet-update` CLI is the entrypoint — there is no longer a
+monolithic playbook.
 
 ```bash
 # On the Ansible manager (Debian — system Python is externally managed):
 apt install python3.13-venv          # match your Python version
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .                     # adds the fleet-update entrypoint + all deps
-fleet-update --use-lxc-flow --check -e fleet_dry_run=true   # dry-run
+fleet-update --check -e fleet_dry_run=true                  # fleet-wide dry-run
+fleet-update -e force_notify=true                           # full run
 
 # Dev / CI:
 pip install -e '.[dev]'
@@ -43,16 +45,12 @@ python -m mypy proxmox_fleet/
 pytest tests/unit/ -v
 ```
 
-Landed so far: pydantic schemas for `configs/<name>.yml` (`CustomConfig`) and the
-fleet state records (`FleetState`), stdlib orchestration helpers (the
-`forks`/`serial`/`retries` equivalents), manager-local IO helpers (`http.py`), the
-ansible-runner wrapper, the custom_update decision logic (`status.py`/`changes.py`),
-and the full **custom_update flow** (`flows/custom.py` + `steps.py` + `executor.py`)
-driven by the `run_shell`/`reboot_host` execution primitives. The flow does per-step
-command interpolation in Python — so a later step can use `{{ steps.NAME }}` from an
-earlier step's output (the eager-templating limitation is gone). Still pending for
-custom_update: wiring the flow into the driver as the default + reworking its molecule
-scenarios. See the migration plan for the full phased roadmap.
+`driver.run_fleet()` runs the pre-flight apt-proxy check then every phase in order
+(remote → custom → lxc → vm → node + manager → briefing), threading one `FleetState`
+through and dispatching the Discord/ntfy briefing at the end. The decision logic
+lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
+`flows/*.py`, manager-local IO in `http.py`, and the byte-parity briefing in
+`briefing.py`. See `docs/migration-roadmap.md` for the completed migration history.
 
 ## 🛠 Prerequisites
 * **Ansible Manager:** A dedicated LXC (e.g., Debian 12+, VMID 121) with a static IP.
@@ -66,23 +64,24 @@ scenarios. See the migration plan for the full phased roadmap.
 ├── ansible.cfg                      # Performance & connection settings
 ├── hosts.ini                        # List of nodes (gitignored — copy from .example)
 ├── vars.yml                         # Credentials and cluster config (gitignored — copy from .example)
-├── fleet-update.yml                 # Main orchestrator playbook (7 phases)
+├── pyproject.toml                   # Package config + the fleet-update entrypoint
 ├── .ansible-lint                    # Lint profile and skip rules
 ├── .yamllint.yml                    # YAML style rules
-├── .github/workflows/ci.yml         # CI: yamllint, ansible-lint, syntax-check, pytest, molecule
-├── tasks/
-│   └── fleet-state-append.yml       # Shared state accumulator (used by all roles)
-├── templates/
-│   └── discord_briefing.j2          # Discord embed body template
+├── .github/workflows/ci.yml         # CI: yamllint, ansible-lint, syntax-check, pytest, mypy, molecule
+├── proxmox_fleet/                   # Python control plane (the "brain")
+│   ├── cli.py / driver.py           # Entrypoint + run_fleet() orchestrator
+│   ├── flows/                       # Per-host control flows (custom/lxc/vm/remote/node)
+│   ├── status.py / changes.py       # Decision trees + change detection
+│   ├── briefing.py / notifiers.py / history.py   # Phase 4 (briefing/notify/history)
+│   └── models/                      # pydantic schemas (config, state, settings)
+├── ansible/primitives/             # Single-purpose Ansible execution primitives
+├── configs/                         # custom_update config files (gitignored; *.example committed)
 ├── tests/
-│   ├── requirements.txt             # pytest, jinja2, pyyaml
-│   ├── conftest.py                  # Ansible-compatible Jinja2 environment for unit tests
-│   ├── unit/                        # 104 pytest tests — no Ansible or PVE required
-│   └── integration/                 # Standalone ansible-playbook tests
+│   ├── requirements.txt             # pytest, pyyaml
+│   └── unit/                        # pytest tests — no Ansible or PVE required
 └── roles/
-    ├── lxc_update/                  # LXC container update logic + 5 molecule scenarios
-    ├── vm_update/                   # QEMU VM update logic + molecule scenario
-    └── remote_host_update/          # Non-Proxmox host update logic + molecule scenario
+    ├── lxc_update/molecule/        # Molecule scenarios driving flows/lxc.py
+    └── custom_update/molecule/     # Molecule scenarios driving flows/custom.py
 ```
 
 ## ⚙️ Configuration (vars.yml)
@@ -186,7 +185,7 @@ ansible all -i hosts.ini -m ping
 If everything comes back GREEN:
 You are ready to run your first real update!
 ```bash
-ansible-playbook -i hosts.ini fleet-update.yml -e "force_notify=true"
+fleet-update -e force_notify=true
 ```
 
 **Summary of what you just did:**
@@ -196,26 +195,24 @@ ansible-playbook -i hosts.ini fleet-update.yml -e "force_notify=true"
 * Built the Folder Structure to hold your SG-1 Fleet intelligence.
 
 ## 🏃 Usage
+Run from the project root with the virtualenv active (`source .venv/bin/activate`).
 ### Manual Fleet Run (With Notification)
 ```bash
-ansible-playbook fleet-update.yml -e "force_notify=true"
+fleet-update -e force_notify=true
 ```
 ### Check Mode (No Changes, Forces Notification)
 ```bash
-ansible-playbook fleet-update.yml --check -e "force_notify=true"
+fleet-update --check -e force_notify=true
 ```
 ### Version Comparison Dry Run (No Updates Applied)
 ```bash
-ansible-playbook fleet-update.yml -e "lxc_dry_run=true force_notify=true"
-```
-### Single Node
-```bash
-ansible-playbook fleet-update.yml --limit pve-01
+fleet-update -e fleet_dry_run=true -e force_notify=true
 ```
 ### Automated Schedule (Cron)
-Add this to the Manager LXC's `crontab -e` to run at 4:00 AM daily:
+Add this to the Manager LXC's `crontab -e` to run at 4:00 AM daily (note the
+venv path so `fleet-update` resolves):
 ```cron
-0 4 * * * cd /root/proxmox-management && /usr/bin/ansible-playbook fleet-update.yml >> /var/log/ansible-fleet-update.log 2>&1
+0 4 * * * cd /root/proxmox-management && /root/proxmox-management/.venv/bin/fleet-update >> /var/log/fleet-update.log 2>&1
 ```
 
 ## 🧪 Development & Testing
@@ -223,16 +220,18 @@ Add this to the Manager LXC's `crontab -e` to run at 4:00 AM daily:
 No Proxmox infrastructure is needed to run the tests.
 
 ```bash
-# Jinja2 unit tests (covers report logic, Discord template, state accumulation)
-pip install -r tests/requirements.txt
+# Python unit tests (decision logic, briefing byte-parity, state, flows)
+pip install -e '.[dev]'
 pytest tests/unit/ -v
+python -m mypy proxmox_fleet/
 
 # Static analysis
 yamllint .
-ansible-lint fleet-update.yml
+ansible-lint ansible/primitives/
 
-# Molecule (uses stub pct/vzdump scripts, runs against localhost)
+# Molecule (drives the Python flows via stub pct/vzdump scripts, against localhost)
 cd roles/lxc_update && molecule test -s lxc_update_normal
+cd roles/custom_update && molecule test -s custom_update_normal
 ```
 
 CI runs automatically on push/PR via GitHub Actions (`.github/workflows/ci.yml`).

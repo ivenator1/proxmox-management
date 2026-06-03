@@ -197,6 +197,140 @@ def lxc_should_report(app: str, os: str, *, dry_run: bool) -> bool:
     return bool(re.search(r"updated|failed", os_l))
 
 
+# ---------------------------------------------------------------------------
+# Phase 4: vm_update trees
+# ---------------------------------------------------------------------------
+
+
+def vm_status(
+    *,
+    pkg_changed: bool = False,
+    rebooted: bool = False,
+    dry_run: bool = False,
+    failed: bool = False,
+) -> str:
+    """Status string from roles/vm_update/tasks/report.yml.
+
+    Mirrors the 5-branch VM_STATUS tree in test_vm_report.py; parity locked
+    by test_status_vm.py which mirrors test_vm_report.py case-for-case.
+    """
+    if failed:
+        return "FAILED"
+    if dry_run:
+        return "WOULD UPDATE" if pkg_changed else "OK"
+    if rebooted:
+        return "UPDATED & REBOOTED"
+    if pkg_changed:
+        return "UPDATED"
+    return "OK"
+
+
+def vm_rescue_status(
+    *,
+    rollback_done: bool = False,
+    snapshot_failed: bool = False,
+) -> str:
+    """Rescue block status from roles/vm_update/tasks/main.yml.
+
+    Mirrors VM_RESCUE_STATUS in test_vm_report.py.
+    """
+    if rollback_done:
+        return "FAILED + ROLLED BACK"
+    if snapshot_failed:
+        return "FAILED (NO SNAPSHOT)"
+    return "FAILED"
+
+
+def vm_should_report(*, pkg_changed: bool, rebooted: bool, failed: bool) -> bool:
+    """The `when:` gate on the 'Append VM record' task in report.yml.
+
+    Mirrors: vm_pkg_res is failed or vm_pkg_res.changed or vm_reboot_action.changed
+    """
+    return failed or pkg_changed or rebooted
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: remote_host_update trees
+# ---------------------------------------------------------------------------
+
+
+def remote_status(
+    *,
+    pkg_changed: bool = False,
+    rebooted: bool = False,
+    dry_run: bool = False,
+    failed: bool = False,
+) -> str:
+    """Status string from roles/remote_host_update/tasks/report.yml.
+
+    Same shape as vm_status (remote has no snapshot so rescue is always
+    plain 'FAILED'). Parity locked by test_status_remote.py.
+    """
+    if failed:
+        return "FAILED"
+    if dry_run:
+        return "WOULD UPDATE" if pkg_changed else "OK"
+    if rebooted:
+        return "UPDATED & REBOOTED"
+    if pkg_changed:
+        return "UPDATED"
+    return "OK"
+
+
+def remote_should_report(*, pkg_changed: bool, rebooted: bool, failed: bool) -> bool:
+    """The `when:` gate on the 'Append remote host record' task in report.yml.
+
+    Mirrors: remote_pkg_res is failed or remote_pkg_res.changed or remote_reboot_action.changed
+    """
+    return failed or pkg_changed or rebooted
+
+
+# ---------------------------------------------------------------------------
+# Phase 4b: node OS update + manager self-update trees
+# ---------------------------------------------------------------------------
+
+
+def node_status(
+    apt_changed: bool,
+    reboot_needed: bool,
+    rebooted: bool,
+    is_manager: bool,
+) -> str:
+    """Status string from Phase 2 of fleet-update.yml (node_status_str set_fact).
+
+    Parity with the Jinja decision tree (lines 317–322 of fleet-update.yml):
+      UPDATED & REBOOTED > UPDATED (MANUAL REBOOT REQ) > REBOOT FAILED > UPDATED > OK
+    REBOOT FAILED is logically unreachable in normal flow (a failed reboot goes to
+    rescue → FAILED) but kept for parity with the Jinja template.
+    """
+    if rebooted:
+        return "UPDATED & REBOOTED"
+    if reboot_needed and is_manager:
+        return "UPDATED (MANUAL REBOOT REQ)"
+    if reboot_needed and not is_manager:
+        return "REBOOT FAILED"
+    if apt_changed:
+        return "UPDATED"
+    return "OK"
+
+
+def manager_status(apt_changed: bool, reboot_needed: bool) -> str:
+    """Status string from Phase 3 of fleet-update.yml (Record Manager Status task).
+
+    Parity with: 'UPDATED (MANUAL REBOOT REQ)' if stat.exists else 'UPDATED' if apt.changed else 'OK'
+    """
+    if reboot_needed:
+        return "UPDATED (MANUAL REBOOT REQ)"
+    if apt_changed:
+        return "UPDATED"
+    return "OK"
+
+
+def node_should_report() -> bool:
+    """Every node and the manager always appears in the briefing — no idle suppression."""
+    return True
+
+
 def lxc_dry_run_status(
     *,
     gh_repo: str = "",

@@ -53,7 +53,7 @@ class MolLxcExecutor(RunnerExecutor):
         self._snap_changed = snap_changed
         self._snap_touch_prefix = snap_touch_prefix
 
-    def snapshot(self, lxc_id: str, *, snap_state: str, **api_params: Any) -> PrimitiveResult:
+    def snapshot(self, vmid: str, *, snap_state: str, **api_params: Any) -> PrimitiveResult:
         if snap_state == "present":
             Path(f"{self._snap_touch_prefix}_snap_created").touch()
         else:

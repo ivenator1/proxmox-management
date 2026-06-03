@@ -14,6 +14,7 @@
         reboot_timeout: "{{ reboot_timeout | default(600) | int }}"
         post_reboot_delay: 30
       register: _reboot
+      check_mode: false
 
     - name: "Return result to the control plane"
       ansible.builtin.set_stats:

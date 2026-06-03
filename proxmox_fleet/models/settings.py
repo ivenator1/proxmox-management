@@ -7,7 +7,7 @@ running with defaults, which is fine for --check runs).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -47,10 +47,43 @@ class GlobalSettings(BaseModel):
     os_update_exclude_list: List[str] = Field(default_factory=list)
     snapshot_exclude_list: List[str] = Field(default_factory=list)
 
+    # vm_update phase settings
+    vm_dry_run: bool = False
+    vm_auto_reboot: bool = True
+    vm_backup_strategy: str = "snapshot"
+    vm_backup_storage: str = "local"
+    vm_kuma_map: Dict[str, Any] = Field(default_factory=dict)
+    vm_forks: int = 2
+
+    # remote_host_update phase settings
+    remote_dry_run: bool = False
+    remote_auto_reboot: bool = True
+    remote_pre_update_cmd: str = ""
+    remote_kuma_map: Dict[str, Any] = Field(default_factory=dict)
+    remote_forks: int = 5
+
+    # node_update / manager phase settings (Phase 2 + Phase 3)
+    node_dry_run: bool = False
+    node_auto_reboot: bool = True
+    manager_lxc_id: str = ""
+    apt_proxy_ip: str = ""
+    apt_proxy_port: int = 3142
+
     # Proxmox API credentials (for snapshot operations)
     pve_api_user: str = ""
     pve_api_token_id: str = ""
     pve_api_token_secret: str = ""
+
+    # Phase 4 — briefing / history / notifiers
+    # notifiers defaults to None (not []) so an unset value is distinguishable
+    # from an explicit empty list, matching the Ansible `notifiers is defined` shim.
+    notifiers: Optional[List[Dict[str, Any]]] = None
+    discord_webhook: str = ""
+    fleet_deadmans_url: str = ""
+    fleet_history_enabled: bool = True
+    fleet_history_dir: str = "/var/log/fleet-update"
+    fleet_history_keep: int = 30
+    force_notify: bool = False
 
     @classmethod
     def load(cls, path: Union[str, Path] = "vars.yml") -> "GlobalSettings":

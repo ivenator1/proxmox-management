@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List, Union
+from typing import List, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -30,6 +30,7 @@ class VmRecord(BaseModel):
     vmid: str
     name: str
     status: str
+    pkg_count: Optional[int] = None
 
 
 class RemoteRecord(BaseModel):
