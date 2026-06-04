@@ -8,12 +8,25 @@ The Ansible→Python migration is **complete**: `fleet-update` (→ `driver.run_
 the only entrypoint. There is no `fleet-update.yml` playbook and no `--use-*-flow` flags —
 Ansible runs only as the execution primitives in `ansible/primitives/*.yml`.
 
+`fleet-update.py` (repo root) is the recommended human-facing interface — it auto-bootstraps
+into `.venv` and exposes friendly flags. The `fleet-update` console command (registered by pip)
+is the programmatic / cron interface.
+
 ```bash
 # Fleet-wide dry-run (no changes), forces a Discord/ntfy notification
-fleet-update --check -e fleet_dry_run=true -e force_notify=true
+./fleet-update.py --dry-run --force-notify
 
 # Full run with forced notification
-fleet-update -e force_notify=true
+./fleet-update.py --force-notify
+
+# Bypass maintenance windows
+./fleet-update.py --force-window
+
+# Pass raw extra vars (same as the old -e interface, still supported)
+./fleet-update.py -e custom_allow_reboot=false
+
+# Using the console command directly (requires active venv or full venv path)
+fleet-update --check -e force_notify=true
 
 # Install required collections (for the primitives + molecule)
 ansible-galaxy collection install community.proxmox community.general
@@ -56,12 +69,13 @@ Activate the venv at the start of each shell session: `source .venv/bin/activate
 ## File Map
 
 ```
+fleet-update.py                         # Runnable wrapper — ./fleet-update.py [--dry-run|--force-notify|--verbose|--force-window|-e K=V]; auto-bootstraps .venv
 ansible.cfg                             # forks=20, pipelining=true, inventory=./hosts.ini
 vars.yml / vars.yml.example             # Secrets + behaviour flags (gitignored; copy from .example)
 hosts.ini / hosts.ini.example           # Inventory (gitignored; copy from .example)
 .ansible-lint                           # profile: moderate; targets ansible/primitives/ (name[casing] demoted to warning)
 .yamllint.yml                           # extends: default; line-length warning at 160
-.github/workflows/ci.yml                # yamllint, ansible-lint (primitives), syntax-check (primitives), unit-tests, mypy, ruff, + molecule matrices (lxc, custom)
+.github/workflows/ci.yml                # yamllint, ansible-lint (primitives), syntax-check (primitives), unit-tests, mypy, ruff (incl. fleet-update.py), lint-wrapper, + molecule matrices (lxc, custom)
 pyproject.toml                          # package config; fleet-update entrypoint; [dev] extras include types-PyYAML for mypy
 proxmox_fleet/
   models/
@@ -90,7 +104,7 @@ proxmox_fleet/
   briefing.py                           # render_briefing() byte-parity port of discord_briefing.j2 + prepare_body/title/color/should_notify
   history.py                            # build_run_summary() + write_history() — port of persist-history.yml; records rendered briefing body; microsecond-precision timestamps prevent same-second collision
   notifiers.py                          # resolve_notifiers() + dispatch() (discord/ntfy) + ping_deadmans() — port of notify.yml + Phase-4 shim
-  cli.py                                # fleet-update CLI — parses --check / -e / --inventory / --vars-file, then calls driver.run_fleet()
+  cli.py                                # fleet-update CLI — parses --check / -e / --inventory / --vars-file, propagates fleet_dry_run/lxc_verbose/force_notify/force_window into settings, then calls driver.run_fleet()
 config_templates/
   custom_system.yml.example             # Fully-commented schema template — copy to configs/<name>.yml
 configs/
@@ -318,6 +332,7 @@ run clean over `proxmox_fleet/` (and `ruff` over `tests/` too).
 | `test_briefing.py` | `render_briefing()` behavioural cases + a **golden parity** test asserting byte-equality with `tests/unit/data/briefing_golden.json` (captured from the retired `.j2`); `prepare_body`/title/color/`should_notify` |
 | `test_history.py` | `build_run_summary()` counts + the `briefing` field; `write_history()` write/prune/`latest.json`; `_ts_now()` microsecond-precision format |
 | `test_notifiers.py` | `resolve_notifiers()` shim, `dispatch()` discord/ntfy payloads + headers, `ping_deadmans()` `/fail` suffix |
+| `test_wrapper.py` | `fleet-update.py` wrapper — defaults, all friendly flags + aliases, `-e` propagation, friendly-flag-over-extravars precedence, `--inventory`/`--vars-file` forwarding, bad `-e` format exit, exit-code forwarding; + `cli.py` `force_window` propagation fix |
 
 **Scripted fake executors**: each flow test defines a `Scripted*Executor` (in its own test file) whose `run_shell` returns queued `PrimitiveResult`s matched by command substring, records `.commands`, and stubs `snapshot()`/`reboot()`. There is no shared `conftest.py`.
 

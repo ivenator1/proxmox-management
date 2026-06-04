@@ -30,16 +30,20 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 A typed-Python "brain" (`proxmox_fleet/`) owns all decision logic, config/state
 schemas, orchestration, and reporting. Ansible is reduced to a catalogue of
 single-purpose execution primitives (`ansible/primitives/*.yml`) invoked through
-`ansible-runner` — no logical branching inside any primitive. The `fleet-update` CLI
-is the sole entrypoint.
+`ansible-runner` — no logical branching inside any primitive. `driver.run_fleet()`
+is the sole entrypoint, driven by either the `fleet-update.py` wrapper (recommended)
+or the `fleet-update` console command.
 
 ```bash
 # On the Manager LXC (Debian — system Python is externally managed):
 apt install python3.13-venv          # match your Python version
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e .                     # adds the fleet-update entrypoint + all deps
-fleet-update --check -e fleet_dry_run=true                  # fleet-wide dry-run
-fleet-update -e force_notify=true                           # full run
+pip install -e .                     # installs fleet-update console command + deps
+
+# fleet-update.py auto-bootstraps into .venv — no activation needed:
+./fleet-update.py --dry-run --force-notify   # fleet-wide dry-run with notification
+./fleet-update.py                            # full run
+./fleet-update.py --help                     # full flag reference + examples
 
 # Dev / CI:
 pip install -e '.[dev]'
@@ -63,10 +67,11 @@ lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
 ## 📂 Project Structure
 ```text
 ~/proxmox-management/
+├── fleet-update.py                  # Runnable wrapper — ./fleet-update.py [--dry-run|--force-notify|…]
 ├── ansible.cfg                      # Performance & connection settings
 ├── hosts.ini                        # List of nodes (gitignored — copy from .example)
 ├── vars.yml                         # Credentials and cluster config (gitignored — copy from .example)
-├── pyproject.toml                   # Package config + the fleet-update entrypoint
+├── pyproject.toml                   # Package config + the fleet-update console-command entrypoint
 ├── .ansible-lint                    # Lint profile and skip rules
 ├── .yamllint.yml                    # YAML style rules
 ├── .github/workflows/ci.yml         # CI: yamllint, ansible-lint, syntax-check, pytest, mypy, ruff, molecule
@@ -198,30 +203,47 @@ ansible all -i hosts.ini -m ping
 ```
 If everything comes back green, run your first dry-run:
 ```bash
-fleet-update --check -e fleet_dry_run=true -e force_notify=true
+./fleet-update.py --dry-run --force-notify
 ```
 
-**Activate the venv at the start of each session:** `source .venv/bin/activate`
+`fleet-update.py` detects `.venv/bin/python` at the repo root and re-execs into it
+automatically, so you do not need to activate the venv before running it.
 
 ## 🏃 Usage
-Run from the project root with the virtualenv active (`source .venv/bin/activate`).
-### Manual Fleet Run (With Notification)
+
+`fleet-update.py` is the recommended interface — no venv activation needed, friendly
+flags, and a built-in `--help`. Run it from the project root.
+
+### Dry Run (No Changes, Forces Notification)
 ```bash
-fleet-update -e force_notify=true
+./fleet-update.py --dry-run --force-notify
 ```
-### Check Mode (No Changes, Forces Notification)
+
+### Full Live Run
 ```bash
-fleet-update --check -e force_notify=true
+./fleet-update.py
 ```
-### Version Comparison Dry Run (No Updates Applied)
+
+### Full Run with Maintenance-Window Bypass
 ```bash
-fleet-update -e fleet_dry_run=true -e force_notify=true
+./fleet-update.py --force-window
 ```
+
+### All Flags
+```
+--dry-run / --check      Simulate everything — no changes, no reboots, no snapshots
+--force-notify / --notify  Send a notification even if nothing changed
+--verbose                Enable verbose LXC output
+--force-window           Bypass per-host maintenance-window checks
+-e KEY=VALUE             Pass a raw extra var (repeatable; e.g. -e custom_allow_reboot=false)
+--inventory PATH         Inventory file (default: hosts.ini)
+--vars-file PATH         Settings YAML (default: vars.yml)
+```
+
 ### Automated Schedule (Cron)
-Add this to the Manager LXC's `crontab -e` to run at 4:00 AM daily (note the
-venv path so `fleet-update` resolves):
+Add this to the Manager LXC's `crontab -e` to run at 4:00 AM daily:
 ```cron
-0 4 * * * cd /root/proxmox-management && /root/proxmox-management/.venv/bin/fleet-update >> /var/log/fleet-update.log 2>&1
+0 4 * * * cd /root/proxmox-management && /usr/bin/python3 fleet-update.py >> /var/log/fleet-update.log 2>&1
 ```
 
 ## 🧪 Development & Testing
@@ -235,7 +257,8 @@ pytest tests/unit/ -v
 python -m mypy proxmox_fleet/
 
 # Static analysis
-ruff check proxmox_fleet/ tests/
+ruff check proxmox_fleet/ tests/ fleet-update.py
+python3 -m py_compile fleet-update.py
 yamllint .
 ansible-lint ansible/primitives/
 

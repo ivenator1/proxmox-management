@@ -94,10 +94,12 @@ What exists now: `proxmox_fleet/{__init__,cli,__main__,runner,orchestration,http
 `proxmox_fleet/models/{config,state,settings}.py`, `proxmox_fleet/flows/{custom,lxc,vm,remote,node}.py`,
 `ansible/primitives/{run_shell,reboot_host,discover_lxcs,pct_config,pct_status,pct_start,pct_stop,pct_pull,snapshot,rollback,vzdump,lxc_os_update,lxc_app_update}.yml`,
 `roles/{custom_update,lxc_update}/molecule/mol_run_flow.py` (flow-driven molecule scenarios only).
-The CLI is just `fleet-update [--check] [-e key=val ...]` → `driver.run_fleet()`; the `--use-*-flow`
-flags and the per-phase merge plays are gone. ~420 plain-Python tests green, mypy clean. The
-golden briefing parity is now locked by `tests/unit/data/briefing_golden.json` (captured from the
-retired `.j2`) rather than the live Jinja shim.
+The CLI is `driver.run_fleet()` driven by either `./fleet-update.py` (recommended human-facing
+wrapper with friendly flags + venv auto-bootstrap) or the `fleet-update` console command
+(`fleet-update [--check] [-e key=val ...]`). The `--use-*-flow` flags and the per-phase merge
+plays are gone. ~440 plain-Python tests green, mypy clean. The golden briefing parity is now
+locked by `tests/unit/data/briefing_golden.json` (captured from the retired `.j2`) rather than
+the live Jinja shim.
 
 ---
 
@@ -547,6 +549,21 @@ in `test_flow_lxc.py` (two cases) and `test_flow_vm.py` (one case).
 `window.in_window` now adds `else: now = now.astimezone(tz)` so a tz-aware `now` in
 a foreign timezone is converted before day/time comparison. Previously only naive
 datetimes were localised. New test: `test_tz_aware_now_in_different_tz_is_converted`.
+
+### ✅ 6. Human-friendly CLI wrapper (`fleet-update.py`)
+`fleet-update.py` added at the repo root as the recommended daily-driver interface.
+Exposes `--dry-run` (sets both `check=True` and `fleet_dry_run=True`), `--force-notify`,
+`--verbose`, and `--force-window` as proper flags instead of `-e KEY=VALUE` strings. Auto-bootstraps
+into `.venv/bin/python` via `os.execv` so activation is not required. Keeps `-e KEY=VALUE` for
+uncommon vars. Calls `driver.run_fleet()` directly (no double-parse through `cli.main`). Friendly
+flags are applied last so they always win over any conflicting `-e` value.
+
+Also fixed a latent bug in `cli.py`: `-e force_window=true` was not propagated into `settings`,
+so `run_vm_phase` and `run_remote_phase` (which read `settings.force_window`) silently ignored
+the flag. A fourth propagation block was added alongside the existing three.
+
+CI additions: `ruff check fleet-update.py` added to the ruff job; new `lint-wrapper` job runs
+`python3 -m py_compile fleet-update.py`. New test file `tests/unit/test_wrapper.py` (20 tests).
 
 ### ✅ Minor: `history.write_history` filename granularity
 `_ts_now()` now uses `%Y%m%dT%H%M%S%fZ` (microsecond precision) instead of second
