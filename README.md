@@ -1,6 +1,6 @@
 # Proxmox Cluster Orchestrator
 
-A professional-grade, Ansible-based automation engine for maintaining a Proxmox VE High-Availability (HA) cluster. This project manages the simultaneous update of numerous LXC containers across multiple nodes while ensuring cluster quorum, service availability, and automated self-healing.
+A professional-grade automation engine for maintaining a Proxmox VE High-Availability (HA) cluster. A typed-Python control plane (`proxmox_fleet/`) owns all decision logic, orchestration, and reporting; Ansible is reduced to a catalogue of single-purpose execution primitives. The `fleet-update` CLI drives everything — there is no monolithic playbook.
 
 ---
 
@@ -13,26 +13,28 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 4. **Tier 4 (Self-Healing):** Automatic Snapshot Rollback if an application fails to respond post-update.
 
 ## ✨ Key Features
-* **Location-Aware Updates:** Dynamically detects which physical node is hosting the Ansible Manager LXC and skips that node's reboot.
+* **Location-Aware Updates:** Dynamically detects which physical node is hosting the Manager LXC and skips that node's reboot.
 * **Controlled Parallelism:** Updates LXCs across multiple nodes simultaneously to save time, while rebooting physical nodes sequentially to maintain Cluster Quorum and HA stability.
 * **Apt-Proxy Awareness:** Optimized for environments using `apt-cacher-ng`; automatically waits for the proxy service to be online before allowing subsequent nodes to start updates.
 * **Tag-Based Discovery:** Only processes LXCs tagged `community-script` or `proxmox-helper-scripts` in PVE — untagged containers are never touched.
-* **Multi-Host Support:** Handles LXC containers, QEMU VMs, and non-Proxmox remote hosts in a single run.
+* **Multi-Host Support:** Handles LXC containers, QEMU VMs, non-Proxmox remote hosts, and config-driven custom systems in a single run.
 * **Flexible Backup Strategy:** Choose per-run between lightweight snapshots, full `vzdump` backups (including PBS), both, or none.
+* **Snapshot-Lock Retry:** Transient Proxmox task locks (`CT is locked`) are retried automatically (up to 3 times, 15 s apart) before a snapshot failure is recorded as a non-fatal warning.
 * **Resource Scaling:** Automatically scales container CPU/RAM up during build-heavy app updates and back down afterward, matching the behaviour of the community-scripts bash installer.
 * **Dry-Run Mode:** Compare installed vs. latest GitHub release versions without applying any changes.
 * **Accurate Change Detection:** OS packages are updated before the community script runs, so each line is correctly attributed. For apps without a version file, a `dpkg-query` package-state hash is taken before and after the community script — if it matches, the container is silent even if the script produced output. This prevents false-positive "UPDATED" reports caused by `PHS_SILENT=1` suppressing apt's stdout inside community scripts.
-* **Consolidated Reporting:** Aggregates results from every node and container into exactly one Discord notification, with a structured error log showing which host, which task, and what the error was.
+* **Consolidated Reporting:** Aggregates results from every node and container into exactly one Discord (or ntfy) notification, with a structured error log showing which host, which task, and what the error was.
+* **Maintenance Windows:** Per-host time/day windows in `host_vars`; `force_window=true` bypasses. Invalid window config fails loud at load time.
 
 ## 🐍 Python Control Plane
 A typed-Python "brain" (`proxmox_fleet/`) owns all decision logic, config/state
-schemas, orchestration, and reporting; Ansible is reduced to a catalogue of
+schemas, orchestration, and reporting. Ansible is reduced to a catalogue of
 single-purpose execution primitives (`ansible/primitives/*.yml`) invoked through
-`ansible-runner`. The `fleet-update` CLI is the entrypoint — there is no longer a
-monolithic playbook.
+`ansible-runner` — no logical branching inside any primitive. The `fleet-update` CLI
+is the sole entrypoint.
 
 ```bash
-# On the Ansible manager (Debian — system Python is externally managed):
+# On the Manager LXC (Debian — system Python is externally managed):
 apt install python3.13-venv          # match your Python version
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .                     # adds the fleet-update entrypoint + all deps
@@ -53,7 +55,7 @@ lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
 `briefing.py`. See `docs/migration-roadmap.md` for the completed migration history.
 
 ## 🛠 Prerequisites
-* **Ansible Manager:** A dedicated LXC (e.g., Debian 12+, VMID 121) with a static IP.
+* **Manager LXC:** A dedicated LXC (e.g., Debian 12+, VMID 121) with a static IP.
 * **SSH Trust:** Passwordless SSH keys distributed from the Manager to all Proxmox Nodes (`ssh-copy-id`).
 * **API Token:** A Proxmox API Token for `root@pam` with "Privilege Separation" unchecked.
 * **Uptime Kuma:** A Public Status Page (e.g., slug: `proxmox-sg1`) containing the monitors to be validated.
@@ -67,14 +69,15 @@ lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
 ├── pyproject.toml                   # Package config + the fleet-update entrypoint
 ├── .ansible-lint                    # Lint profile and skip rules
 ├── .yamllint.yml                    # YAML style rules
-├── .github/workflows/ci.yml         # CI: yamllint, ansible-lint, syntax-check, pytest, mypy, molecule
+├── .github/workflows/ci.yml         # CI: yamllint, ansible-lint, syntax-check, pytest, mypy, ruff, molecule
 ├── proxmox_fleet/                   # Python control plane (the "brain")
 │   ├── cli.py / driver.py           # Entrypoint + run_fleet() orchestrator
 │   ├── flows/                       # Per-host control flows (custom/lxc/vm/remote/node)
+│   ├── executor.py                  # Executor protocol + RunnerExecutor + snapshot_with_retry()
 │   ├── status.py / changes.py       # Decision trees + change detection
 │   ├── briefing.py / notifiers.py / history.py   # Phase 4 (briefing/notify/history)
-│   └── models/                      # pydantic schemas (config, state, settings)
-├── ansible/primitives/             # Single-purpose Ansible execution primitives
+│   └── models/                      # Pydantic schemas (config, state, settings)
+├── ansible/primitives/             # Single-purpose Ansible execution primitives (no logic)
 ├── configs/                         # custom_update config files (gitignored; *.example committed)
 ├── tests/
 │   ├── requirements.txt             # pytest, pyyaml
@@ -90,13 +93,14 @@ The `vars.yml` file is the central intelligence of the orchestrator.
 ### 🔑 Authentication & Notifications
 * `pve_api_...`: Credentials for the Proxmox API. Required for snapshots and rollbacks.
 * `discord_webhook`: Your unique Discord Webhook URL for the morning briefing.
+* `notifiers`: List of notifier configs (type `discord` or `ntfy`). If unset, `discord_webhook` is used as a back-compat single notifier; an explicit `[]` means no notifications.
 
 ### 🌐 Networking (Apt-Cacher NG)
-* `apt_proxy_ip` / `apt_proxy_port`: If the node hosting your proxy reboots, Ansible will pause and wait for this IP/Port to respond.
+* `apt_proxy_ip` / `apt_proxy_port`: If the node hosting your proxy reboots, the orchestrator will pause and wait for this IP/Port to respond before continuing.
 
 ### 🚥 Uptime Kuma Integration
 * `kuma_url` / `kuma_slug`: Points to your Kuma instance and the specific Status Page slug.
-* `lxc_kuma_map` / `vm_kuma_map` / `remote_kuma_map`: Map an inventory hostname or LXC ID to an Uptime Kuma Monitor ID. Ansible will wait up to 5×30 seconds for Kuma to report `status: 1`. The monitor ID is the integer visible in the Kuma URL when editing a monitor; `kuma_slug` is the status page slug, not a monitor slug.
+* `lxc_kuma_map` / `vm_kuma_map` / `remote_kuma_map`: Map an inventory hostname or LXC ID to an Uptime Kuma Monitor ID. The orchestrator waits up to `kuma_health_check_retries` × `kuma_health_check_delay` seconds (default 5×30 s) for Kuma to report `status: 1`.
 
 ### 🔄 Backup Strategy
 * `lxc_backup_strategy`: `snapshot` (default) | `vzdump` | `both` | `none`
@@ -109,39 +113,44 @@ The `vars.yml` file is the central intelligence of the orchestrator.
 * `lxc_backup_strategy` / `lxc_auto_reboot` / `lxc_continue_on_error`: See `vars.yml.example` for defaults.
 
 ### 🛡️ Management & Exclusions
-* `manager_lxc_id`: The VMID of the Ansible Manager itself. The node hosting this container is never rebooted automatically.
+* `manager_lxc_id`: The VMID of the Manager LXC itself. The node hosting this container is never rebooted automatically.
 * `exclude_list`: LXC IDs completely skipped (no updates, no snapshots).
 * `os_update_exclude_list`: Skip `apt dist-upgrade` / `apk upgrade` for these IDs (app update still runs).
 * `snapshot_exclude_list`: Updates run but no snapshot is taken (use for LXCs with bind mounts).
-* **Note:** Phase 2 (node OS updates) uses `any_errors_fatal: true` and `serial: 1` to protect cluster quorum.
+* **Note:** Phase 2 (node OS updates) runs serially with abort-on-first-failure to protect cluster quorum.
 
 ## 🚀 Setup Instructions
-To set up this project from scratch on a brand-new Ansible Manager LXC, follow these steps in order. This ensures all dependencies are met and the "trust" between your manager and your Proxmox nodes is established correctly.
+To set up this project from scratch on a brand-new Manager LXC, follow these steps in order. This ensures all dependencies are met and SSH trust between your Manager and your Proxmox nodes is established correctly.
 
 ### 1. Create the Manager LXC
-* **OS:** Debian 13 (highly recommended) or Ubuntu 22.04/24.04.
-* **Resources:** 1 CPU, 1GB RAM, 8GB Disk.
-* **Network:** Assign a Static IP. (If the IP changes, your SSH keys might be flagged).
+* **OS:** Debian 12+ (recommended) or Ubuntu 22.04/24.04.
+* **Resources:** 1 CPU, 1 GB RAM, 8 GB Disk.
+* **Network:** Assign a Static IP.
 
 ### 2. Install Core Software
-Log into your new Manager LXC and run these commands to install Ansible and the libraries required to talk to the Proxmox API:
+Log into your new Manager LXC and install the Python toolchain, Git, and the Ansible collections used as execution primitives:
 ```bash
 # Update the OS
 apt update && apt upgrade -y
 
-# Install Ansible, Git, and the Proxmox Python library
-# We use the 'python3-proxmoxer' apt package to avoid pip library conflicts
-apt install -y ansible python3-pip python3-proxmoxer python3-jmespath git
+# Install Python venv support and Git
+apt install -y python3-venv git
 
-# Install required Ansible Collections
+# Create a virtualenv and install the orchestrator + all dependencies
+python3 -m venv .venv
+source .venv/bin/activate
+# (run after cloning — see step 4)
+pip install -e .
+
+# Install required Ansible Collections (for the execution primitives)
 ansible-galaxy collection install community.proxmox community.general
 ```
 
 ### 3. Establish SSH Trust (Passwordless Login)
-Ansible needs to log into your Proxmox nodes without a password.
+The orchestrator SSHs into your Proxmox nodes to run primitives and gather state.
 1. **Generate your SSH Key:**
    ```bash
-   ssh-keygen -t ed25519 -C "ansible-manager"
+   ssh-keygen -t ed25519 -C "fleet-manager"
    # Press Enter for all prompts (no passphrase)
    ```
 2. **Copy the key to every Proxmox Node:**
@@ -153,7 +162,7 @@ Ansible needs to log into your Proxmox nodes without a password.
 3. **Test the connection:**
    ```bash
    ssh root@<NODE_IP>
-   # It should let you in without a password. Type 'exit' to return.
+   # Should log in without a password. Type 'exit' to return.
    ```
 
 ### 4. Clone and Configure
@@ -167,32 +176,32 @@ Copy the example files to create your own configuration:
 cp vars.yml.example vars.yml
 cp hosts.ini.example hosts.ini
 ```
-Populate these new files (`hosts.ini`, `vars.yml`) with your cluster-specific configuration.
+Populate `hosts.ini` and `vars.yml` with your cluster-specific configuration.
 
-### 5. Final Initial Configuration
-Once the files are created, tell Ansible to silence the purple "Python interpreter" warnings by adding this to your `hosts.ini` (under `[proxmox_nodes:vars]`):
+### 5. Configure Ansible Hosts
+Ensure `hosts.ini` sets the correct interpreter for each group so Ansible's executor primitives use the right Python:
 ```ini
 [proxmox_nodes:vars]
 ansible_user=root
 ansible_python_interpreter=/usr/bin/python3
 ```
 
-### 6. Verify the Whole Setup
-Run this "Ping" test to make sure Ansible can talk to all your nodes at once:
+### 6. Install the Package and Verify
+With the virtualenv active, install the package and run the connectivity test:
 ```bash
+source .venv/bin/activate
+pip install -e .
+ansible-galaxy collection install community.proxmox community.general
+
+# Verify Ansible can reach all nodes
 ansible all -i hosts.ini -m ping
 ```
-If everything comes back GREEN:
-You are ready to run your first real update!
+If everything comes back green, run your first dry-run:
 ```bash
-fleet-update -e force_notify=true
+fleet-update --check -e fleet_dry_run=true -e force_notify=true
 ```
 
-**Summary of what you just did:**
-* Installed Ansible as the engine.
-* Installed Proxmoxer as the bridge to the Proxmox API.
-* Set up SSH Keys as the secure doorway to your nodes.
-* Built the Folder Structure to hold your SG-1 Fleet intelligence.
+**Activate the venv at the start of each session:** `source .venv/bin/activate`
 
 ## 🏃 Usage
 Run from the project root with the virtualenv active (`source .venv/bin/activate`).
@@ -226,6 +235,7 @@ pytest tests/unit/ -v
 python -m mypy proxmox_fleet/
 
 # Static analysis
+ruff check proxmox_fleet/ tests/
 yamllint .
 ansible-lint ansible/primitives/
 
@@ -236,15 +246,6 @@ cd roles/custom_update && molecule test -s custom_update_normal
 
 CI runs automatically on push/PR via GitHub Actions (`.github/workflows/ci.yml`).
 
-## ✅ Recent additions
-
-- **Automatic Snapshot Rollback** (LXC + VM): health-check failure triggers the rescue block and a snapshot rollback (`pct`/`qm rollback BEFORE_UPDATE_AUTO`) when a snapshot was taken. Rollback is **snapshot-only** — never a destructive restore. A failed snapshot records a non-fatal warning and continues; reports distinguish `FAILED + ROLLED BACK` / `FAILED (NO SNAPSHOT)` / `FAILED`. `*_backup_strategy: both` also takes a simultaneous vzdump.
-- **`custom_update` role**: config-driven updates for non-standard systems (binary apps, compose stacks, git deploys, vendor CLIs) via `configs/<name>.yml` (template in `config_templates/`). Supports per-step controls (`when`/`become`/`timeout`/`register`/…), `update_only_if_outdated`, config validation, dependency ordering (`depends_on`), and maintenance windows.
-- **Pluggable notifiers**: the briefing fans out to a `notifiers` list (Discord + ntfy); `discord_webhook` alone still works (back-compat).
-- **Run history**: each run writes `run-<ts>.json` + `latest.json` under `fleet_history_dir`.
-- **Fleet-wide dry-run**: `-e fleet_dry_run=true` simulates every role (LXC/VM/remote/custom) and reports what *would* change.
-- **Dead-man's-switch**: optional `fleet_deadmans_url` ping so absence of a run alerts you.
-
 ## 📡 Discord Briefing Format
 The orchestrator sends one consolidated embed per run:
 * **Per-Node sections:** Node status (`OK` / `UPDATED & REBOOTED` / `UPDATED (MANUAL REBOOT REQ)` / `FAILED`), followed by each changed LXC and VM.
@@ -253,3 +254,25 @@ The orchestrator sends one consolidated embed per run:
 * **Remote Hosts section:** Listed separately (not tied to a PVE node).
 * **Error Log:** Structured entries showing which host failed, which task failed, and the first 300 characters of stderr.
 * Containers where nothing changed produce no embed entry — they are absorbed into `*No container changes.*` for that node.
+
+## 📜 License
+
+This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**. See the [`LICENSE`](LICENSE) file for the full text.
+
+You are free to use, modify, and distribute this software under the terms of the GPL-3.0. Any modified versions distributed to others must also be released under the GPL-3.0.
+
+## 📣 Notices
+
+This project includes code derived from [community-scripts/ProxmoxVE](https://github.com/community-scripts/ProxmoxVE), licensed under the MIT License:
+
+> MIT License
+>
+> Copyright (c) 2021-2026 tteck | community-scripts ORG
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+See the [`NOTICES`](NOTICES) file for complete third-party attribution.
