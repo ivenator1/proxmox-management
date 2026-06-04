@@ -77,6 +77,16 @@ jobs:
         run: pip install ruff
       - name: Run ruff
         run: ruff check proxmox_fleet/ tests/
+      - name: Run ruff on wrapper script
+        run: ruff check fleet-update.py
+
+  lint-wrapper:
+    name: fleet-update.py syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check wrapper script
+        run: python3 -m py_compile fleet-update.py && echo "OK"
 
   molecule-lxc-update:
     name: Molecule — lxc_update ${{ matrix.scenario }}

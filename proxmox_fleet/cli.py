@@ -59,6 +59,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         settings = settings.model_copy(update={"lxc_verbose": True})
     if _is_true(extravars.get("force_notify", "")):
         settings = settings.model_copy(update={"force_notify": True})
+    if _is_true(extravars.get("force_window", "")):
+        settings = settings.model_copy(update={"force_window": True})
 
     return driver.run_fleet(
         settings=settings,
