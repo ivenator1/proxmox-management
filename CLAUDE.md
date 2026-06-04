@@ -77,18 +77,18 @@ proxmox_fleet/
     node.py                             # run_node_update() + run_manager_update() — Phase 2+3; apt w/ 5 retries, robust reboot check, manager-host skip, proxy wait
   deps.py                               # validate_depends_order() + dependency_failed() — ports of Phase-0a Jinja logic
   driver.py                             # run_fleet() end-to-end orchestrator (pre-flight → all phases → _merge_state → notify) + per-phase run_*_phase() helpers
-  executor.py                           # Executor protocol + RunnerExecutor; snapshot() added for proxmox_snap primitive
+  executor.py                           # Executor protocol + RunnerExecutor; snapshot() for proxmox_snap primitive; snapshot_with_retry() shared retry helper (LXC + VM)
   http.py                               # Manager-local HTTP: get_json, poll_until, request, post_json
-  inventory.py                          # _iter_section() + load_custom_hosts/proxmox_nodes/proxmox_vms/remote_hosts() — manual hosts.ini parsers (+ host_vars merge)
+  inventory.py                          # _iter_section() + load_custom_hosts/proxmox_nodes/proxmox_vms/remote_hosts() — manual hosts.ini parsers (+ host_vars merge); maintenance_window raw dicts parsed into typed MaintenanceWindow at load time
   lxc_parse.py                          # parse_pct_config(), parse_pct_status(), parse_ct_script() — regex helpers for lxc flow
   orchestration.py                      # run_serial(), run_concurrent() — Python equivalents of serial/forks
   runner.py                             # invoke_primitive() — thin ansible-runner wrapper; passes project_dir=os.getcwd()
   steps.py                              # run_steps() — executes update_steps with per-step timeout + when gate
   status.py                             # all status decision trees: custom_status(), lxc_*(), vm_status(), vm_rescue_status(), remote_status(), node_status(), manager_status()
   changes.py                            # change detection helpers; lxc_os_changed(), dpkg_hash_differs(), lxc_os_pkg_count()
-  window.py                             # in_window() — port of tasks/check-window.yml using stdlib zoneinfo
+  window.py                             # in_window() — port of tasks/check-window.yml using stdlib zoneinfo; accepts MaintenanceWindow or plain dict; tz-aware datetimes are converted via astimezone()
   briefing.py                           # render_briefing() byte-parity port of discord_briefing.j2 + prepare_body/title/color/should_notify
-  history.py                            # build_run_summary() + write_history() — port of persist-history.yml; records rendered briefing body
+  history.py                            # build_run_summary() + write_history() — port of persist-history.yml; records rendered briefing body; microsecond-precision timestamps prevent same-second collision
   notifiers.py                          # resolve_notifiers() + dispatch() (discord/ntfy) + ping_deadmans() — port of notify.yml + Phase-4 shim
   cli.py                                # fleet-update CLI — parses --check / -e / --inventory / --vars-file, then calls driver.run_fleet()
 config_templates/
@@ -162,11 +162,9 @@ with `changed`/`failed` flags and `errors`/`warnings` logs (`models/state.py`). 
 `state_output_path` (used by tooling / molecule); `run_fleet()` passes `None` and merges
 in-memory.
 
-### Unwired / not-yet-implemented features
+### Remaining unfinished work
 
-Present in the tree but **not** wired into the running flows — intended features, not dead
-code. Don't delete them as cruft; wire them in or extend. Full backlog + suggested
-approaches live in `docs/migration-roadmap.md` → "Post-migration backlog".
+One architecture gap remains. Full backlog history is in `docs/migration-roadmap.md` → "Post-migration backlog".
 
 - **Most `ansible/primitives/*.yml` are not invoked yet.** Only `run_shell`, `reboot_host`,
   and `snapshot` are called by `executor.py`. The other ten (`pct_config`, `pct_status`,
@@ -175,15 +173,6 @@ approaches live in `docs/migration-roadmap.md` → "Post-migration backlog".
   currently inline equivalent shell via `run_shell`. Wiring them in — ideally as batched
   multi-read primitives — is the planned speed optimisation: each inline `run_shell` is its
   own `ansible-runner` subprocess (~15 per container).
-- **`models/config.MaintenanceWindow`** is defined + exported but unused — windows flow as
-  raw dicts into `window.in_window`. Wire it into `inventory.py` parsing for validation, or
-  remove.
-- **`lxc_parse.script_name_from_update()`** is unused — `flows/lxc.py` greps the ct-script
-  name on the node instead. Either parse in Python (pull file → parse) or remove.
-- **`changes.dpkg_hash_differs()`** is unused — `status.lxc_app_status()` inlines the same
-  comparison. Route through the helper for one source of truth, or remove.
-- **No snapshot-lock retry:** a lingering PVE task lock makes `executor.snapshot()` fail; the
-  flow warns and continues without rollback. No `orchestration.retry()` wrapper yet.
 
 ### Phase 4 subsystems
 
@@ -197,7 +186,7 @@ approaches live in `docs/migration-roadmap.md` → "Post-migration backlog".
 
 - **Snapshot-only rollback + warnings**: the LXC and VM flows roll back via snapshot (`pct/qm rollback BEFORE_UPDATE_AUTO`) only when the snapshot was actually taken (`snap_taken`, i.e. the snapshot primitive returned `changed=True`). A failed snapshot records a non-fatal warning and continues; rescue app/status string is `FAILED (NO SNAPSHOT)` vs `FAILED + ROLLED BACK` vs `FAILED` (see `status.lxc_rescue_app_status` / `vm_rescue_status`). `lxc_backup_strategy: both` / `vm_backup_strategy: both` take a simultaneous vzdump (never used for restore).
 - **Fleet-wide dry-run**: `-e fleet_dry_run=true` (or `--check`, or a per-phase `<phase>_dry_run`) puts every flow in simulate mode — Python builds a simulate command (`apt-get -s` / `dnf --assumeno` / `apk -s`) and reports `WOULD UPDATE`/`OK`. `fleet_dry_run` also forces a notification.
-- **Maintenance windows** (`window.in_window`): inventory hosts (remote/vm/custom) with a `maintenance_window` dict are silently skipped outside the window; `force_window=true` (or `-e force_window=true`) bypasses. Evaluated per-host in the `run_*_phase()` helpers before the flow runs.
+- **Maintenance windows** (`window.in_window`): inventory hosts (remote/vm/custom) with a `maintenance_window` key in `host_vars` are silently skipped outside the window; `force_window=true` (or `-e force_window=true`) bypasses. The raw dict is parsed into a typed `MaintenanceWindow` by `inventory.py` at load time — invalid keys fail loud. `window.in_window` accepts `MaintenanceWindow` or plain `dict`, and converts tz-aware `now` values via `astimezone()` before comparing. Evaluated per-host in the `run_*_phase()` helpers before the flow runs.
 
 ### Flow structure (`flows/lxc.py`)
 
@@ -248,7 +237,7 @@ Step order matters for correct attribution:
 
 The detect section, in sequence:
 1. `pct pull {lxc_id} /usr/bin/update /tmp/ansible_update_{lxc_id}` — extracts the community-scripts update script. `pull` failing ⇒ `lxc_no_update_script=True`.
-2. `grep -oP 'ct/\K[^.]+(?=\.sh)'` **on the node** to get the ct script name (e.g. `sonarr`). (A Python parser `lxc_parse.script_name_from_update()` exists for this but is not wired in — see "Unwired / not-yet-implemented features".)
+2. `cat /tmp/ansible_update_{lxc_id}` **on the node** to read the file content, then `lxc_parse.script_name_from_update(content)` **in Python** on the manager extracts the ct script name (e.g. `sonarr`). This keeps extract logic in Python and avoids a dependency on Perl-regex `grep -P` on the node.
 3. Fetch `https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/{name}.sh` via `http.request` **on the manager** (PVE nodes may lack outbound HTTPS) — `lxc_parse.parse_ct_script()` reads `var_cpu`/`var_ram` (build resources) and `pct set $CTID -cores/-memory` (run resources).
 
 **Version files**: community-scripts store the installed app version at `~/.{scriptname}` inside the container (e.g. `~/.sonarr` → `4.0.17.2952`). `_read_version()` reads it before/after the update; the dry-check path reads it and compares against the latest GitHub release tag.
@@ -289,10 +278,11 @@ All flows poll `{kuma_url}/api/status-page/heartbeat/{kuma_slug}` via `http.poll
 - **`run_shell.yml` has `check_mode: false`** on the shell task — the command **always executes** regardless of Ansible check mode. Python controls dry-run by passing either a simulate command (`apt-get -s`) or a real command; Ansible's `--check` flag is bypassed at the shell level. `reboot_host.yml` has the same `check_mode: false` for consistency; the node flow additionally guards the reboot call with `not dry_run` in Python so it never fires during dry-run regardless.
 - **`run_node_update` retry uses injectable `_sleep`**: `orchestration.retry(apt_fn, retries=5, delay=30.0, sleep=_sleep)`. Callers pass `_sleep=lambda s: None` in tests to avoid 150 s of wait. `run_node_phase()` in the driver doesn't pass `_sleep`, so real runs use `time.sleep`. Tests that call via `run_node_phase()` must monkeypatch `time.sleep` to keep fast. `steps.run_steps()` has the same injectable `sleep` for honouring a step's `delay` between failed retries.
 - **`executor.snapshot(vmid, *, snap_state, api_host, ...)`**: invokes `snapshot.yml` (which runs `community.proxmox.proxmox_snap` on localhost, ignoring the executor's host binding). `api_host` must be the node's `ansible_host` IP — not the inventory name. `vmid` (not `lxc_id`) because the same primitive handles both LXC containers and QEMU VMs. Molecule overrides this with `MolLxcExecutor` (touch-file stub).
+- **`executor.snapshot_with_retry(executor, vmid, *, snap_state, retries=3, delay=15.0, _sleep=time.sleep, **api_params)`**: module-level free function (not on the `Executor` protocol) wrapping `orchestration.retry()` around `executor.snapshot()`. Used by both `flows/lxc.py` and `flows/vm.py` for both create (`until=changed`) and delete (`until=not failed`) calls. Returns a failed `PrimitiveResult` after exhausting retries so existing warning/fallback paths apply unchanged. Treats "CT is locked" PVE task-lock errors as transient. `_sleep` is injectable for tests.
 - **Two-executor pattern for VMs** (Phase 4a): `run_vm_update()` takes `executor` (bound to the VM guest via SSH, for package upgrades) and `node_executor` (bound to the Proxmox node via SSH, for `qm rollback`/`qm status`). Using the wrong executor causes `qm` commands to SSH into the VM and fail silently.
 - **HA-aware VM node discovery** (Phase 4a): `driver.run_vm_phase()` calls `pvesh get /cluster/resources --type vm` on the first available Proxmox node to build a live `{vmid: (node, api_host)}` map. `pve_node` in inventory is only a fallback hint — it goes stale when HA migrates a VM.
 - **Package manager detection uses `if/elif/else`**: `&&`/`||` chains with equal precedence cause all branches to fire on Debian systems (right-hand side of `&&` runs when left succeeds, right-hand side of `||` is skipped — but the next `&&` in the chain still runs). Always use `if which apt-get ...; then echo apt; elif which dnf ...; then echo dnf; fi` for unambiguous detection.
-- **`lxc_parse.py` owns all regex extraction**: `parse_pct_config()`, `parse_pct_status()`, `parse_ct_script()` (+ the unused `script_name_from_update()`). Parity is locked by `tests/unit/test_status_lxc.py` — if a pattern changes, update both the parser and its test.
+- **`lxc_parse.py` owns all regex extraction**: `parse_pct_config()`, `parse_pct_status()`, `parse_ct_script()`, and `script_name_from_update()` (used in the detect flow — `cat` the update script on the node, parse the ct-script name in Python). Parity is locked by `tests/unit/test_status_lxc.py` — if a pattern changes, update both the parser and its test.
 
 ### Testing infrastructure
 
@@ -308,7 +298,7 @@ run clean over `proxmox_fleet/` (and `ruff` over `tests/` too).
 | `test_state_model.py` | `FleetState` construction, `from_raw()` aliases, `dump_for_ansible()` |
 | `test_settings.py` | `GlobalSettings.load()`, field defaults (node/manager), missing-file, integer kuma-map key coercion |
 | `test_deps.py` | `validate_depends_order()` + `dependency_failed()` |
-| `test_window.py` | `in_window()` day/time/wrap/force + locale-independent weekday mapping |
+| `test_window.py` | `in_window()` day/time/wrap/force + locale-independent weekday mapping; tz-aware datetime conversion; `MaintenanceWindow` model accepted directly |
 | `test_inventory.py` | `load_custom_hosts/proxmox_nodes/proxmox_vms/remote_hosts()` with `tmp_path`; inline-vs-host_vars precedence (incl. node `ansible_host` from host_vars) |
 | `test_pkg.py` | `detect_pkg_mgr()` (apt/dnf/apk/fallback), `upgrade_cmd()` per-mgr + `LC_ALL=C` pin, `kuma_healthy()` |
 | `test_driver.py` | `run_*_phase()` with monkeypatched `RunnerExecutor`; dep-abort, window skip, dry-run propagation, abort-on-first-failure, state JSON output |
@@ -318,15 +308,15 @@ run clean over `proxmox_fleet/` (and `ruff` over `tests/` too).
 | `test_steps.py` | `run_steps()` interpolation, `when` gating, `timeout` wrap, retries + injected `delay` sleep |
 | `test_flow_custom.py` | `run_custom_update()` end-to-end with fake executor |
 | `test_status_lxc.py` | `lxc_app_status/os_status/rescue_app_status/dry_run_status/should_report`, `parse_pct_config/status`, `parse_ct_script`, `dpkg_hash_differs` |
-| `test_flow_lxc.py` | `run_lxc_update()` end-to-end with `ScriptedLxcExecutor`; Alpine `ash` version read; `LC_ALL=C` on OS/dpkg commands |
+| `test_flow_lxc.py` | `run_lxc_update()` end-to-end with `ScriptedLxcExecutor`; Alpine `ash` version read; `LC_ALL=C` on OS/dpkg commands; `snapshot_with_retry` retry-succeeds and retry-exhausted cases |
 | `test_status_vm.py` | `vm_status()`, `vm_rescue_status()`, `vm_should_report()` |
-| `test_flow_vm.py` | `run_vm_update()` end-to-end with `ScriptedVmExecutor` + `ScriptedNodeExecutor` (two-executor pattern) |
+| `test_flow_vm.py` | `run_vm_update()` end-to-end with `ScriptedVmExecutor` + `ScriptedNodeExecutor` (two-executor pattern); `snapshot_with_retry` retry success case |
 | `test_status_remote.py` | `remote_status()`, `remote_should_report()` |
 | `test_flow_remote.py` | `run_remote_update()` end-to-end with `ScriptedRemoteExecutor` |
 | `test_status_node.py` | `node_status()` (5 branches), `manager_status()` (3 branches), `node_should_report()` |
 | `test_flow_node.py` | `run_node_update()` + `run_manager_update()` with `ScriptedNodeExecutor`; retry, reboot, proxy wait, manager-host skip |
 | `test_briefing.py` | `render_briefing()` behavioural cases + a **golden parity** test asserting byte-equality with `tests/unit/data/briefing_golden.json` (captured from the retired `.j2`); `prepare_body`/title/color/`should_notify` |
-| `test_history.py` | `build_run_summary()` counts + the `briefing` field; `write_history()` write/prune/`latest.json` |
+| `test_history.py` | `build_run_summary()` counts + the `briefing` field; `write_history()` write/prune/`latest.json`; `_ts_now()` microsecond-precision format |
 | `test_notifiers.py` | `resolve_notifiers()` shim, `dispatch()` discord/ntfy payloads + headers, `ping_deadmans()` `/fail` suffix |
 
 **Scripted fake executors**: each flow test defines a `Scripted*Executor` (in its own test file) whose `run_shell` returns queued `PrimitiveResult`s matched by command substring, records `.commands`, and stubs `snapshot()`/`reboot()`. There is no shared `conftest.py`.

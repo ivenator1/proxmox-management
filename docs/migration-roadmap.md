@@ -494,14 +494,12 @@ unconditional default.
 
 ---
 
-## Post-migration backlog — found but not yet implemented
+## Post-migration backlog
 
-Items discovered after the migration "completed": present in the tree but **not
-wired into the running flows**, or known gaps with no code yet. None are bugs in
-current behaviour — they are unfinished features / consistency work. Do not
-delete them as "dead code"; wire them in or extend. Listed roughly by value.
+Items discovered after the migration "completed". Listed roughly by value.
+✅ = shipped; ⬜ = still open.
 
-### 1. Execution primitives not wired into the flows (architecture gap)
+### ⬜ 1. Execution primitives not wired into the flows (architecture gap)
 The guiding principle is "Ansible = single-purpose execution primitives, Python =
 all logic." Today only **three** primitives are actually invoked
 (`run_shell`, `reboot_host`, `snapshot` — see `executor.py`). The other ten —
@@ -518,44 +516,42 @@ directly). They are intended building blocks, not dead code.
   invoked via `invoke_primitive`. Keep all branching in Python. This is the same
   work as "Future TODO — speed optimisation" under Phase 3.
 
-### 2. `MaintenanceWindow` model is defined but unwired
-`models/config.py` defines and exports `MaintenanceWindow`, but maintenance
-windows travel through the code as raw `dict`s (`inventory.*Spec.maintenance_window:
-Optional[Dict]`, consumed by `window.in_window(dict)`). The typed model is never
-instantiated.
-- **Suggested approach:** parse inventory `maintenance_window` into a
-  `MaintenanceWindow` in `inventory.py` (validation + typo-catching) and have
-  `window.in_window` accept the model. Or drop the model if raw dicts are preferred.
+### ✅ 2. `MaintenanceWindow` model wired
+`inventory.py` now parses `maintenance_window` host_vars dicts into typed
+`MaintenanceWindow` objects at load time — invalid keys raise `ValidationError`
+immediately. `window.in_window` accepts `MaintenanceWindow` or plain `dict` (converts
+to dict internally via `.model_dump()`). Tests updated in `test_inventory.py` and
+`test_window.py`.
 
-### 3. `lxc_parse.script_name_from_update()` is unused
-A Python parser that extracts the community-script name from `/usr/bin/update`
-content. `flows/lxc.py` instead greps for it **on the node**
-(`grep -oP 'ct/\K[^.]+(?=\.sh)'`).
-- **Suggested approach (consistent with "logic in Python"):** `pct pull` the file
-  to the manager and parse with `script_name_from_update()`, dropping the
-  node-side grep. Or remove the function.
+### ✅ 3. `lxc_parse.script_name_from_update()` wired
+`flows/lxc.py` now `cat`s the pulled update script on the node and calls
+`lxc_parse.script_name_from_update(content)` in Python, replacing the previous
+`grep -oP 'ct/\K[^.]+(?=\.sh)'` node-side grep. Logic is in Python; no dependency
+on Perl-regex grep availability. Test stubs in `test_flow_lxc.py` updated from
+`"grep"` key to `"cat /tmp/ansible_update_"` key.
 
-### 4. `changes.dpkg_hash_differs()` is unused
-The dpkg-hash comparison is inlined inside `status.lxc_app_status()`. The helper
-duplicates that logic and is exercised only by its own test.
-- **Suggested approach:** route `lxc_app_status` through `dpkg_hash_differs()` so
-  there is one source of truth, or remove the helper.
+### ✅ 4. `changes.dpkg_hash_differs()` wired
+`status.lxc_app_status()` now calls `changes.dpkg_hash_differs()` instead of
+inlining the same comparison. One source of truth; no behaviour change.
 
-### 5. Snapshot lock retry (known gap from live testing)
-A Proxmox task lock left by a prior snapshot-delete can make the next snapshot
-create/delete fail ("CT is locked (snapshot-delete)"). The flow records a warning
-and continues **without rollback capability** — there is no retry.
-- **Suggested approach:** wrap `executor.snapshot()` create/delete in
-  `orchestration.retry()` with a short backoff that treats "is locked" as retryable.
+### ✅ 5. Snapshot lock retry
+`executor.snapshot_with_retry()` added as a module-level free function shared by
+both `flows/lxc.py` and `flows/vm.py`. Wraps `orchestration.retry()` with
+`retries=3, delay=15.0` and `until=changed` (create) / `until=not failed` (delete).
+Returns a failed `PrimitiveResult` on exhaustion so existing warning/fallback paths
+apply unchanged. `_sleep` is injectable for fast unit tests. Both snapshot create and
+delete call sites in LXC and VM flows replaced. New tests: `test_snapshot_with_retry_*`
+in `test_flow_lxc.py` (two cases) and `test_flow_vm.py` (one case).
 
-### Minor / nice-to-have
-- **`window.in_window` and tz-aware `now`:** an aware `now` passed in a *different*
-  tz is not converted to the window's tz (only a naive `now` is localised). Real
-  runs use `now=None` (correct); only matters for callers passing a foreign-tz
-  datetime. Fix with `now = now.astimezone(tz)`.
-- **`history.write_history` filename granularity:** `run-<ts>.json` uses second
-  precision, so two runs in the same second overwrite each other. Add sub-second
-  precision or a uniqueness suffix if that ever becomes reachable.
+### ✅ Minor: `window.in_window` tz-aware datetime
+`window.in_window` now adds `else: now = now.astimezone(tz)` so a tz-aware `now` in
+a foreign timezone is converted before day/time comparison. Previously only naive
+datetimes were localised. New test: `test_tz_aware_now_in_different_tz_is_converted`.
+
+### ✅ Minor: `history.write_history` filename granularity
+`_ts_now()` now uses `%Y%m%dT%H%M%S%fZ` (microsecond precision) instead of second
+precision. Lexicographic sort order preserved; pruning unaffected. New test:
+`test_ts_now_includes_microseconds`.
 
 ---
 
