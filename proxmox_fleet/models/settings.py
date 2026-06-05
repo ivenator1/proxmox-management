@@ -74,6 +74,16 @@ class GlobalSettings(BaseModel):
     pve_api_token_id: str = ""
     pve_api_token_secret: str = ""
 
+    # Timeouts & retries (formerly hardcoded)
+    apt_proxy_check_timeout: float = 30.0
+    node_reboot_port_wait_timeout: float = 300.0
+    snapshot_retries: int = 3
+    snapshot_retry_delay: float = 15.0
+    notifier_retries: int = 15
+    deadmans_retries: int = 5
+    node_apt_retries: int = 5
+    node_apt_retry_delay: float = 30.0
+
     # Phase 4 — briefing / history / notifiers
     # notifiers defaults to None (not []) so an unset value is distinguishable
     # from an explicit empty list, matching the Ansible `notifiers is defined` shim.

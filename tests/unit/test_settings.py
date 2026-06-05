@@ -102,3 +102,15 @@ def test_integer_kuma_map_keys_load_from_yaml(tmp_path):
     f.write_text("lxc_kuma_map:\n  101: 5\n  102: 6\n")
     s = GlobalSettings.load(f)
     assert s.lxc_kuma_map == {"101": 5, "102": 6}
+
+
+def test_new_timeout_fields_have_correct_defaults():
+    s = GlobalSettings()
+    assert s.apt_proxy_check_timeout == 30.0
+    assert s.node_reboot_port_wait_timeout == 300.0
+    assert s.snapshot_retries == 3
+    assert s.snapshot_retry_delay == 15.0
+    assert s.notifier_retries == 15
+    assert s.deadmans_retries == 5
+    assert s.node_apt_retries == 5
+    assert s.node_apt_retry_delay == 30.0

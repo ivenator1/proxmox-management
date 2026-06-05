@@ -74,3 +74,27 @@ def test_retry_reraises_last_exception():
 def test_retry_raises_when_condition_never_holds():
     with pytest.raises(RuntimeError):
         retry(lambda: 1, retries=2, delay=0, until=lambda r: False, sleep=lambda _: None)
+
+
+def test_run_concurrent_falls_back_to_serial_when_workers_lte_one():
+    out = run_concurrent([1, 2, 3], lambda x: x * 2, max_workers=1)
+    assert [r[1] for r in out] == [2, 4, 6]
+
+
+def test_retry_with_empty_exceptions_does_not_catch():
+    def fn():
+        raise ValueError("uncaught")
+
+    with pytest.raises(ValueError):
+        retry(fn, retries=3, delay=0, exceptions=(), sleep=lambda _: None)
+
+
+def test_retry_total_attempts_is_retries_plus_one():
+    calls = []
+
+    def fn():
+        calls.append(1)
+        return 42
+
+    retry(fn, retries=0, delay=0, sleep=lambda _: None)
+    assert len(calls) == 1

@@ -188,3 +188,35 @@ def test_outdated_gate_fail_open_warns(monkeypatch):
     out = flow.run_custom_update("nas-01", cfg, ex)
     assert any("fail-open" in w.warning for w in out.warnings)
     assert "do-upgrade" in ex.commands
+
+
+# --- command health check ----------------------------------------------------
+
+def test_health_check_command_passes():
+    cfg = _cfg(
+        health_check={"type": "command", "command": "check-alive"},
+    )
+    ex = ScriptedExecutor(
+        script={
+            "gitea --version": [_ok(stdout="1.0"), _ok(stdout="1.1")],
+            "check-alive": [_ok(rc=0)],
+        }
+    )
+    out = flow.run_custom_update("nas-01", cfg, ex)
+    assert out.failed is False
+    assert "check-alive" in ex.commands
+
+
+def test_health_check_command_fails_triggers_rescue():
+    cfg = _cfg(
+        health_check={"type": "command", "command": "check-alive"},
+    )
+    ex = ScriptedExecutor(
+        script={
+            "gitea --version": [_ok(stdout="1.0"), _ok(stdout="1.1")],
+            "check-alive": [_fail(rc=1)],
+        }
+    )
+    out = flow.run_custom_update("nas-01", cfg, ex)
+    assert out.failed is True
+    assert out.record.app == "FAILED"

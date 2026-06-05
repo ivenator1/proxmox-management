@@ -56,6 +56,7 @@ def dispatch(
     body: str,
     color: int,
     failed: bool,
+    retries: int = 15,
 ) -> None:
     """Send the briefing to every enabled notifier. Errors are swallowed per notifier."""
     for notifier in notifiers:
@@ -67,7 +68,7 @@ def dispatch(
                 http.post_json(
                     notifier["webhook"],
                     {"embeds": [{"title": title, "description": body, "color": color}]},
-                    retries=15,
+                    retries=retries,
                     delay=10.0,
                     ok_statuses=(200, 204),
                 )
@@ -80,7 +81,7 @@ def dispatch(
                         headers=headers,
                         data=body.encode("utf-8"),
                     ),
-                    retries=15,
+                    retries=retries,
                     delay=10.0,
                     until=lambda r: r.status == 200,
                 )
@@ -88,7 +89,7 @@ def dispatch(
             continue
 
 
-def ping_deadmans(url: str, *, failed: bool) -> None:
+def ping_deadmans(url: str, *, failed: bool, retries: int = 5) -> None:
     """Dead-man's-switch ping (``/fail`` suffix on failure). Errors swallowed."""
     if not url or not url.strip():
         return
@@ -96,7 +97,7 @@ def ping_deadmans(url: str, *, failed: bool) -> None:
     try:
         retry(
             lambda: http.request(target, method="GET"),
-            retries=5,
+            retries=retries,
             delay=10.0,
             until=lambda r: r.status in (200, 201, 202, 204),
         )

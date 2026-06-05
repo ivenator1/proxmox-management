@@ -572,7 +572,8 @@ def test_notify_phase_dispatches_and_writes_history(tmp_path, monkeypatch):
     assert kw["color"] == 3066993
 
     # dead-man pinged
-    assert calls["ping"] == [("https://hc.io/abc", {"failed": False})]
+    assert calls["ping"][0][0] == "https://hc.io/abc"
+    assert calls["ping"][0][1]["failed"] is False
 
     # history written, carrying the exact briefing body
     latest = json.loads((tmp_path / "latest.json").read_text())
@@ -616,7 +617,7 @@ def test_notify_phase_failed_state_titles(tmp_path, monkeypatch):
     assert kw["title"] == "⚠️ Briefing: Failures Detected"
     assert kw["ntfy_title"] == "Fleet Update: Failures Detected"
     assert kw["color"] == 15158332
-    assert calls["ping"][0][1] == {"failed": True}
+    assert calls["ping"][0][1]["failed"] is True
 
 
 # --- _merge_state -------------------------------------------------------------

@@ -53,6 +53,65 @@ class Executor(Protocol):
         """
         ...
 
+    def introspect(self, lxc_id: str) -> PrimitiveResult:
+        """Read pct config, pct status, and update-script content in one subprocess.
+
+        Returns facts: config_stdout, config_rc, status_stdout, pull_rc, script_stdout.
+        """
+        ...
+
+    def vzdump(self, lxc_id: str, *, backup_storage: str, lxc_name: str) -> PrimitiveResult:
+        """Create a full vzdump backup. Failure is hard — callers do not ignore errors."""
+        ...
+
+    def lxc_os_update(self, lxc_id: str, *, os_update_cmd: str) -> PrimitiveResult:
+        """Run OS package upgrade inside the container via the lxc_os_update primitive."""
+        ...
+
+    def lxc_app_update(
+        self,
+        lxc_id: str,
+        *,
+        lxc_shell: str = "bash",
+        lxc_unattended: bool = True,
+        lxc_needs_scale: bool = False,
+        lxc_build_cpu: str = "",
+        lxc_build_ram: str = "",
+        lxc_run_cpu: str = "",
+        lxc_run_ram: str = "",
+    ) -> PrimitiveResult:
+        """Run the community-scripts /usr/bin/update via the lxc_app_update primitive.
+
+        Handles resource scaling (up before, down after) internally when lxc_needs_scale=True.
+        """
+        ...
+
+    def post_update(
+        self,
+        lxc_id: str,
+        *,
+        lxc_shell: str = "bash",
+        dpkg_hash_cmd: str = "",
+        lxc_script_name: str = "",
+    ) -> PrimitiveResult:
+        """Read dpkg hash and version file after the update in one subprocess.
+
+        Returns facts: dpkg_hash_after, version_after.
+        """
+        ...
+
+    def pct_rollback(self, lxc_id: str) -> PrimitiveResult:
+        """Roll back the container to BEFORE_UPDATE_AUTO via the rollback primitive."""
+        ...
+
+    def pct_start(self, lxc_id: str) -> PrimitiveResult:
+        """Start a stopped container via the pct_start primitive."""
+        ...
+
+    def pct_stop(self, lxc_id: str) -> PrimitiveResult:
+        """Stop a container via the pct_stop primitive."""
+        ...
+
 
 class RunnerExecutor:
     """Executor backed by ansible-runner primitives, bound to a single host."""
@@ -127,6 +186,114 @@ class RunnerExecutor:
         if "failed" in facts:
             result.failed = bool(facts["failed"])
         return result
+
+    def introspect(self, lxc_id: str) -> PrimitiveResult:
+        return invoke_primitive(
+            "lxc_introspect",
+            inventory=self.inventory,
+            host_pattern=self.host,
+            extravars={"lxc_id": lxc_id},
+            check=self.check,
+        )
+
+    def vzdump(self, lxc_id: str, *, backup_storage: str, lxc_name: str) -> PrimitiveResult:
+        return _merge_facts(invoke_primitive(
+            "vzdump",
+            inventory=self.inventory,
+            host_pattern=self.host,
+            extravars={
+                "lxc_id": lxc_id,
+                "backup_storage": backup_storage,
+                "lxc_name": lxc_name,
+            },
+            check=self.check,
+        ))
+
+    def lxc_os_update(self, lxc_id: str, *, os_update_cmd: str) -> PrimitiveResult:
+        return _merge_facts(invoke_primitive(
+            "lxc_os_update",
+            inventory=self.inventory,
+            host_pattern=self.host,
+            extravars={"lxc_id": lxc_id, "os_update_cmd": os_update_cmd},
+            check=self.check,
+        ))
+
+    def lxc_app_update(
+        self,
+        lxc_id: str,
+        *,
+        lxc_shell: str = "bash",
+        lxc_unattended: bool = True,
+        lxc_needs_scale: bool = False,
+        lxc_build_cpu: str = "",
+        lxc_build_ram: str = "",
+        lxc_run_cpu: str = "",
+        lxc_run_ram: str = "",
+    ) -> PrimitiveResult:
+        return _merge_facts(invoke_primitive(
+            "lxc_app_update",
+            inventory=self.inventory,
+            host_pattern=self.host,
+            extravars={
+                "lxc_id": lxc_id,
+                "lxc_shell": lxc_shell,
+                "lxc_unattended": lxc_unattended,
+                "lxc_needs_scale": lxc_needs_scale,
+                "lxc_build_cpu": lxc_build_cpu,
+                "lxc_build_ram": lxc_build_ram,
+                "lxc_run_cpu": lxc_run_cpu,
+                "lxc_run_ram": lxc_run_ram,
+            },
+            check=self.check,
+        ))
+
+    def post_update(
+        self,
+        lxc_id: str,
+        *,
+        lxc_shell: str = "bash",
+        dpkg_hash_cmd: str = "",
+        lxc_script_name: str = "",
+    ) -> PrimitiveResult:
+        return invoke_primitive(
+            "lxc_post_update",
+            inventory=self.inventory,
+            host_pattern=self.host,
+            extravars={
+                "lxc_id": lxc_id,
+                "lxc_shell": lxc_shell,
+                "dpkg_hash_cmd": dpkg_hash_cmd,
+                "lxc_script_name": lxc_script_name,
+            },
+            check=self.check,
+        )
+
+    def pct_rollback(self, lxc_id: str) -> PrimitiveResult:
+        return _merge_facts(invoke_primitive(
+            "rollback",
+            inventory=self.inventory,
+            host_pattern=self.host,
+            extravars={"lxc_id": lxc_id},
+            check=self.check,
+        ))
+
+    def pct_start(self, lxc_id: str) -> PrimitiveResult:
+        return _merge_facts(invoke_primitive(
+            "pct_start",
+            inventory=self.inventory,
+            host_pattern=self.host,
+            extravars={"lxc_id": lxc_id},
+            check=self.check,
+        ))
+
+    def pct_stop(self, lxc_id: str) -> PrimitiveResult:
+        return _merge_facts(invoke_primitive(
+            "pct_stop",
+            inventory=self.inventory,
+            host_pattern=self.host,
+            extravars={"lxc_id": lxc_id},
+            check=self.check,
+        ))
 
 
 def _merge_facts(result: PrimitiveResult) -> PrimitiveResult:

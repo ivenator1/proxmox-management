@@ -281,7 +281,12 @@ def _discover_vm_locations(
             if vmid and node_name:
                 result[vmid] = (node_name, nodes_map.get(node_name, node_name))
         return result
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[vm phase] WARNING: cluster VM discovery failed ({exc!s}), "
+            "falling back to pve_node inventory hints",
+            file=sys.stderr,
+        )
         return {}
 
 
@@ -499,6 +504,7 @@ def run_notify_phase(
             body=body,
             color=briefing.discord_color(failed),
             failed=failed,
+            retries=settings.notifier_retries,
         )
 
     if settings.fleet_history_enabled:
@@ -509,7 +515,8 @@ def run_notify_phase(
             briefing=body,
         )
 
-    notifiers.ping_deadmans(settings.fleet_deadmans_url, failed=failed)
+    notifiers.ping_deadmans(settings.fleet_deadmans_url, failed=failed,
+                            retries=settings.deadmans_retries)
     return body
 
 
@@ -554,7 +561,8 @@ def run_fleet(
     # (port of the "Verify Apt-Cacher-NG is Online" / "Halt if Proxy is Offline" play).
     if settings.apt_proxy_ip:
         try:
-            http.wait_for_port(settings.apt_proxy_ip, settings.apt_proxy_port, timeout=30)
+            http.wait_for_port(settings.apt_proxy_ip, settings.apt_proxy_port,
+                               timeout=settings.apt_proxy_check_timeout)
         except (TimeoutError, OSError):
             print(
                 f"CRITICAL: Apt Proxy ({settings.apt_proxy_ip}) is unreachable. "

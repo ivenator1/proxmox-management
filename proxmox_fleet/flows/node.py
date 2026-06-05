@@ -95,7 +95,8 @@ def run_node_update(
                 )
             return res.stdout
 
-        apt_stdout = retry(_apt, retries=5, delay=30.0, sleep=_sleep)
+        apt_stdout = retry(_apt, retries=settings.node_apt_retries,
+                           delay=settings.node_apt_retry_delay, sleep=_sleep)
         apt_changed = _pkg_changed(apt_stdout, "apt")
 
         # ------------------------------------------------------------------
@@ -116,7 +117,7 @@ def run_node_update(
                 http_mod.wait_for_port(
                     settings.apt_proxy_ip,
                     settings.apt_proxy_port,
-                    timeout=300.0,
+                    timeout=settings.node_reboot_port_wait_timeout,
                 )
             _sleep(15)
 

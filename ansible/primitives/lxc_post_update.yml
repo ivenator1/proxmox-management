@@ -1,0 +1,45 @@
+---
+# Execution primitive: read post-update state from an LXC container in one pass.
+# Combines the dpkg/apk package hash and version-file reads into a single
+# ansible-runner subprocess, replacing two separate run_shell calls.
+# Makes no decisions. Invoked by proxmox_fleet.flows.lxc (post-update phase).
+#
+# Params (extravars):
+#   target_hosts      Proxmox node hosting the container (set by invoke_primitive)
+#   lxc_id            Container VMID
+#   lxc_shell         Shell inside the container: "bash" (default) or "ash" (Alpine)
+#   dpkg_hash_cmd     Full hash command to run via pct exec (built by Python from
+#                     _dpkg_hash_cmd()). Empty string skips the hash read.
+#   lxc_script_name   Script name for the version file (e.g. "sonarr"). Empty skips.
+#
+# Returns (via set_stats):
+#   dpkg_hash_after   Package-set hash after update (empty when not applicable)
+#   version_after     Installed version string after update (empty when not applicable)
+- name: "lxc_post_update primitive"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  tasks:
+    - name: "Read package hash after update"
+      ansible.builtin.command: "{{ dpkg_hash_cmd }}"
+      register: _hash
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: dpkg_hash_cmd | default('') != ''
+
+    - name: "Read version file after update"
+      ansible.builtin.command: >
+        pct exec {{ lxc_id }} -- {{ lxc_shell | default('bash') }} -c
+        'cat ~/."{{ lxc_script_name }}" 2>/dev/null || echo ""'
+      register: _ver
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: lxc_script_name | default('') != ''
+
+    - name: "Return results"
+      ansible.builtin.set_stats:
+        data:
+          dpkg_hash_after: "{{ _hash.stdout | default('') }}"
+          version_after: "{{ _ver.stdout | default('') }}"
+        aggregate: false

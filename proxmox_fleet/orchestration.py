@@ -49,11 +49,16 @@ def run_concurrent(
     fn: Callable[[T], R],
     *,
     max_workers: int = 1,
+    timeout: Optional[float] = None,
 ) -> List[Tuple[T, Optional[R], Optional[BaseException]]]:
     """Run ``fn`` over ``items`` with bounded concurrency (forks / serial: N).
 
     Preserves input order in the returned triples. Exceptions are captured per
     item, never raised, so one failing host does not abort the others.
+
+    ``timeout`` is passed to ``future.result()`` — a hung SSH session raises
+    ``concurrent.futures.TimeoutError`` which is captured as a per-item failure
+    rather than blocking the phase indefinitely.
     """
     if max_workers <= 1:
         return run_serial(items, fn, abort_on_error=False)
@@ -66,7 +71,7 @@ def run_concurrent(
         for future, idx in future_to_idx.items():
             item = items[idx]
             try:
-                results[idx] = (item, future.result(), None)
+                results[idx] = (item, future.result(timeout=timeout), None)
             except BaseException as exc:  # noqa: BLE001
                 results[idx] = (item, None, exc)
     return results

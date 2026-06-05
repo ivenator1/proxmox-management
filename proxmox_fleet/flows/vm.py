@@ -92,7 +92,10 @@ def run_vm_update(
                 executor.run_shell(vzdump_cmd)
 
             if strategy in ("snapshot", "both"):
-                snap_res = snapshot_with_retry(executor, vmid, snap_state="present", **api_params)
+                snap_res = snapshot_with_retry(executor, vmid, snap_state="present",
+                                               retries=settings.snapshot_retries,
+                                               delay=settings.snapshot_retry_delay,
+                                               **api_params)
                 snap_taken = snap_res.changed
                 if not snap_taken:
                     outcome.warnings.append(WarningEntry(
@@ -212,4 +215,7 @@ def run_vm_update(
         # Always — delete snapshot
         # ------------------------------------------------------------------
         if snap_taken:
-            snapshot_with_retry(executor, vmid, snap_state="absent", **api_params)
+            snapshot_with_retry(executor, vmid, snap_state="absent",
+                                retries=settings.snapshot_retries,
+                                delay=settings.snapshot_retry_delay,
+                                **api_params)

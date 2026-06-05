@@ -152,8 +152,9 @@ def run_lxc_update(
     # Introspect — OUTSIDE try/except (fail loud like Ansible block does).
     # Templates and introspect failures abort without hitting rescue.
     # ------------------------------------------------------------------
-    config_res = executor.run_shell(f"pct config {lxc_id}", changed_when=False)
-    pct_info = parse_pct_config(config_res.stdout)
+    introspect_res = executor.introspect(lxc_id)
+    config_stdout = str(introspect_res.facts.get("config_stdout", ""))
+    pct_info = parse_pct_config(config_stdout)
     name: str = pct_info["name"]
     lxc_os: str = pct_info["os_type"]
     is_template: bool = pct_info["is_template"]
@@ -161,15 +162,15 @@ def run_lxc_update(
     if is_template:
         return LxcFlowOutcome()  # skipped, no record
 
-    status_res = executor.run_shell(f"pct status {lxc_id}", changed_when=False)
-    status_info = parse_pct_status(status_res.stdout)
+    status_stdout = str(introspect_res.facts.get("status_stdout", ""))
+    status_info = parse_pct_status(status_stdout)
     is_running: bool = status_info["is_running"]
     was_stopped: bool = status_info["was_stopped"]
 
     if was_stopped:
-        executor.run_shell(f"pct start {lxc_id}")
+        executor.pct_start(lxc_id)
         time.sleep(5)
-        # Re-read status after start
+        # Re-read status after start (conditional — can't batch with introspect)
         status_res2 = executor.run_shell(f"pct status {lxc_id}", changed_when=False)
         is_running = parse_pct_status(status_res2.stdout)["is_running"]
 
@@ -190,24 +191,20 @@ def run_lxc_update(
 
     try:
         # ------------------------------------------------------------------
-        # Detect — pull /usr/bin/update and parse the ct script
+        # Detect — parse the update script pulled by introspect
         # ------------------------------------------------------------------
         ct_script_name: Optional[str] = None
         ct_info: Dict[str, Any] = {}
 
-        pull_dst = f"/tmp/ansible_update_{lxc_id}"
-        pull_res = executor.run_shell(
-            f"pct pull {lxc_id} /usr/bin/update {pull_dst}", changed_when=False
-        )
-        lxc_no_update_script = pull_res.rc != 0
+        pull_rc_val = introspect_res.facts.get("pull_rc", 1)
+        lxc_no_update_script = int(pull_rc_val) != 0
 
         if settings.lxc_verbose:
             _vprint(node, lxc_id, name, f"script={'NONE (pull failed)' if lxc_no_update_script else 'found'}")
 
         if not lxc_no_update_script:
-            cat_res = executor.run_shell(f"cat {pull_dst}", changed_when=False)
-            ct_script_name_raw = script_name_from_update(cat_res.stdout) or ""
-            executor.run_shell(f"rm -f {pull_dst}", changed_when=False)
+            update_content = str(introspect_res.facts.get("script_stdout", ""))
+            ct_script_name_raw = script_name_from_update(update_content) or ""
 
             if settings.lxc_verbose:
                 _vprint(node, lxc_id, name, f"ct_script={ct_script_name_raw or 'NOT FOUND'}")
@@ -264,14 +261,13 @@ def run_lxc_update(
         # ------------------------------------------------------------------
         strategy = settings.lxc_backup_strategy
         if strategy in ("vzdump", "both"):
-            vzdump_cmd = (
-                f"vzdump {lxc_id} --compress zstd --storage {settings.lxc_backup_storage}"
-                f' --notes-template "{name} - ansible fleet-update"'
-            )
-            executor.run_shell(vzdump_cmd)  # fail hard — no ignore_errors
+            executor.vzdump(lxc_id, backup_storage=settings.lxc_backup_storage, lxc_name=name)
 
         if strategy in ("snapshot", "both") and lxc_id not in {str(x) for x in settings.snapshot_exclude_list}:
-            snap_res = snapshot_with_retry(executor, lxc_id, snap_state="present", **api_params)
+            snap_res = snapshot_with_retry(executor, lxc_id, snap_state="present",
+                                           retries=settings.snapshot_retries,
+                                           delay=settings.snapshot_retry_delay,
+                                           **api_params)
             snap_taken = snap_res.changed
             if settings.lxc_verbose:
                 _vprint(node, lxc_id, name, f"snapshot={'taken' if snap_taken else 'FAILED'}")
@@ -295,7 +291,7 @@ def run_lxc_update(
         os_failed = False
         if lxc_id not in {str(x) for x in settings.os_update_exclude_list}:
             os_cmd = _os_update_cmd(lxc_id, lxc_os)
-            os_res = executor.run_shell(os_cmd, ignore_errors=True)
+            os_res = executor.lxc_os_update(lxc_id, os_update_cmd=os_cmd)
             os_res_stdout = os_res.stdout
             os_failed = os_res.failed
             if settings.lxc_verbose:
@@ -310,65 +306,51 @@ def run_lxc_update(
                 dpkg_res = executor.run_shell(hash_cmd, changed_when=False)
                 dpkg_before = dpkg_res.stdout.strip()
 
-        # 4. Scale up resources (if needed)
+        # 4-5. App update with resource scaling (primitive handles scale up/down)
         needs_scale = ct_info.get("needs_resource_scale", False)
         build_cpu = ct_info.get("build_cpu", "")
         build_ram = ct_info.get("build_ram", "")
         run_cpu = ct_info.get("run_cpu", "")
         run_ram = ct_info.get("run_ram", "")
 
-        if needs_scale and build_cpu and build_ram:
-            executor.run_shell(
-                f"pct set {lxc_id} --cores {build_cpu} --memory {build_ram}",
-                changed_when=False,
-            )
-
-        # 5. App update
         app_failed = False
         app_changed = False
+        shell = _build_shell(lxc_os)
 
         if not lxc_no_update_script:
-            shell = _build_shell(lxc_os)
-            phs_silent = "export PHS_SILENT=1" if settings.lxc_unattended else ""
-            app_cmd = (
-                f"pct exec {lxc_id} -- {shell} -c '"
-                f"mkdir -p /tmp/.nc; "
-                f"printf \"#!/bin/sh\\n:\\n\" > /tmp/.nc/clear; "
-                f"chmod +x /tmp/.nc/clear; "
-                f"export PATH=/tmp/.nc:$PATH; "
-                f"export TERM=dumb; "
-                f"{phs_silent + '; ' if phs_silent else ''}"
-                f"/usr/bin/update'"
+            app_res = executor.lxc_app_update(
+                lxc_id,
+                lxc_shell=shell,
+                lxc_unattended=settings.lxc_unattended,
+                lxc_needs_scale=bool(needs_scale),
+                lxc_build_cpu=str(build_cpu),
+                lxc_build_ram=str(build_ram),
+                lxc_run_cpu=str(run_cpu),
+                lxc_run_ram=str(run_ram),
             )
-            app_res = executor.run_shell(app_cmd, ignore_errors=True)
             app_failed = app_res.failed
             app_changed = not app_res.failed  # tentative; overridden below by version/hash
             if settings.lxc_verbose:
                 summary = (app_res.stdout or "").strip().replace("\n", " ")[:120]
                 _vprint(node, lxc_id, name, f"app_update: {'FAILED' if app_failed else 'ok'}  {summary}")
 
-        # 6. dpkg hash after
+        # 6-7. dpkg hash after + version after (batched into one primitive)
         dpkg_after = ""
+        ver_after = ""
         if not lxc_no_update_script:
             hash_cmd = _dpkg_hash_cmd(lxc_id, lxc_os)
-            if hash_cmd:
-                dpkg_res2 = executor.run_shell(hash_cmd, changed_when=False)
-                dpkg_after = dpkg_res2.stdout.strip()
-
-        # 7. Read post-update version
-        ver_after = ""
-        if ct_script_name and not lxc_no_update_script:
-            ver_after = _read_version(executor, lxc_id, ct_script_name, lxc_os)
-            if settings.lxc_verbose:
+            safe_script_name = ct_script_name.lower().replace("-", "") if ct_script_name else ""
+            post_res = executor.post_update(
+                lxc_id,
+                lxc_shell=shell,
+                dpkg_hash_cmd=hash_cmd,
+                lxc_script_name=safe_script_name,
+            )
+            dpkg_after = str(post_res.facts.get("dpkg_hash_after", "")).strip()
+            ver_after = str(post_res.facts.get("version_after", "")).strip()
+            if settings.lxc_verbose and ct_script_name:
                 dpkg_diff = "dpkg=changed" if dpkg_before != dpkg_after else "dpkg=same"
                 _vprint(node, lxc_id, name, f"ver: {ver_before!r} → {ver_after!r}  {dpkg_diff}")
-
-        # 8. Scale down
-        if needs_scale and run_cpu and run_ram:
-            executor.run_shell(
-                f"pct set {lxc_id} --cores {run_cpu} --memory {run_ram}",
-                changed_when=False,
-            )
 
         # 9. Wait for Proxmox task locks
         time.sleep(5)
@@ -446,10 +428,7 @@ def run_lxc_update(
 
         if snap_taken:
             try:
-                executor.run_shell(
-                    f"pct rollback {lxc_id} BEFORE_UPDATE_AUTO",
-                    ignore_errors=True,
-                )
+                executor.pct_rollback(lxc_id)
                 # Poll until container is running again (up to 12 × 10s)
                 for _ in range(12):
                     time.sleep(10)
@@ -479,10 +458,13 @@ def run_lxc_update(
         # Always — delete snapshot; stop container if it was stopped before
         # ------------------------------------------------------------------
         if snap_taken:
-            snapshot_with_retry(executor, lxc_id, snap_state="absent", **api_params)
+            snapshot_with_retry(executor, lxc_id, snap_state="absent",
+                                retries=settings.snapshot_retries,
+                                delay=settings.snapshot_retry_delay,
+                                **api_params)
 
         if was_stopped and not rollback_done and not is_template:
             try:
-                executor.run_shell(f"pct stop {lxc_id}", ignore_errors=True)
+                executor.pct_stop(lxc_id)
             except Exception:  # noqa: BLE001
                 pass
