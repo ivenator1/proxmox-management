@@ -19,7 +19,8 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 * **Tag-Based Discovery:** Only processes LXCs tagged `community-script` or `proxmox-helper-scripts` in PVE — untagged containers are never touched.
 * **Multi-Host Support:** Handles LXC containers, QEMU VMs, non-Proxmox remote hosts, and config-driven custom systems in a single run.
 * **Flexible Backup Strategy:** Choose per-run between lightweight snapshots, full `vzdump` backups (including PBS), both, or none.
-* **Snapshot-Lock Retry:** Transient Proxmox task locks (`CT is locked`) are retried automatically (up to 3 times, 15 s apart) before a snapshot failure is recorded as a non-fatal warning.
+* **Snapshot-Lock Retry:** Transient Proxmox task locks (`CT is locked`) are retried automatically (up to 3 times, 15 s apart by default) before a snapshot failure is recorded as a non-fatal warning.
+* **Configurable Timeouts & Retries:** All hardcoded timeouts and retry counts (snapshot, apt proxy wait, notifier, dead-man ping, node apt) are exposed as `vars.yml` fields — override per environment without touching code.
 * **Resource Scaling:** Automatically scales container CPU/RAM up during build-heavy app updates and back down afterward, matching the behaviour of the community-scripts bash installer.
 * **Dry-Run Mode:** Compare installed vs. latest GitHub release versions without applying any changes.
 * **Accurate Change Detection:** OS packages are updated before the community script runs, so each line is correctly attributed. For apps without a version file, a `dpkg-query` package-state hash is taken before and after the community script — if it matches, the container is silent even if the script produced output. This prevents false-positive "UPDATED" reports caused by `PHS_SILENT=1` suppressing apt's stdout inside community scripts.
@@ -82,7 +83,7 @@ lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
 │   ├── status.py / changes.py       # Decision trees + change detection
 │   ├── briefing.py / notifiers.py / history.py   # Phase 4 (briefing/notify/history)
 │   └── models/                      # Pydantic schemas (config, state, settings)
-├── ansible/primitives/             # Single-purpose Ansible execution primitives (no logic)
+├── ansible/primitives/             # Single-purpose Ansible execution primitives (no logic); includes batched read primitives (lxc_introspect, lxc_post_update)
 ├── configs/                         # custom_update config files (gitignored; *.example committed)
 ├── tests/
 │   ├── requirements.txt             # pytest, pyyaml
@@ -251,9 +252,9 @@ Add this to the Manager LXC's `crontab -e` to run at 4:00 AM daily:
 No Proxmox infrastructure is needed to run the tests.
 
 ```bash
-# Python unit tests (decision logic, briefing byte-parity, state, flows)
+# Python unit tests (decision logic, briefing byte-parity, state, flows) with coverage
 pip install -e '.[dev]'
-pytest tests/unit/ -v
+pytest tests/unit/ -v --cov=proxmox_fleet --cov-report=term-missing
 python -m mypy proxmox_fleet/
 
 # Static analysis
@@ -262,12 +263,17 @@ python3 -m py_compile fleet-update.py
 yamllint .
 ansible-lint ansible/primitives/
 
+# Security scan (medium+ severity)
+bandit -r proxmox_fleet/ -ll
+
 # Molecule (drives the Python flows via stub pct/vzdump scripts, against localhost)
 cd roles/lxc_update && molecule test -s lxc_update_normal
 cd roles/custom_update && molecule test -s custom_update_normal
 ```
 
-CI runs automatically on push/PR via GitHub Actions (`.github/workflows/ci.yml`).
+CI runs automatically on push/PR via GitHub Actions (`.github/workflows/ci.yml`),
+covering yamllint, ansible-lint, syntax-check, pytest (Python 3.10/3.11/3.12 matrix with
+coverage), mypy, ruff, bandit security scan, and molecule scenarios.
 
 ## 📡 Discord Briefing Format
 The orchestrator sends one consolidated embed per run:

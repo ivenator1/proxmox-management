@@ -92,14 +92,16 @@ notes below are retained as historical record.
 
 What exists now: `proxmox_fleet/{__init__,cli,__main__,runner,orchestration,http,steps,executor,status,changes,deps,driver,inventory,window,lxc_parse,briefing,history,notifiers}.py`,
 `proxmox_fleet/models/{config,state,settings}.py`, `proxmox_fleet/flows/{custom,lxc,vm,remote,node}.py`,
-`ansible/primitives/{run_shell,reboot_host,discover_lxcs,pct_config,pct_status,pct_start,pct_stop,pct_pull,snapshot,rollback,vzdump,lxc_os_update,lxc_app_update}.yml`,
+`ansible/primitives/{run_shell,reboot_host,discover_lxcs,pct_config,pct_status,pct_start,pct_stop,pct_pull,snapshot,rollback,vzdump,lxc_os_update,lxc_app_update,lxc_introspect,lxc_post_update}.yml`,
 `roles/{custom_update,lxc_update}/molecule/mol_run_flow.py` (flow-driven molecule scenarios only).
 The CLI is `driver.run_fleet()` driven by either `./fleet-update.py` (recommended human-facing
 wrapper with friendly flags + venv auto-bootstrap) or the `fleet-update` console command
 (`fleet-update [--check] [-e key=val ...]`). The `--use-*-flow` flags and the per-phase merge
-plays are gone. ~440 plain-Python tests green, mypy clean. The golden briefing parity is now
-locked by `tests/unit/data/briefing_golden.json` (captured from the retired `.j2`) rather than
-the live Jinja shim.
+plays are gone. All 15 primitives are now invoked via typed `Executor` methods — no inline
+`run_shell` strings remain for the LXC flow's main operations. 460+ plain-Python tests green
+across Python 3.10/3.11/3.12, mypy clean. The golden briefing parity is now locked by
+`tests/unit/data/briefing_golden.json` (captured from the retired `.j2`) rather than the live
+Jinja shim.
 
 ---
 
@@ -285,8 +287,10 @@ Testing environment: manager LXC CTID 121 on node 10.10.10.44, `/root/test/proxm
 - **Snapshot "CT is locked (snapshot-delete)"** — Hammond/106 uptimekuma snapshot failed with this error. Caused by a Proxmox task lock from a prior snapshot-delete (from an earlier test run) still held when the new snapshot was attempted. No retry logic exists yet; the flow records a warning and continues without rollback capability.
 - **Containers with no version file** (`technitiumdns`, `plex`, `apt-cacher-ng`, `proxmox-backup-server`) — `ver: '' → ''`; change detection falls back to dpkg hash. This is correct behaviour per the status decision tree.
 
-**Future TODO — speed optimisation:**
-The per-`run_shell()` subprocess overhead is the primary bottleneck. Recommended approach: consolidate the ~15 individual primitive calls per container into 4–5 purpose-built multi-read primitives (e.g., one `introspect` primitive returning pct config + status + version file; one `post-update` primitive returning dpkg hash + version file). This keeps all decision logic in Python, maintains clean error attribution, and cuts subprocess spawns from ~15 to ~4–5 per container. Do NOT batch decision logic into shell scripts — that moves branching out of Python. Do NOT use direct SSH (loses Ansible inventory/SSH config integration). See memory `project_speed_todo.md` for full notes.
+**Speed optimisation: ✅ done (2026-06-05).**
+Two batched read primitives (`lxc_introspect.yml`, `lxc_post_update.yml`) were added and all
+LXC flow operations wired to dedicated `Executor` methods — subprocess spawns reduced from
+~15 to ~7–8 per container. See backlog item #1 above for full details.
 
 ---
 
@@ -501,22 +505,52 @@ unconditional default.
 Items discovered after the migration "completed". Listed roughly by value.
 ✅ = shipped; ⬜ = still open.
 
-### ⬜ 1. Execution primitives not wired into the flows (architecture gap)
-The guiding principle is "Ansible = single-purpose execution primitives, Python =
-all logic." Today only **three** primitives are actually invoked
-(`run_shell`, `reboot_host`, `snapshot` — see `executor.py`). The other ten —
-`pct_config`, `pct_status`, `pct_start`, `pct_stop`, `pct_pull`, `rollback`,
-`vzdump`, `lxc_os_update`, `lxc_app_update`, `discover_lxcs` — exist under
-`ansible/primitives/` but the flows reimplement each inline as a `run_shell`
-string (e.g. `flows/lxc.py` builds `pct config {id}`, `vzdump …`, `pct rollback …`
-directly). They are intended building blocks, not dead code.
-- **Why it matters:** ties directly to the speed work below — each inline
-  `run_shell` is a separate `ansible-runner` subprocess (~15 per container).
-- **Suggested approach:** fold the ~15 inline calls per container into 4–5
-  purpose-built multi-action primitives (one `introspect` returning pct
-  config+status+version file; one `post-update` returning dpkg hash+version),
-  invoked via `invoke_primitive`. Keep all branching in Python. This is the same
-  work as "Future TODO — speed optimisation" under Phase 3.
+### ✅ 1. Execution primitives wired + subprocess consolidation (shipped `testing` branch, 2026-06-05)
+
+All primitives are now invoked via `executor.py` — no more inline `run_shell` strings
+for the LXC flow operations. Two new batched read primitives reduce subprocess spawns
+from ~15 to ~7–8 per container.
+
+**New primitives:**
+- `ansible/primitives/lxc_introspect.yml` — batches `pct config` + `pct status` +
+  `pct pull /usr/bin/update` + `cat` script content into **one** subprocess; returns
+  `config_stdout`, `status_stdout`, `pull_rc`, `script_stdout` via `set_stats`.
+- `ansible/primitives/lxc_post_update.yml` — batches dpkg/apk hash read + version file
+  read after the update into **one** subprocess; returns `dpkg_hash_after`, `version_after`.
+
+**New `Executor` protocol methods + `RunnerExecutor` implementations:**
+`introspect()`, `vzdump()`, `lxc_os_update()`, `lxc_app_update()`, `post_update()`,
+`pct_rollback()`, `pct_start()`, `pct_stop()`.
+
+**`flows/lxc.py` rewrite:** introspect block, detect (pull/cat/rm-f), vzdump backup,
+OS update, app update + resource scaling, post-update reads, rollback, and container
+stop all converted to dedicated method calls. The remaining `run_shell` calls are:
+`ver_before` (script name unknown until after detect), `dpkg_before` (runs between OS
+and app update), and the post-start status re-check (conditional one-liner).
+
+**Robustness & quality work shipped in the same batch:**
+- `tests/unit/test_changes.py`, `test_cli.py`, `test_runner.py`, `test_executor.py`
+  — new direct unit-test files covering previously untested modules; all edge cases
+  for regex-based change detection (`changes.py`), CLI flag propagation (`cli.py`),
+  runner event harvesting (`runner.py`), and executor extravars/fact-merge logic.
+- `tests/unit/test_orchestration.py` augmented: `run_concurrent` falls back to serial
+  when workers ≤ 1; `retry` with empty exceptions propagates immediately; retries=0
+  means exactly 1 call.
+- `tests/unit/test_flow_custom.py` augmented: `type=command` health-check branch
+  (passes on rc=0, triggers rescue on rc=1).
+- `tests/unit/test_settings.py` augmented: new timeout/retry field defaults verified.
+- `orchestration.run_concurrent()` now accepts `timeout: Optional[float] = None`;
+  `future.result(timeout=timeout)` prevents hung SSH from blocking the thread pool
+  forever (default None = existing behaviour).
+- `driver._discover_vm_locations()`: silent `except Exception: return {}` now prints
+  a stderr warning before returning so the failure is visible without aborting.
+- `GlobalSettings` gains 8 configurable timeout/retry fields:
+  `apt_proxy_check_timeout`, `node_reboot_port_wait_timeout`, `snapshot_retries`,
+  `snapshot_retry_delay`, `notifier_retries`, `deadmans_retries`, `node_apt_retries`,
+  `node_apt_retry_delay`. All callers wired.
+- CI: `unit-tests` job expanded to Python 3.10/3.11/3.12 matrix with
+  `--cov=proxmox_fleet --cov-report=term-missing`; new `bandit -r proxmox_fleet/ -ll`
+  security scan job.
 
 ### ✅ 2. `MaintenanceWindow` model wired
 `inventory.py` now parses `maintenance_window` host_vars dicts into typed
