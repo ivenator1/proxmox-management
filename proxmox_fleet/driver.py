@@ -66,7 +66,7 @@ def run_custom_phase(
     inventory_path: str = "hosts.ini",
     extra_vars: Optional[Dict[str, Any]] = None,
     check: bool = False,
-    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_custom_state.json",
+    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_custom_state.json",  # nosec B108 - tooling output path
 ) -> FleetState:
     """Run Phase 0a dependency validation + Phase 0b custom host updates.
 
@@ -167,7 +167,7 @@ def run_lxc_phase(
     settings: GlobalSettings,
     inventory_path: str = "hosts.ini",
     check: bool = False,
-    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_lxc_state.json",
+    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_lxc_state.json",  # nosec B108 - tooling output path
 ) -> FleetState:
     """Run Phase 1 (LXC container updates) via the Python driver.
 
@@ -295,7 +295,7 @@ def run_vm_phase(
     settings: GlobalSettings,
     inventory_path: str = "hosts.ini",
     check: bool = False,
-    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_vm_state.json",
+    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_vm_state.json",  # nosec B108 - tooling output path
 ) -> FleetState:
     """Run Phase 1b (QEMU VM updates) via the Python driver.
 
@@ -375,7 +375,7 @@ def run_remote_phase(
     settings: GlobalSettings,
     inventory_path: str = "hosts.ini",
     check: bool = False,
-    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_remote_state.json",
+    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_remote_state.json",  # nosec B108 - tooling output path
 ) -> FleetState:
     """Run Phase 0 (remote host updates) via the Python driver.
 
@@ -429,7 +429,7 @@ def run_node_phase(
     settings: GlobalSettings,
     inventory_path: str = "hosts.ini",
     check: bool = False,
-    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_node_state.json",
+    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_node_state.json",  # nosec B108 - tooling output path
 ) -> FleetState:
     """Run Phase 2 (node OS updates) + Phase 3 (manager self-update) via the Python driver.
 

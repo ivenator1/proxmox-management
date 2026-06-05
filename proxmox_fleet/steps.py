@@ -84,7 +84,7 @@ def evaluate_when(when: Any, context: Dict[str, Any]) -> bool:
     if isinstance(when, bool):
         return when
     conditions = when if isinstance(when, (list, tuple)) else [when]
-    env = jinja2.Environment(undefined=jinja2.Undefined)
+    env = jinja2.Environment(undefined=jinja2.Undefined)  # nosec B701 - evaluates shell when: conditions, not HTML (no XSS surface)
     for cond in conditions:
         try:
             value = env.compile_expression(str(cond))(**context)
