@@ -122,8 +122,23 @@ The `vars.yml` file is the central intelligence of the orchestrator.
 * `manager_lxc_id`: The VMID of the Manager LXC itself. The node hosting this container is never rebooted automatically.
 * `exclude_list`: LXC IDs completely skipped (no updates, no snapshots).
 * `os_update_exclude_list`: Skip `apt dist-upgrade` / `apk upgrade` for these IDs (app update still runs).
+* `app_update_exclude_list`: Skip the community-script app update for these tagged LXC IDs (the OS update still runs).
+* `os_only_lxc_list`: Pull these *untagged* LXC IDs into discovery for OS-only management — they have no `/usr/bin/update`, so the app line reports `NO SCRIPT`.
 * `snapshot_exclude_list`: Updates run but no snapshot is taken (use for LXCs with bind mounts).
 * **Note:** Phase 2 (node OS updates) runs serially with abort-on-first-failure to protect cluster quorum.
+
+### ⏱️ Timeouts & Retries
+All previously-hardcoded timeouts and retry counts are overridable per environment in `vars.yml`
+(see `vars.yml.example` / `GlobalSettings` for full defaults):
+* `apt_proxy_check_timeout` / `node_reboot_port_wait_timeout`: How long to wait for the apt-cacher-ng proxy / a rebooted node's SSH port to come back.
+* `snapshot_retries` / `snapshot_retry_delay`: Retry attempts and delay for transient `CT is locked` snapshot failures.
+* `notifier_retries` / `deadmans_retries`: Retry attempts for notifier dispatch and dead-man's-switch pings.
+* `node_apt_retries` / `node_apt_retry_delay`: Retry attempts and delay for the Phase 2 node OS update.
+
+### 📨 Notifications, History & Dead-Man's Switch
+* `force_notify`: Send a Discord/ntfy notification even if nothing changed (same as `--force-notify`).
+* `fleet_history_enabled` / `fleet_history_dir` / `fleet_history_keep`: Each run writes `<dir>/run-<UTC-timestamp>.json` and overwrites `<dir>/latest.json`, pruned to the newest N (`0` = keep all).
+* `fleet_deadmans_url`: Pinged at the end of every run (e.g. a [healthchecks.io](https://healthchecks.io)-style URL) so its *absence* alerts you if the orchestrator stops running; `<url>/fail` is pinged on failure.
 
 ## 🚀 Setup Instructions
 To set up this project from scratch on a brand-new Manager LXC, follow these steps in order. This ensures all dependencies are met and SSH trust between your Manager and your Proxmox nodes is established correctly.
