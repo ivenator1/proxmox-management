@@ -5,7 +5,6 @@ lines 317–322 (node_status_str) and line 383 (manager status ternary).
 Plain Python — no Jinja shim needed.
 """
 
-import pytest
 
 from proxmox_fleet.status import manager_status, node_should_report, node_status
 

@@ -13,6 +13,8 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+from proxmox_fleet.changes import dpkg_hash_differs
+
 
 def _reboot_suffix(reboot_done: bool) -> str:
     return " + Rebooted" if reboot_done else ""
@@ -88,6 +90,7 @@ def lxc_app_status(
     dry_run: bool = False,
     dry_run_status: str = "",
     no_update_script: bool = False,
+    excluded: bool = False,
     app_failed: bool = False,
     app_changed: bool = False,
     ver_before: str = "",
@@ -108,6 +111,8 @@ def lxc_app_status(
         return dry_run_status if dry_run_status else "dry-run"
     if no_update_script:
         return "NO SCRIPT"
+    if excluded:
+        return "SKIPPED"
     if app_failed:
         return "FAILED"
 
@@ -121,10 +126,10 @@ def lxc_app_status(
             return "OK"
 
         # dpkg-hash comparison
-        db = dpkg_before.strip()
-        da = dpkg_after.strip()
-        if db and da:
-            return "UPDATED" if db != da else "OK"
+        if dpkg_hash_differs(dpkg_before, dpkg_after):
+            return "UPDATED"
+        if dpkg_before.strip() and dpkg_after.strip():
+            return "OK"
 
         # No version data, no hash data — non-apt OS or silent run
         return "UPDATED"
@@ -296,12 +301,12 @@ def node_status(
     rebooted: bool,
     is_manager: bool,
 ) -> str:
-    """Status string from Phase 2 of fleet-update.yml (node_status_str set_fact).
+    """Node OS-update status string (Phase 2; ports the old node_status_str set_fact).
 
-    Parity with the Jinja decision tree (lines 317–322 of fleet-update.yml):
+    Decision-tree priority:
       UPDATED & REBOOTED > UPDATED (MANUAL REBOOT REQ) > REBOOT FAILED > UPDATED > OK
     REBOOT FAILED is logically unreachable in normal flow (a failed reboot goes to
-    rescue → FAILED) but kept for parity with the Jinja template.
+    rescue → FAILED) but kept for parity with the original template.
     """
     if rebooted:
         return "UPDATED & REBOOTED"

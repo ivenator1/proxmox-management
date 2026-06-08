@@ -42,7 +42,7 @@
           chmod +x /tmp/.nc/clear
           export PATH=/tmp/.nc:$PATH
           export TERM=dumb
-          {% if lxc_unattended | default(true) | bool %}export PHS_SILENT=1{% endif %}
+          {{ "export PHS_SILENT=1" if (lxc_unattended | default(true) | bool) else "" }}
           /usr/bin/update'
       register: _app
       changed_when: true

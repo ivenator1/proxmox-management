@@ -7,10 +7,10 @@ running with defaults, which is fine for --check runs).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class GlobalSettings(BaseModel):
@@ -45,7 +45,9 @@ class GlobalSettings(BaseModel):
     lxc_kuma_map: Dict[str, Any] = Field(default_factory=dict)
     exclude_list: List[str] = Field(default_factory=list)
     os_update_exclude_list: List[str] = Field(default_factory=list)
+    app_update_exclude_list: List[str] = Field(default_factory=list)
     snapshot_exclude_list: List[str] = Field(default_factory=list)
+    os_only_lxc_list: List[str] = Field(default_factory=list)
 
     # vm_update phase settings
     vm_dry_run: bool = False
@@ -73,6 +75,39 @@ class GlobalSettings(BaseModel):
     pve_api_user: str = ""
     pve_api_token_id: str = ""
     pve_api_token_secret: str = ""
+
+    # Timeouts & retries (formerly hardcoded)
+    apt_proxy_check_timeout: float = 30.0
+    node_reboot_port_wait_timeout: float = 300.0
+    snapshot_retries: int = 3
+    snapshot_retry_delay: float = 15.0
+    notifier_retries: int = 15
+    deadmans_retries: int = 5
+    node_apt_retries: int = 5
+    node_apt_retry_delay: float = 30.0
+
+    # Phase 4 — briefing / history / notifiers
+    # notifiers defaults to None (not []) so an unset value is distinguishable
+    # from an explicit empty list, matching the Ansible `notifiers is defined` shim.
+    notifiers: Optional[List[Dict[str, Any]]] = None
+    discord_webhook: str = ""
+    fleet_deadmans_url: str = ""
+    fleet_history_enabled: bool = True
+    fleet_history_dir: str = "/var/log/fleet-update"
+    fleet_history_keep: int = 30
+    force_notify: bool = False
+
+    @field_validator("lxc_kuma_map", "vm_kuma_map", "remote_kuma_map", mode="before")
+    @classmethod
+    def _stringify_kuma_keys(cls, value: Any) -> Any:
+        """Coerce kuma-map keys to str so integer vmids in vars.yml are accepted.
+
+        YAML writes ``lxc_kuma_map: {101: 5}`` with an int key, which would
+        otherwise fail validation (the field is ``Dict[str, Any]``).
+        """
+        if isinstance(value, dict):
+            return {str(k): v for k, v in value.items()}
+        return value
 
     @classmethod
     def load(cls, path: Union[str, Path] = "vars.yml") -> "GlobalSettings":

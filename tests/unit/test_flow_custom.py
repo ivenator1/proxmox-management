@@ -4,7 +4,6 @@ Uses a scripted fake executor (no real Ansible) and monkeypatches http for the
 GitHub/Kuma calls. Asserts the control flow: rescue/rollback, health gating,
 dependency skip, dry-run, outdated gate, and byte-parity status strings.
 """
-import pytest
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.flows import custom as flow
@@ -189,3 +188,35 @@ def test_outdated_gate_fail_open_warns(monkeypatch):
     out = flow.run_custom_update("nas-01", cfg, ex)
     assert any("fail-open" in w.warning for w in out.warnings)
     assert "do-upgrade" in ex.commands
+
+
+# --- command health check ----------------------------------------------------
+
+def test_health_check_command_passes():
+    cfg = _cfg(
+        health_check={"type": "command", "command": "check-alive"},
+    )
+    ex = ScriptedExecutor(
+        script={
+            "gitea --version": [_ok(stdout="1.0"), _ok(stdout="1.1")],
+            "check-alive": [_ok(rc=0)],
+        }
+    )
+    out = flow.run_custom_update("nas-01", cfg, ex)
+    assert out.failed is False
+    assert "check-alive" in ex.commands
+
+
+def test_health_check_command_fails_triggers_rescue():
+    cfg = _cfg(
+        health_check={"type": "command", "command": "check-alive"},
+    )
+    ex = ScriptedExecutor(
+        script={
+            "gitea --version": [_ok(stdout="1.0"), _ok(stdout="1.1")],
+            "check-alive": [_fail(rc=1)],
+        }
+    )
+    out = flow.run_custom_update("nas-01", cfg, ex)
+    assert out.failed is True
+    assert out.record.app == "FAILED"

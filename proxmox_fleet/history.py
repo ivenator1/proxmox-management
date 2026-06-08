@@ -1,0 +1,100 @@
+"""Run-history persistence — the Python port of ``tasks/persist-history.yml``.
+
+Writes a timestamped ``run-<UTC-ts>.json`` plus an overwritten ``latest.json``
+to the manager's history directory and prunes to the newest N runs. Beyond the
+legacy summary it also records the **rendered Discord message body** for the run,
+so each history file carries the exact briefing that was (or would be) sent.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
+
+from proxmox_fleet.models.state import FleetState
+
+
+def _ts_now() -> str:
+    """UTC timestamp with microsecond precision to avoid same-second collisions."""
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def build_run_summary(
+    state: FleetState,
+    *,
+    timestamp: str,
+    briefing: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Assemble the run-summary dict written to history (mirrors persist-history.yml).
+
+    When *briefing* is provided, a ``briefing`` key carrying the exact message
+    body (``briefing.prepare_body(state)``) is added so the persisted record
+    holds the Discord message verbatim.
+    """
+    lxc = [r.model_dump() for r in state.lxc]
+    vm = [r.model_dump() for r in state.vm]
+    remote = [r.model_dump() for r in state.remote]
+    node = [r.model_dump() for r in state.node]
+    custom = [r.model_dump() for r in state.custom]
+    errors = [r.model_dump() for r in state.errors]
+    warnings = [r.model_dump() for r in state.warnings]
+
+    summary: Dict[str, Any] = {
+        "timestamp": timestamp,
+        "changed": state.changed,
+        "failed": state.failed,
+        "counts": {
+            "lxc": len(lxc),
+            "vm": len(vm),
+            "remote": len(remote),
+            "node": len(node),
+            "custom": len(custom),
+            "errors": len(errors),
+            "warnings": len(warnings),
+        },
+        "lxc": lxc,
+        "vm": vm,
+        "remote": remote,
+        "node": node,
+        "custom": custom,
+        "errors": errors,
+        "warnings": warnings,
+    }
+    if briefing is not None:
+        summary["briefing"] = briefing
+    return summary
+
+
+def write_history(
+    state: FleetState,
+    *,
+    history_dir: Union[str, Path] = "/var/log/fleet-update",
+    keep: int = 30,
+    timestamp: Optional[str] = None,
+    briefing: Optional[str] = None,
+) -> Path:
+    """Write ``run-<ts>.json`` + ``latest.json`` and prune to the newest *keep* runs.
+
+    Returns the path of the timestamped run file. Mirrors persist-history.yml:
+    ``to_nice_json`` → ``json.dump(indent=4, sort_keys=True)``.
+    """
+    ts = timestamp or _ts_now()
+    summary = build_run_summary(state, timestamp=ts, briefing=briefing)
+
+    directory = Path(history_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    run_file = directory / f"run-{ts}.json"
+    payload = json.dumps(summary, indent=4, sort_keys=True, ensure_ascii=False)
+    run_file.write_text(payload, encoding="utf-8")
+    (directory / "latest.json").write_text(payload, encoding="utf-8")
+
+    if keep > 0:
+        # Timestamps sort lexically; newest last. Keep the newest `keep`, drop the rest.
+        runs = sorted(directory.glob("run-*.json"))
+        for stale in runs[:-keep]:
+            stale.unlink(missing_ok=True)
+
+    return run_file

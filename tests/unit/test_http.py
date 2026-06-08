@@ -1,6 +1,5 @@
 """Tests for proxmox_fleet.http — manager-local IO helpers (no real network)."""
 import socket
-import threading
 
 import pytest
 

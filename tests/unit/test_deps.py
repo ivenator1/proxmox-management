@@ -1,7 +1,6 @@
 """Tests for proxmox_fleet.deps — mirrors test_custom_depends.py's contract
 using plain Python (no Jinja shim).
 """
-import pytest
 
 from proxmox_fleet.deps import dependency_failed, validate_depends_order
 

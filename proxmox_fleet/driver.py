@@ -1,16 +1,18 @@
-"""Python driver for Phase 0a + 0b — custom system updates.
+"""The fleet driver — the Python orchestrator and per-phase runners.
 
-Replaces the Ansible ``custom_update`` role and fleet-update.yml Phase 0a/0b
-logic. Invoked by ``cli.py`` when ``--use-custom-flow`` is set; the playbook
-is told to skip its Phase 0b via the ``skip_phase_0b=true`` extravar.
+``run_fleet()`` is the entrypoint ``cli.py`` calls: it runs the pre-flight
+proxy check and every phase in order (remote → custom → lxc → vm →
+node+manager → notify), merging each phase's :class:`FleetState` into one
+fleet-wide state. The per-phase ``run_*_phase()`` helpers can also be called
+individually (used by tests and the molecule harness).
 
 Conventions:
 - All decisions are here in Python; Ansible executes only via RunnerExecutor.
 - deep_merge: dict values recurse, list values REPLACE — matching
   ``combine(recursive=true)`` documented Ansible behaviour.
-- State is returned as a FleetState and also written to a JSON file via
-  dump_for_ansible() so fleet-update.yml can seed localhost facts before
-  Phases 1–3 run their fleet-state-append.yml accumulations.
+- Each phase returns a FleetState; ``_merge_state()`` folds them together
+  (the in-Python replacement for the old "Merge Python … state" plays). The
+  ``state_output_path`` arg still dumps per-phase JSON when set, for tooling.
 """
 from __future__ import annotations
 
@@ -21,11 +23,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import yaml
 
-from proxmox_fleet import deps, inventory, window
+from proxmox_fleet import briefing, deps, history, http, inventory, notifiers, window
 from proxmox_fleet.executor import RunnerExecutor
 from proxmox_fleet.flows.custom import run_custom_update
 from proxmox_fleet.flows.lxc import LxcFlowOutcome, _discover_lxcs, run_lxc_update
-from proxmox_fleet.flows.node import NodeFlowOutcome, run_manager_update, run_node_update
+from proxmox_fleet.flows.node import run_manager_update, run_node_update
 from proxmox_fleet.flows.remote import RemoteFlowOutcome, run_remote_update
 from proxmox_fleet.flows.vm import VmFlowOutcome, run_vm_update
 from proxmox_fleet.inventory import HostSpec, RemoteHostSpec, VmSpec
@@ -64,17 +66,17 @@ def run_custom_phase(
     inventory_path: str = "hosts.ini",
     extra_vars: Optional[Dict[str, Any]] = None,
     check: bool = False,
-    state_output_path: Union[str, Path] = "/tmp/fleet_custom_state.json",
+    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_custom_state.json",  # nosec B108 - tooling output path
 ) -> FleetState:
     """Run Phase 0a dependency validation + Phase 0b custom host updates.
 
-    Writes the resulting FleetState to *state_output_path* via
-    dump_for_ansible() so fleet-update.yml can load it with include_vars.
+    When *state_output_path* is set, writes the resulting FleetState via
+    dump_for_ansible() for tooling / the molecule harness (whose verify.yml
+    loads it with include_vars). run_fleet() passes None and merges in-memory.
 
-    Raises SystemExit(1) on Phase 0a dependency-order problems (mirrors the
-    ``assert`` task in fleet-update.yml that fails loud on bad ordering).
-    Never raises for per-host execution failures — those are captured into the
-    FleetState as FAILED records, matching run_custom_update() semantics.
+    Raises SystemExit(1) on Phase 0a dependency-order problems (fail-loud on bad
+    ordering). Never raises for per-host execution failures — those are captured
+    into the FleetState as FAILED records, matching run_custom_update() semantics.
     """
     ev = extra_vars or {}
 
@@ -137,25 +139,27 @@ def run_custom_phase(
             state.errors.append(outcome.error)
         state.warnings.extend(outcome.warnings)
 
-    state.dump_for_ansible(state_output_path)
+    if state_output_path is not None:
+        state.dump_for_ansible(state_output_path)
     return state
 
 
-def _fold_lxc_outcome(
-    state: FleetState,
-    lxc_id: str,
-    outcome: LxcFlowOutcome,
-) -> None:
-    """Merge one container's outcome into the running FleetState."""
+def _fold_outcome(state: FleetState, outcome: Any, bucket: List[Any]) -> None:
+    """Merge one per-host flow outcome into the running FleetState.
+
+    Appends ``outcome.record`` to ``bucket`` (the matching record list), OR-joins
+    the changed/failed flags, and accumulates errors/warnings. Node outcomes carry
+    no warnings, so that field is read defensively.
+    """
     if outcome.record is not None:
-        state.lxc.append(outcome.record)
+        bucket.append(outcome.record)
     if outcome.changed:
         state.changed = True
     if outcome.failed:
         state.failed = True
     if outcome.error is not None:
         state.errors.append(outcome.error)
-    state.warnings.extend(outcome.warnings)
+    state.warnings.extend(getattr(outcome, "warnings", []))
 
 
 def run_lxc_phase(
@@ -163,7 +167,7 @@ def run_lxc_phase(
     settings: GlobalSettings,
     inventory_path: str = "hosts.ini",
     check: bool = False,
-    state_output_path: Union[str, Path] = "/tmp/fleet_lxc_state.json",
+    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_lxc_state.json",  # nosec B108 - tooling output path
 ) -> FleetState:
     """Run Phase 1 (LXC container updates) via the Python driver.
 
@@ -171,12 +175,13 @@ def run_lxc_phase(
     concurrently (max_workers=lxc_forks, default 20), mirroring Ansible's
     forks setting. Nodes are processed serially.
 
-    Writes the resulting FleetState via dump_for_ansible() so fleet-update.yml
-    can seed fleet_lxc_data / fleet_changed / fleet_failed before Phase 1b.
+    When *state_output_path* is set, writes the resulting FleetState via
+    dump_for_ansible() for tooling / molecule; run_fleet() passes None and
+    merges each phase in-memory via _merge_state().
 
     Never raises for per-container failures — those become FAILED records.
     """
-    nodes = inventory.load_proxmox_nodes(inventory_path)
+    nodes = inventory.load_proxmox_nodes(inventory_path, host_vars_dir=settings.host_vars_dir)
     dry_run = check or settings.fleet_dry_run or settings.lxc_dry_run
     state = FleetState()
 
@@ -184,7 +189,6 @@ def run_lxc_phase(
         node_name = node_info["name"]
         api_host = node_info["ansible_host"]
 
-        executor = RunnerExecutor(node_name, inventory=inventory_path, check=check)
         # Discovery is read-only — never pass --check or pct list won't run remotely.
         discovery_executor = RunnerExecutor(node_name, inventory=inventory_path, check=False)
 
@@ -199,7 +203,7 @@ def run_lxc_phase(
             ))
             continue
 
-        print(f"[{node_name}] found {len(lxc_ids)} tagged LXC(s): {', '.join(lxc_ids) or 'none'}")
+        print(f"[{node_name}] found {len(lxc_ids)} managed LXC(s): {', '.join(lxc_ids) or 'none'}")
 
         # Concurrent per-container updates (lxc_continue_on_error is the default)
         def _run_one(lxc_id: str) -> LxcFlowOutcome:
@@ -217,7 +221,7 @@ def run_lxc_phase(
 
         for lxc_id, outcome, run_err in results:
             if outcome is not None:
-                _fold_lxc_outcome(state, lxc_id, outcome)
+                _fold_outcome(state, outcome, state.lxc)
                 rec = outcome.record
                 if rec is not None:
                     status = "FAILED" if outcome.failed else f"app={rec.app}  os={rec.os}"
@@ -233,7 +237,8 @@ def run_lxc_phase(
                 ))
                 print(f"  [{node_name}/{lxc_id}] ERROR: {run_err}")
 
-    state.dump_for_ansible(state_output_path)
+    if state_output_path is not None:
+        state.dump_for_ansible(state_output_path)
     return state
 
 
@@ -276,20 +281,13 @@ def _discover_vm_locations(
             if vmid and node_name:
                 result[vmid] = (node_name, nodes_map.get(node_name, node_name))
         return result
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[vm phase] WARNING: cluster VM discovery failed ({exc!s}), "
+            "falling back to pve_node inventory hints",
+            file=sys.stderr,
+        )
         return {}
-
-
-def _fold_vm_outcome(state: FleetState, vm_name: str, outcome: VmFlowOutcome) -> None:
-    if outcome.record is not None:
-        state.vm.append(outcome.record)
-    if outcome.changed:
-        state.changed = True
-    if outcome.failed:
-        state.failed = True
-    if outcome.error is not None:
-        state.errors.append(outcome.error)
-    state.warnings.extend(outcome.warnings)
 
 
 def run_vm_phase(
@@ -297,18 +295,18 @@ def run_vm_phase(
     settings: GlobalSettings,
     inventory_path: str = "hosts.ini",
     check: bool = False,
-    state_output_path: Union[str, Path] = "/tmp/fleet_vm_state.json",
+    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_vm_state.json",  # nosec B108 - tooling output path
 ) -> FleetState:
     """Run Phase 1b (QEMU VM updates) via the Python driver.
 
-    Loads all VMs from inventory, runs them concurrently (max_workers=vm_forks),
-    and writes the resulting FleetState so fleet-update.yml can merge it before
-    Phase 2.
+    Loads all VMs from inventory, runs them concurrently (max_workers=vm_forks).
+    When *state_output_path* is set, writes the FleetState for tooling / molecule;
+    run_fleet() passes None and merges in-memory.
 
     Never raises for per-VM failures — those become FAILED records.
     """
-    vms = inventory.load_proxmox_vms(inventory_path)
-    nodes = inventory.load_proxmox_nodes(inventory_path)
+    vms = inventory.load_proxmox_vms(inventory_path, host_vars_dir=settings.host_vars_dir)
+    nodes = inventory.load_proxmox_nodes(inventory_path, host_vars_dir=settings.host_vars_dir)
     nodes_map = {n["name"]: n["ansible_host"] for n in nodes}
 
     dry_run = check or settings.fleet_dry_run or settings.vm_dry_run
@@ -353,7 +351,7 @@ def run_vm_phase(
     for vm_spec, outcome, run_err in results:
         vm_name = vm_spec.name if isinstance(vm_spec, VmSpec) else str(vm_spec)
         if outcome is not None:
-            _fold_vm_outcome(state, vm_name, outcome)
+            _fold_outcome(state, outcome, state.vm)
             rec = outcome.record
             if rec is not None:
                 status = "FAILED" if outcome.failed else rec.status
@@ -367,22 +365,9 @@ def run_vm_phase(
             ))
             print(f"  [{vm_name}] ERROR: {run_err}")
 
-    state.dump_for_ansible(state_output_path)
+    if state_output_path is not None:
+        state.dump_for_ansible(state_output_path)
     return state
-
-
-def _fold_remote_outcome(
-    state: FleetState, host_name: str, outcome: RemoteFlowOutcome
-) -> None:
-    if outcome.record is not None:
-        state.remote.append(outcome.record)
-    if outcome.changed:
-        state.changed = True
-    if outcome.failed:
-        state.failed = True
-    if outcome.error is not None:
-        state.errors.append(outcome.error)
-    state.warnings.extend(outcome.warnings)
 
 
 def run_remote_phase(
@@ -390,17 +375,17 @@ def run_remote_phase(
     settings: GlobalSettings,
     inventory_path: str = "hosts.ini",
     check: bool = False,
-    state_output_path: Union[str, Path] = "/tmp/fleet_remote_state.json",
+    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_remote_state.json",  # nosec B108 - tooling output path
 ) -> FleetState:
     """Run Phase 0 (remote host updates) via the Python driver.
 
     Loads all [remote_hosts] from inventory, runs them concurrently
-    (max_workers=remote_forks), and writes the resulting FleetState so
-    fleet-update.yml can merge it before Phase 0a.
+    (max_workers=remote_forks). When *state_output_path* is set, writes the
+    FleetState for tooling / molecule; run_fleet() passes None and merges in-memory.
 
     Never raises for per-host failures — those become FAILED records.
     """
-    hosts = inventory.load_remote_hosts(inventory_path)
+    hosts = inventory.load_remote_hosts(inventory_path, host_vars_dir=settings.host_vars_dir)
     dry_run = check or settings.fleet_dry_run or settings.remote_dry_run
     state = FleetState()
 
@@ -420,7 +405,7 @@ def run_remote_phase(
     for spec, outcome, run_err in results:
         host_name = spec.name if isinstance(spec, RemoteHostSpec) else str(spec)
         if outcome is not None:
-            _fold_remote_outcome(state, host_name, outcome)
+            _fold_outcome(state, outcome, state.remote)
             rec = outcome.record
             if rec is not None:
                 status = "FAILED" if outcome.failed else rec.status
@@ -434,19 +419,9 @@ def run_remote_phase(
             ))
             print(f"  [{host_name}] ERROR: {run_err}")
 
-    state.dump_for_ansible(state_output_path)
+    if state_output_path is not None:
+        state.dump_for_ansible(state_output_path)
     return state
-
-
-def _fold_node_outcome(state: FleetState, outcome: NodeFlowOutcome) -> None:
-    if outcome.record is not None:
-        state.node.append(outcome.record)
-    if outcome.changed:
-        state.changed = True
-    if outcome.failed:
-        state.failed = True
-    if outcome.error is not None:
-        state.errors.append(outcome.error)
 
 
 def run_node_phase(
@@ -454,21 +429,21 @@ def run_node_phase(
     settings: GlobalSettings,
     inventory_path: str = "hosts.ini",
     check: bool = False,
-    state_output_path: Union[str, Path] = "/tmp/fleet_node_state.json",
+    state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_node_state.json",  # nosec B108 - tooling output path
 ) -> FleetState:
     """Run Phase 2 (node OS updates) + Phase 3 (manager self-update) via the Python driver.
 
     Node processing is serial (one node at a time) and aborts on the first failure
     — mirroring Ansible's ``any_errors_fatal: true`` / ``serial: 1``. The manager
-    self-update always runs regardless of node failures (Phase 3 is ``ignore_errors``
-    in the legacy playbook and is independent of Phase 2 outcomes).
+    self-update always runs regardless of node failures (Phase 3 is independent of
+    Phase 2 outcomes).
 
-    Writes the resulting FleetState via dump_for_ansible() so fleet-update.yml can
-    seed fleet_node_data / fleet_changed / fleet_failed before Phase 4.
+    When *state_output_path* is set, writes the FleetState via dump_for_ansible()
+    for tooling / molecule; run_fleet() passes None and merges in-memory.
 
     Never raises for per-node failures — those become FAILED records.
     """
-    nodes = inventory.load_proxmox_nodes(inventory_path)
+    nodes = inventory.load_proxmox_nodes(inventory_path, host_vars_dir=settings.host_vars_dir)
     dry_run = check or settings.fleet_dry_run or settings.node_dry_run
     state = FleetState()
 
@@ -477,7 +452,7 @@ def run_node_phase(
         node_name = node_info["name"]
         executor = RunnerExecutor(node_name, inventory=inventory_path, check=check)
         outcome = run_node_update(node_name, executor, settings, dry_run=dry_run)
-        _fold_node_outcome(state, outcome)
+        _fold_outcome(state, outcome, state.node)
         status = outcome.record.status if outcome.record else "?"
         print(f"  [{node_name}] {status}")
         if outcome.failed:
@@ -486,9 +461,129 @@ def run_node_phase(
     # Phase 3: manager self-update always runs — independent of node failures.
     manager_ex = RunnerExecutor("localhost", inventory=inventory_path, check=check)
     manager_outcome = run_manager_update(manager_ex, settings, dry_run=dry_run)
-    _fold_node_outcome(state, manager_outcome)
+    _fold_outcome(state, manager_outcome, state.node)
     mgr_status = manager_outcome.record.status if manager_outcome.record else "?"
     print(f"  [Ansible-Manager] {mgr_status}")
 
-    state.dump_for_ansible(state_output_path)
+    if state_output_path is not None:
+        state.dump_for_ansible(state_output_path)
     return state
+
+
+def run_notify_phase(
+    *,
+    settings: GlobalSettings,
+    state: FleetState,
+    check: bool = False,
+) -> str:
+    """Run Phase 4 (final briefing) via the Python driver.
+
+    Consumes the *merged* FleetState (all phases), renders the briefing body
+    once, then: dispatches it to the resolved notifiers when ``should_notify``
+    holds; records the run history (carrying the rendered body) when history is
+    enabled; and pings the dead-man's-switch. The body is rendered
+    unconditionally so the history file captures the message even when
+    notification is suppressed.
+
+    Returns the rendered briefing body (handy for tests / logging). Never raises
+    — notification/history failures must not abort the run.
+    """
+    body = briefing.prepare_body(state)
+    failed = state.failed
+
+    if briefing.should_notify(
+        force_notify=settings.force_notify,
+        dry_run=settings.fleet_dry_run,
+        changed=state.changed,
+        failed=failed,
+    ):
+        notifiers.dispatch(
+            notifiers.resolve_notifiers(settings),
+            title=briefing.briefing_title(failed),
+            ntfy_title=briefing.ntfy_title(failed),
+            body=body,
+            color=briefing.discord_color(failed),
+            failed=failed,
+            retries=settings.notifier_retries,
+        )
+
+    if settings.fleet_history_enabled:
+        history.write_history(
+            state,
+            history_dir=settings.fleet_history_dir,
+            keep=settings.fleet_history_keep,
+            briefing=body,
+        )
+
+    notifiers.ping_deadmans(settings.fleet_deadmans_url, failed=failed,
+                            retries=settings.deadmans_retries)
+    return body
+
+
+def _merge_state(dst: FleetState, src: FleetState) -> None:
+    """Fold one phase's FleetState into the running fleet-wide state.
+
+    Record lists concatenate, the changed/failed flags OR-join, and the
+    error/warning logs accumulate. (Replaces the old per-phase merge plays —
+    everything now happens in-memory in run_fleet().)
+    """
+    dst.lxc.extend(src.lxc)
+    dst.vm.extend(src.vm)
+    dst.remote.extend(src.remote)
+    dst.node.extend(src.node)
+    dst.custom.extend(src.custom)
+    dst.errors.extend(src.errors)
+    dst.warnings.extend(src.warnings)
+    dst.changed = dst.changed or src.changed
+    dst.failed = dst.failed or src.failed
+
+
+def run_fleet(
+    *,
+    settings: GlobalSettings,
+    inventory_path: str = "hosts.ini",
+    check: bool = False,
+    extra_vars: Optional[Dict[str, Any]] = None,
+) -> int:
+    """End-to-end fleet update — the Python orchestrator (the sole entrypoint).
+
+    Runs the pre-flight apt-proxy check, then every phase in order
+    (remote → custom → lxc → vm → node+manager), merging each phase's FleetState
+    into one fleet-wide state, then renders/dispatches the final briefing.
+
+    Returns a process exit code: 1 if any phase recorded a failure, else 0.
+    Raises SystemExit(1) on a pre-flight proxy failure or a custom dependency-order
+    problem (both fail-loud, mirroring the legacy playbook).
+    """
+    ev = extra_vars or {}
+
+    # Pre-flight: the apt-cacher-ng proxy must be reachable or the whole run aborts
+    # (port of the "Verify Apt-Cacher-NG is Online" / "Halt if Proxy is Offline" play).
+    if settings.apt_proxy_ip:
+        try:
+            http.wait_for_port(settings.apt_proxy_ip, settings.apt_proxy_port,
+                               timeout=settings.apt_proxy_check_timeout)
+        except (TimeoutError, OSError):
+            print(
+                f"CRITICAL: Apt Proxy ({settings.apt_proxy_ip}) is unreachable. "
+                "Aborting fleet update.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
+    state = FleetState()
+    _merge_state(state, run_remote_phase(
+        settings=settings, inventory_path=inventory_path, check=check, state_output_path=None))
+    _merge_state(state, run_custom_phase(
+        settings=settings, inventory_path=inventory_path, extra_vars=ev, check=check,
+        state_output_path=None))
+    _merge_state(state, run_lxc_phase(
+        settings=settings, inventory_path=inventory_path, check=check, state_output_path=None))
+    _merge_state(state, run_vm_phase(
+        settings=settings, inventory_path=inventory_path, check=check, state_output_path=None))
+    _merge_state(state, run_node_phase(
+        settings=settings, inventory_path=inventory_path, check=check, state_output_path=None))
+
+    run_notify_phase(settings=settings, state=state, check=check)
+
+    return 1 if state.failed else 0

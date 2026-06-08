@@ -19,7 +19,8 @@ because the values exist by the time we evaluate).
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Protocol
+import time
+from typing import Any, Callable, Dict, List, Optional, Protocol
 
 import jinja2
 
@@ -83,7 +84,7 @@ def evaluate_when(when: Any, context: Dict[str, Any]) -> bool:
     if isinstance(when, bool):
         return when
     conditions = when if isinstance(when, (list, tuple)) else [when]
-    env = jinja2.Environment(undefined=jinja2.Undefined)
+    env = jinja2.Environment(undefined=jinja2.Undefined)  # nosec B701 - evaluates shell when: conditions, not HTML (no XSS surface)
     for cond in conditions:
         try:
             value = env.compile_expression(str(cond))(**context)
@@ -99,11 +100,14 @@ def run_steps(
     executor: StepExecutor,
     *,
     context: Optional[Dict[str, Any]] = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> Dict[str, str]:
     """Run each step in order. Returns the map of ``register`` name → trimmed stdout.
 
     Raises StepError on the first failing, non-ignored step (the flow's rescue
-    block converts that into a FAILED record + rollback).
+    block converts that into a FAILED record + rollback). Between failed retry
+    attempts the step's ``delay`` seconds are honoured; ``sleep`` is injectable
+    so tests stay fast (mirrors flows/node.py's ``_sleep``).
     """
     results: Dict[str, str] = {}
     extra = dict(context or {})
@@ -127,6 +131,8 @@ def run_steps(
             )
             if res.ok or step.ignore_errors:
                 break
+            if attempt < attempts - 1 and step.delay:
+                sleep(step.delay)
 
         if not res.ok and not step.ignore_errors:
             raise StepError(step.name, res)

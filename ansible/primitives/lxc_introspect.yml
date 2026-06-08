@@ -1,0 +1,62 @@
+---
+# Execution primitive: read all introspect data for an LXC container in one pass.
+# Combines pct config, pct status, update-script pull, and script content read
+# into a single ansible-runner subprocess, replacing four separate run_shell calls.
+# Makes no decisions. Invoked by proxmox_fleet.flows.lxc (introspect phase).
+#
+# Params (extravars):
+#   target_hosts   Proxmox node hosting the container (set by invoke_primitive)
+#   lxc_id         Container VMID
+#
+# Returns (via set_stats):
+#   config_stdout  stdout of pct config
+#   config_rc      rc of pct config (non-zero → template or missing container)
+#   status_stdout  stdout of pct status
+#   pull_rc        rc of pct pull (non-zero → no /usr/bin/update script)
+#   script_stdout  content of /usr/bin/update (empty when pull_rc != 0)
+- name: "lxc_introspect primitive"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  tasks:
+    - name: "Get container config"
+      ansible.builtin.command: "pct config {{ lxc_id }}"
+      register: _config
+      changed_when: false
+      check_mode: false
+
+    - name: "Get container status"
+      ansible.builtin.command: "pct status {{ lxc_id }}"
+      register: _status
+      changed_when: false
+      check_mode: false
+
+    - name: "Pull update script from container"
+      ansible.builtin.command: "pct pull {{ lxc_id }} /usr/bin/update /tmp/ansible_update_{{ lxc_id }}"
+      register: _pull
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Read update script content"
+      ansible.builtin.command: "cat /tmp/ansible_update_{{ lxc_id }}"
+      register: _script
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: _pull.rc == 0
+
+    - name: "Clean up pulled update script"
+      ansible.builtin.command: "rm -f /tmp/ansible_update_{{ lxc_id }}"
+      changed_when: false
+      check_mode: false
+      when: _pull.rc == 0
+
+    - name: "Return results"
+      ansible.builtin.set_stats:
+        data:
+          config_stdout: "{{ _config.stdout | default('') }}"
+          config_rc: "{{ _config.rc | default(1) }}"
+          status_stdout: "{{ _status.stdout | default('') }}"
+          pull_rc: "{{ _pull.rc | default(1) }}"
+          script_stdout: "{{ _script.stdout | default('') }}"
+        aggregate: false

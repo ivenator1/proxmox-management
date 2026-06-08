@@ -1,5 +1,4 @@
 """Tests for proxmox_fleet.models.settings.GlobalSettings."""
-import pytest
 
 from proxmox_fleet.models.settings import GlobalSettings
 
@@ -83,3 +82,35 @@ def test_node_fields_load_from_yaml(tmp_path):
     assert s.apt_proxy_port == 3143
     assert s.node_dry_run is True
     assert s.node_auto_reboot is False
+
+
+def test_integer_kuma_map_keys_are_coerced_to_str():
+    """vars.yml naturally writes integer vmids as keys; they must not crash load."""
+    s = GlobalSettings.model_validate({
+        "lxc_kuma_map": {101: 5},
+        "vm_kuma_map": {200: 9},
+        "remote_kuma_map": {"web": 3},
+    })
+    assert s.lxc_kuma_map == {"101": 5}
+    assert s.lxc_kuma_map.get("101") == 5
+    assert s.vm_kuma_map == {"200": 9}
+    assert s.remote_kuma_map == {"web": 3}
+
+
+def test_integer_kuma_map_keys_load_from_yaml(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text("lxc_kuma_map:\n  101: 5\n  102: 6\n")
+    s = GlobalSettings.load(f)
+    assert s.lxc_kuma_map == {"101": 5, "102": 6}
+
+
+def test_new_timeout_fields_have_correct_defaults():
+    s = GlobalSettings()
+    assert s.apt_proxy_check_timeout == 30.0
+    assert s.node_reboot_port_wait_timeout == 300.0
+    assert s.snapshot_retries == 3
+    assert s.snapshot_retry_delay == 15.0
+    assert s.notifier_retries == 15
+    assert s.deadmans_retries == 5
+    assert s.node_apt_retries == 5
+    assert s.node_apt_retry_delay == 30.0

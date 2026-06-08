@@ -5,10 +5,9 @@ Covers: normal update, update with reboot, snapshot warning, rescue/rollback,
 rescue without snapshot, dry-run, idle (nothing to upgrade), correct executor
 binding (qm commands must go to node_executor, not the VM executor).
 """
-import pytest
 
 from proxmox_fleet import http as http_mod
-from proxmox_fleet.flows.vm import VmFlowOutcome, run_vm_update
+from proxmox_fleet.flows.vm import run_vm_update
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.runner import PrimitiveResult
 
@@ -345,3 +344,32 @@ def test_kuma_not_called_when_idle(monkeypatch):
     run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings,
                   dry_run=False, api_host="1.2.3.4")
     assert polled == []
+
+
+# ---------------------------------------------------------------------------
+# snapshot_with_retry (VM variant — same helper, parallel assertion)
+# ---------------------------------------------------------------------------
+
+def test_snapshot_with_retry_vm_succeeds_after_failure():
+    from proxmox_fleet.executor import snapshot_with_retry
+
+    results = [
+        PrimitiveResult(rc=1, failed=True, changed=False, stdout="CT is locked"),
+        _ok(changed=True),
+    ]
+    calls = []
+
+    class LockedThenOkEx:
+        host = "my-vm"
+        def snapshot(self, vmid, *, snap_state, **kw):
+            calls.append(snap_state)
+            return results.pop(0)
+
+    result = snapshot_with_retry(
+        LockedThenOkEx(), "200", snap_state="present",
+        api_host="1.2.3.4", api_user="root@pam",
+        api_token_id="tok", api_token_secret="sec",
+        retries=2, _sleep=lambda s: None,
+    )
+    assert result.changed is True
+    assert len(calls) == 2

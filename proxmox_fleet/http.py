@@ -38,9 +38,15 @@ def request(
     data: Optional[bytes] = None,
     timeout: float = 30.0,
 ) -> HttpResponse:
-    """Single HTTP request. Raises urllib.error.HTTPError on 4xx/5xx."""
-    req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - operator-controlled URLs
+    """Single HTTP request. Raises urllib.error.HTTPError on 4xx/5xx.
+
+    Sets a browser-like ``User-Agent`` by default — urllib's stock
+    ``Python-urllib/x.y`` is blocked by Cloudflare-fronted hosts (e.g. Discord
+    webhooks return 403 Forbidden) unless overridden via ``headers``.
+    """
+    req_headers = {"User-Agent": "proxmox-fleet/1.0", **(headers or {})}
+    req = urllib.request.Request(url, data=data, method=method, headers=req_headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # nosec B310 - operator-controlled URLs
         raw = resp.read().decode("utf-8", errors="replace")
         return HttpResponse(status=resp.status, body=raw, headers=dict(resp.headers.items()))
 

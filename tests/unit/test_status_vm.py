@@ -3,7 +3,6 @@
 test_vm_report.py tests the Jinja expression directly; this file tests the
 Python function that replaces it. Both must agree on every case.
 """
-import pytest
 
 from proxmox_fleet.status import vm_rescue_status, vm_should_report, vm_status
 

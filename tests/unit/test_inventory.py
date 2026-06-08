@@ -1,7 +1,11 @@
-"""Tests for proxmox_fleet.inventory.load_custom_hosts and load_proxmox_nodes."""
-import pytest
+"""Tests for proxmox_fleet.inventory loaders (custom/nodes/vms/remote)."""
 
-from proxmox_fleet.inventory import load_custom_hosts, load_proxmox_nodes
+from proxmox_fleet.inventory import (
+    load_custom_hosts,
+    load_proxmox_nodes,
+    load_proxmox_vms,
+    load_remote_hosts,
+)
 
 
 def _write_ini(tmp_path, content: str) -> str:
@@ -90,10 +94,11 @@ def test_maintenance_window_from_host_vars(tmp_path):
         "maintenance_window:\n  days: [Sat, Sun]\n  start: '02:00'\n  end: '04:00'\n  tz: UTC\n",
     )
     specs = load_custom_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))
+    from proxmox_fleet.models.config import MaintenanceWindow
     mw = specs[0].maintenance_window
-    assert mw is not None
-    assert mw["days"] == ["Sat", "Sun"]
-    assert mw["start"] == "02:00"
+    assert isinstance(mw, MaintenanceWindow)
+    assert mw.days == ["Sat", "Sun"]
+    assert mw.start == "02:00"
 
 
 def test_custom_overrides_from_host_vars(tmp_path):
@@ -169,3 +174,83 @@ def test_proxmox_nodes_ansible_host_defaults_to_name(tmp_path):
 def test_proxmox_nodes_missing_section_returns_empty(tmp_path):
     path = _write_ini(tmp_path, "[other_group]\nhost1\n")
     assert load_proxmox_nodes(path) == []
+
+
+def test_proxmox_nodes_ansible_host_from_host_vars(tmp_path):
+    """Regression: a node whose IP lives only in host_vars must resolve to the IP,
+    not the bare name — that value becomes the snapshot API api_host (must be an IP)."""
+    path = _write_ini(tmp_path, "[proxmox_nodes]\npve-01\n")
+    _write_host_vars(tmp_path, "pve-01", "ansible_host: 10.0.0.10\n")
+    nodes = load_proxmox_nodes(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert nodes[0]["ansible_host"] == "10.0.0.10"
+
+
+def test_proxmox_nodes_inline_wins_over_host_vars(tmp_path):
+    path = _write_ini(tmp_path, "[proxmox_nodes]\npve-01 ansible_host=10.0.0.10\n")
+    _write_host_vars(tmp_path, "pve-01", "ansible_host: 9.9.9.9\n")
+    nodes = load_proxmox_nodes(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert nodes[0]["ansible_host"] == "10.0.0.10"
+
+
+# --- load_proxmox_vms ---
+
+def test_proxmox_vms_inline_vars(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[proxmox_vms]\n"
+        "vm-web ansible_host=10.0.0.30 vmid=200 pve_node=pve-01\n",
+    )
+    vms = load_proxmox_vms(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert len(vms) == 1
+    assert vms[0].name == "vm-web"
+    assert vms[0].ansible_host == "10.0.0.30"
+    assert vms[0].vmid == "200"
+    assert vms[0].pve_node == "pve-01"
+
+
+def test_proxmox_vms_from_host_vars(tmp_path):
+    path = _write_ini(tmp_path, "[proxmox_vms]\nvm-web\n")
+    _write_host_vars(
+        tmp_path, "vm-web",
+        "ansible_host: 10.0.0.30\nvmid: 200\npve_node: pve-02\n",
+    )
+    vms = load_proxmox_vms(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert vms[0].vmid == "200"
+    assert vms[0].pve_node == "pve-02"
+    assert vms[0].ansible_host == "10.0.0.30"
+
+
+def test_proxmox_vms_missing_section_returns_empty(tmp_path):
+    path = _write_ini(tmp_path, "[remote_hosts]\n")
+    assert load_proxmox_vms(path) == []
+
+
+# --- load_remote_hosts ---
+
+def test_remote_hosts_inline_and_host_vars(tmp_path):
+    path = _write_ini(tmp_path, "[remote_hosts]\nweb-01 ansible_host=10.0.0.40\n")
+    _write_host_vars(
+        tmp_path, "web-01",
+        "pre_update_cmd: systemctl stop app\n"
+        "maintenance_window:\n  start: '01:00'\n  end: '02:00'\n",
+    )
+    hosts = load_remote_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert len(hosts) == 1
+    assert hosts[0].name == "web-01"
+    assert hosts[0].ansible_host == "10.0.0.40"
+    assert hosts[0].pre_update_cmd == "systemctl stop app"
+    assert hosts[0].maintenance_window.start == "01:00"
+
+
+def test_remote_hosts_order_preserved(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[remote_hosts]\nhost-b\nhost-a\n",
+    )
+    hosts = load_remote_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert [h.name for h in hosts] == ["host-b", "host-a"]
+
+
+def test_remote_hosts_missing_section_returns_empty(tmp_path):
+    path = _write_ini(tmp_path, "[proxmox_nodes]\npve-01\n")
+    assert load_remote_hosts(path) == []

@@ -12,7 +12,15 @@ from typing import Any, Dict, List, Optional
 import pytest
 import yaml
 
-from proxmox_fleet.driver import _deep_merge, run_custom_phase, run_node_phase
+import proxmox_fleet.driver as driver_mod
+from proxmox_fleet.driver import (
+    _deep_merge,
+    _merge_state,
+    run_custom_phase,
+    run_fleet,
+    run_node_phase,
+    run_notify_phase,
+)
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import FleetState
 from proxmox_fleet.runner import PrimitiveResult
@@ -515,3 +523,175 @@ def test_dep_failed_propagates_to_next_host(tmp_path, monkeypatch):
     # app-01 should have a warning (dep skip), not a FAILED record.
     assert any("dependency" in w.warning.lower() for w in state.warnings)
     assert "do-app" not in executor.commands
+
+
+# --------------------------------------------------------------------------- #
+# run_notify_phase — Phase 4 (briefing / history / notifiers)
+# --------------------------------------------------------------------------- #
+
+def _notify_state(**kw) -> FleetState:
+    return FleetState.from_raw(kw)
+
+
+def _patch_notifiers(monkeypatch):
+    """Capture dispatch / ping_deadmans calls made by the driver."""
+    calls: Dict[str, List[Any]] = {"dispatch": [], "ping": []}
+    monkeypatch.setattr(
+        "proxmox_fleet.driver.notifiers.dispatch",
+        lambda nl, **kw: calls["dispatch"].append((nl, kw)),
+    )
+    monkeypatch.setattr(
+        "proxmox_fleet.driver.notifiers.ping_deadmans",
+        lambda url, **kw: calls["ping"].append((url, kw)),
+    )
+    return calls
+
+
+def test_notify_phase_dispatches_and_writes_history(tmp_path, monkeypatch):
+    calls = _patch_notifiers(monkeypatch)
+    state = _notify_state(
+        fleet_changed=True,
+        fleet_node_data=[{"node": "pve-01", "status": "OK"}],
+        fleet_lxc_data=[{"node": "pve-01", "name": "sonarr", "id": "101",
+                         "app": "Updated: v4.0 → v4.1", "os": "OK", "snap": True}],
+    )
+    settings = GlobalSettings(
+        discord_webhook="https://d/hook",
+        fleet_history_dir=str(tmp_path),
+        fleet_deadmans_url="https://hc.io/abc",
+    )
+
+    body = run_notify_phase(settings=settings, state=state)
+
+    # dispatched once, to the synthesized discord notifier, with the rendered body
+    assert len(calls["dispatch"]) == 1
+    notifier_list, kw = calls["dispatch"][0]
+    assert notifier_list == [{"type": "discord", "enabled": True, "webhook": "https://d/hook"}]
+    assert kw["body"] == body
+    assert kw["title"] == "✅ Briefing: All Systems Clear"
+    assert kw["color"] == 3066993
+
+    # dead-man pinged
+    assert calls["ping"][0][0] == "https://hc.io/abc"
+    assert calls["ping"][0][1]["failed"] is False
+
+    # history written, carrying the exact briefing body
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["briefing"] == body
+    assert "sonarr" in latest["briefing"]
+
+
+def test_notify_phase_suppressed_when_idle_but_history_still_written(tmp_path, monkeypatch):
+    calls = _patch_notifiers(monkeypatch)
+    state = _notify_state()  # nothing changed/failed
+    settings = GlobalSettings(discord_webhook="https://d/hook", fleet_history_dir=str(tmp_path))
+
+    body = run_notify_phase(settings=settings, state=state)
+
+    assert calls["dispatch"] == []  # should_notify is False
+    # history still records the (empty) briefing
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["briefing"] == body
+
+
+def test_notify_phase_force_notify_overrides_idle(tmp_path, monkeypatch):
+    calls = _patch_notifiers(monkeypatch)
+    settings = GlobalSettings(discord_webhook="https://d/hook",
+                              fleet_history_dir=str(tmp_path), force_notify=True)
+    run_notify_phase(settings=settings, state=_notify_state())
+    assert len(calls["dispatch"]) == 1
+
+
+def test_notify_phase_history_disabled(tmp_path, monkeypatch):
+    _patch_notifiers(monkeypatch)
+    settings = GlobalSettings(fleet_history_enabled=False, fleet_history_dir=str(tmp_path))
+    run_notify_phase(settings=settings, state=_notify_state(fleet_changed=True))
+    assert not (tmp_path / "latest.json").exists()
+
+
+def test_notify_phase_failed_state_titles(tmp_path, monkeypatch):
+    calls = _patch_notifiers(monkeypatch)
+    settings = GlobalSettings(discord_webhook="https://d/hook", fleet_history_dir=str(tmp_path))
+    run_notify_phase(settings=settings, state=_notify_state(fleet_failed=True))
+    _, kw = calls["dispatch"][0]
+    assert kw["title"] == "⚠️ Briefing: Failures Detected"
+    assert kw["ntfy_title"] == "Fleet Update: Failures Detected"
+    assert kw["color"] == 15158332
+    assert calls["ping"][0][1]["failed"] is True
+
+
+# --- _merge_state -------------------------------------------------------------
+
+def test_merge_state_concatenates_and_or_joins():
+    dst = FleetState.from_raw({
+        "fleet_lxc_data": [{"node": "n1", "name": "a", "id": "1", "app": "OK"}],
+        "fleet_changed": True,
+        "fleet_failed": False,
+        "fleet_error_log": [{"host": "h1", "task": "t", "error": "e"}],
+    })
+    src = FleetState.from_raw({
+        "fleet_lxc_data": [{"node": "n2", "name": "b", "id": "2", "app": "OK"}],
+        "fleet_vm_data": [{"node": "n2", "vmid": "9", "name": "vm", "status": "OK"}],
+        "fleet_changed": False,
+        "fleet_failed": True,
+        "fleet_warning_log": [{"host": "h2", "task": "u", "warning": "w"}],
+    })
+    _merge_state(dst, src)
+    assert [r.id for r in dst.lxc] == ["1", "2"]
+    assert [r.vmid for r in dst.vm] == ["9"]
+    assert dst.changed is True   # True or False
+    assert dst.failed is True    # False or True
+    assert len(dst.errors) == 1 and len(dst.warnings) == 1
+
+
+# --- run_fleet orchestrator ---------------------------------------------------
+
+def _stub_phases(monkeypatch, *, remote=None, custom=None, lxc=None, vm=None, node=None):
+    def mk(state):
+        def _fn(**kwargs):
+            return state if state is not None else FleetState()
+        return _fn
+    monkeypatch.setattr(driver_mod, "run_remote_phase", mk(remote))
+    monkeypatch.setattr(driver_mod, "run_custom_phase", mk(custom))
+    monkeypatch.setattr(driver_mod, "run_lxc_phase", mk(lxc))
+    monkeypatch.setattr(driver_mod, "run_vm_phase", mk(vm))
+    monkeypatch.setattr(driver_mod, "run_node_phase", mk(node))
+
+
+def test_run_fleet_merges_all_phases(monkeypatch):
+    captured = {}
+
+    def _notify(*, settings, state, check=False):
+        captured["state"] = state
+        return "body"
+
+    monkeypatch.setattr(driver_mod, "run_notify_phase", _notify)
+    _stub_phases(
+        monkeypatch,
+        remote=FleetState.from_raw({"fleet_remote_data": [{"host": "r", "status": "OK"}]}),
+        node=FleetState.from_raw({"fleet_node_data": [{"node": "n", "status": "OK"}]}),
+    )
+    settings = GlobalSettings(apt_proxy_ip="")  # skip pre-flight
+    rc = run_fleet(settings=settings, inventory_path="x", check=True)
+    assert rc == 0
+    assert len(captured["state"].remote) == 1
+    assert len(captured["state"].node) == 1
+
+
+def test_run_fleet_returns_1_on_failure(monkeypatch):
+    monkeypatch.setattr(driver_mod, "run_notify_phase", lambda **kw: "body")
+    _stub_phases(monkeypatch, lxc=FleetState.from_raw({"fleet_failed": True}))
+    rc = run_fleet(settings=GlobalSettings(apt_proxy_ip=""), inventory_path="x")
+    assert rc == 1
+
+
+def test_run_fleet_preflight_abort(monkeypatch):
+    def _boom(host, port, **kw):
+        raise TimeoutError("nope")
+
+    monkeypatch.setattr(driver_mod.http, "wait_for_port", _boom)
+    monkeypatch.setattr(driver_mod, "run_notify_phase", lambda **kw: "body")
+    _stub_phases(monkeypatch)
+    with pytest.raises(SystemExit):
+        run_fleet(settings=GlobalSettings(apt_proxy_ip="10.0.0.1", apt_proxy_port=3142),
+                  inventory_path="x")

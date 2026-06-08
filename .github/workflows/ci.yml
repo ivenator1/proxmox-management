@@ -3,9 +3,9 @@ name: CI
 
 "on":
   push:
-    branches: [main]
+    branches: [main, testing]
   pull_request:
-    branches: [main]
+    branches: [main, testing]
 
 jobs:
   lint-yaml:
@@ -27,10 +27,8 @@ jobs:
         run: pip install ansible-lint
       - name: Install collections
         run: ansible-galaxy collection install community.proxmox community.general
-      - name: Create stub vars.yml for linting
-        run: cp vars.yml.example vars.yml
       - name: Run ansible-lint
-        run: ansible-lint fleet-update.yml
+        run: ansible-lint ansible/primitives/
 
   syntax-check:
     name: syntax-check
@@ -41,24 +39,41 @@ jobs:
         run: pip install ansible
       - name: Install collections
         run: ansible-galaxy collection install community.proxmox community.general
-      - name: Create stub inventory and vars
+      - name: Syntax check execution primitives
         run: |
-          cp vars.yml.example vars.yml
-          cp hosts.ini.example hosts.ini
-      - name: Syntax check
-        run: ansible-playbook fleet-update.yml --syntax-check
+          for f in ansible/primitives/*.yml; do
+            echo "== $f =="
+            ansible-playbook "$f" --syntax-check -i localhost,
+          done
 
   unit-tests:
-    name: Python unit tests
+    name: Python unit tests (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt pytest-cov
+      - name: Install proxmox_fleet package
+        run: pip install -e .
+      - name: Run pytest with coverage
+        run: pytest tests/unit/ -v --tb=short --cov=proxmox_fleet --cov-report=term-missing
+
+  security:
+    name: bandit security scan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install test dependencies
-        run: pip install -r tests/requirements.txt
-      - name: Install proxmox_fleet package
-        run: pip install -e .
-      - name: Run pytest
-        run: pytest tests/unit/ -v --tb=short
+      - name: Install bandit
+        run: pip install bandit
+      - name: Run bandit (medium+ severity)
+        run: bandit -r proxmox_fleet/ -ll
 
   typecheck:
     name: mypy
@@ -69,6 +84,26 @@ jobs:
         run: pip install -e '.[dev]'
       - name: Run mypy
         run: python -m mypy proxmox_fleet/
+
+  lint-python:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ruff
+        run: pip install ruff
+      - name: Run ruff
+        run: ruff check proxmox_fleet/ tests/
+      - name: Run ruff on wrapper script
+        run: ruff check fleet-update.py
+
+  lint-wrapper:
+    name: fleet-update.py syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check wrapper script
+        run: python3 -m py_compile fleet-update.py && echo "OK"
 
   molecule-lxc-update:
     name: Molecule — lxc_update ${{ matrix.scenario }}

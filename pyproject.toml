@@ -22,6 +22,7 @@ dev = [
     "pyyaml>=6",
     "types-PyYAML",
     "pydantic>=2,<3",
+    "ruff>=0.4",
 ]
 
 [project.scripts]
@@ -29,6 +30,16 @@ fleet-update = "proxmox_fleet.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["proxmox_fleet*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+# F = pyflakes (unused imports/vars, undefined names), E = pycodestyle errors.
+select = ["F", "E"]
+# E501 (line length) is advisory here; line-length above keeps it reasonable.
+ignore = ["E501"]
 
 [tool.mypy]
 python_version = "3.10"
