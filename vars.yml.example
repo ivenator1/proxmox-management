@@ -87,6 +87,16 @@ exclude_list:
 os_update_exclude_list:
   - "120" #PBS
 
+# List of tagged LXC IDs to skip the community-script app update for
+# (the 'apt/apk' OS update still runs)
+app_update_exclude_list:
+  - "xxx"
+
+# List of untagged LXC IDs to manage for OS updates only — pulled into discovery
+# even without the community-script tag (no /usr/bin/update; app reports "NO SCRIPT")
+os_only_lxc_list:
+  - "xxx"
+
 # List of IDs to update but not snapshot
 snapshot_exclude_list:
   - "117" #Plex

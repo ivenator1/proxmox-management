@@ -225,8 +225,11 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
 
 ### Key non-obvious details
 
-- **Tag-based LXC discovery**: only LXCs tagged `community-script` or `proxmox-helper-scripts`
-  in PVE are processed (set in PVE UI → Container → Options → Tags).
+- **Tag-based LXC discovery**: LXCs tagged `community-script` or `proxmox-helper-scripts`
+  in PVE are processed (set in PVE UI → Container → Options → Tags), **plus** any IDs in
+  `os_only_lxc_list` (pulled in for OS updates only — they lack `/usr/bin/update`, so the
+  flow naturally reports `app="NO SCRIPT"`). `app_update_exclude_list` is the inverse for
+  already-tagged LXCs: keep the OS update, skip the community-script app update (`SKIPPED`).
 - **GitHub HTTPS runs on the manager** (`http.request`/`get_json`, `urllib`) — never the PVE node.
 - **`pve_node` is a fallback hint only**: `run_vm_phase()` discovers the live VM→node map via
   `pvesh get /cluster/resources` (HA-aware); `pve_node` is used only when discovery fails.

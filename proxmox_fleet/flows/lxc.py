@@ -107,15 +107,22 @@ def _read_version(executor: Executor, lxc_id: str, script_name: str, os_type: st
 
 
 def _discover_lxcs(executor: Executor, settings: GlobalSettings) -> List[str]:
-    """List container VMIDs on the node that carry any of the configured fleet tags."""
+    """List container VMIDs on the node that carry any of the configured fleet tags,
+    plus any IDs explicitly listed in os_only_lxc_list (OS updates only — they lack
+    /usr/bin/update, so the flow naturally reports app="NO SCRIPT")."""
     tag_regex = "|".join(settings.lxc_tags)
+    extra_ids = [str(x) for x in settings.os_only_lxc_list]
+    extra_clause = ""
+    if extra_ids:
+        extra_regex = "|".join(extra_ids)
+        extra_clause = f' || echo "$vmid" | grep -qxE \'({extra_regex})\''
     # Use `while read vmid rest` instead of awk to extract the first field —
     # awk's $1 gets expanded through extravars/Jinja2/shell quoting layers.
     # if/fi ensures the loop always exits 0 (grep non-match would exit 1 and
     # cause _harvest() to discard stdout as a failed task).
     cmd = (
         f"pct list | tail -n +2 | while read vmid rest; do "
-        f"if pct config \"$vmid\" 2>/dev/null | grep -qE '^tags:.*({tag_regex})'; "
+        f"if pct config \"$vmid\" 2>/dev/null | grep -qE '^tags:.*({tag_regex})'{extra_clause}; "
         f"then echo \"$vmid\"; fi; done"
     )
     res = executor.run_shell(cmd, changed_when=False)
@@ -198,6 +205,7 @@ def run_lxc_update(
 
         pull_rc_val = introspect_res.facts.get("pull_rc", 1)
         lxc_no_update_script = int(pull_rc_val) != 0
+        app_excluded = lxc_id in {str(x) for x in settings.app_update_exclude_list}
 
         if settings.lxc_verbose:
             _vprint(node, lxc_id, name, f"script={'NONE (pull failed)' if lxc_no_update_script else 'found'}")
@@ -228,28 +236,31 @@ def run_lxc_update(
         # Dry-check — version compare only, no mutations
         # ------------------------------------------------------------------
         if dry_run:
-            gh_repo = ct_info.get("gh_repo", "")
-            installed_ver = ""
-            latest_tag = ""
-            fetch_ok = True
+            if app_excluded:
+                dry_status = "SKIPPED"
+            else:
+                gh_repo = ct_info.get("gh_repo", "")
+                installed_ver = ""
+                latest_tag = ""
+                fetch_ok = True
 
-            if ct_script_name and gh_repo:
-                installed_ver = _read_version(executor, lxc_id, ct_script_name, lxc_os)
-                try:
-                    data = http_mod.get_json(
-                        f"https://api.github.com/repos/{gh_repo}/releases/latest",
-                        headers={"Accept": "application/vnd.github+json"},
-                    )
-                    latest_tag = str((data or {}).get("tag_name", "")).strip()
-                except Exception:  # noqa: BLE001
-                    fetch_ok = False
+                if ct_script_name and gh_repo:
+                    installed_ver = _read_version(executor, lxc_id, ct_script_name, lxc_os)
+                    try:
+                        data = http_mod.get_json(
+                            f"https://api.github.com/repos/{gh_repo}/releases/latest",
+                            headers={"Accept": "application/vnd.github+json"},
+                        )
+                        latest_tag = str((data or {}).get("tag_name", "")).strip()
+                    except Exception:  # noqa: BLE001
+                        fetch_ok = False
 
-            dry_status = lxc_dry_run_status(
-                gh_repo=gh_repo,
-                fetch_ok=fetch_ok,
-                installed_ver=installed_ver,
-                latest_tag=latest_tag,
-            )
+                dry_status = lxc_dry_run_status(
+                    gh_repo=gh_repo,
+                    fetch_ok=fetch_ok,
+                    installed_ver=installed_ver,
+                    latest_tag=latest_tag,
+                )
             outcome.record = LxcRecord(
                 node=node, name=name, id=lxc_id,
                 app=dry_status, os="", snap=False,
@@ -283,7 +294,7 @@ def run_lxc_update(
         # ------------------------------------------------------------------
         # 1. Read pre-update version
         ver_before = ""
-        if ct_script_name and not lxc_no_update_script:
+        if ct_script_name and not lxc_no_update_script and not app_excluded:
             ver_before = _read_version(executor, lxc_id, ct_script_name, lxc_os)
 
         # 2. OS update (skip if excluded)
@@ -300,7 +311,7 @@ def run_lxc_update(
 
         # 3. dpkg hash before app update
         dpkg_before = ""
-        if not lxc_no_update_script:
+        if not lxc_no_update_script and not app_excluded:
             hash_cmd = _dpkg_hash_cmd(lxc_id, lxc_os)
             if hash_cmd:
                 dpkg_res = executor.run_shell(hash_cmd, changed_when=False)
@@ -317,7 +328,7 @@ def run_lxc_update(
         app_changed = False
         shell = _build_shell(lxc_os)
 
-        if not lxc_no_update_script:
+        if not lxc_no_update_script and not app_excluded:
             app_res = executor.lxc_app_update(
                 lxc_id,
                 lxc_shell=shell,
@@ -337,7 +348,7 @@ def run_lxc_update(
         # 6-7. dpkg hash after + version after (batched into one primitive)
         dpkg_after = ""
         ver_after = ""
-        if not lxc_no_update_script:
+        if not lxc_no_update_script and not app_excluded:
             hash_cmd = _dpkg_hash_cmd(lxc_id, lxc_os)
             safe_script_name = ct_script_name.lower().replace("-", "") if ct_script_name else ""
             post_res = executor.post_update(
@@ -374,6 +385,7 @@ def run_lxc_update(
             is_running=is_running,
             dry_run=False,
             no_update_script=lxc_no_update_script,
+            excluded=app_excluded,
             app_failed=app_failed,
             app_changed=app_changed,
             ver_before=ver_before,

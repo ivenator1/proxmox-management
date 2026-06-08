@@ -8,7 +8,7 @@ import time
 
 
 from proxmox_fleet import http as http_mod
-from proxmox_fleet.flows.lxc import run_lxc_update
+from proxmox_fleet.flows.lxc import _discover_lxcs, run_lxc_update
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.runner import PrimitiveResult
 
@@ -441,6 +441,29 @@ def test_os_excluded(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# App update excluded
+# ---------------------------------------------------------------------------
+
+
+def test_app_excluded(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = ScriptedLxcExecutor(
+        introspect_facts=_INTROSPECT_WITH_SCRIPT,
+        script={"reboot-required": [_fail(rc=1)]},
+        lxc_os_result=_ok(stdout="2 upgraded, 0 newly installed", changed=True),
+    )
+    settings = _settings(app_update_exclude_list=["101"])
+    out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10")
+    assert any("apt-get" in c for c in ex.commands)
+    assert not any(c.startswith("lxc_app_update:") for c in ex.commands)
+    assert not any(c.startswith("post_update:") for c in ex.commands)
+    assert out.record is not None
+    assert out.record.app == "SKIPPED"
+    assert out.record.os.startswith("Updated")
+
+
+# ---------------------------------------------------------------------------
 # dpkg hash detects change when versions match
 # ---------------------------------------------------------------------------
 
@@ -601,3 +624,30 @@ def test_snapshot_with_retry_returns_failed_after_exhaustion():
     assert result.failed is True
     assert result.changed is False
     assert len(ex.calls) == 3  # initial + 2 retries
+
+
+# ---------------------------------------------------------------------------
+# _discover_lxcs — os_only_lxc_list union
+# ---------------------------------------------------------------------------
+
+
+def test_discover_lxcs_includes_os_only_ids():
+    ex = ScriptedLxcExecutor(default=_ok(stdout="101\n105\n"))
+    settings = _settings(os_only_lxc_list=["105"])
+    ids = _discover_lxcs(ex, settings)
+    assert "grep -qxE '(105)'" in ex.commands[0]
+    assert ids == ["101", "105"]
+
+
+def test_discover_lxcs_no_os_only_list_keeps_command_unchanged():
+    ex = ScriptedLxcExecutor(default=_ok(stdout="101\n"))
+    settings = _settings()
+    _discover_lxcs(ex, settings)
+    assert "grep -qxE" not in ex.commands[0]
+
+
+def test_discover_lxcs_exclude_list_wins_over_os_only_list():
+    ex = ScriptedLxcExecutor(default=_ok(stdout="101\n105\n"))
+    settings = _settings(os_only_lxc_list=["105"], exclude_list=["105"])
+    ids = _discover_lxcs(ex, settings)
+    assert ids == ["101"]

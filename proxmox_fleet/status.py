@@ -90,6 +90,7 @@ def lxc_app_status(
     dry_run: bool = False,
     dry_run_status: str = "",
     no_update_script: bool = False,
+    excluded: bool = False,
     app_failed: bool = False,
     app_changed: bool = False,
     ver_before: str = "",
@@ -110,6 +111,8 @@ def lxc_app_status(
         return dry_run_status if dry_run_status else "dry-run"
     if no_update_script:
         return "NO SCRIPT"
+    if excluded:
+        return "SKIPPED"
     if app_failed:
         return "FAILED"
 
