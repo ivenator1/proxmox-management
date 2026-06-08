@@ -45,7 +45,9 @@ class GlobalSettings(BaseModel):
     lxc_kuma_map: Dict[str, Any] = Field(default_factory=dict)
     exclude_list: List[str] = Field(default_factory=list)
     os_update_exclude_list: List[str] = Field(default_factory=list)
+    app_update_exclude_list: List[str] = Field(default_factory=list)
     snapshot_exclude_list: List[str] = Field(default_factory=list)
+    os_only_lxc_list: List[str] = Field(default_factory=list)
 
     # vm_update phase settings
     vm_dry_run: bool = False

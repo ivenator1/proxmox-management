@@ -203,7 +203,7 @@ def run_lxc_phase(
             ))
             continue
 
-        print(f"[{node_name}] found {len(lxc_ids)} tagged LXC(s): {', '.join(lxc_ids) or 'none'}")
+        print(f"[{node_name}] found {len(lxc_ids)} managed LXC(s): {', '.join(lxc_ids) or 'none'}")
 
         # Concurrent per-container updates (lxc_continue_on_error is the default)
         def _run_one(lxc_id: str) -> LxcFlowOutcome:

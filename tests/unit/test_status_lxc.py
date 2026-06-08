@@ -54,6 +54,24 @@ def test_app_failed():
     assert lxc_app_status(app_failed=True) == "FAILED"
 
 
+def test_app_excluded_from_app_update():
+    assert lxc_app_status(excluded=True) == "SKIPPED"
+
+
+def test_app_excluded_id_no_match():
+    assert lxc_app_status(excluded=False) == "OK"
+
+
+def test_no_update_script_wins_over_excluded():
+    # Nothing to skip when the container has no app-update script at all.
+    assert lxc_app_status(no_update_script=True, excluded=True) == "NO SCRIPT"
+
+
+def test_excluded_wins_over_app_failed():
+    # The step never ran, so it can't have failed.
+    assert lxc_app_status(excluded=True, app_failed=True) == "SKIPPED"
+
+
 def test_version_updated():
     assert (
         lxc_app_status(app_changed=True, ver_before="v4.0", ver_after="v4.1")
