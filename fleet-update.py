@@ -20,10 +20,15 @@ from pathlib import Path
 
 def _bootstrap_venv() -> None:
     repo_root = Path(__file__).resolve().parent
-    venv_python = repo_root / ".venv" / "bin" / "python"
+    venv_dir = repo_root / ".venv"
+    venv_python = venv_dir / "bin" / "python"
     if venv_python.exists():
-        venv_str = str(venv_python)
-        if os.path.realpath(sys.executable) != os.path.realpath(venv_str):
+        # Compare sys.prefix, not realpath(sys.executable): venvs created
+        # without --copies symlink to the base interpreter, so the venv
+        # python and the system python can share the same realpath while
+        # having different sys.prefix (and thus different site-packages).
+        if Path(sys.prefix).resolve() != venv_dir.resolve():
+            venv_str = str(venv_python)
             os.execv(venv_str, [venv_str] + sys.argv)
     else:
         try:
