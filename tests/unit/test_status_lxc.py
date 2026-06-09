@@ -225,8 +225,12 @@ def test_report_app_failed_is_included():
     assert lxc_should_report("FAILED", "OK", dry_run=False) is True
 
 
-def test_report_app_no_script_is_included():
-    assert lxc_should_report("NO SCRIPT", "OK", dry_run=False) is True
+def test_report_app_no_script_os_ok_is_suppressed():
+    assert lxc_should_report("NO SCRIPT", "OK", dry_run=False) is False
+
+
+def test_report_app_no_script_os_updated_is_included():
+    assert lxc_should_report("NO SCRIPT", "Updated (3 upgraded)", dry_run=False) is True
 
 
 def test_report_app_never_started_is_included():

@@ -188,15 +188,14 @@ def lxc_rescue_app_status(
 def lxc_should_report(app: str, os: str, *, dry_run: bool) -> bool:
     """The `when:` gate on the 'Append LXC record' task in report.yml.
 
-    Idle containers (app='OK', os='OK') are suppressed. Mirrors:
-      lxc_dry_run | bool or
-      (tmp_app | lower) is search('updated|failed|no script|never started') or
-      (tmp_os  | lower) is search('updated|failed')
+    Idle containers (app='OK', os='OK') are suppressed. 'NO SCRIPT' is only
+    reported when the OS also has something to show (updated|failed), so that
+    os_only_lxc_list containers don't appear on idle runs.
     """
     if dry_run:
         return True
     app_l = app.strip().lower()
-    if re.search(r"updated|failed|no script|never started", app_l):
+    if re.search(r"updated|failed|never started", app_l):
         return True
     os_l = os.strip().lower()
     return bool(re.search(r"updated|failed", os_l))
