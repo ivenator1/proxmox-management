@@ -244,11 +244,25 @@ def test_dry_run(monkeypatch):
 
 
 def test_no_update_script(monkeypatch):
+    # NO SCRIPT + idle OS → suppressed (no record)
     monkeypatch.setattr(time, "sleep", lambda s: None)
     ex = ScriptedLxcExecutor(
         introspect_facts=_INTROSPECT_NO_SCRIPT,
         script={"reboot-required": [_fail(rc=1)]},
         lxc_os_result=_ok(stdout="0 upgraded, 0 newly installed"),
+    )
+    out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
+    assert out.record is None
+    assert out.failed is False
+
+
+def test_no_update_script_os_updated(monkeypatch):
+    # NO SCRIPT + OS changed → record emitted
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    ex = ScriptedLxcExecutor(
+        introspect_facts=_INTROSPECT_NO_SCRIPT,
+        script={"reboot-required": [_fail(rc=1)]},
+        lxc_os_result=_ok(stdout="1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded."),
     )
     out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
     assert out.record is not None
