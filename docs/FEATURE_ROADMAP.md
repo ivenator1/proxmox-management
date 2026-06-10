@@ -10,6 +10,8 @@ phases update everything in one wave, and there is no UI or pending-update visib
 
 ### S1. `--history` CLI — view past runs
 
+**Status: ✅ Implemented.**
+
 **Gap**: `history.py` writes `run-<ts>.json` + `latest.json` to `fleet_history_dir`, but nothing
 ever reads them back; users must `cat` JSON manually.
 
@@ -25,6 +27,8 @@ naming/pruning conventions); flag parsing in `proxmox_fleet/cli.py` plus a pass-
 **Effort**: ~½ day. No new dependencies.
 
 ### S2. Generic webhook + Telegram notifiers
+
+**Status: ✅ Implemented.**
 
 **Gap**: `notifiers.dispatch()` supports only `discord` and `ntfy`; anything else needs code.
 
@@ -46,6 +50,8 @@ the existing per-notifier error-swallowing + `notifier_retries`. Schema addition
 
 ### M1. Host/phase targeting: `--limit` and `--phases`
 
+**Status: ✅ Implemented.**
+
 **Gap**: every run is fleet-wide; there is no way to re-run one failed host or test a single LXC
 without editing `hosts.ini` or waiting through all phases.
 
@@ -66,6 +72,8 @@ serial / abort-on-first-failure semantics. Tests extend `test_driver.py` and `te
 phase helper.
 
 ### M2. Snapshot/rollback for the `custom_update` flow (v2)
+
+**Status: ✅ Implemented.**
 
 **Gap**: `flows/custom.py` is explicitly "v1, no snapshot" — rescue runs an opaque
 `rollback_command` and hopes. Yet most `[custom_hosts]` are LXCs/VMs on PVE, and all snapshot
@@ -90,6 +98,8 @@ Status strings gain `FAILED + ROLLED BACK` / `FAILED (NO SNAPSHOT)` parity via `
 
 ### L1. Canary / staged rollout
 
+**Status: ✅ Implemented.**
+
 **Gap**: Phases 0/1/1b update everything concurrently in one wave; a bad upstream package can
 take out the whole fleet between two runs.
 
@@ -108,6 +118,8 @@ Tests: `test_driver.py` wave/abort/soak cases with monkeypatched sleep.
 **Effort**: ~1–2 weeks. Big blast-radius reduction.
 
 ### L2. Fleet web dashboard: pending updates (PatchMon-style) + run history + run trigger
+
+**Status: 🚧 Partially implemented — `--scan` (pillar 1's data source) is done; the FastAPI app remains.**
 
 **Gap**: the only visibility is a Discord/ntfy message and raw JSON files; no way to see what is
 *pending* across the fleet, browse past runs, or kick off a run remotely. PatchMon covers the
