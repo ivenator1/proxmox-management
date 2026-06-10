@@ -19,11 +19,12 @@ def _run(argv: list, *, run_fleet_return: int = 0):
     """
     captured = {}
 
-    def _fake_run_fleet(*, settings, inventory_path, check, extra_vars):
+    def _fake_run_fleet(*, settings, inventory_path, check, extra_vars, **kwargs):
         captured["settings"] = settings
         captured["check"] = check
         captured["inventory_path"] = inventory_path
         captured["extra_vars"] = extra_vars or {}
+        captured["kwargs"] = kwargs
         return run_fleet_return
 
     with (
@@ -161,7 +162,7 @@ def test_bad_extravars_raises_systemexit():
 def test_inventory_forwarded():
     captured = {}
 
-    def _fake(*, settings, inventory_path, check, extra_vars):
+    def _fake(*, settings, inventory_path, check, extra_vars, **kwargs):
         captured["inventory_path"] = inventory_path
         return 0
 
@@ -187,6 +188,56 @@ def test_vars_file_forwarded():
 def test_exit_code_forwarded():
     rc, _, _, _ = _run([], run_fleet_return=1)
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# cli.main() — --limit / --phases forwarding
+# ---------------------------------------------------------------------------
+
+def test_parse_csv_set_none_and_blank():
+    assert cli._parse_csv_set(None) is None
+    assert cli._parse_csv_set("") is None
+    assert cli._parse_csv_set(" , ,") is None
+
+
+def test_parse_csv_set_splits_and_strips():
+    assert cli._parse_csv_set("pve-01, 105 ,media-vm") == {"pve-01", "105", "media-vm"}
+
+
+def test_limit_and_phases_default_to_none():
+    captured = {}
+
+    def _fake(*, settings, inventory_path, check, extra_vars, limit, phases):
+        captured["limit"] = limit
+        captured["phases"] = phases
+        return 0
+
+    with (
+        patch("proxmox_fleet.driver.run_fleet", side_effect=_fake),
+        patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+    ):
+        cli.main([])
+
+    assert captured["limit"] is None
+    assert captured["phases"] is None
+
+
+def test_limit_and_phases_forwarded_as_sets():
+    captured = {}
+
+    def _fake(*, settings, inventory_path, check, extra_vars, limit, phases):
+        captured["limit"] = limit
+        captured["phases"] = phases
+        return 0
+
+    with (
+        patch("proxmox_fleet.driver.run_fleet", side_effect=_fake),
+        patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+    ):
+        cli.main(["--limit", "pve-01,105", "--phases", "lxc,vm"])
+
+    assert captured["limit"] == {"pve-01", "105"}
+    assert captured["phases"] == {"lxc", "vm"}
 
 
 # ---------------------------------------------------------------------------

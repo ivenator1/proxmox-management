@@ -73,6 +73,10 @@ EXAMPLES
   # Show the last 5 persisted runs / replay the latest run's briefing:
   ./fleet-update.py --history 5
   ./fleet-update.py --history-show latest
+
+  # Re-run a single failed LXC (dry-run first), or only the VM phase:
+  ./fleet-update.py --dry-run --phases lxc --limit 105
+  ./fleet-update.py --phases vm --limit media-vm
 """,
     )
 
@@ -140,6 +144,24 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="TS|latest",
         help="Print one persisted run's briefing (run timestamp or 'latest') and exit.",
     )
+    parser.add_argument(
+        "--limit",
+        default=None,
+        metavar="HOST,ID,...",
+        help=(
+            "Restrict the run to these host names and/or LXC/VM ids — everything else "
+            "is silently skipped. Use 'manager' to include the manager self-update."
+        ),
+    )
+    parser.add_argument(
+        "--phases",
+        default=None,
+        metavar="P1,P2",
+        help=(
+            "Run only these phases: remote,custom,lxc,vm,node,manager. "
+            "Pre-flight and the final notify/history phase always run."
+        ),
+    )
 
 
 def main() -> int:
@@ -150,6 +172,7 @@ def main() -> int:
     try:
         from proxmox_fleet import driver
         from proxmox_fleet.cli import (
+            _parse_csv_set,
             _parse_extra_vars,
             apply_extravar_overrides,
             history_main,
@@ -185,6 +208,8 @@ def main() -> int:
         inventory_path=args.inventory,
         check=args.dry_run,
         extra_vars=extravars,
+        limit=_parse_csv_set(args.limit),
+        phases=_parse_csv_set(args.phases),
     )
 
 

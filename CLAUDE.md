@@ -18,6 +18,8 @@ flags. `fleet-update` (pip console command) is the programmatic/cron interface.
 ./fleet-update.py -e custom_allow_reboot=false # raw extra vars (old -e interface)
 ./fleet-update.py --history 5                  # table of the last 5 persisted runs (no fleet run)
 ./fleet-update.py --history-show latest        # replay a stored run's briefing (TS or 'latest')
+./fleet-update.py --limit pve-01,105           # target host names and/or LXC/VM ids only
+./fleet-update.py --phases lxc,vm              # run only these phases (pre-flight+notify always run)
 fleet-update --check -e force_notify=true      # console command (needs active venv)
 
 ansible-galaxy collection install community.proxmox community.general
@@ -120,6 +122,15 @@ returned state in):
 
 Returns exit code 1 if any phase recorded a failure. Each phase's dry-run flag is
 `check or fleet_dry_run or <phase>_dry_run`; `fleet_dry_run` also forces a notification.
+
+**Targeting**: `run_fleet(phases=...)` (`--phases`) selects phases by name
+(`driver.PHASE_NAMES`: remote/custom/lxc/vm/node/manager — node and manager map onto
+`run_node_phase(include_nodes=, include_manager=)`); pre-flight and Phase 4 always run; unknown
+names `SystemExit`. `run_fleet(limit=...)` (`--limit`) restricts every phase to the named
+hosts/ids — silently omitted like window skips. LXC limit mixes node names (whole node) and bare
+ids (that container anywhere; nodes are skipped pre-discovery only when the limit holds no ids);
+VM limit matches name or vmid; custom dep *validation* still covers the full inventory. The
+manager self-update obeys limit via the tokens `manager`/`localhost`/`Ansible-Manager`.
 
 ### State accumulation
 

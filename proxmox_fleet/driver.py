@@ -68,6 +68,15 @@ def _truthy(val: Any) -> bool:
     return str(val).strip().lower() in ("true", "1", "yes")
 
 
+# Phase names accepted by run_fleet(phases=...) / the --phases flag, in run order.
+# "node" is Phase 2 (PVE node OS updates), "manager" is Phase 3 (self-update) —
+# both execute inside run_node_phase() but are individually selectable.
+PHASE_NAMES = ("remote", "custom", "lxc", "vm", "node", "manager")
+
+# Limit tokens that address the manager self-update (it is not an inventory host).
+_MANAGER_LIMIT_TOKENS = frozenset({"manager", "localhost", "Ansible-Manager"})
+
+
 def run_custom_phase(
     *,
     settings: GlobalSettings,
@@ -75,12 +84,18 @@ def run_custom_phase(
     extra_vars: Optional[Dict[str, Any]] = None,
     check: bool = False,
     state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_custom_state.json",  # nosec B108 - tooling output path
+    limit: Optional[Set[str]] = None,
 ) -> FleetState:
     """Run Phase 0a dependency validation + Phase 0b custom host updates.
 
     When *state_output_path* is set, writes the resulting FleetState via
     dump_for_ansible() for tooling / the molecule harness (whose verify.yml
     loads it with include_vars). run_fleet() passes None and merges in-memory.
+
+    *limit* (host names) restricts execution to the listed hosts; everything
+    else is silently omitted (mirroring the maintenance-window skip). Dependency
+    *validation* still covers the full inventory — ordering is an inventory
+    property, not a run property.
 
     Raises SystemExit(1) on Phase 0a dependency-order problems (fail-loud on bad
     ordering). Never raises for per-host execution failures — those are captured
@@ -98,6 +113,9 @@ def run_custom_phase(
         for p in problems:
             print(f"FATAL: {p}", file=sys.stderr)
         raise SystemExit(1)
+
+    if limit is not None:
+        specs = [s for s in specs if s.name in limit]
 
     # Phase 0b: serial execution loop.
     state = FleetState()
@@ -177,12 +195,18 @@ def run_lxc_phase(
     inventory_path: str = "hosts.ini",
     check: bool = False,
     state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_lxc_state.json",  # nosec B108 - tooling output path
+    limit: Optional[Set[str]] = None,
 ) -> FleetState:
     """Run Phase 1 (LXC container updates) via the Python driver.
 
     For each Proxmox node: discovers tagged LXCs, then updates them
     concurrently (max_workers=lxc_forks, default 20), mirroring Ansible's
     forks setting. Nodes are processed serially.
+
+    *limit* may mix node names and container ids: a node name keeps that node's
+    whole discovery, a bare id keeps just that container wherever it lives. A
+    node is skipped before discovery when it isn't named and the limit holds no
+    ids at all.
 
     When *state_output_path* is set, writes the resulting FleetState via
     dump_for_ansible() for tooling / molecule; run_fleet() passes None and
@@ -194,9 +218,16 @@ def run_lxc_phase(
     dry_run = check or settings.fleet_dry_run or settings.lxc_dry_run
     state = FleetState()
 
+    limit_has_ids = limit is not None and any(token.isdigit() for token in limit)
+
     for node_info in nodes:
         node_name = node_info["name"]
         api_host = node_info["ansible_host"]
+
+        # Node not targeted and no container ids to look for anywhere → skip
+        # the discovery SSH round-trip entirely.
+        if limit is not None and node_name not in limit and not limit_has_ids:
+            continue
 
         # Discovery is read-only — never pass --check or pct list won't run remotely.
         discovery_executor = RunnerExecutor(node_name, inventory=inventory_path, check=False)
@@ -211,6 +242,9 @@ def run_lxc_phase(
                 host=node_name, task="discover_lxcs", error=str(exc)[:300]
             ))
             continue
+
+        if limit is not None and node_name not in limit:
+            lxc_ids = [i for i in lxc_ids if i in limit]
 
         print(f"[{node_name}] found {len(lxc_ids)} managed LXC(s): {', '.join(lxc_ids) or 'none'}")
 
@@ -305,12 +339,14 @@ def run_vm_phase(
     inventory_path: str = "hosts.ini",
     check: bool = False,
     state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_vm_state.json",  # nosec B108 - tooling output path
+    limit: Optional[Set[str]] = None,
 ) -> FleetState:
     """Run Phase 1b (QEMU VM updates) via the Python driver.
 
     Loads all VMs from inventory, runs them concurrently (max_workers=vm_forks).
-    When *state_output_path* is set, writes the FleetState for tooling / molecule;
-    run_fleet() passes None and merges in-memory.
+    *limit* matches inventory names or vmids; non-matching VMs are silently
+    omitted. When *state_output_path* is set, writes the FleetState for
+    tooling / molecule; run_fleet() passes None and merges in-memory.
 
     Never raises for per-VM failures — those become FAILED records.
     """
@@ -318,16 +354,22 @@ def run_vm_phase(
     nodes = inventory.load_proxmox_nodes(inventory_path, host_vars_dir=settings.host_vars_dir)
     nodes_map = {n["name"]: n["ansible_host"] for n in nodes}
 
+    if limit is not None:
+        vms = [v for v in vms if v.name in limit or v.vmid in limit]
+
     dry_run = check or settings.fleet_dry_run or settings.vm_dry_run
     state = FleetState()
 
     # Discover VM locations once up-front via pvesh. Live cluster state always
     # wins over static pve_node inventory hints — pve_node is only a fallback
     # for non-cluster / non-HA setups where discovery is unavailable.
-    vm_locations = _discover_vm_locations(nodes, inventory_path=inventory_path)
+    # Skipped when nothing is targeted (no point in the SSH round-trip).
+    vm_locations = (
+        _discover_vm_locations(nodes, inventory_path=inventory_path) if vms else {}
+    )
     if vm_locations:
         print(f"[vm phase] discovered {len(vm_locations)} VM location(s) from cluster")
-    else:
+    elif vms:
         print("[vm phase] cluster discovery unavailable — using pve_node inventory hints")
 
     def _run_one(vm_spec: VmSpec) -> VmFlowOutcome:
@@ -385,16 +427,20 @@ def run_remote_phase(
     inventory_path: str = "hosts.ini",
     check: bool = False,
     state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_remote_state.json",  # nosec B108 - tooling output path
+    limit: Optional[Set[str]] = None,
 ) -> FleetState:
     """Run Phase 0 (remote host updates) via the Python driver.
 
     Loads all [remote_hosts] from inventory, runs them concurrently
-    (max_workers=remote_forks). When *state_output_path* is set, writes the
-    FleetState for tooling / molecule; run_fleet() passes None and merges in-memory.
+    (max_workers=remote_forks). *limit* restricts to the named hosts. When
+    *state_output_path* is set, writes the FleetState for tooling / molecule;
+    run_fleet() passes None and merges in-memory.
 
     Never raises for per-host failures — those become FAILED records.
     """
     hosts = inventory.load_remote_hosts(inventory_path, host_vars_dir=settings.host_vars_dir)
+    if limit is not None:
+        hosts = [h for h in hosts if h.name in limit]
     dry_run = check or settings.fleet_dry_run or settings.remote_dry_run
     state = FleetState()
 
@@ -439,6 +485,9 @@ def run_node_phase(
     inventory_path: str = "hosts.ini",
     check: bool = False,
     state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_node_state.json",  # nosec B108 - tooling output path
+    limit: Optional[Set[str]] = None,
+    include_nodes: bool = True,
+    include_manager: bool = True,
 ) -> FleetState:
     """Run Phase 2 (node OS updates) + Phase 3 (manager self-update) via the Python driver.
 
@@ -447,32 +496,42 @@ def run_node_phase(
     self-update always runs regardless of node failures (Phase 3 is independent of
     Phase 2 outcomes).
 
+    *include_nodes* / *include_manager* let run_fleet() map the ``node`` and
+    ``manager`` phase selections onto this single helper. *limit* restricts
+    Phase 2 to the named nodes; the manager (not an inventory host) runs only
+    when the limit is unset or names it via ``manager``/``localhost``/
+    ``Ansible-Manager``.
+
     When *state_output_path* is set, writes the FleetState via dump_for_ansible()
     for tooling / molecule; run_fleet() passes None and merges in-memory.
 
     Never raises for per-node failures — those become FAILED records.
     """
     nodes = inventory.load_proxmox_nodes(inventory_path, host_vars_dir=settings.host_vars_dir)
+    if limit is not None:
+        nodes = [n for n in nodes if n["name"] in limit]
     dry_run = check or settings.fleet_dry_run or settings.node_dry_run
     state = FleetState()
 
     # Phase 2: serial node loop — abort on first failure (any_errors_fatal equivalent).
-    for node_info in nodes:
-        node_name = node_info["name"]
-        executor = RunnerExecutor(node_name, inventory=inventory_path, check=check)
-        outcome = run_node_update(node_name, executor, settings, dry_run=dry_run)
-        _fold_outcome(state, outcome, state.node)
-        status = outcome.record.status if outcome.record else "?"
-        print(f"  [{node_name}] {status}")
-        if outcome.failed:
-            break  # abort remaining nodes; manager update still runs
+    if include_nodes:
+        for node_info in nodes:
+            node_name = node_info["name"]
+            executor = RunnerExecutor(node_name, inventory=inventory_path, check=check)
+            outcome = run_node_update(node_name, executor, settings, dry_run=dry_run)
+            _fold_outcome(state, outcome, state.node)
+            status = outcome.record.status if outcome.record else "?"
+            print(f"  [{node_name}] {status}")
+            if outcome.failed:
+                break  # abort remaining nodes; manager update still runs
 
     # Phase 3: manager self-update always runs — independent of node failures.
-    manager_ex = RunnerExecutor("localhost", inventory=inventory_path, check=check)
-    manager_outcome = run_manager_update(manager_ex, settings, dry_run=dry_run)
-    _fold_outcome(state, manager_outcome, state.node)
-    mgr_status = manager_outcome.record.status if manager_outcome.record else "?"
-    print(f"  [Ansible-Manager] {mgr_status}")
+    if include_manager and (limit is None or not _MANAGER_LIMIT_TOKENS.isdisjoint(limit)):
+        manager_ex = RunnerExecutor("localhost", inventory=inventory_path, check=check)
+        manager_outcome = run_manager_update(manager_ex, settings, dry_run=dry_run)
+        _fold_outcome(state, manager_outcome, state.node)
+        mgr_status = manager_outcome.record.status if manager_outcome.record else "?"
+        print(f"  [Ansible-Manager] {mgr_status}")
 
     if state_output_path is not None:
         state.dump_for_ansible(state_output_path)
@@ -553,6 +612,8 @@ def run_fleet(
     inventory_path: str = "hosts.ini",
     check: bool = False,
     extra_vars: Optional[Dict[str, Any]] = None,
+    limit: Optional[Set[str]] = None,
+    phases: Optional[Set[str]] = None,
 ) -> int:
     """End-to-end fleet update — the Python orchestrator (the sole entrypoint).
 
@@ -560,11 +621,28 @@ def run_fleet(
     (remote → custom → lxc → vm → node+manager), merging each phase's FleetState
     into one fleet-wide state, then renders/dispatches the final briefing.
 
+    *phases* (subset of :data:`PHASE_NAMES`) selects which phases run; the
+    pre-flight check and Phase 4 (notify/history) always run. *limit* restricts
+    every selected phase to the named hosts / LXC or VM ids — hosts outside it
+    are silently omitted, like maintenance-window skips. The manager
+    self-update obeys the limit too (token ``manager``/``localhost``).
+
     Returns a process exit code: 1 if any phase recorded a failure, else 0.
-    Raises SystemExit(1) on a pre-flight proxy failure or a custom dependency-order
-    problem (both fail-loud, mirroring the legacy playbook).
+    Raises SystemExit(1) on a pre-flight proxy failure, a custom dependency-order
+    problem (both fail-loud, mirroring the legacy playbook), or an unknown phase
+    name.
     """
     ev = extra_vars or {}
+
+    if phases is not None:
+        unknown = sorted(set(phases) - set(PHASE_NAMES))
+        if unknown:
+            raise SystemExit(
+                f"unknown phase(s): {', '.join(unknown)} (valid: {', '.join(PHASE_NAMES)})"
+            )
+
+    def _phase_on(name: str) -> bool:
+        return phases is None or name in phases
 
     # Pre-flight: the apt-cacher-ng proxy must be reachable or the whole run aborts
     # (port of the "Verify Apt-Cacher-NG is Online" / "Halt if Proxy is Offline" play).
@@ -581,17 +659,27 @@ def run_fleet(
             raise SystemExit(1)
 
     state = FleetState()
-    _merge_state(state, run_remote_phase(
-        settings=settings, inventory_path=inventory_path, check=check, state_output_path=None))
-    _merge_state(state, run_custom_phase(
-        settings=settings, inventory_path=inventory_path, extra_vars=ev, check=check,
-        state_output_path=None))
-    _merge_state(state, run_lxc_phase(
-        settings=settings, inventory_path=inventory_path, check=check, state_output_path=None))
-    _merge_state(state, run_vm_phase(
-        settings=settings, inventory_path=inventory_path, check=check, state_output_path=None))
-    _merge_state(state, run_node_phase(
-        settings=settings, inventory_path=inventory_path, check=check, state_output_path=None))
+    if _phase_on("remote"):
+        _merge_state(state, run_remote_phase(
+            settings=settings, inventory_path=inventory_path, check=check,
+            state_output_path=None, limit=limit))
+    if _phase_on("custom"):
+        _merge_state(state, run_custom_phase(
+            settings=settings, inventory_path=inventory_path, extra_vars=ev, check=check,
+            state_output_path=None, limit=limit))
+    if _phase_on("lxc"):
+        _merge_state(state, run_lxc_phase(
+            settings=settings, inventory_path=inventory_path, check=check,
+            state_output_path=None, limit=limit))
+    if _phase_on("vm"):
+        _merge_state(state, run_vm_phase(
+            settings=settings, inventory_path=inventory_path, check=check,
+            state_output_path=None, limit=limit))
+    if _phase_on("node") or _phase_on("manager"):
+        _merge_state(state, run_node_phase(
+            settings=settings, inventory_path=inventory_path, check=check,
+            state_output_path=None, limit=limit,
+            include_nodes=_phase_on("node"), include_manager=_phase_on("manager")))
 
     run_notify_phase(settings=settings, state=state, check=check)
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 if TYPE_CHECKING:
     from proxmox_fleet.models.settings import GlobalSettings
@@ -31,6 +31,14 @@ def _parse_extra_vars(pairs: List[str]) -> dict:
 
 def _is_true(val: str) -> bool:
     return val.lower() in ("true", "1", "yes")
+
+
+def _parse_csv_set(value: Optional[str]) -> Optional[Set[str]]:
+    """Parse a comma-separated flag value into a set; None/blank → None (no filter)."""
+    if value is None:
+        return None
+    items = {token.strip() for token in value.split(",") if token.strip()}
+    return items or None
 
 
 # Boolean -e extravars that map 1:1 onto GlobalSettings fields.
@@ -134,6 +142,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="show the last N persisted runs (default 10) and exit; no fleet run.")
     parser.add_argument("--history-show", default=None, metavar="TS|latest",
                         help="print one persisted run's briefing (timestamp or 'latest') and exit.")
+    parser.add_argument("--limit", default=None, metavar="HOST,ID,...",
+                        help="restrict the run to these host names and/or LXC/VM ids "
+                             "(everything else is silently skipped).")
+    parser.add_argument("--phases", default=None, metavar="P1,P2",
+                        help="run only these phases: remote,custom,lxc,vm,node,manager "
+                             "(pre-flight and notify always run).")
     args = parser.parse_args(argv)
 
     if args.history is not None or args.history_show is not None:
@@ -158,6 +172,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         inventory_path=args.inventory,
         check=args.check,
         extra_vars=extravars,
+        limit=_parse_csv_set(args.limit),
+        phases=_parse_csv_set(args.phases),
     )
 
 

@@ -48,7 +48,7 @@ def _run(argv: list, *, run_fleet_return: int = 0) -> tuple[int, GlobalSettings,
     """
     captured: Dict[str, Any] = {}
 
-    def _fake_run_fleet(*, settings, inventory_path, check, extra_vars):
+    def _fake_run_fleet(*, settings, inventory_path, check, extra_vars, **kwargs):
         captured["settings"] = settings
         captured["check"] = check
         captured["inventory_path"] = inventory_path
@@ -99,7 +99,7 @@ def test_check_alias():
 def test_dry_run_passes_check_true_to_driver():
     captured: Dict[str, Any] = {}
 
-    def _fake(*, settings, inventory_path, check, extra_vars):
+    def _fake(*, settings, inventory_path, check, extra_vars, **kwargs):
         captured["check"] = check
         return 0
 
@@ -204,7 +204,7 @@ def test_extra_vars_bad_format_exits():
 def test_custom_inventory():
     captured: Dict[str, Any] = {}
 
-    def _fake(*, settings, inventory_path, check, extra_vars):
+    def _fake(*, settings, inventory_path, check, extra_vars, **kwargs):
         captured["inventory_path"] = inventory_path
         return 0
 
@@ -224,7 +224,7 @@ def test_custom_vars_file(tmp_path):
 
     captured: Dict[str, Any] = {}
 
-    def _fake(*, settings, inventory_path, check, extra_vars):
+    def _fake(*, settings, inventory_path, check, extra_vars, **kwargs):
         captured["ok"] = True
         return 0
 
@@ -244,6 +244,49 @@ def test_custom_vars_file(tmp_path):
 def test_exit_code_forwarded():
     rc, _, _ = _run([], run_fleet_return=1)
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: --limit / --phases forwarding
+# ---------------------------------------------------------------------------
+
+def test_limit_and_phases_forwarded():
+    captured: Dict[str, Any] = {}
+
+    def _fake(*, settings, inventory_path, check, extra_vars, limit, phases):
+        captured["limit"] = limit
+        captured["phases"] = phases
+        return 0
+
+    with (
+        patch.object(sys, "argv",
+                     ["./fleet-update.py", "--limit", "pve-01,105", "--phases", "lxc"]),
+        patch("proxmox_fleet.driver.run_fleet", side_effect=_fake),
+        patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+    ):
+        _wrapper.main()
+
+    assert captured["limit"] == {"pve-01", "105"}
+    assert captured["phases"] == {"lxc"}
+
+
+def test_limit_and_phases_default_none():
+    captured: Dict[str, Any] = {}
+
+    def _fake(*, settings, inventory_path, check, extra_vars, limit, phases):
+        captured["limit"] = limit
+        captured["phases"] = phases
+        return 0
+
+    with (
+        patch.object(sys, "argv", ["./fleet-update.py"]),
+        patch("proxmox_fleet.driver.run_fleet", side_effect=_fake),
+        patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+    ):
+        _wrapper.main()
+
+    assert captured["limit"] is None
+    assert captured["phases"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +343,7 @@ def test_cli_force_window_propagates(tmp_path):
 
     captured: Dict[str, Any] = {}
 
-    def _fake_fleet(*, settings, inventory_path, check, extra_vars):
+    def _fake_fleet(*, settings, inventory_path, check, extra_vars, **kwargs):
         captured["force_window"] = settings.force_window
         return 0
 
@@ -319,7 +362,7 @@ def test_cli_force_window_false_by_default(tmp_path):
 
     captured: Dict[str, Any] = {}
 
-    def _fake_fleet(*, settings, inventory_path, check, extra_vars):
+    def _fake_fleet(*, settings, inventory_path, check, extra_vars, **kwargs):
         captured["force_window"] = settings.force_window
         return 0
 
