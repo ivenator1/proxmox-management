@@ -1043,3 +1043,98 @@ def test_lxc_phase_limit_by_container_id(tmp_path, monkeypatch):
     driver_mod.run_lxc_phase(settings=GlobalSettings(), inventory_path=str(p),
                              state_output_path=None, limit={"201"})
     assert ran == ["pve-02/201"]
+
+
+# --- run_custom_phase — PVE snapshot wiring (v2) --------------------------------
+
+def _pve_custom_inventory(tmp_path: Path) -> str:
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\npve-01 ansible_host=10.0.0.9\n"
+        "[custom_hosts]\ngitea ansible_host=10.0.0.1 custom_config=gitea\n"
+    )
+    return str(p)
+
+
+def test_custom_phase_passes_snapshot_wiring(tmp_path, monkeypatch):
+    inv = _pve_custom_inventory(tmp_path)
+    _write_config(tmp_path, "gitea", {
+        "name": "Gitea",
+        "update_steps": [{"name": "upgrade", "command": "do-upgrade"}],
+        "health_check": {"type": "none"},
+        "pve_vmid": 105,
+        "pve_node": "pve-01",
+    })
+    settings = _settings(tmp_path, pve_api_user="root@pam",
+                         pve_api_token_id="tk", pve_api_token_secret="sec",
+                         snapshot_retries=2, snapshot_retry_delay=1.5)
+
+    captured: Dict[str, Any] = {}
+
+    def _fake_update(host, config, executor, **kw):
+        captured.update(kw, host=host, config=config, executor=executor)
+        from proxmox_fleet.flows.custom import CustomFlowOutcome
+        return CustomFlowOutcome()
+
+    executors: Dict[str, Any] = {}
+
+    def _fake_executor(host, **kw):
+        ex = ScriptedExecutor()
+        ex.host = host
+        executors[host] = ex
+        return ex
+
+    monkeypatch.setattr(driver_mod, "run_custom_update", _fake_update)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+
+    run_custom_phase(settings=settings, inventory_path=inv, state_output_path=None)
+
+    assert captured["api_params"] == {
+        "api_host": "10.0.0.9", "api_user": "root@pam",
+        "api_token_id": "tk", "api_token_secret": "sec",
+    }
+    assert captured["node_executor"] is executors["pve-01"]
+    assert captured["snapshot_retries"] == 2
+    assert captured["snapshot_retry_delay"] == 1.5
+
+
+def test_custom_phase_no_snapshot_wiring_without_pve_vmid(tmp_path, monkeypatch):
+    inv = _pve_custom_inventory(tmp_path)
+    _write_config(tmp_path, "gitea", {
+        "name": "Gitea",
+        "update_steps": [{"name": "upgrade", "command": "do-upgrade"}],
+        "health_check": {"type": "none"},
+    })
+    captured: Dict[str, Any] = {}
+
+    def _fake_update(host, config, executor, **kw):
+        captured.update(kw)
+        from proxmox_fleet.flows.custom import CustomFlowOutcome
+        return CustomFlowOutcome()
+
+    monkeypatch.setattr(driver_mod, "run_custom_update", _fake_update)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    run_custom_phase(settings=_settings(tmp_path), inventory_path=inv, state_output_path=None)
+
+    assert captured["node_executor"] is None
+    assert captured["api_params"] is None
+
+
+def test_custom_phase_unknown_pve_node_fails_loud(tmp_path, monkeypatch):
+    inv = _pve_custom_inventory(tmp_path)
+    _write_config(tmp_path, "gitea", {
+        "name": "Gitea",
+        "update_steps": [{"name": "upgrade", "command": "do-upgrade"}],
+        "health_check": {"type": "none"},
+        "pve_vmid": "105",
+        "pve_node": "pve-99",   # not in [proxmox_nodes]
+    })
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    with pytest.raises(SystemExit) as exc:
+        run_custom_phase(settings=_settings(tmp_path), inventory_path=inv,
+                         state_output_path=None)
+    assert exc.value.code == 1

@@ -3,7 +3,14 @@
 Owns the full control flow that used to live in main.yml's block/rescue/always:
   load (done by caller) -> detect -> backup -> update (steps) -> change-detect ->
   reboot -> health-check -> report, with dependency-skip gating and a rescue path
-  that runs rollback_command and records FAILED.
+  that rolls back and records FAILED.
+
+v2 adds optional PVE snapshot/rollback: when the config carries ``pve_vmid`` (and
+the driver supplies a node executor + API params), a ``BEFORE_UPDATE_AUTO``
+snapshot is taken before the update steps, rolled back in rescue, and deleted in
+``finally`` — the same try/except/finally shape as the lxc/vm flows. Hosts
+without ``pve_vmid`` keep the legacy rescue (run ``rollback_command``, errors
+ignored, plain ``FAILED``).
 
 All decisions are here in Python; the Executor + http module do the actual work.
 Status strings come from proxmox_fleet.status (byte-parity with the old Jinja).
@@ -11,16 +18,17 @@ Status strings come from proxmox_fleet.status (byte-parity with the old Jinja).
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import custom_changed, is_outdated
-from proxmox_fleet.executor import Executor
+from proxmox_fleet.executor import Executor, snapshot_with_retry
 from proxmox_fleet.flows._pkg import kuma_healthy
 from proxmox_fleet.models.config import CustomConfig
 from proxmox_fleet.models.state import CustomRecord, ErrorEntry, WarningEntry
-from proxmox_fleet.status import custom_should_report, custom_status
+from proxmox_fleet.status import custom_rescue_status, custom_should_report, custom_status
 from proxmox_fleet.steps import run_steps
 
 
@@ -117,11 +125,28 @@ def run_custom_update(
     kuma_url: str = "",
     kuma_retries: int = 5,
     kuma_delay: float = 30.0,
+    node_executor: Optional[Executor] = None,
+    api_params: Optional[Dict[str, Any]] = None,
+    snapshot_retries: int = 3,
+    snapshot_retry_delay: float = 15.0,
+    _sleep: Callable[[float], None] = time.sleep,
 ) -> CustomFlowOutcome:
     """Run the whole custom_update flow for one host. Never raises — failures are
-    captured into the outcome (FAILED record + error entry), mirroring rescue."""
+    captured into the outcome (FAILED record + error entry), mirroring rescue.
+
+    PVE snapshots fire only when the config has ``pve_vmid`` AND the driver
+    passed both *node_executor* (SSH to the owning Proxmox node, for
+    ``pct/qm rollback``) and *api_params* (``api_host``/``api_user``/
+    ``api_token_id``/``api_token_secret`` for the snapshot primitive).
+    """
 
     name = config.name or host
+    snap_enabled = bool(
+        config.pve_vmid.strip() and node_executor is not None and api_params is not None
+    )
+    snap_taken = False
+    snapshot_failed = False
+    rollback_done = False
 
     # Dependency gating: a dependency failed earlier this run → skip with a warning.
     if dep_failed:
@@ -170,6 +195,20 @@ def run_custom_update(
         if config.backup_command.strip():
             executor.run_shell(config.backup_command)
 
+        if snap_enabled:
+            snap_res = snapshot_with_retry(
+                executor, config.pve_vmid, snap_state="present",
+                retries=snapshot_retries, delay=snapshot_retry_delay,
+                **(api_params or {}),
+            )
+            snap_taken = snap_res.changed
+            if not snap_taken:
+                snapshot_failed = True
+                outcome.warnings.append(WarningEntry(
+                    host=host, task=f"Snapshot {config.pve_vmid}",
+                    warning="snapshot failed — automatic rollback unavailable for this update",
+                ))
+
         # --- update (per-step, with Python interpolation) -------------------
         run_steps(config.update_steps, executor, context=when_context)
 
@@ -217,13 +256,48 @@ def run_custom_update(
 
     except Exception as exc:  # noqa: BLE001 - mirror Ansible rescue catch-all (StepError/HealthCheckError/…)
         # --- rescue: rollback + record FAILED -------------------------------
-        if config.rollback_command.strip():
+        # Snapshot rollback when one was confirmed taken (pct/qm on the node,
+        # rollback_done only once the guest is confirmed running again);
+        # otherwise the legacy rollback_command fallback (errors ignored).
+        if snap_taken and node_executor is not None:
+            pve_cmd = "pct" if config.pve_type == "lxc" else "qm"
+            try:
+                rb = node_executor.run_shell(
+                    f"{pve_cmd} rollback {config.pve_vmid} BEFORE_UPDATE_AUTO",
+                    ignore_errors=True,
+                )
+                if not rb.failed:
+                    # Poll until the guest is running again (up to 12 × 10 s)
+                    for _ in range(12):
+                        _sleep(10)
+                        chk = node_executor.run_shell(
+                            f"{pve_cmd} status {config.pve_vmid}",
+                            changed_when=False, ignore_errors=True,
+                        )
+                        if "running" in chk.stdout:
+                            rollback_done = True
+                            break
+            except Exception:  # noqa: BLE001 - rollback errors are ignored
+                pass
+        elif config.rollback_command.strip():
             try:
                 executor.run_shell(config.rollback_command, ignore_errors=True)
             except Exception:  # noqa: BLE001 - rollback errors are ignored
                 pass
         failed_task = getattr(exc, "step_name", type(exc).__name__)
+        rescue_str = custom_rescue_status(
+            rollback_done=rollback_done, snapshot_failed=snapshot_failed
+        )
         outcome.failed = True
-        outcome.record = CustomRecord(host=host, name=name, app="FAILED")
+        outcome.record = CustomRecord(host=host, name=name, app=rescue_str)
         outcome.error = ErrorEntry(host=host, task=str(failed_task), error=str(exc)[:300])
         return outcome
+
+    finally:
+        # --- always: delete the snapshot we created -------------------------
+        if snap_taken:
+            snapshot_with_retry(
+                executor, config.pve_vmid, snap_state="absent",
+                retries=snapshot_retries, delay=snapshot_retry_delay,
+                **(api_params or {}),
+            )

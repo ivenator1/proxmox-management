@@ -135,6 +135,7 @@ jobs:
           - custom_update_normal
           - custom_update_noop
           - custom_update_rescue
+          - custom_update_rollback
           - custom_update_dry_run
           - custom_update_uptodate
           - custom_update_per_step

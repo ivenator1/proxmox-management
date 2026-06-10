@@ -99,7 +99,7 @@ ansible/primitives/        # thin single-purpose playbooks: run_shell, reboot_ho
 tests/unit/                # plain pytest, no Ansible/PVE; data/briefing_golden.json locks parity
 roles/                     # molecule scenarios ONLY — drive Python flows via mol_run_flow.py
   lxc_update/molecule/{lxc_update_normal,lxc_update_rollback,lxc_update_snapfail}
-  custom_update/molecule/{custom_update_normal,_noop,_rescue,_dry_run,_uptodate,_per_step}
+  custom_update/molecule/{custom_update_normal,_noop,_rescue,_rollback,_dry_run,_uptodate,_per_step}
 ```
 
 ## Architecture
@@ -190,9 +190,16 @@ snapshots). Outcomes are folded by `driver._fold_outcome()`.
 - Config load is **outside** the flow (fail loud): `driver._load_config()` reads
   `configs/<name>.yml` (`settings.configs_dir`), deep-merges `custom_overrides` from host_vars,
   validates via `CustomConfig`.
-- Flow body: detect (`version_command` + latest lookup) → backup (if `backup_command`) →
-  `steps.run_steps()` → change detection → reboot → health → report.
-- `except`: run `rollback_command` (errors ignored) → record `FAILED`. No `finally` (v1, no snapshot).
+- Flow body: detect (`version_command` + latest lookup) → backup (`backup_command`, then a PVE
+  snapshot when enabled) → `steps.run_steps()` → change detection → reboot → health → report.
+- **PVE snapshot/rollback (v2)**: a config with `pve_vmid` + `pve_node` (`pve_type: lxc|vm`)
+  gets the lxc/vm-style safety net — `BEFORE_UPDATE_AUTO` snapshot before the steps,
+  `pct/qm rollback` on the node in rescue (status `FAILED + ROLLED BACK` /
+  `FAILED (NO SNAPSHOT)` via `status.custom_rescue_status()`), delete in `finally`.
+  `run_custom_phase()` resolves `pve_node` → `ansible_host` (unknown node fails loud) and
+  passes `node_executor` + `api_params`; without them the flow never snapshots.
+- `except` (no `pve_vmid`, legacy): run `rollback_command` (errors ignored) → record `FAILED`.
+  When a snapshot was taken, the snapshot rollback wins and `rollback_command` is NOT run.
 - Each `[custom_hosts]` host needs `custom_config=<name>`; optional `custom_overrides: {...}`.
 - `configs/*.yml` is gitignored — commit `*.yml.example`. Schema: `config_templates/custom_system.yml.example`.
 
@@ -324,7 +331,7 @@ includes the **golden byte-parity** test against `tests/unit/data/briefing_golde
 
 **Molecule** drives the Python flows (not roles): `roles/lxc_update/molecule/` has
 `normal`/`rollback`/`snapfail`; `roles/custom_update/molecule/` has `normal`/`noop`/`rescue`/
-`dry_run`/`uptodate`/`per_step`. Each `converge.yml` runs `mol_run_flow.py` → a stub executor →
+`rollback`/`dry_run`/`uptodate`/`per_step`. Each `converge.yml` runs `mol_run_flow.py` → a stub executor →
 the flow function → `verify.yml` `include_vars`s the dumped JSON. Idempotency is disabled
 (backup/update are intentionally non-idempotent). `roles/` contains **only** these harnesses.
 

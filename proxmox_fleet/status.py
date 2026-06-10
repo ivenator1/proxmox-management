@@ -78,6 +78,24 @@ def custom_should_report(status: str, *, dry_run: bool) -> bool:
     return dry_run or ("updated" in lowered) or ("failed" in lowered)
 
 
+def custom_rescue_status(
+    *,
+    rollback_done: bool = False,
+    snapshot_failed: bool = False,
+) -> str:
+    """Rescue status for the custom flow's PVE-snapshot path (v2).
+
+    Same tree as :func:`vm_rescue_status` — kept per-flow so the trees can
+    diverge without cross-flow surprises. Hosts without ``pve_vmid`` (legacy
+    ``rollback_command`` path) keep the plain ``FAILED``.
+    """
+    if rollback_done:
+        return "FAILED + ROLLED BACK"
+    if snapshot_failed:
+        return "FAILED (NO SNAPSHOT)"
+    return "FAILED"
+
+
 # ---------------------------------------------------------------------------
 # Phase 3: lxc_update trees
 # ---------------------------------------------------------------------------

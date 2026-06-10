@@ -1,0 +1,54 @@
+---
+- name: Verify — custom_update snapshot rollback
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  pre_tasks:
+    - name: Load fleet state from converge play
+      include_vars:
+        file: /tmp/mol_fleet_state_rollback.json
+  tasks:
+    - name: Check fleet_custom_data has one failure entry
+      assert:
+        that:
+          - hostvars['localhost']['fleet_custom_data'] | default([]) | length == 1
+        fail_msg: "fleet_custom_data should have exactly one entry after rescue"
+
+    - name: Check custom record shows FAILED + ROLLED BACK
+      vars:
+        record: "{{ hostvars['localhost']['fleet_custom_data'][0] }}"
+      assert:
+        that:
+          - record.name == 'mol-rollback-app'
+          - record.app == 'FAILED + ROLLED BACK'
+        fail_msg: "Custom record should show FAILED + ROLLED BACK: {{ record }}"
+
+    - name: Confirm fleet_failed is True
+      assert:
+        that:
+          - hostvars['localhost']['fleet_failed'] | default(false) | bool
+        fail_msg: "fleet_failed should be True when update step fails"
+
+    - name: Stat snapshot/rollback touch files
+      stat:
+        path: "{{ item }}"
+      loop:
+        - /tmp/mol_custom_snap_created
+        - /tmp/mol_custom_snap_deleted
+        - /tmp/mol_custom_pct_rollback
+        - /tmp/mol_rollback_called
+      register: touches
+
+    - name: Assert snapshot created, rolled back, and deleted
+      assert:
+        that:
+          - touches.results[0].stat.exists    # snapshot created before steps
+          - touches.results[1].stat.exists    # snapshot deleted in finally
+          - touches.results[2].stat.exists    # pct rollback ran on the "node"
+        fail_msg: "snapshot lifecycle incomplete: {{ touches.results | map(attribute='stat.exists') | list }}"
+
+    - name: Assert legacy rollback_command did NOT run (snapshot path wins)
+      assert:
+        that:
+          - not touches.results[3].stat.exists
+        fail_msg: "rollback_command must not run when a snapshot was taken"

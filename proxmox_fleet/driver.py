@@ -120,6 +120,9 @@ def run_custom_phase(
     # Phase 0b: serial execution loop.
     state = FleetState()
     failed_hosts: Set[str] = set()
+    # Node name → ansible_host IP map, loaded lazily on the first config that
+    # opts into PVE snapshots (pve_vmid).
+    nodes_map: Optional[Dict[str, str]] = None
 
     for spec in specs:
         # Maintenance window gate (silently skip, mirroring role behaviour).
@@ -143,6 +146,28 @@ def run_custom_phase(
 
         executor = RunnerExecutor(spec.name, inventory=inventory_path, check=check)
 
+        # PVE snapshot/rollback wiring (config v2): resolve the owning node's
+        # ansible_host for the snapshot API and bind a node executor for
+        # pct/qm rollback. An unknown pve_node fails loud, like config validation.
+        node_executor = None
+        api_params: Optional[Dict[str, Any]] = None
+        if config.pve_vmid.strip():
+            if nodes_map is None:
+                nodes_map = {n["name"]: n["ansible_host"] for n in inventory.load_proxmox_nodes(
+                    inventory_path, host_vars_dir=settings.host_vars_dir)}
+            api_host = nodes_map.get(config.pve_node)
+            if api_host is None:
+                print(f"FATAL: config {spec.custom_config!r}: pve_node {config.pve_node!r} "
+                      "is not in [proxmox_nodes]", file=sys.stderr)
+                raise SystemExit(1)
+            node_executor = RunnerExecutor(config.pve_node, inventory=inventory_path, check=check)
+            api_params = {
+                "api_host": api_host,
+                "api_user": settings.pve_api_user,
+                "api_token_id": settings.pve_api_token_id,
+                "api_token_secret": settings.pve_api_token_secret,
+            }
+
         outcome = run_custom_update(
             spec.name,
             config,
@@ -153,6 +178,10 @@ def run_custom_phase(
             kuma_url=settings.kuma_url,
             kuma_retries=settings.kuma_health_check_retries,
             kuma_delay=settings.kuma_health_check_delay,
+            node_executor=node_executor,
+            api_params=api_params,
+            snapshot_retries=settings.snapshot_retries,
+            snapshot_retry_delay=settings.snapshot_retry_delay,
         )
 
         if outcome.record is not None:
