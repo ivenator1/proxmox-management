@@ -373,3 +373,27 @@ def test_cli_force_window_false_by_default(tmp_path):
         cli.main(["--inventory", str(hosts)])
 
     assert captured["force_window"] is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: --scan early exit (no fleet run)
+# ---------------------------------------------------------------------------
+
+def test_scan_flag_skips_fleet_run():
+    captured: Dict[str, Any] = {}
+
+    def _fake_scan(*, settings, inventory_path, limit):
+        captured["limit"] = limit
+        return 0
+
+    with (
+        patch.object(sys, "argv", ["./fleet-update.py", "--scan", "--limit", "105"]),
+        patch("proxmox_fleet.scan.run_fleet_scan", side_effect=_fake_scan),
+        patch("proxmox_fleet.driver.run_fleet") as mock_fleet,
+        patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+    ):
+        rc = _wrapper.main()
+
+    mock_fleet.assert_not_called()
+    assert rc == 0
+    assert captured["limit"] == {"105"}

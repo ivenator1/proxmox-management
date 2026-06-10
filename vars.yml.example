@@ -54,6 +54,11 @@ canary_hosts: []
 # canary_hosts: ["101", "media-vm", "web-01"]
 canary_soak_minutes: 0      # wait this long after the canary wave before the Kuma check
 
+# --- PENDING-UPDATES SCAN (--scan) ---
+# `fleet-update --scan` is read-only: it writes pending-<ts>.json +
+# pending-latest.json to fleet_history_dir. Keep the newest N scan snapshots.
+scan_history_keep: 30
+
 # --- LXC TAG DISCOVERY ---
 lxc_tags:
   - "community-script"

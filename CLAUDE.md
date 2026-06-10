@@ -20,6 +20,7 @@ flags. `fleet-update` (pip console command) is the programmatic/cron interface.
 ./fleet-update.py --history-show latest        # replay a stored run's briefing (TS or 'latest')
 ./fleet-update.py --limit pve-01,105           # target host names and/or LXC/VM ids only
 ./fleet-update.py --phases lxc,vm              # run only these phases (pre-flight+notify always run)
+./fleet-update.py --scan                       # read-only pending-updates scan → pending-*.json
 fleet-update --check -e force_notify=true      # console command (needs active venv)
 
 ansible-galaxy collection install community.proxmox community.general
@@ -89,6 +90,7 @@ proxmox_fleet/
   briefing.py              # render_briefing() byte-parity port of discord_briefing.j2
   history.py               # build_run_summary() + write_history(); history_summary()/read_run() readers
   notifiers.py             # resolve_notifiers(), dispatch() (discord/ntfy/webhook/telegram), ping_deadmans()
+  scan.py                  # --scan: read-only pending-updates walk → pending-*.json (next to history)
   cli.py                   # fleet-update CLI: parses flags, calls driver.run_fleet()
 config_templates/custom_system.yml.example   # full commented schema → copy to configs/<name>.yml
 configs/                   # real configs/*.yml gitignored; commit *.yml.example only
@@ -167,6 +169,13 @@ merges purely in-memory.
   before any driver import).
 - **Dead-man's switch**: `notifiers.ping_deadmans()` pings `fleet_deadmans_url` (`/fail` on
   failure) so its absence alerts when the orchestrator stops running.
+- **Pending-updates scan** (`scan.py`, `--scan`): strictly read-only fleet walk — pending OS
+  packages per host (apt `-s dist-upgrade` / `dnf check-update` rc-100-tolerant / `apk version
+  -l '<'`, parsed by `parse_pending()`) plus per-LXC app current→latest (the lxc dry-check
+  detect chain, reused). Stopped CTs/templates are skipped, never started. Writes
+  `pending-<ts>.json` + `pending-latest.json` to `fleet_history_dir` (pruned to
+  `scan_history_keep`); obeys `--limit`; exit 1 if any scan errored. Bypasses `run_fleet()`
+  entirely (no phases, no notify).
 
 ### Cross-cutting subsystems
 

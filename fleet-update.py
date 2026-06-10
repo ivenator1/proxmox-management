@@ -162,6 +162,15 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
             "Pre-flight and the final notify/history phase always run."
         ),
     )
+    parser.add_argument(
+        "--scan",
+        action="store_true",
+        help=(
+            "Read-only pending-updates scan: per-host pending OS packages plus "
+            "community-script app versions (current → latest) for managed LXCs. "
+            "Writes pending-*.json next to the run history; no changes are made."
+        ),
+    )
 
 
 def main() -> int:
@@ -184,6 +193,15 @@ def main() -> int:
     if args.history is not None or args.history_show is not None:
         return history_main(history=args.history, history_show=args.history_show,
                             vars_file=args.vars_file)
+
+    if args.scan:
+        from proxmox_fleet import scan as scan_mod
+
+        return scan_mod.run_fleet_scan(
+            settings=GlobalSettings.load(args.vars_file),
+            inventory_path=args.inventory,
+            limit=_parse_csv_set(args.limit),
+        )
 
     extravars = _parse_extra_vars(args.extra_vars)
 

@@ -372,3 +372,36 @@ def test_format_history_table_result_column():
     # Counts land under their columns; missing counts render as 0.
     assert lines[1].split() == ["T3", "failed", "1", "0", "0", "0", "0", "2", "0"]
     assert lines[3].split() == ["T1", "clean", "0", "0", "0", "0", "0", "0", "0"]
+
+
+# ---------------------------------------------------------------------------
+# cli.main() — --scan (early exit, no fleet run)
+# ---------------------------------------------------------------------------
+
+def test_scan_flag_runs_scan_not_fleet(tmp_path):
+    captured = {}
+
+    def _fake_scan(*, settings, inventory_path, limit):
+        captured["inventory_path"] = inventory_path
+        captured["limit"] = limit
+        return 0
+
+    with (
+        patch("proxmox_fleet.scan.run_fleet_scan", side_effect=_fake_scan),
+        patch("proxmox_fleet.driver.run_fleet") as mock_fleet,
+        patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+    ):
+        rc = cli.main(["--scan", "--limit", "web-01", "--inventory", "inv.ini"])
+
+    mock_fleet.assert_not_called()
+    assert rc == 0
+    assert captured["inventory_path"] == "inv.ini"
+    assert captured["limit"] == {"web-01"}
+
+
+def test_scan_exit_code_forwarded():
+    with (
+        patch("proxmox_fleet.scan.run_fleet_scan", return_value=1),
+        patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+    ):
+        assert cli.main(["--scan"]) == 1

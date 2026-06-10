@@ -148,11 +148,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--phases", default=None, metavar="P1,P2",
                         help="run only these phases: remote,custom,lxc,vm,node,manager "
                              "(pre-flight and notify always run).")
+    parser.add_argument("--scan", action="store_true",
+                        help="read-only pending-updates scan (no changes); writes "
+                             "pending-*.json to fleet_history_dir and exits.")
     args = parser.parse_args(argv)
 
     if args.history is not None or args.history_show is not None:
         return history_main(history=args.history, history_show=args.history_show,
                             vars_file=args.vars_file)
+
+    if args.scan:
+        from proxmox_fleet import scan as scan_mod
+        from proxmox_fleet.models.settings import GlobalSettings as _Settings
+
+        return scan_mod.run_fleet_scan(
+            settings=_Settings.load(args.vars_file),
+            inventory_path=args.inventory,
+            limit=_parse_csv_set(args.limit),
+        )
 
     extravars = _parse_extra_vars(args.extra_vars)
 

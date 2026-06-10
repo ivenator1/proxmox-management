@@ -102,6 +102,7 @@ class GlobalSettings(BaseModel):
     fleet_history_enabled: bool = True
     fleet_history_dir: str = "/var/log/fleet-update"
     fleet_history_keep: int = 30
+    scan_history_keep: int = 30
     force_notify: bool = False
 
     @field_validator("canary_hosts", mode="before")
