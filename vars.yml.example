@@ -6,7 +6,7 @@ discord_webhook: "discord_webhook" #Change with your Discord Webook URL
 # --- NOTIFIERS ---
 # Pluggable notifier list. If omitted, the legacy `discord_webhook` above is used
 # as a single Discord notifier (back-compat). Define `notifiers` to fan the same
-# briefing out to multiple targets. Supported types: discord, ntfy.
+# briefing out to multiple targets. Supported types: discord, ntfy, webhook, telegram.
 # notifiers:
 #   - type: discord
 #     enabled: true
@@ -17,6 +17,17 @@ discord_webhook: "discord_webhook" #Change with your Discord Webook URL
 #     token: ""                                # optional bearer token for protected topics
 #     priority: 3                              # 1-5 (default: 5 on failure, else 3)
 #     tags: "package"                          # optional ntfy tags/emoji
+#   - type: webhook                            # generic JSON POST — Slack/Mattermost/HA/n8n intakes
+#     enabled: true
+#     url: "https://hooks.example.com/fleet"   # receives {title, body, failed, timestamp}
+#     headers:                                 # optional extra HTTP headers
+#       X-Api-Key: "secret"
+#   - type: telegram
+#     enabled: true
+#     bot_token: "123456:ABC-bot-token"        # from @BotFather
+#     chat_id: "-1001234567890"                # target chat/channel id
+#     # parse_mode: ""                         # optional; default is plain text (briefing
+#     #                                        # markdown is Discord-flavoured, not Telegram's)
 
 #Apt-Cacher NG
 apt_proxy_ip: "10.10.10.12" #Apt Procy IP

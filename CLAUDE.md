@@ -16,6 +16,8 @@ flags. `fleet-update` (pip console command) is the programmatic/cron interface.
 ./fleet-update.py --force-notify               # full run, forced notification
 ./fleet-update.py --force-window               # bypass maintenance windows
 ./fleet-update.py -e custom_allow_reboot=false # raw extra vars (old -e interface)
+./fleet-update.py --history 5                  # table of the last 5 persisted runs (no fleet run)
+./fleet-update.py --history-show latest        # replay a stored run's briefing (TS or 'latest')
 fleet-update --check -e force_notify=true      # console command (needs active venv)
 
 ansible-galaxy collection install community.proxmox community.general
@@ -83,8 +85,8 @@ proxmox_fleet/
   changes.py               # change-detection helpers (lxc_os_changed, dpkg_hash_differs, ...)
   window.py                # in_window() — zoneinfo port of check-window.yml
   briefing.py              # render_briefing() byte-parity port of discord_briefing.j2
-  history.py               # build_run_summary() + write_history()
-  notifiers.py             # resolve_notifiers(), dispatch() (discord/ntfy), ping_deadmans()
+  history.py               # build_run_summary() + write_history(); history_summary()/read_run() readers
+  notifiers.py             # resolve_notifiers(), dispatch() (discord/ntfy/webhook/telegram), ping_deadmans()
   cli.py                   # fleet-update CLI: parses flags, calls driver.run_fleet()
 config_templates/custom_system.yml.example   # full commented schema → copy to configs/<name>.yml
 configs/                   # real configs/*.yml gitignored; commit *.yml.example only
@@ -131,11 +133,16 @@ merges purely in-memory.
 ### Phase 4 subsystems (`driver.run_notify_phase()`)
 
 - **Notifiers**: `briefing.prepare_body()` renders the body once; `notifiers.dispatch()` fans
-  it to a `notifiers` list (`discord`/`ntfy`). Back-compat `resolve_notifiers()`: if
-  `settings.notifiers` is unset (`None`) but `discord_webhook` is set, synthesize one Discord
-  notifier; an explicit `[]` means "none". ntfy reuses the same body, different envelope.
+  it to a `notifiers` list (`discord`/`ntfy`/`webhook`/`telegram`). Back-compat
+  `resolve_notifiers()`: if `settings.notifiers` is unset (`None`) but `discord_webhook` is set,
+  synthesize one Discord notifier; an explicit `[]` means "none". All types reuse the same body,
+  different envelope: ntfy headers, generic-webhook `{title, body, failed, timestamp}` JSON,
+  Telegram `sendMessage` (plain text by default — briefing markdown is Discord-flavoured).
 - **Run history** (`history.py`): `write_history()` writes `run-<UTC-ts>.json` + `latest.json`
   to `fleet_history_dir`, pruned to `fleet_history_keep`; gated on `fleet_history_enabled`.
+  Read back via `history_summary()`/`read_run()` — surfaced as `--history [N]` /
+  `--history-show <ts|latest>` (`cli.history_main()`, shared by both entry points, early-exits
+  before any driver import).
 - **Dead-man's switch**: `notifiers.ping_deadmans()` pings `fleet_deadmans_url` (`/fail` on
   failure) so its absence alerts when the orchestrator stops running.
 
