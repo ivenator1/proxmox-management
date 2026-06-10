@@ -18,13 +18,15 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import yaml
 
 from proxmox_fleet import briefing, deps, history, http, inventory, notifiers, window
 from proxmox_fleet.executor import RunnerExecutor
+from proxmox_fleet.flows._pkg import kuma_healthy
 from proxmox_fleet.flows.custom import run_custom_update
 from proxmox_fleet.flows.lxc import LxcFlowOutcome, _discover_lxcs, run_lxc_update
 from proxmox_fleet.flows.node import run_manager_update, run_node_update
@@ -33,7 +35,13 @@ from proxmox_fleet.flows.vm import VmFlowOutcome, run_vm_update
 from proxmox_fleet.inventory import HostSpec, RemoteHostSpec, VmSpec
 from proxmox_fleet.models.config import CustomConfig
 from proxmox_fleet.models.settings import GlobalSettings
-from proxmox_fleet.models.state import ErrorEntry, FleetState
+from proxmox_fleet.models.state import (
+    ErrorEntry,
+    FleetState,
+    LxcRecord,
+    RemoteRecord,
+    VmRecord,
+)
 from proxmox_fleet.orchestration import run_concurrent
 
 
@@ -75,6 +83,43 @@ PHASE_NAMES = ("remote", "custom", "lxc", "vm", "node", "manager")
 
 # Limit tokens that address the manager self-update (it is not an inventory host).
 _MANAGER_LIMIT_TOKENS = frozenset({"manager", "localhost", "Ansible-Manager"})
+
+# Status recorded for hosts whose wave was aborted by a canary failure.
+CANARY_SKIP_STATUS = "SKIPPED (canary failed)"
+
+
+def _soak_canaries(
+    settings: GlobalSettings,
+    kuma_map: Dict[str, Any],
+    tokens: Sequence[str],
+    *,
+    _sleep: Callable[[float], None] = time.sleep,
+) -> Optional[str]:
+    """Soak after a successful canary wave: wait ``canary_soak_minutes``, then
+    poll Kuma for every canary token that has a monitor mapping.
+
+    Returns None when all monitored canaries are healthy (or nothing is
+    monitored), else an error message — the caller aborts the second wave.
+    """
+    if settings.canary_soak_minutes > 0:
+        _sleep(settings.canary_soak_minutes * 60)
+    if not settings.kuma_url:
+        return None
+    url = f"{settings.kuma_url}/api/status-page/heartbeat/{settings.kuma_slug}"
+    for token in tokens:
+        monitor_id = str(kuma_map.get(token, ""))
+        if not monitor_id:
+            continue
+        try:
+            http.poll_until(
+                lambda: http.get_json(url),
+                lambda p: kuma_healthy(p, monitor_id=monitor_id),
+                retries=settings.kuma_health_check_retries,
+                delay=settings.kuma_health_check_delay,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return f"canary {token} unhealthy after soak: {exc}"
+    return None
 
 
 def run_custom_phase(
@@ -237,6 +282,11 @@ def run_lxc_phase(
     node is skipped before discovery when it isn't named and the limit holds no
     ids at all.
 
+    Canary staging: container ids listed in ``settings.canary_hosts`` update
+    first (across all nodes); the rest run only if no canary failed and the
+    post-soak Kuma checks pass — otherwise they are recorded as
+    ``SKIPPED (canary failed)``.
+
     When *state_output_path* is set, writes the resulting FleetState via
     dump_for_ansible() for tooling / molecule; run_fleet() passes None and
     merges each phase in-memory via _merge_state().
@@ -249,6 +299,10 @@ def run_lxc_phase(
 
     limit_has_ids = limit is not None and any(token.isdigit() for token in limit)
 
+    # Discovery pass: resolve every node's managed container ids up-front so
+    # the canary wave can span nodes. A discovery failure on one node is
+    # recorded and skips that node only — it never gates the canary waves.
+    discovered: List[Tuple[str, str, List[str]]] = []
     for node_info in nodes:
         node_name = node_info["name"]
         api_host = node_info["ansible_host"]
@@ -276,6 +330,11 @@ def run_lxc_phase(
             lxc_ids = [i for i in lxc_ids if i in limit]
 
         print(f"[{node_name}] found {len(lxc_ids)} managed LXC(s): {', '.join(lxc_ids) or 'none'}")
+        discovered.append((node_name, api_host, lxc_ids))
+
+    def _run_node_ids(node_name: str, api_host: str, ids: List[str]) -> bool:
+        """Run one node's containers concurrently; returns True if any failed."""
+        wave_failed = False
 
         # Concurrent per-container updates (lxc_continue_on_error is the default)
         def _run_one(lxc_id: str) -> LxcFlowOutcome:
@@ -286,7 +345,7 @@ def run_lxc_phase(
             )
 
         results = run_concurrent(
-            lxc_ids,
+            ids,
             _run_one,
             max_workers=settings.lxc_forks,
         )
@@ -294,6 +353,7 @@ def run_lxc_phase(
         for lxc_id, outcome, run_err in results:
             if outcome is not None:
                 _fold_outcome(state, outcome, state.lxc)
+                wave_failed = wave_failed or outcome.failed
                 rec = outcome.record
                 if rec is not None:
                     status = "FAILED" if outcome.failed else f"app={rec.app}  os={rec.os}"
@@ -302,12 +362,53 @@ def run_lxc_phase(
                     print(f"  [{node_name}/{lxc_id}] idle (no changes)")
             elif run_err is not None:
                 state.failed = True
+                wave_failed = True
                 state.errors.append(ErrorEntry(
                     host=str(lxc_id),
                     task="run_lxc_update",
                     error=str(run_err)[:300],
                 ))
                 print(f"  [{node_name}/{lxc_id}] ERROR: {run_err}")
+        return wave_failed
+
+    canary_set = {str(c) for c in settings.canary_hosts}
+    all_ids = [i for _, _, ids in discovered for i in ids]
+    canary_ids = [i for i in all_ids if i in canary_set]
+    rest_ids = [i for i in all_ids if i not in canary_set]
+
+    if not canary_ids or not rest_ids:
+        for node_name, api_host, ids in discovered:
+            _run_node_ids(node_name, api_host, ids)
+    else:
+        print(f"[lxc phase] canary wave: {', '.join(canary_ids)}")
+        canary_failed = False
+        for node_name, api_host, ids in discovered:
+            wave = [i for i in ids if i in canary_set]
+            if wave:
+                canary_failed = _run_node_ids(node_name, api_host, wave) or canary_failed
+        abort: Optional[str] = None
+        if canary_failed:
+            abort = "a canary container failed"
+        elif not dry_run:
+            abort = _soak_canaries(settings, settings.lxc_kuma_map, canary_ids)
+            if abort is not None:
+                state.failed = True
+                state.errors.append(ErrorEntry(
+                    host="lxc-canary", task="canary soak", error=abort[:300]))
+        if abort is not None:
+            print(f"[lxc phase] canary gate failed ({abort}) — "
+                  f"skipping {len(rest_ids)} container(s)")
+            for node_name, _, ids in discovered:
+                for lxc_id in ids:
+                    if lxc_id not in canary_set:
+                        state.lxc.append(LxcRecord(node=node_name, name=lxc_id,
+                                                   id=lxc_id, app=CANARY_SKIP_STATUS,
+                                                   snap=False))
+        else:
+            for node_name, api_host, ids in discovered:
+                wave = [i for i in ids if i not in canary_set]
+                if wave:
+                    _run_node_ids(node_name, api_host, wave)
 
     if state_output_path is not None:
         state.dump_for_ansible(state_output_path)
@@ -374,8 +475,11 @@ def run_vm_phase(
 
     Loads all VMs from inventory, runs them concurrently (max_workers=vm_forks).
     *limit* matches inventory names or vmids; non-matching VMs are silently
-    omitted. When *state_output_path* is set, writes the FleetState for
-    tooling / molecule; run_fleet() passes None and merges in-memory.
+    omitted. VMs flagged ``canary`` (inventory/host_vars) or listed in
+    ``settings.canary_hosts`` (name or vmid) update first; the rest run only
+    if the canary wave succeeded and the post-soak Kuma checks pass. When
+    *state_output_path* is set, writes the FleetState for tooling / molecule;
+    run_fleet() passes None and merges in-memory.
 
     Never raises for per-VM failures — those become FAILED records.
     """
@@ -426,24 +530,54 @@ def run_vm_phase(
             dry_run=dry_run, api_host=api_host,
         )
 
-    results = run_concurrent(vms, _run_one, max_workers=settings.vm_forks)
+    def _run_wave(wave: List[VmSpec]) -> None:
+        results = run_concurrent(wave, _run_one, max_workers=settings.vm_forks)
+        for vm_spec, outcome, run_err in results:
+            vm_name = vm_spec.name if isinstance(vm_spec, VmSpec) else str(vm_spec)
+            if outcome is not None:
+                _fold_outcome(state, outcome, state.vm)
+                rec = outcome.record
+                if rec is not None:
+                    status = "FAILED" if outcome.failed else rec.status
+                    print(f"  [{vm_name}] {status}")
+                else:
+                    print(f"  [{vm_name}] idle (no changes)")
+            elif run_err is not None:
+                state.failed = True
+                state.errors.append(ErrorEntry(
+                    host=vm_name, task="run_vm_update", error=str(run_err)[:300]
+                ))
+                print(f"  [{vm_name}] ERROR: {run_err}")
 
-    for vm_spec, outcome, run_err in results:
-        vm_name = vm_spec.name if isinstance(vm_spec, VmSpec) else str(vm_spec)
-        if outcome is not None:
-            _fold_outcome(state, outcome, state.vm)
-            rec = outcome.record
-            if rec is not None:
-                status = "FAILED" if outcome.failed else rec.status
-                print(f"  [{vm_name}] {status}")
-            else:
-                print(f"  [{vm_name}] idle (no changes)")
-        elif run_err is not None:
-            state.failed = True
-            state.errors.append(ErrorEntry(
-                host=vm_name, task="run_vm_update", error=str(run_err)[:300]
-            ))
-            print(f"  [{vm_name}] ERROR: {run_err}")
+    canary = [v for v in vms
+              if v.canary or v.name in settings.canary_hosts
+              or v.vmid in settings.canary_hosts]
+    rest = [v for v in vms if v not in canary]
+
+    if not canary or not rest:
+        _run_wave(vms)
+    else:
+        print(f"[vm phase] canary wave: {', '.join(v.name for v in canary)}")
+        _run_wave(canary)
+        abort: Optional[str] = None
+        if state.failed:
+            abort = "a canary VM failed"
+        elif not dry_run:
+            abort = _soak_canaries(settings, settings.vm_kuma_map,
+                                   [v.name for v in canary])
+            if abort is not None:
+                state.failed = True
+                state.errors.append(ErrorEntry(
+                    host="vm-canary", task="canary soak", error=abort[:300]))
+        if abort is not None:
+            print(f"[vm phase] canary gate failed ({abort}) — skipping {len(rest)} VM(s)")
+            for v in rest:
+                # Live cluster location wins over the pve_node hint, like _run_one.
+                node_name = vm_locations.get(v.vmid, (v.pve_node or "?", ""))[0]
+                state.vm.append(VmRecord(node=node_name, vmid=v.vmid, name=v.name,
+                                         status=CANARY_SKIP_STATUS))
+        else:
+            _run_wave(rest)
 
     if state_output_path is not None:
         state.dump_for_ansible(state_output_path)
@@ -461,7 +595,10 @@ def run_remote_phase(
     """Run Phase 0 (remote host updates) via the Python driver.
 
     Loads all [remote_hosts] from inventory, runs them concurrently
-    (max_workers=remote_forks). *limit* restricts to the named hosts. When
+    (max_workers=remote_forks). *limit* restricts to the named hosts. Hosts
+    flagged ``canary`` (inventory/host_vars) or listed in
+    ``settings.canary_hosts`` update first; the rest run only if the canary
+    wave succeeded and the post-soak Kuma checks pass. When
     *state_output_path* is set, writes the FleetState for tooling / molecule;
     run_fleet() passes None and merges in-memory.
 
@@ -484,24 +621,51 @@ def run_remote_phase(
             spec.name, ex, settings, dry_run=dry_run, pre_update_cmd=spec.pre_update_cmd
         )
 
-    results = run_concurrent(hosts, _run_one, max_workers=settings.remote_forks)
+    def _run_wave(wave: List[RemoteHostSpec]) -> None:
+        results = run_concurrent(wave, _run_one, max_workers=settings.remote_forks)
+        for spec, outcome, run_err in results:
+            host_name = spec.name if isinstance(spec, RemoteHostSpec) else str(spec)
+            if outcome is not None:
+                _fold_outcome(state, outcome, state.remote)
+                rec = outcome.record
+                if rec is not None:
+                    status = "FAILED" if outcome.failed else rec.status
+                    print(f"  [{host_name}] {status}")
+                else:
+                    print(f"  [{host_name}] idle (no changes)")
+            elif run_err is not None:
+                state.failed = True
+                state.errors.append(ErrorEntry(
+                    host=host_name, task="run_remote_update", error=str(run_err)[:300]
+                ))
+                print(f"  [{host_name}] ERROR: {run_err}")
 
-    for spec, outcome, run_err in results:
-        host_name = spec.name if isinstance(spec, RemoteHostSpec) else str(spec)
-        if outcome is not None:
-            _fold_outcome(state, outcome, state.remote)
-            rec = outcome.record
-            if rec is not None:
-                status = "FAILED" if outcome.failed else rec.status
-                print(f"  [{host_name}] {status}")
-            else:
-                print(f"  [{host_name}] idle (no changes)")
-        elif run_err is not None:
-            state.failed = True
-            state.errors.append(ErrorEntry(
-                host=host_name, task="run_remote_update", error=str(run_err)[:300]
-            ))
-            print(f"  [{host_name}] ERROR: {run_err}")
+    canary = [h for h in hosts
+              if h.canary or h.name in settings.canary_hosts]
+    rest = [h for h in hosts if h not in canary]
+
+    if not canary or not rest:
+        _run_wave(hosts)
+    else:
+        print(f"[remote phase] canary wave: {', '.join(h.name for h in canary)}")
+        _run_wave(canary)
+        abort: Optional[str] = None
+        if state.failed:
+            abort = "a canary host failed"
+        elif not dry_run:
+            abort = _soak_canaries(settings, settings.remote_kuma_map,
+                                   [h.name for h in canary])
+            if abort is not None:
+                state.failed = True
+                state.errors.append(ErrorEntry(
+                    host="remote-canary", task="canary soak", error=abort[:300]))
+        if abort is not None:
+            print(f"[remote phase] canary gate failed ({abort}) — "
+                  f"skipping {len(rest)} host(s)")
+            for spec in rest:
+                state.remote.append(RemoteRecord(host=spec.name, status=CANARY_SKIP_STATUS))
+        else:
+            _run_wave(rest)
 
     if state_output_path is not None:
         state.dump_for_ansible(state_output_path)

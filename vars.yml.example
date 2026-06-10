@@ -43,6 +43,17 @@ kuma_slug: "slug"
 lxc_kuma_map:
   "100": "5" #Pi-Hole
 
+# --- CANARY / STAGED ROLLOUT ---
+# Optional: update these hosts first (remote/lxc/vm phases). The rest of each
+# phase runs only if no canary failed and — after the soak window — every
+# Kuma-monitored canary is healthy; otherwise the remaining hosts are recorded
+# as "SKIPPED (canary failed)". Entries are inventory names and/or LXC/VM ids;
+# remote hosts and VMs can also be flagged with `canary=true` in hosts.ini or
+# host_vars. Empty list = no staging (everything runs in one wave).
+canary_hosts: []
+# canary_hosts: ["101", "media-vm", "web-01"]
+canary_soak_minutes: 0      # wait this long after the canary wave before the Kuma check
+
 # --- LXC TAG DISCOVERY ---
 lxc_tags:
   - "community-script"

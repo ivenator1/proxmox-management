@@ -132,6 +132,17 @@ ids (that container anywhere; nodes are skipped pre-discovery only when the limi
 VM limit matches name or vmid; custom dep *validation* still covers the full inventory. The
 manager self-update obeys limit via the tokens `manager`/`localhost`/`Ansible-Manager`.
 
+**Canary staging** (remote/lxc/vm phases): hosts flagged `canary=true` (inventory/host_vars,
+remote+vm) or listed in `canary_hosts` (names and/or LXC/VM ids, str-coerced) form wave 1; the
+rest run only if no canary failed AND `driver._soak_canaries()` passes (sleep
+`canary_soak_minutes`, then poll Kuma for each canary with a `*_kuma_map` entry — injectable
+`_sleep`). On a failed gate the remainder get `SKIPPED (canary failed)` records
+(`driver.CANARY_SKIP_STATUS`) and the phase is failed. The LXC phase discovers all nodes
+up-front so the canary wave spans nodes; a discovery error never trips the gate (per-wave
+failure tracking, not `state.failed`). Soak is skipped in dry-run; no canaries → single wave,
+identical to pre-canary behaviour. Custom (dependency-ordered) and node (serial,
+abort-on-first-failure) phases stage themselves already.
+
 ### State accumulation
 
 Each `flows/*` call returns a per-host outcome → `run_*_phase()` folds it into a `FleetState`

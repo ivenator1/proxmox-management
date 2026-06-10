@@ -114,3 +114,14 @@ def test_new_timeout_fields_have_correct_defaults():
     assert s.deadmans_retries == 5
     assert s.node_apt_retries == 5
     assert s.node_apt_retry_delay == 30.0
+
+
+def test_canary_hosts_entries_coerced_to_str():
+    s = GlobalSettings.model_validate({"canary_hosts": [101, "media-vm"]})
+    assert s.canary_hosts == ["101", "media-vm"]
+
+
+def test_canary_defaults():
+    s = GlobalSettings()
+    assert s.canary_hosts == []
+    assert s.canary_soak_minutes == 0.0

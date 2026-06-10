@@ -1138,3 +1138,299 @@ def test_custom_phase_unknown_pve_node_fails_loud(tmp_path, monkeypatch):
         run_custom_phase(settings=_settings(tmp_path), inventory_path=inv,
                          state_output_path=None)
     assert exc.value.code == 1
+
+
+# --- canary / staged rollout ----------------------------------------------------
+
+def _remote_inventory(tmp_path: Path) -> str:
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[remote_hosts]\n"
+        "canary-01 ansible_host=10.0.2.1 canary=true\n"
+        "web-01 ansible_host=10.0.2.2\n"
+        "web-02 ansible_host=10.0.2.3\n"
+    )
+    return str(p)
+
+
+def _patch_remote_flow(monkeypatch, *, fail_hosts=()):
+    """Stub run_remote_update, recording the order hosts ran in."""
+    ran: List[str] = []
+
+    def _fake(name, ex, settings, **kw):
+        ran.append(name)
+        from proxmox_fleet.flows.remote import RemoteFlowOutcome
+        from proxmox_fleet.models.state import ErrorEntry, RemoteRecord
+        if name in fail_hosts:
+            return RemoteFlowOutcome(
+                record=RemoteRecord(host=name, status="FAILED"), failed=True,
+                error=ErrorEntry(host=name, task="upgrade", error="boom"))
+        return RemoteFlowOutcome(record=RemoteRecord(host=name, status="Updated"),
+                                 changed=True)
+
+    monkeypatch.setattr(driver_mod, "run_remote_update", _fake)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+    return ran
+
+
+def test_remote_canary_runs_first_then_rest(tmp_path, monkeypatch):
+    ran = _patch_remote_flow(monkeypatch)
+    soaked = {}
+    monkeypatch.setattr(driver_mod, "_soak_canaries",
+                        lambda settings, kuma_map, tokens, **kw:
+                        soaked.setdefault("tokens", list(tokens)))
+    monkeypatch.setattr(driver_mod, "_soak_canaries",
+                        lambda settings, kuma_map, tokens, **kw: soaked.update(
+                            tokens=list(tokens)) or None)
+
+    state = driver_mod.run_remote_phase(
+        settings=GlobalSettings(), inventory_path=_remote_inventory(tmp_path),
+        state_output_path=None)
+
+    assert ran[0] == "canary-01"            # canary wave first
+    assert set(ran[1:]) == {"web-01", "web-02"}
+    assert soaked["tokens"] == ["canary-01"]
+    assert state.failed is False
+
+
+def test_remote_canary_failure_skips_rest(tmp_path, monkeypatch):
+    ran = _patch_remote_flow(monkeypatch, fail_hosts={"canary-01"})
+
+    state = driver_mod.run_remote_phase(
+        settings=GlobalSettings(), inventory_path=_remote_inventory(tmp_path),
+        state_output_path=None)
+
+    assert ran == ["canary-01"]             # rest never ran
+    skipped = [r for r in state.remote if r.status == "SKIPPED (canary failed)"]
+    assert sorted(r.host for r in skipped) == ["web-01", "web-02"]
+    assert state.failed is True
+
+
+def test_remote_canary_soak_failure_skips_rest(tmp_path, monkeypatch):
+    ran = _patch_remote_flow(monkeypatch)
+    monkeypatch.setattr(driver_mod, "_soak_canaries",
+                        lambda *a, **kw: "canary canary-01 unhealthy after soak: down")
+
+    state = driver_mod.run_remote_phase(
+        settings=GlobalSettings(), inventory_path=_remote_inventory(tmp_path),
+        state_output_path=None)
+
+    assert ran == ["canary-01"]
+    assert state.failed is True
+    assert any("unhealthy after soak" in e.error for e in state.errors)
+    assert sorted(r.host for r in state.remote if "SKIPPED" in r.status) == ["web-01", "web-02"]
+
+
+def test_remote_no_canaries_single_wave(tmp_path, monkeypatch):
+    p = tmp_path / "hosts.ini"
+    p.write_text("[remote_hosts]\nweb-01 ansible_host=10.0.2.2\n")
+    ran = _patch_remote_flow(monkeypatch)
+    soak_called = {}
+    monkeypatch.setattr(driver_mod, "_soak_canaries",
+                        lambda *a, **kw: soak_called.setdefault("yes", True))
+
+    driver_mod.run_remote_phase(settings=GlobalSettings(), inventory_path=str(p),
+                                state_output_path=None)
+
+    assert ran == ["web-01"]
+    assert soak_called == {}                # no staging → no soak
+
+
+def test_remote_canary_via_settings_list(tmp_path, monkeypatch):
+    p = tmp_path / "hosts.ini"
+    p.write_text("[remote_hosts]\nweb-01 ansible_host=1.1.1.1\nweb-02 ansible_host=1.1.1.2\n")
+    ran = _patch_remote_flow(monkeypatch)
+    monkeypatch.setattr(driver_mod, "_soak_canaries", lambda *a, **kw: None)
+
+    driver_mod.run_remote_phase(
+        settings=GlobalSettings(canary_hosts=["web-02"]), inventory_path=str(p),
+        state_output_path=None)
+
+    assert ran == ["web-02", "web-01"]
+
+
+def test_remote_canary_dry_run_skips_soak(tmp_path, monkeypatch):
+    ran = _patch_remote_flow(monkeypatch)
+    monkeypatch.setattr(driver_mod, "_soak_canaries",
+                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("no soak in dry-run")))
+
+    state = driver_mod.run_remote_phase(
+        settings=GlobalSettings(fleet_dry_run=True),
+        inventory_path=_remote_inventory(tmp_path), state_output_path=None)
+
+    assert len(ran) == 3                    # both waves still ran
+    assert state.failed is False
+
+
+def test_vm_canary_failure_skips_rest_with_records(tmp_path, monkeypatch):
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\npve-01 ansible_host=10.0.0.1\n"
+        "[proxmox_vms]\n"
+        "media-vm ansible_host=10.0.1.1 vmid=200 pve_node=pve-01 canary=true\n"
+        "db-vm ansible_host=10.0.1.2 vmid=201 pve_node=pve-01\n"
+    )
+    ran: List[str] = []
+
+    def _fake_vm_update(node_name, vmid, name, vm_ex, node_ex, settings, **kw):
+        ran.append(name)
+        from proxmox_fleet.flows.vm import VmFlowOutcome
+        from proxmox_fleet.models.state import ErrorEntry, VmRecord
+        return VmFlowOutcome(record=VmRecord(node=node_name, vmid=vmid, name=name,
+                                             status="FAILED"), failed=True,
+                             error=ErrorEntry(host=name, task="upgrade", error="boom"))
+
+    monkeypatch.setattr(driver_mod, "run_vm_update", _fake_vm_update)
+    monkeypatch.setattr(driver_mod, "_discover_vm_locations", lambda *a, **kw: {})
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    state = driver_mod.run_vm_phase(settings=GlobalSettings(), inventory_path=str(p),
+                                    state_output_path=None)
+
+    assert ran == ["media-vm"]
+    skipped = [r for r in state.vm if r.status == "SKIPPED (canary failed)"]
+    assert [r.name for r in skipped] == ["db-vm"]
+    assert skipped[0].node == "pve-01"      # pve_node hint used for the record
+
+
+def test_lxc_canary_id_failure_skips_rest_across_nodes(tmp_path, monkeypatch):
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\n"
+        "pve-01 ansible_host=10.0.0.1\n"
+        "pve-02 ansible_host=10.0.0.2\n"
+    )
+    per_node_ids = {"pve-01": ["101", "102"], "pve-02": ["201"]}
+    ran: List[str] = []
+
+    def _fake_discover(ex, settings):
+        return per_node_ids[ex.host]
+
+    def _fake_lxc_update(node_name, lxc_id, ex, settings, **kw):
+        ran.append(lxc_id)
+        from proxmox_fleet.flows.lxc import LxcFlowOutcome
+        from proxmox_fleet.models.state import ErrorEntry, LxcRecord
+        return LxcFlowOutcome(
+            record=LxcRecord(node=node_name, name=f"ct{lxc_id}", id=lxc_id, app="FAILED"),
+            failed=True,
+            error=ErrorEntry(host=lxc_id, task="update", error="boom"))
+
+    def _fake_executor(host, **kw):
+        ex = ScriptedExecutor()
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", _fake_discover)
+    monkeypatch.setattr(driver_mod, "run_lxc_update", _fake_lxc_update)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+
+    state = driver_mod.run_lxc_phase(
+        settings=GlobalSettings(canary_hosts=["201"]), inventory_path=str(p),
+        state_output_path=None)
+
+    assert ran == ["201"]                   # canary wave only
+    skipped = [r for r in state.lxc if r.app == "SKIPPED (canary failed)"]
+    assert sorted(r.id for r in skipped) == ["101", "102"]
+    assert all(r.snap is False for r in skipped)
+
+
+def test_lxc_canary_success_runs_rest(tmp_path, monkeypatch):
+    p = tmp_path / "hosts.ini"
+    p.write_text("[proxmox_nodes]\npve-01 ansible_host=10.0.0.1\n")
+    ran: List[str] = []
+
+    def _fake_lxc_update(node_name, lxc_id, ex, settings, **kw):
+        ran.append(lxc_id)
+        from proxmox_fleet.flows.lxc import LxcFlowOutcome
+        return LxcFlowOutcome()
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", lambda ex, s: ["101", "102", "103"])
+    monkeypatch.setattr(driver_mod, "run_lxc_update", _fake_lxc_update)
+    monkeypatch.setattr(driver_mod, "_soak_canaries", lambda *a, **kw: None)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    state = driver_mod.run_lxc_phase(
+        settings=GlobalSettings(canary_hosts=["102"]), inventory_path=str(p),
+        state_output_path=None)
+
+    assert ran == ["102", "101", "103"]     # canary first, then the rest
+    assert state.failed is False
+
+
+def test_lxc_discovery_failure_does_not_trip_canary_gate(tmp_path, monkeypatch):
+    """A discovery error on one node must not abort the canary waves."""
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\n"
+        "pve-01 ansible_host=10.0.0.1\n"
+        "pve-bad ansible_host=10.0.0.9\n"
+    )
+    ran: List[str] = []
+
+    def _fake_discover(ex, settings):
+        if ex.host == "pve-bad":
+            raise RuntimeError("ssh down")
+        return ["101", "102"]
+
+    def _fake_lxc_update(node_name, lxc_id, ex, settings, **kw):
+        ran.append(lxc_id)
+        from proxmox_fleet.flows.lxc import LxcFlowOutcome
+        return LxcFlowOutcome()
+
+    def _fake_executor(host, **kw):
+        ex = ScriptedExecutor()
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", _fake_discover)
+    monkeypatch.setattr(driver_mod, "run_lxc_update", _fake_lxc_update)
+    monkeypatch.setattr(driver_mod, "_soak_canaries", lambda *a, **kw: None)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+
+    state = driver_mod.run_lxc_phase(
+        settings=GlobalSettings(canary_hosts=["101"]), inventory_path=str(p),
+        state_output_path=None)
+
+    assert state.failed is True             # discovery error recorded
+    assert sorted(ran) == ["101", "102"]    # both waves still ran
+    assert not any("SKIPPED" in r.app for r in state.lxc)
+
+
+# --- _soak_canaries --------------------------------------------------------------
+
+def test_soak_sleeps_then_checks(monkeypatch):
+    slept: List[float] = []
+    polled: List[str] = []
+
+    def _fake_poll(fetch, pred, **kw):
+        polled.append("x")
+        return {"heartbeatList": {}}
+
+    monkeypatch.setattr(driver_mod.http, "poll_until", _fake_poll)
+    settings = GlobalSettings(canary_soak_minutes=2, kuma_url="http://kuma",
+                              kuma_slug="fleet")
+    err = driver_mod._soak_canaries(settings, {"101": "5"}, ["101", "102"],
+                                    _sleep=slept.append)
+    assert err is None
+    assert slept == [120.0]
+    assert len(polled) == 1                 # only the mapped canary is polled
+
+
+def test_soak_returns_error_on_unhealthy(monkeypatch):
+    def _boom(fetch, pred, **kw):
+        raise TimeoutError("monitor down")
+
+    monkeypatch.setattr(driver_mod.http, "poll_until", _boom)
+    settings = GlobalSettings(kuma_url="http://kuma", kuma_slug="fleet")
+    err = driver_mod._soak_canaries(settings, {"101": "5"}, ["101"],
+                                    _sleep=lambda s: None)
+    assert err is not None and "101" in err
+
+
+def test_soak_no_kuma_url_is_noop():
+    err = driver_mod._soak_canaries(GlobalSettings(), {"101": "5"}, ["101"],
+                                    _sleep=lambda s: None)
+    assert err is None
