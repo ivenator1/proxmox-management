@@ -12,7 +12,8 @@ Imports are lazy so unit tests never need ansible-runner.
 from __future__ import annotations
 
 import argparse
-from typing import TYPE_CHECKING, Dict, List, Optional
+import json
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
     from proxmox_fleet.models.settings import GlobalSettings
@@ -34,6 +35,72 @@ def _is_true(val: str) -> bool:
 
 # Boolean -e extravars that map 1:1 onto GlobalSettings fields.
 _SETTINGS_EXTRAVARS = ("fleet_dry_run", "lxc_verbose", "force_notify", "force_window")
+
+# Per-type record counts shown as table columns, in briefing/phase order.
+_HISTORY_COUNT_COLUMNS = ("lxc", "vm", "remote", "node", "custom", "errors", "warnings")
+
+
+def _format_history_table(rows: List[Dict[str, Any]]) -> str:
+    """Render history_summary() rows as a fixed-width table (newest first)."""
+    headers = ["TIMESTAMP", "RESULT", *(c.upper() for c in _HISTORY_COUNT_COLUMNS)]
+    lines = []
+    for row in rows:
+        if row["failed"]:
+            result = "failed"
+        elif row["changed"]:
+            result = "changed"
+        else:
+            result = "clean"
+        counts = row.get("counts") or {}
+        lines.append([
+            str(row["timestamp"]),
+            result,
+            *(str(counts.get(c, 0)) for c in _HISTORY_COUNT_COLUMNS),
+        ])
+    widths = [max(len(line[i]) for line in [headers, *lines]) for i in range(len(headers))]
+    return "\n".join(
+        "  ".join(cell.ljust(width) for cell, width in zip(line, widths)).rstrip()
+        for line in [headers, *lines]
+    )
+
+
+def history_main(
+    *,
+    history: Optional[int],
+    history_show: Optional[str],
+    vars_file: str,
+) -> int:
+    """Handle ``--history [N]`` / ``--history-show REF`` — read-only, no fleet run.
+
+    Shared by this CLI and the ``fleet-update.py`` wrapper. Reads
+    ``fleet_history_dir`` from settings, never imports the driver (so it works
+    without ansible-runner installed).
+    """
+    from proxmox_fleet import history as history_mod
+    from proxmox_fleet.models.settings import GlobalSettings
+
+    settings = GlobalSettings.load(vars_file)
+
+    if history_show is not None:
+        try:
+            run = history_mod.read_run(settings.fleet_history_dir, history_show)
+        except FileNotFoundError:
+            print(f"no history record {history_show!r} in {settings.fleet_history_dir}")
+            return 1
+        briefing = run.get("briefing")
+        if briefing:
+            print(briefing)
+        else:
+            # Pre-briefing history files: fall back to the raw summary.
+            print(json.dumps(run, indent=4, sort_keys=True, ensure_ascii=False))
+        return 0
+
+    rows = history_mod.history_summary(settings.fleet_history_dir, limit=history or 0)
+    if not rows:
+        print(f"no run history found in {settings.fleet_history_dir}")
+        return 1
+    print(_format_history_table(rows))
+    return 0
 
 
 def apply_extravar_overrides(
@@ -63,7 +130,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--inventory", default="hosts.ini", help="inventory path.")
     parser.add_argument("--vars-file", default="vars.yml",
                         help="path to vars.yml used to load GlobalSettings.")
+    parser.add_argument("--history", nargs="?", const=10, type=int, default=None, metavar="N",
+                        help="show the last N persisted runs (default 10) and exit; no fleet run.")
+    parser.add_argument("--history-show", default=None, metavar="TS|latest",
+                        help="print one persisted run's briefing (timestamp or 'latest') and exit.")
     args = parser.parse_args(argv)
+
+    if args.history is not None or args.history_show is not None:
+        return history_main(history=args.history, history_show=args.history_show,
+                            vars_file=args.vars_file)
 
     extravars = _parse_extra_vars(args.extra_vars)
 

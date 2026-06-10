@@ -69,6 +69,10 @@ EXAMPLES
 
   # Pass a raw extra var (same as old 'fleet-update -e KEY=VALUE'):
   ./fleet-update.py -e custom_allow_reboot=false
+
+  # Show the last 5 persisted runs / replay the latest run's briefing:
+  ./fleet-update.py --history 5
+  ./fleet-update.py --history-show latest
 """,
     )
 
@@ -121,6 +125,21 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="PATH",
         help="Path to vars.yml used to load GlobalSettings (default: vars.yml).",
     )
+    parser.add_argument(
+        "--history",
+        nargs="?",
+        const=10,
+        type=int,
+        default=None,
+        metavar="N",
+        help="Show the last N persisted runs (default: 10) and exit — no fleet run.",
+    )
+    parser.add_argument(
+        "--history-show",
+        default=None,
+        metavar="TS|latest",
+        help="Print one persisted run's briefing (run timestamp or 'latest') and exit.",
+    )
 
 
 def main() -> int:
@@ -130,10 +149,18 @@ def main() -> int:
 
     try:
         from proxmox_fleet import driver
-        from proxmox_fleet.cli import _parse_extra_vars, apply_extravar_overrides
+        from proxmox_fleet.cli import (
+            _parse_extra_vars,
+            apply_extravar_overrides,
+            history_main,
+        )
         from proxmox_fleet.models.settings import GlobalSettings
     except ImportError as exc:
         raise SystemExit(f"Cannot import proxmox_fleet — is the venv active? ({exc})")
+
+    if args.history is not None or args.history_show is not None:
+        return history_main(history=args.history, history_show=args.history_show,
+                            vars_file=args.vars_file)
 
     extravars = _parse_extra_vars(args.extra_vars)
 

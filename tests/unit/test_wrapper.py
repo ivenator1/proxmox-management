@@ -247,6 +247,50 @@ def test_exit_code_forwarded():
 
 
 # ---------------------------------------------------------------------------
+# Tests: --history / --history-show early exit (no fleet run)
+# ---------------------------------------------------------------------------
+
+def _write_history(tmp_path, *, timestamp, briefing=None):
+    from proxmox_fleet.history import write_history
+    from proxmox_fleet.models.state import FleetState
+
+    write_history(FleetState.from_raw({}), history_dir=tmp_path, keep=0,
+                  timestamp=timestamp, briefing=briefing)
+
+
+def test_history_flag_skips_fleet_run(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z")
+
+    with (
+        patch.object(sys, "argv", ["./fleet-update.py", "--history"]),
+        patch("proxmox_fleet.driver.run_fleet") as mock_fleet,
+        patch("proxmox_fleet.models.settings.GlobalSettings.load",
+              return_value=GlobalSettings(fleet_history_dir=str(tmp_path))),
+    ):
+        rc = _wrapper.main()
+
+    mock_fleet.assert_not_called()
+    assert rc == 0
+    assert "20260101T000000000000Z" in capsys.readouterr().out
+
+
+def test_history_show_flag_prints_briefing(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z", briefing="THE BRIEFING")
+
+    with (
+        patch.object(sys, "argv", ["./fleet-update.py", "--history-show", "latest"]),
+        patch("proxmox_fleet.driver.run_fleet") as mock_fleet,
+        patch("proxmox_fleet.models.settings.GlobalSettings.load",
+              return_value=GlobalSettings(fleet_history_dir=str(tmp_path))),
+    ):
+        rc = _wrapper.main()
+
+    mock_fleet.assert_not_called()
+    assert rc == 0
+    assert "THE BRIEFING" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # Tests: cli.py force_window propagation fix
 # ---------------------------------------------------------------------------
 

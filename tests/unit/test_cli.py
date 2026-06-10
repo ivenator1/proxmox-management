@@ -187,3 +187,137 @@ def test_vars_file_forwarded():
 def test_exit_code_forwarded():
     rc, _, _, _ = _run([], run_fleet_return=1)
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# cli.main() — --history / --history-show (early exit, no fleet run)
+# ---------------------------------------------------------------------------
+
+def _write_history(tmp_path, *, timestamp, changed=False, failed=False, briefing=None):
+    from proxmox_fleet.history import write_history
+    from proxmox_fleet.models.state import FleetState
+
+    state = FleetState.from_raw({"fleet_changed": changed, "fleet_failed": failed})
+    write_history(state, history_dir=tmp_path, keep=0, timestamp=timestamp,
+                  briefing=briefing)
+
+
+def _settings_with_history(tmp_path) -> GlobalSettings:
+    return GlobalSettings(fleet_history_dir=str(tmp_path))
+
+
+def test_history_lists_runs_without_running_fleet(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z")
+    _write_history(tmp_path, timestamp="20260102T000000000000Z", changed=True)
+
+    with (
+        patch("proxmox_fleet.driver.run_fleet") as mock_fleet,
+        patch("proxmox_fleet.models.settings.GlobalSettings.load",
+              return_value=_settings_with_history(tmp_path)),
+    ):
+        rc = cli.main(["--history"])
+
+    mock_fleet.assert_not_called()
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Newest first, header row present.
+    assert out.index("20260102T000000000000Z") < out.index("20260101T000000000000Z")
+    assert "TIMESTAMP" in out and "RESULT" in out
+
+
+def test_history_limit_respected(tmp_path, capsys):
+    for i in range(4):
+        _write_history(tmp_path, timestamp=f"2026010{i}T000000000000Z")
+
+    with patch("proxmox_fleet.models.settings.GlobalSettings.load",
+               return_value=_settings_with_history(tmp_path)):
+        rc = cli.main(["--history", "2"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "20260103T000000000000Z" in out and "20260102T000000000000Z" in out
+    assert "20260101T000000000000Z" not in out
+
+
+def test_history_empty_dir_exits_nonzero(tmp_path, capsys):
+    with patch("proxmox_fleet.models.settings.GlobalSettings.load",
+               return_value=_settings_with_history(tmp_path)):
+        rc = cli.main(["--history"])
+
+    assert rc == 1
+    assert "no run history" in capsys.readouterr().out
+
+
+def test_history_show_prints_briefing(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z",
+                   briefing="**Fleet Update Complete**\n- sonarr OK")
+
+    with patch("proxmox_fleet.models.settings.GlobalSettings.load",
+               return_value=_settings_with_history(tmp_path)):
+        rc = cli.main(["--history-show", "latest"])
+
+    assert rc == 0
+    assert "sonarr OK" in capsys.readouterr().out
+
+
+def test_history_show_by_timestamp(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z", briefing="OLD RUN")
+    _write_history(tmp_path, timestamp="20260102T000000000000Z", briefing="NEW RUN")
+
+    with patch("proxmox_fleet.models.settings.GlobalSettings.load",
+               return_value=_settings_with_history(tmp_path)):
+        rc = cli.main(["--history-show", "20260101T000000000000Z"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "OLD RUN" in out and "NEW RUN" not in out
+
+
+def test_history_show_falls_back_to_json_without_briefing(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z")  # no briefing key
+
+    with patch("proxmox_fleet.models.settings.GlobalSettings.load",
+               return_value=_settings_with_history(tmp_path)):
+        rc = cli.main(["--history-show", "latest"])
+
+    assert rc == 0
+    assert '"timestamp": "20260101T000000000000Z"' in capsys.readouterr().out
+
+
+def test_history_show_missing_run_exits_nonzero(tmp_path, capsys):
+    with patch("proxmox_fleet.models.settings.GlobalSettings.load",
+               return_value=_settings_with_history(tmp_path)):
+        rc = cli.main(["--history-show", "latest"])
+
+    assert rc == 1
+    assert "no history record" in capsys.readouterr().out
+
+
+def test_history_uses_vars_file_history_dir(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z")
+    vars_file = tmp_path / "vars.yml"
+    vars_file.write_text(f"fleet_history_dir: {tmp_path}\n", encoding="utf-8")
+
+    rc = cli.main(["--history", "--vars-file", str(vars_file)])
+
+    assert rc == 0
+    assert "20260101T000000000000Z" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# _format_history_table
+# ---------------------------------------------------------------------------
+
+def test_format_history_table_result_column():
+    rows = [
+        {"timestamp": "T3", "changed": False, "failed": True,
+         "counts": {"lxc": 1, "errors": 2}},
+        {"timestamp": "T2", "changed": True, "failed": False, "counts": {}},
+        {"timestamp": "T1", "changed": False, "failed": False, "counts": {}},
+    ]
+    lines = cli._format_history_table(rows).splitlines()
+    assert lines[0].startswith("TIMESTAMP")
+    assert "failed" in lines[1] and "changed" in lines[2] and "clean" in lines[3]
+    # Counts land under their columns; missing counts render as 0.
+    assert lines[1].split() == ["T3", "failed", "1", "0", "0", "0", "0", "2", "0"]
+    assert lines[3].split() == ["T1", "clean", "0", "0", "0", "0", "0", "0", "0"]
