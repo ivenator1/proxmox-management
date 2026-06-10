@@ -221,6 +221,55 @@ def test_extra_vars_fleet_dry_run_propagated(tmp_path, monkeypatch):
     assert "dry-run" in state.custom[0].app
 
 
+def test_extra_vars_false_string_is_not_truthy(tmp_path, monkeypatch):
+    """-e fleet_dry_run=false arrives as the string 'false' — it must NOT put
+    the phase in dry-run (bool('false') is True; _truthy must not be)."""
+    inv = _write_inventory(tmp_path, "gitea ansible_host=10.0.0.1 custom_config=gitea")
+    _write_config(tmp_path, "gitea", {
+        "name": "Gitea",
+        "version_command": "ver",
+        "update_steps": [{"name": "upgrade", "command": "do-upgrade"}],
+        "changed_when": {"type": "version"},
+        "health_check": {"type": "none"},
+    })
+    settings = _settings(tmp_path)
+
+    executor = ScriptedExecutor({"ver": [_ok("1.0"), _ok("1.1")]})
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", lambda *a, **kw: executor)
+
+    state = run_custom_phase(
+        settings=settings,
+        inventory_path=inv,
+        extra_vars={"fleet_dry_run": "false", "custom_dry_run": "no", "force_window": "0"},
+        state_output_path=str(tmp_path / "out.json"),
+    )
+    # Real run: the update step executed, status is not dry-run.
+    assert "do-upgrade" in executor.commands
+    assert "dry-run" not in state.custom[0].app
+
+
+def test_check_puts_custom_phase_in_dry_run(tmp_path, monkeypatch):
+    """check=True must imply dry-run (run_shell primitives have check_mode: false,
+    so without this the custom phase would execute real update steps)."""
+    inv = _write_inventory(tmp_path, "gitea ansible_host=10.0.0.1 custom_config=gitea")
+    _write_config(tmp_path, "gitea", {
+        "name": "Gitea",
+        "version_command": "ver",
+        "update_steps": [{"name": "upgrade", "command": "do-upgrade"}],
+        "changed_when": {"type": "version"},
+        "health_check": {"type": "none"},
+    })
+    settings = _settings(tmp_path)
+
+    executor = ScriptedExecutor({"ver": [_ok("1.0")]})
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", lambda *a, **kw: executor)
+
+    state = run_custom_phase(settings=settings, inventory_path=inv, check=True,
+                             state_output_path=str(tmp_path / "out.json"))
+    assert "do-upgrade" not in executor.commands
+    assert "dry-run" in state.custom[0].app
+
+
 def test_failed_host_recorded_in_state(tmp_path, monkeypatch):
     inv = _write_inventory(tmp_path, "gitea ansible_host=10.0.0.1 custom_config=gitea")
     _write_config(tmp_path, "gitea", {

@@ -120,9 +120,13 @@ class UpdateStep(BaseModel):
 
 
 class MaintenanceWindow(BaseModel):
-    """Optional maintenance window. Evaluated by proxmox_fleet.window."""
+    """Optional maintenance window. Evaluated by proxmox_fleet.window.
 
-    model_config = ConfigDict(extra="allow")
+    extra='forbid': a typo'd key (``day:`` for ``days:``) must fail loud at
+    inventory load — silently accepting it would widen the window to any day.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     days: Optional[List[str]] = None
     start: str = "00:00"

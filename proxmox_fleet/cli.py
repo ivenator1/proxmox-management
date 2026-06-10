@@ -12,7 +12,10 @@ Imports are lazy so unit tests never need ansible-runner.
 from __future__ import annotations
 
 import argparse
-from typing import List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from proxmox_fleet.models.settings import GlobalSettings
 
 
 def _parse_extra_vars(pairs: List[str]) -> dict:
@@ -27,6 +30,26 @@ def _parse_extra_vars(pairs: List[str]) -> dict:
 
 def _is_true(val: str) -> bool:
     return val.lower() in ("true", "1", "yes")
+
+
+# Boolean -e extravars that map 1:1 onto GlobalSettings fields.
+_SETTINGS_EXTRAVARS = ("fleet_dry_run", "lxc_verbose", "force_notify", "force_window")
+
+
+def apply_extravar_overrides(
+    settings: "GlobalSettings", extravars: Dict[str, str]
+) -> "GlobalSettings":
+    """Fold boolean ``-e`` extravars that affect driver behaviour into settings.
+
+    Shared by this CLI and the ``fleet-update.py`` wrapper so the two entry
+    points cannot drift on which flags they propagate.
+    """
+    updates = {
+        key: True
+        for key in _SETTINGS_EXTRAVARS
+        if _is_true(str(extravars.get(key, "")))
+    }
+    return settings.model_copy(update=updates) if updates else settings
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -53,14 +76,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     settings = GlobalSettings.load(args.vars_file)
 
     # Propagate CLI extravars that affect driver behaviour into settings.
-    if _is_true(extravars.get("fleet_dry_run", "")):
-        settings = settings.model_copy(update={"fleet_dry_run": True})
-    if _is_true(extravars.get("lxc_verbose", "")):
-        settings = settings.model_copy(update={"lxc_verbose": True})
-    if _is_true(extravars.get("force_notify", "")):
-        settings = settings.model_copy(update={"force_notify": True})
-    if _is_true(extravars.get("force_window", "")):
-        settings = settings.model_copy(update={"force_window": True})
+    settings = apply_extravar_overrides(settings, extravars)
 
     return driver.run_fleet(
         settings=settings,

@@ -123,20 +123,6 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _parse_extra_vars(pairs: list) -> dict:
-    out: dict = {}
-    for pair in pairs:
-        if "=" not in pair:
-            raise SystemExit(f"-e expects KEY=VALUE, got: {pair!r}")
-        key, val = pair.split("=", 1)
-        out[key.strip()] = val.strip()
-    return out
-
-
-def _is_true(val: str) -> bool:
-    return val.lower() in ("true", "1", "yes")
-
-
 def main() -> int:
     parser = _build_parser()
     _add_arguments(parser)
@@ -144,6 +130,7 @@ def main() -> int:
 
     try:
         from proxmox_fleet import driver
+        from proxmox_fleet.cli import _parse_extra_vars, apply_extravar_overrides
         from proxmox_fleet.models.settings import GlobalSettings
     except ImportError as exc:
         raise SystemExit(f"Cannot import proxmox_fleet — is the venv active? ({exc})")
@@ -153,19 +140,12 @@ def main() -> int:
     settings = GlobalSettings.load(args.vars_file)
 
     # Apply -e extravars propagation first (lower priority than friendly flags).
-    if _is_true(extravars.get("fleet_dry_run", "")):
-        settings = settings.model_copy(update={"fleet_dry_run": True})
-    if _is_true(extravars.get("lxc_verbose", "")):
-        settings = settings.model_copy(update={"lxc_verbose": True})
-    if _is_true(extravars.get("force_notify", "")):
-        settings = settings.model_copy(update={"force_notify": True})
-    if _is_true(extravars.get("force_window", "")):
-        settings = settings.model_copy(update={"force_window": True})
+    # Shared with proxmox_fleet.cli so the two entry points cannot drift.
+    settings = apply_extravar_overrides(settings, extravars)
 
     # Friendly flags override extravars — applied last so they always win.
     if args.dry_run:
         settings = settings.model_copy(update={"fleet_dry_run": True})
-        extravars.setdefault("fleet_dry_run", "true")  # run_custom_phase reads ev directly
     if args.force_notify:
         settings = settings.model_copy(update={"force_notify": True})
     if args.lxc_verbose:

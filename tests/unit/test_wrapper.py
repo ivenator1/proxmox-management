@@ -83,15 +83,17 @@ def test_defaults_pass_through():
 # ---------------------------------------------------------------------------
 
 def test_dry_run_flag():
+    # settings.fleet_dry_run (plus check=True) is the contract — the driver no
+    # longer needs a synthetic "fleet_dry_run" extravar.
     _, settings, ev = _run(["--dry-run"])
     assert settings.fleet_dry_run is True
-    assert ev.get("fleet_dry_run") == "true"
+    assert "fleet_dry_run" not in ev
 
 
 def test_check_alias():
     _, settings, ev = _run(["--check"])
     assert settings.fleet_dry_run is True
-    assert ev.get("fleet_dry_run") == "true"
+    assert "fleet_dry_run" not in ev
 
 
 def test_dry_run_passes_check_true_to_driver():

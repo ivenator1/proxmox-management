@@ -28,9 +28,18 @@ def test_day_ok_when_days_omitted():
     assert in_window({}, now=now) is True
 
 
-def test_day_ok_case_sensitive_match():
+def test_day_ok_titlecase_match():
     now = _dt(5, "03:00")  # Saturday
     assert in_window({"days": ["Sat", "Sun"]}, now=now) is True
+
+
+def test_day_match_is_case_insensitive():
+    """Parity with the retired check-window.yml, which lowercased both sides —
+    `days: [sat, sun]` in host_vars must not silently skip the host forever."""
+    now = _dt(5, "03:00")  # Saturday
+    assert in_window({"days": ["sat", "sun"]}, now=now) is True
+    assert in_window({"days": ["SAT"]}, now=now) is True
+    assert in_window({"days": ["mon"]}, now=now) is False
 
 
 def test_day_not_matched():

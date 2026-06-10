@@ -243,8 +243,22 @@ def test_dry_run(monkeypatch):
     assert ex.snapshots_created == []
 
 
-def test_no_update_script(monkeypatch):
-    # NO SCRIPT + idle OS → suppressed (no record)
+def test_no_update_script_os_only_idle_suppressed(monkeypatch):
+    # os_only_lxc_list container (script expected to be missing) + idle OS → no record
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    ex = ScriptedLxcExecutor(
+        introspect_facts=_INTROSPECT_NO_SCRIPT,
+        script={"reboot-required": [_fail(rc=1)]},
+        lxc_os_result=_ok(stdout="0 upgraded, 0 newly installed"),
+    )
+    settings = _settings(os_only_lxc_list=["101"])
+    out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10")
+    assert out.record is None
+    assert out.failed is False
+
+
+def test_no_update_script_unexpected_is_reported(monkeypatch):
+    # Tagged container whose script pull failed unexpectedly → anomaly, record emitted
     monkeypatch.setattr(time, "sleep", lambda s: None)
     ex = ScriptedLxcExecutor(
         introspect_facts=_INTROSPECT_NO_SCRIPT,
@@ -252,22 +266,44 @@ def test_no_update_script(monkeypatch):
         lxc_os_result=_ok(stdout="0 upgraded, 0 newly installed"),
     )
     out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
-    assert out.record is None
+    assert out.record is not None
+    assert out.record.app == "NO SCRIPT"
     assert out.failed is False
 
 
 def test_no_update_script_os_updated(monkeypatch):
-    # NO SCRIPT + OS changed → record emitted
+    # NO SCRIPT + OS changed → record emitted even for os_only containers
     monkeypatch.setattr(time, "sleep", lambda s: None)
     ex = ScriptedLxcExecutor(
         introspect_facts=_INTROSPECT_NO_SCRIPT,
         script={"reboot-required": [_fail(rc=1)]},
         lxc_os_result=_ok(stdout="1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded."),
     )
-    out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
+    settings = _settings(os_only_lxc_list=["101"])
+    out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10")
     assert out.record is not None
     assert out.record.app == "NO SCRIPT"
     assert out.failed is False
+
+
+def test_no_update_script_os_only_reboots_after_kernel_update(monkeypatch):
+    # The reboot-required check must run even without an update script —
+    # os_only_lxc_list containers still get kernel updates.
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    ex = ScriptedLxcExecutor(
+        introspect_facts=_INTROSPECT_NO_SCRIPT,
+        script={
+            "reboot-required": [_ok(rc=0, changed=False)],
+            "pct reboot": [_ok(changed=True)],
+        },
+        lxc_os_result=_ok(stdout="5 upgraded, 0 newly installed", changed=True),
+    )
+    settings = _settings(os_only_lxc_list=["101"], lxc_auto_reboot=True,
+                         lxc_backup_strategy="none")
+    out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10")
+    assert out.record is not None
+    assert "Rebooted" in out.record.os
+    assert any("pct reboot" in c for c in ex.commands)
 
 
 def test_template_skipped(monkeypatch):
@@ -569,7 +605,7 @@ def test_os_and_dpkg_commands_pin_locale(monkeypatch):
 
 
 def test_reboot_suffix_in_os_status(monkeypatch):
-    """Reboot check runs only when an update script exists (not lxc_no_update_script)."""
+    """A reboot-required file plus lxc_auto_reboot yields the '& Rebooted' suffix."""
     monkeypatch.setattr(time, "sleep", lambda s: None)
     monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
     ex = ScriptedLxcExecutor(
@@ -638,6 +674,23 @@ def test_snapshot_with_retry_returns_failed_after_exhaustion():
     assert result.failed is True
     assert result.changed is False
     assert len(ex.calls) == 3  # initial + 2 retries
+
+
+def test_snapshot_with_retry_returns_failed_when_snapshot_raises():
+    # Contract: a failed snapshot is a warning, never a raise — even when the
+    # primitive invocation itself throws instead of returning failed=True.
+    from proxmox_fleet.executor import snapshot_with_retry
+
+    class _RaisingEx:
+        host = "pve-01"
+
+        def snapshot(self, vmid, *, snap_state, **kw):
+            raise OSError("ansible-runner exploded")
+
+    result = snapshot_with_retry(_RaisingEx(), "101", snap_state="present", **_API,
+                                 retries=2, _sleep=lambda s: None)
+    assert result.failed is True
+    assert result.changed is False
 
 
 # ---------------------------------------------------------------------------

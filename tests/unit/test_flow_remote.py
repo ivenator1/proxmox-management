@@ -250,3 +250,23 @@ def test_kuma_not_called_when_idle(monkeypatch):
     )
     run_remote_update("my-server", ex, settings, dry_run=False)
     assert polled == []
+
+
+def test_kuma_not_called_in_dry_run(monkeypatch):
+    """Dry-run never polls Kuma — 'changed' only means updates are *available*
+    (apt-get -s prints the same summary), nothing was actually touched."""
+    polled = []
+    monkeypatch.setattr(http_mod, "poll_until", lambda *a, **kw: polled.append(True))
+
+    ex = ScriptedRemoteExecutor(script={
+        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+    })
+    settings = _settings(
+        remote_kuma_map={"my-server": "5"},
+        kuma_url="http://kuma.local",
+        kuma_slug="fleet",
+    )
+    outcome = run_remote_update("my-server", ex, settings, dry_run=True)
+    assert polled == []
+    assert not outcome.failed
