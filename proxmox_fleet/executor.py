@@ -342,5 +342,5 @@ def snapshot_with_retry(
             exceptions=(),
             sleep=_sleep,
         )
-    except RuntimeError:
+    except Exception:  # noqa: BLE001 - contract: a failed snapshot is a warning, never a raise
         return PrimitiveResult(rc=1, stdout="", stderr="", changed=False, failed=True, facts={})

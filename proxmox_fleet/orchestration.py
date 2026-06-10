@@ -58,7 +58,11 @@ def run_concurrent(
 
     ``timeout`` is passed to ``future.result()`` — a hung SSH session raises
     ``concurrent.futures.TimeoutError`` which is captured as a per-item failure
-    rather than blocking the phase indefinitely.
+    rather than blocking the phase indefinitely. The pool is shut down with
+    ``wait=False`` for the same reason: ``shutdown(wait=True)`` (what the
+    context manager does) would block on the hung worker thread, defeating the
+    timeout. A timed-out worker thread is leaked until it finishes on its own —
+    unavoidable without process isolation.
     """
     if max_workers <= 1:
         return run_serial(items, fn, abort_on_error=False)
@@ -66,7 +70,8 @@ def run_concurrent(
     results: List[Tuple[T, Optional[R], Optional[BaseException]]] = [
         (item, None, None) for item in items
     ]
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=max_workers)
+    try:
         future_to_idx = {pool.submit(fn, item): idx for idx, item in enumerate(items)}
         for future, idx in future_to_idx.items():
             item = items[idx]
@@ -74,6 +79,8 @@ def run_concurrent(
                 results[idx] = (item, future.result(timeout=timeout), None)
             except BaseException as exc:  # noqa: BLE001
                 results[idx] = (item, None, exc)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     return results
 
 

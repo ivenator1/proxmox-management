@@ -94,8 +94,10 @@ def run_remote_update(
         # ------------------------------------------------------------------
         # Health check — only when something changed
         # ------------------------------------------------------------------
+        # In dry-run `changed` reflects *available* updates (apt-get -s prints the
+        # same summary), but nothing was touched — never poll Kuma for a dry-run.
         kuma_id = str(settings.remote_kuma_map.get(hostname, ""))
-        if kuma_id and settings.kuma_url and (changed or rebooted):
+        if kuma_id and settings.kuma_url and not dry_run and (changed or rebooted):
             kuma_url = (
                 f"{settings.kuma_url}/api/status-page/heartbeat/{settings.kuma_slug}"
             )

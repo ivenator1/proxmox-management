@@ -346,6 +346,27 @@ def test_kuma_not_called_when_idle(monkeypatch):
     assert polled == []
 
 
+def test_kuma_not_called_in_dry_run(monkeypatch):
+    """Dry-run never polls Kuma — 'changed' only means updates are *available*
+    (apt-get -s prints the same summary), nothing was actually touched."""
+    polled = []
+    monkeypatch.setattr(http_mod, "poll_until", lambda *a, **kw: polled.append(True))
+
+    vm_ex = _vm_ex(**{
+        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+    })
+    settings = _settings(
+        vm_kuma_map={"my-vm": "1"},
+        kuma_url="http://kuma.local",
+        kuma_slug="fleet",
+    )
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings,
+                            dry_run=True, api_host="1.2.3.4")
+    assert polled == []
+    assert not outcome.failed
+
+
 # ---------------------------------------------------------------------------
 # snapshot_with_retry (VM variant — same helper, parallel assertion)
 # ---------------------------------------------------------------------------

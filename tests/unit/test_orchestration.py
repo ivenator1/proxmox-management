@@ -98,3 +98,28 @@ def test_retry_total_attempts_is_retries_plus_one():
 
     retry(fn, retries=0, delay=0, sleep=lambda _: None)
     assert len(calls) == 1
+
+
+def test_run_concurrent_timeout_does_not_block_on_hung_worker():
+    """A worker that outlives the timeout must not block run_concurrent's return:
+    shutdown(wait=True) — what the context manager does — would hang here."""
+    import threading
+    import time as _time
+    from concurrent.futures import TimeoutError as FuturesTimeoutError
+
+    release = threading.Event()
+
+    def fn(x):
+        if x == "hung":
+            release.wait(timeout=30)  # simulates a hung SSH session
+            return "late"
+        return "ok"
+
+    start = _time.monotonic()
+    results = run_concurrent(["fast", "hung"], fn, max_workers=2, timeout=0.2)
+    elapsed = _time.monotonic() - start
+    release.set()  # let the leaked worker thread finish
+
+    assert elapsed < 5, f"run_concurrent blocked on the hung worker ({elapsed:.1f}s)"
+    assert results[0][1] == "ok"
+    assert isinstance(results[1][2], FuturesTimeoutError)

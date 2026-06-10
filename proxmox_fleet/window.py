@@ -12,6 +12,10 @@ from zoneinfo import ZoneInfo
 
 from proxmox_fleet.models.config import MaintenanceWindow
 
+# Fixed English abbreviations indexed by datetime.weekday() — strftime('%a')
+# is locale-sensitive and would break day matching under a non-English locale.
+_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
 
 def in_window(
     window: Union[MaintenanceWindow, Dict[str, Any]],
@@ -49,11 +53,12 @@ def in_window(
     else:
         now = now.astimezone(tz)
 
-    # Day check — absent days key means any day is allowed.
+    # Day check — absent days key means any day is allowed. Case-insensitive,
+    # matching the retired check-window.yml (`map('lower')` on both sides).
     days: Optional[List[str]] = window.get("days")
     if days is not None:
-        day_now = now.strftime("%a")  # "Mon", "Tue", …
-        if day_now not in days:
+        day_now = _WEEKDAYS[now.weekday()]
+        if day_now not in {str(d).lower() for d in days}:
             return False
 
     # Time check.

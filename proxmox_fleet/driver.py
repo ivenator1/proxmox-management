@@ -60,6 +60,14 @@ def _load_config(spec: HostSpec, configs_dir: str) -> CustomConfig:
     return CustomConfig.model_validate(raw)
 
 
+def _truthy(val: Any) -> bool:
+    """Coerce an extra-var value to bool — '-e' values arrive as raw strings,
+    so 'false'/'0'/'no' must be False (bool('false') is True)."""
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("true", "1", "yes")
+
+
 def run_custom_phase(
     *,
     settings: GlobalSettings,
@@ -98,18 +106,19 @@ def run_custom_phase(
     for spec in specs:
         # Maintenance window gate (silently skip, mirroring role behaviour).
         if spec.maintenance_window is not None:
-            force = settings.force_window or bool(ev.get("force_window", False))
+            force = settings.force_window or _truthy(ev.get("force_window", False))
             if not window.in_window(spec.maintenance_window, force=force):
                 continue
 
         dep_failed = deps.dependency_failed(spec.name, spec.depends_on, failed_hosts)
 
-        # fleet_dry_run | custom_dry_run from settings OR from -e extra vars.
+        # check | fleet_dry_run | custom_dry_run from settings OR from -e extra vars.
         dry_run = (
-            settings.fleet_dry_run
+            check
+            or settings.fleet_dry_run
             or settings.custom_dry_run
-            or bool(ev.get("fleet_dry_run", False))
-            or bool(ev.get("custom_dry_run", False))
+            or _truthy(ev.get("fleet_dry_run", False))
+            or _truthy(ev.get("custom_dry_run", False))
         )
 
         config = _load_config(spec, settings.configs_dir)
