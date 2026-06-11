@@ -151,3 +151,51 @@ def test_shipped_example_configs_validate(path):
     with open(path, "r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh)
     CustomConfig.model_validate(data)
+
+
+# --- MaintenanceWindow ----------------------------------------------------------
+
+def test_maintenance_window_rejects_unknown_keys():
+    """A typo'd key (day: for days:) must fail loud — silently accepting it
+    would leave days=None and widen the window to every day."""
+    from proxmox_fleet.models.config import MaintenanceWindow
+
+    with pytest.raises(ValidationError):
+        MaintenanceWindow(day=["Sat"])  # typo: 'day' instead of 'days'
+
+
+def test_maintenance_window_accepts_valid_keys():
+    from proxmox_fleet.models.config import MaintenanceWindow
+
+    mw = MaintenanceWindow(days=["Sat"], start="02:00", end="04:00", tz="UTC")
+    assert mw.days == ["Sat"]
+
+
+# --- PVE snapshot keys (v2) ------------------------------------------------------
+
+def test_pve_keys_default_off():
+    cfg = CustomConfig.model_validate(_minimal())
+    assert cfg.pve_vmid == ""
+    assert cfg.pve_node == ""
+    assert cfg.pve_type == "lxc"
+
+
+def test_pve_vmid_int_coerced_to_str():
+    cfg = CustomConfig.model_validate(_minimal(pve_vmid=105, pve_node="pve-01"))
+    assert cfg.pve_vmid == "105"
+
+
+def test_pve_vmid_requires_pve_node():
+    with pytest.raises(ValidationError):
+        CustomConfig.model_validate(_minimal(pve_vmid="105"))
+
+
+def test_pve_type_vm_accepted():
+    cfg = CustomConfig.model_validate(_minimal(pve_vmid="200", pve_node="pve-01", pve_type="vm"))
+    assert cfg.pve_type == "vm"
+
+
+def test_pve_type_invalid_rejected():
+    with pytest.raises(ValidationError):
+        CustomConfig.model_validate(
+            _minimal(pve_vmid="200", pve_node="pve-01", pve_type="container"))

@@ -18,6 +18,7 @@ Each test section mirrors its Jinja counterpart case-for-case:
 from proxmox_fleet.changes import dpkg_hash_differs, lxc_os_changed, lxc_os_pkg_count
 from proxmox_fleet.lxc_parse import parse_ct_script, parse_pct_config, parse_pct_status
 from proxmox_fleet.status import (
+    lxc_app_did_update,
     lxc_app_status,
     lxc_dry_run_status,
     lxc_os_status,
@@ -225,8 +226,20 @@ def test_report_app_failed_is_included():
     assert lxc_should_report("FAILED", "OK", dry_run=False) is True
 
 
-def test_report_app_no_script_is_included():
+def test_report_app_no_script_expected_missing_is_suppressed():
+    # os_only_lxc_list container (script_expected=False): idle NO SCRIPT is noise.
+    assert lxc_should_report("NO SCRIPT", "OK", dry_run=False, script_expected=False) is False
+
+
+def test_report_app_no_script_unexpected_is_included():
+    # A tagged community-script container missing its script is an anomaly —
+    # surfaced even when the OS is idle (script_expected defaults to True).
     assert lxc_should_report("NO SCRIPT", "OK", dry_run=False) is True
+
+
+def test_report_app_no_script_os_updated_is_included():
+    assert lxc_should_report("NO SCRIPT", "Updated (3 upgraded)", dry_run=False,
+                             script_expected=False) is True
 
 
 def test_report_app_never_started_is_included():
@@ -531,3 +544,51 @@ def test_dpkg_hash_differs_false_empty_after():
 
 def test_dpkg_hash_differs_false_both_empty():
     assert dpkg_hash_differs("", "") is False
+
+
+# ---------------------------------------------------------------------------
+# lxc_app_did_update — structured decision shared with the health-check gate
+# ---------------------------------------------------------------------------
+
+
+def test_did_update_version_differs():
+    assert lxc_app_did_update(app_changed=True, ver_before="1.0", ver_after="1.1") is True
+
+
+def test_did_update_version_same_v_prefix_stripped():
+    assert lxc_app_did_update(app_changed=True, ver_before="v1.0", ver_after="1.0") is False
+
+
+def test_did_update_dpkg_hash_differs():
+    assert lxc_app_did_update(app_changed=True, dpkg_before="aaa", dpkg_after="bbb") is True
+
+
+def test_did_update_dpkg_hash_same():
+    assert lxc_app_did_update(app_changed=True, dpkg_before="aaa", dpkg_after="aaa") is False
+
+
+def test_did_update_no_data_fallback_true():
+    assert lxc_app_did_update(app_changed=True) is True
+
+
+def test_did_update_false_when_not_changed_failed_excluded_or_no_script():
+    assert lxc_app_did_update(app_changed=False) is False
+    assert lxc_app_did_update(app_changed=True, app_failed=True) is False
+    assert lxc_app_did_update(app_changed=True, excluded=True) is False
+    assert lxc_app_did_update(app_changed=True, no_update_script=True) is False
+
+
+def test_did_update_agrees_with_status_string():
+    """lxc_app_status must say 'Updated'/'UPDATED' exactly when did_update is True
+    (the flow's health-check gate relies on this equivalence)."""
+    cases = [
+        dict(ver_before="1.0", ver_after="1.1"),
+        dict(ver_before="1.0", ver_after="1.0"),
+        dict(dpkg_before="aaa", dpkg_after="bbb"),
+        dict(dpkg_before="aaa", dpkg_after="aaa"),
+        dict(),
+    ]
+    for kwargs in cases:
+        status = lxc_app_status(app_changed=True, **kwargs)
+        did = lxc_app_did_update(app_changed=True, **kwargs)
+        assert ("updated" in status.lower()) == did, (kwargs, status, did)

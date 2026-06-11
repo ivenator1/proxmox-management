@@ -254,3 +254,32 @@ def test_remote_hosts_order_preserved(tmp_path):
 def test_remote_hosts_missing_section_returns_empty(tmp_path):
     path = _write_ini(tmp_path, "[proxmox_nodes]\npve-01\n")
     assert load_remote_hosts(path) == []
+
+
+# --- canary flag (staged rollout) ---
+
+def test_canary_defaults_false(tmp_path):
+    path = _write_ini(tmp_path, "[remote_hosts]\nweb-01\n[proxmox_vms]\nvm-01 vmid=200\n")
+    assert load_remote_hosts(path)[0].canary is False
+    assert load_proxmox_vms(path)[0].canary is False
+
+
+def test_canary_inline_var_parsed(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[remote_hosts]\nweb-01 canary=true\nweb-02 canary=false\n"
+        "[proxmox_vms]\nvm-01 vmid=200 canary=true\n",
+    )
+    hosts = load_remote_hosts(path)
+    assert hosts[0].canary is True
+    assert hosts[1].canary is False         # string 'false' must not be truthy
+    assert load_proxmox_vms(path)[0].canary is True
+
+
+def test_canary_from_host_vars(tmp_path):
+    path = _write_ini(tmp_path, "[remote_hosts]\nweb-01\n")
+    hv = tmp_path / "host_vars"
+    hv.mkdir()
+    (hv / "web-01.yml").write_text("canary: true\n")
+    hosts = load_remote_hosts(path, host_vars_dir=str(hv))
+    assert hosts[0].canary is True

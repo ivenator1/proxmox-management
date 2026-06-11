@@ -120,9 +120,13 @@ class UpdateStep(BaseModel):
 
 
 class MaintenanceWindow(BaseModel):
-    """Optional maintenance window. Evaluated by proxmox_fleet.window."""
+    """Optional maintenance window. Evaluated by proxmox_fleet.window.
 
-    model_config = ConfigDict(extra="allow")
+    extra='forbid': a typo'd key (``day:`` for ``days:``) must fail loud at
+    inventory load — silently accepting it would widen the window to any day.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     days: Optional[List[str]] = None
     start: str = "00:00"
@@ -148,6 +152,22 @@ class CustomConfig(BaseModel):
     health_check: HealthCheck = Field(default_factory=HealthCheck)
     reboot: bool = False
     rollback_command: str = ""
+    # Optional PVE snapshot/rollback (v2): when the host is an LXC/VM on a
+    # Proxmox node, a BEFORE_UPDATE_AUTO snapshot is taken before update_steps
+    # and rolled back on failure — exactly like the lxc/vm flows.
+    # `rollback_command` remains the fallback when pve_vmid is unset.
+    pve_vmid: str = ""
+    pve_node: str = ""
+    pve_type: Literal["lxc", "vm"] = "lxc"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_pve_vmid(cls, data: Any) -> Any:
+        """YAML writes ``pve_vmid: 105`` as an int — normalise to str."""
+        if isinstance(data, dict) and data.get("pve_vmid") is not None:
+            data = dict(data)
+            data["pve_vmid"] = str(data["pve_vmid"])
+        return data
 
     @model_validator(mode="after")
     def _check_config(self) -> "CustomConfig":
@@ -160,4 +180,7 @@ class CustomConfig(BaseModel):
                 raise ValueError("update_only_if_outdated requires a 'version_command'")
             if self.latest_version.type == "none":
                 raise ValueError("update_only_if_outdated requires a latest_version source (type != none)")
+        if _nonempty(self.pve_vmid) and not _nonempty(self.pve_node):
+            raise ValueError("pve_vmid requires 'pve_node' (the [proxmox_nodes] inventory "
+                             "name hosting the guest)")
         return self

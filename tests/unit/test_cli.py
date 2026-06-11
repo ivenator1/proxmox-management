@@ -19,11 +19,12 @@ def _run(argv: list, *, run_fleet_return: int = 0):
     """
     captured = {}
 
-    def _fake_run_fleet(*, settings, inventory_path, check, extra_vars):
+    def _fake_run_fleet(*, settings, inventory_path, check, extra_vars, **kwargs):
         captured["settings"] = settings
         captured["check"] = check
         captured["inventory_path"] = inventory_path
         captured["extra_vars"] = extra_vars or {}
+        captured["kwargs"] = kwargs
         return run_fleet_return
 
     with (
@@ -161,7 +162,7 @@ def test_bad_extravars_raises_systemexit():
 def test_inventory_forwarded():
     captured = {}
 
-    def _fake(*, settings, inventory_path, check, extra_vars):
+    def _fake(*, settings, inventory_path, check, extra_vars, **kwargs):
         captured["inventory_path"] = inventory_path
         return 0
 
@@ -187,3 +188,220 @@ def test_vars_file_forwarded():
 def test_exit_code_forwarded():
     rc, _, _, _ = _run([], run_fleet_return=1)
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# cli.main() — --limit / --phases forwarding
+# ---------------------------------------------------------------------------
+
+def test_parse_csv_set_none_and_blank():
+    assert cli._parse_csv_set(None) is None
+    assert cli._parse_csv_set("") is None
+    assert cli._parse_csv_set(" , ,") is None
+
+
+def test_parse_csv_set_splits_and_strips():
+    assert cli._parse_csv_set("pve-01, 105 ,media-vm") == {"pve-01", "105", "media-vm"}
+
+
+def test_limit_and_phases_default_to_none():
+    captured = {}
+
+    def _fake(*, settings, inventory_path, check, extra_vars, limit, phases):
+        captured["limit"] = limit
+        captured["phases"] = phases
+        return 0
+
+    with (
+        patch("proxmox_fleet.driver.run_fleet", side_effect=_fake),
+        patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+    ):
+        cli.main([])
+
+    assert captured["limit"] is None
+    assert captured["phases"] is None
+
+
+def test_limit_and_phases_forwarded_as_sets():
+    captured = {}
+
+    def _fake(*, settings, inventory_path, check, extra_vars, limit, phases):
+        captured["limit"] = limit
+        captured["phases"] = phases
+        return 0
+
+    with (
+        patch("proxmox_fleet.driver.run_fleet", side_effect=_fake),
+        patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+    ):
+        cli.main(["--limit", "pve-01,105", "--phases", "lxc,vm"])
+
+    assert captured["limit"] == {"pve-01", "105"}
+    assert captured["phases"] == {"lxc", "vm"}
+
+
+# ---------------------------------------------------------------------------
+# cli.main() — --history / --history-show (early exit, no fleet run)
+# ---------------------------------------------------------------------------
+
+def _write_history(tmp_path, *, timestamp, changed=False, failed=False, briefing=None):
+    from proxmox_fleet.history import write_history
+    from proxmox_fleet.models.state import FleetState
+
+    state = FleetState.from_raw({"fleet_changed": changed, "fleet_failed": failed})
+    write_history(state, history_dir=tmp_path, keep=0, timestamp=timestamp,
+                  briefing=briefing)
+
+
+def _settings_with_history(tmp_path) -> GlobalSettings:
+    return GlobalSettings(fleet_history_dir=str(tmp_path))
+
+
+def test_history_lists_runs_without_running_fleet(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z")
+    _write_history(tmp_path, timestamp="20260102T000000000000Z", changed=True)
+
+    with (
+        patch("proxmox_fleet.driver.run_fleet") as mock_fleet,
+        patch("proxmox_fleet.models.settings.GlobalSettings.load",
+              return_value=_settings_with_history(tmp_path)),
+    ):
+        rc = cli.main(["--history"])
+
+    mock_fleet.assert_not_called()
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Newest first, header row present.
+    assert out.index("20260102T000000000000Z") < out.index("20260101T000000000000Z")
+    assert "TIMESTAMP" in out and "RESULT" in out
+
+
+def test_history_limit_respected(tmp_path, capsys):
+    for i in range(4):
+        _write_history(tmp_path, timestamp=f"2026010{i}T000000000000Z")
+
+    with patch("proxmox_fleet.models.settings.GlobalSettings.load",
+               return_value=_settings_with_history(tmp_path)):
+        rc = cli.main(["--history", "2"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "20260103T000000000000Z" in out and "20260102T000000000000Z" in out
+    assert "20260101T000000000000Z" not in out
+
+
+def test_history_empty_dir_exits_nonzero(tmp_path, capsys):
+    with patch("proxmox_fleet.models.settings.GlobalSettings.load",
+               return_value=_settings_with_history(tmp_path)):
+        rc = cli.main(["--history"])
+
+    assert rc == 1
+    assert "no run history" in capsys.readouterr().out
+
+
+def test_history_show_prints_briefing(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z",
+                   briefing="**Fleet Update Complete**\n- sonarr OK")
+
+    with patch("proxmox_fleet.models.settings.GlobalSettings.load",
+               return_value=_settings_with_history(tmp_path)):
+        rc = cli.main(["--history-show", "latest"])
+
+    assert rc == 0
+    assert "sonarr OK" in capsys.readouterr().out
+
+
+def test_history_show_by_timestamp(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z", briefing="OLD RUN")
+    _write_history(tmp_path, timestamp="20260102T000000000000Z", briefing="NEW RUN")
+
+    with patch("proxmox_fleet.models.settings.GlobalSettings.load",
+               return_value=_settings_with_history(tmp_path)):
+        rc = cli.main(["--history-show", "20260101T000000000000Z"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "OLD RUN" in out and "NEW RUN" not in out
+
+
+def test_history_show_falls_back_to_json_without_briefing(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z")  # no briefing key
+
+    with patch("proxmox_fleet.models.settings.GlobalSettings.load",
+               return_value=_settings_with_history(tmp_path)):
+        rc = cli.main(["--history-show", "latest"])
+
+    assert rc == 0
+    assert '"timestamp": "20260101T000000000000Z"' in capsys.readouterr().out
+
+
+def test_history_show_missing_run_exits_nonzero(tmp_path, capsys):
+    with patch("proxmox_fleet.models.settings.GlobalSettings.load",
+               return_value=_settings_with_history(tmp_path)):
+        rc = cli.main(["--history-show", "latest"])
+
+    assert rc == 1
+    assert "no history record" in capsys.readouterr().out
+
+
+def test_history_uses_vars_file_history_dir(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z")
+    vars_file = tmp_path / "vars.yml"
+    vars_file.write_text(f"fleet_history_dir: {tmp_path}\n", encoding="utf-8")
+
+    rc = cli.main(["--history", "--vars-file", str(vars_file)])
+
+    assert rc == 0
+    assert "20260101T000000000000Z" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# _format_history_table
+# ---------------------------------------------------------------------------
+
+def test_format_history_table_result_column():
+    rows = [
+        {"timestamp": "T3", "changed": False, "failed": True,
+         "counts": {"lxc": 1, "errors": 2}},
+        {"timestamp": "T2", "changed": True, "failed": False, "counts": {}},
+        {"timestamp": "T1", "changed": False, "failed": False, "counts": {}},
+    ]
+    lines = cli._format_history_table(rows).splitlines()
+    assert lines[0].startswith("TIMESTAMP")
+    assert "failed" in lines[1] and "changed" in lines[2] and "clean" in lines[3]
+    # Counts land under their columns; missing counts render as 0.
+    assert lines[1].split() == ["T3", "failed", "1", "0", "0", "0", "0", "2", "0"]
+    assert lines[3].split() == ["T1", "clean", "0", "0", "0", "0", "0", "0", "0"]
+
+
+# ---------------------------------------------------------------------------
+# cli.main() — --scan (early exit, no fleet run)
+# ---------------------------------------------------------------------------
+
+def test_scan_flag_runs_scan_not_fleet(tmp_path):
+    captured = {}
+
+    def _fake_scan(*, settings, inventory_path, limit):
+        captured["inventory_path"] = inventory_path
+        captured["limit"] = limit
+        return 0
+
+    with (
+        patch("proxmox_fleet.scan.run_fleet_scan", side_effect=_fake_scan),
+        patch("proxmox_fleet.driver.run_fleet") as mock_fleet,
+        patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+    ):
+        rc = cli.main(["--scan", "--limit", "web-01", "--inventory", "inv.ini"])
+
+    mock_fleet.assert_not_called()
+    assert rc == 0
+    assert captured["inventory_path"] == "inv.ini"
+    assert captured["limit"] == {"web-01"}
+
+
+def test_scan_exit_code_forwarded():
+    with (
+        patch("proxmox_fleet.scan.run_fleet_scan", return_value=1),
+        patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+    ):
+        assert cli.main(["--scan"]) == 1

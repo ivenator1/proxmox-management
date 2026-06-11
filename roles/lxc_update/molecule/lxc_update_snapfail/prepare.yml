@@ -47,7 +47,7 @@
               shift; shift
               CMD_STR="$*"
               if echo "$CMD_STR" | grep -q 'dist-upgrade'; then
-                echo "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded."
+                echo "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded."
               elif echo "$CMD_STR" | grep -q 'reboot-required'; then
                 exit 1
               fi

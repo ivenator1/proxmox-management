@@ -1,0 +1,18 @@
+---
+- name: Converge — custom_update snapshot rollback (PVE path, update step fails → pct rollback)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    PATH: "/tmp/mol_stubs:{{ lookup('env', 'PATH') }}"
+  tasks:
+    - name: Run flow via Python (RunnerExecutor path, stubbed snapshot + pct)
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/../mol_run_flow.py"
+          - "--config-file=/tmp/mol_custom_rollback/configs/mol_test_rollback.yml"
+          - "--host=localhost"
+          - "--inventory=/tmp/mol_hosts.ini"
+          - "--state-out=/tmp/mol_fleet_state_rollback.json"
+          - "--pve-snapshots"

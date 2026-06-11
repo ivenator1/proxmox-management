@@ -78,9 +78,63 @@ def custom_should_report(status: str, *, dry_run: bool) -> bool:
     return dry_run or ("updated" in lowered) or ("failed" in lowered)
 
 
+def custom_rescue_status(
+    *,
+    rollback_done: bool = False,
+    snapshot_failed: bool = False,
+) -> str:
+    """Rescue status for the custom flow's PVE-snapshot path (v2).
+
+    Same tree as :func:`vm_rescue_status` — kept per-flow so the trees can
+    diverge without cross-flow surprises. Hosts without ``pve_vmid`` (legacy
+    ``rollback_command`` path) keep the plain ``FAILED``.
+    """
+    if rollback_done:
+        return "FAILED + ROLLED BACK"
+    if snapshot_failed:
+        return "FAILED (NO SNAPSHOT)"
+    return "FAILED"
+
+
 # ---------------------------------------------------------------------------
 # Phase 3: lxc_update trees
 # ---------------------------------------------------------------------------
+
+
+def lxc_app_did_update(
+    *,
+    no_update_script: bool = False,
+    excluded: bool = False,
+    app_failed: bool = False,
+    app_changed: bool = False,
+    ver_before: str = "",
+    ver_after: str = "",
+    dpkg_before: str = "",
+    dpkg_after: str = "",
+) -> bool:
+    """Structured "did the app update actually change anything" decision.
+
+    Single source of truth shared by lxc_app_status() (display string) and the
+    flow's health-check gate (control flow), so rewording a status string can
+    never silently change which containers get health-checked.
+    """
+    if no_update_script or excluded or app_failed or not app_changed:
+        return False
+
+    # Version-file comparison (strip leading 'v' before equality check)
+    before = ver_before.strip()
+    after = ver_after.strip()
+    if before and after:
+        return re.sub(r"^v", "", before) != re.sub(r"^v", "", after)
+
+    # dpkg-hash comparison
+    if dpkg_hash_differs(dpkg_before, dpkg_after):
+        return True
+    if dpkg_before.strip() and dpkg_after.strip():
+        return False
+
+    # No version data, no hash data — non-apt OS or silent run
+    return True
 
 
 def lxc_app_status(
@@ -117,22 +171,18 @@ def lxc_app_status(
         return "FAILED"
 
     if app_changed:
-        # Version-file comparison (strip leading 'v' before equality check)
+        did_update = lxc_app_did_update(
+            app_changed=True,
+            ver_before=ver_before,
+            ver_after=ver_after,
+            dpkg_before=dpkg_before,
+            dpkg_after=dpkg_after,
+        )
         before = ver_before.strip()
         after = ver_after.strip()
         if before and after:
-            if re.sub(r"^v", "", before) != re.sub(r"^v", "", after):
-                return f"Updated: {before} → {after}"
-            return "OK"
-
-        # dpkg-hash comparison
-        if dpkg_hash_differs(dpkg_before, dpkg_after):
-            return "UPDATED"
-        if dpkg_before.strip() and dpkg_after.strip():
-            return "OK"
-
-        # No version data, no hash data — non-apt OS or silent run
-        return "UPDATED"
+            return f"Updated: {before} → {after}" if did_update else "OK"
+        return "UPDATED" if did_update else "OK"
 
     return "OK"
 
@@ -185,18 +235,21 @@ def lxc_rescue_app_status(
     return "FAILED"
 
 
-def lxc_should_report(app: str, os: str, *, dry_run: bool) -> bool:
+def lxc_should_report(app: str, os: str, *, dry_run: bool, script_expected: bool = True) -> bool:
     """The `when:` gate on the 'Append LXC record' task in report.yml.
 
-    Idle containers (app='OK', os='OK') are suppressed. Mirrors:
-      lxc_dry_run | bool or
-      (tmp_app | lower) is search('updated|failed|no script|never started') or
-      (tmp_os  | lower) is search('updated|failed')
+    Idle containers (app='OK', os='OK') are suppressed. 'NO SCRIPT' depends on
+    *script_expected*: os_only_lxc_list containers lack /usr/bin/update by
+    design (script_expected=False), so their idle runs are suppressed — but a
+    tagged community-script container missing its script is an anomaly and is
+    always surfaced.
     """
     if dry_run:
         return True
     app_l = app.strip().lower()
-    if re.search(r"updated|failed|no script|never started", app_l):
+    if script_expected and "no script" in app_l:
+        return True
+    if re.search(r"updated|failed|never started", app_l):
         return True
     os_l = os.strip().lower()
     return bool(re.search(r"updated|failed", os_l))

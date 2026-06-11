@@ -24,6 +24,7 @@ from proxmox_fleet.lxc_parse import parse_ct_script, parse_pct_config, parse_pct
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import ErrorEntry, LxcRecord, WarningEntry
 from proxmox_fleet.status import (
+    lxc_app_did_update,
     lxc_app_status,
     lxc_dry_run_status,
     lxc_os_status,
@@ -67,9 +68,12 @@ def _os_update_cmd(lxc_id: str, lxc_os: str) -> str:
     summary lines regardless of the container's configured locale.
     """
     if lxc_os in ("debian", "ubuntu", "devuan"):
+        # DEBIAN_FRONTEND=noninteractive: -y alone does not suppress debconf
+        # prompts, which would stall an unattended pct exec forever.
+        apt_env = "LC_ALL=C DEBIAN_FRONTEND=noninteractive"
         return (
             f"pct exec {lxc_id} -- bash -c "
-            f"'LC_ALL=C apt-get update && LC_ALL=C apt-get -y dist-upgrade'"
+            f"'{apt_env} apt-get update && {apt_env} apt-get -y dist-upgrade'"
         )
     if lxc_os == "alpine":
         return f"pct exec {lxc_id} -- ash -c 'LC_ALL=C apk -U upgrade'"
@@ -366,16 +370,17 @@ def run_lxc_update(
         # 9. Wait for Proxmox task locks
         time.sleep(5)
 
-        # 10. Reboot check
+        # 10. Reboot check — unconditional (parity with the old update.yml): an
+        # OS update alone can install a kernel, and os_only_lxc_list containers
+        # never have an update script, so gating on it would skip their reboots.
         reboot_done = False
-        if not lxc_no_update_script:
-            reboot_chk = executor.run_shell(
-                f"pct exec {lxc_id} -- test -f /var/run/reboot-required",
-                changed_when=False, ignore_errors=True,
-            )
-            if reboot_chk.rc == 0 and settings.lxc_auto_reboot:
-                executor.run_shell(f"pct reboot {lxc_id}")
-                reboot_done = True
+        reboot_chk = executor.run_shell(
+            f"pct exec {lxc_id} -- test -f /var/run/reboot-required",
+            changed_when=False, ignore_errors=True,
+        )
+        if reboot_chk.rc == 0 and settings.lxc_auto_reboot:
+            executor.run_shell(f"pct reboot {lxc_id}")
+            reboot_done = True
 
         # ------------------------------------------------------------------
         # Health check (only when something changed)
@@ -394,7 +399,19 @@ def run_lxc_update(
             dpkg_after=dpkg_after,
         )
         os_changed = lxc_os_changed(os_res_stdout)
-        something_changed = ("updated" in app_status_str.lower()) or os_changed
+        # Structured decision (shared with lxc_app_status) — never re-parse the
+        # rendered status string for control flow.
+        app_did_update = lxc_app_did_update(
+            no_update_script=lxc_no_update_script,
+            excluded=app_excluded,
+            app_failed=app_failed,
+            app_changed=app_changed,
+            ver_before=ver_before,
+            ver_after=ver_after,
+            dpkg_before=dpkg_before,
+            dpkg_after=dpkg_after,
+        )
+        something_changed = app_did_update or os_changed
 
         kuma_id = str(settings.lxc_kuma_map.get(lxc_id, ""))
         if kuma_id and settings.kuma_url and something_changed:
@@ -425,7 +442,9 @@ def run_lxc_update(
         )
 
         outcome.changed = something_changed
-        if lxc_should_report(app_status_str, os_status_str, dry_run=False):
+        script_expected = lxc_id not in {str(x) for x in settings.os_only_lxc_list}
+        if lxc_should_report(app_status_str, os_status_str, dry_run=False,
+                             script_expected=script_expected):
             outcome.record = LxcRecord(
                 node=node, name=name, id=lxc_id,
                 app=app_status_str, os=os_status_str, snap=snap_taken,

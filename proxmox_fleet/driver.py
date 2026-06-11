@@ -18,13 +18,15 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import yaml
 
 from proxmox_fleet import briefing, deps, history, http, inventory, notifiers, window
 from proxmox_fleet.executor import RunnerExecutor
+from proxmox_fleet.flows._pkg import kuma_healthy
 from proxmox_fleet.flows.custom import run_custom_update
 from proxmox_fleet.flows.lxc import LxcFlowOutcome, _discover_lxcs, run_lxc_update
 from proxmox_fleet.flows.node import run_manager_update, run_node_update
@@ -33,7 +35,13 @@ from proxmox_fleet.flows.vm import VmFlowOutcome, run_vm_update
 from proxmox_fleet.inventory import HostSpec, RemoteHostSpec, VmSpec
 from proxmox_fleet.models.config import CustomConfig
 from proxmox_fleet.models.settings import GlobalSettings
-from proxmox_fleet.models.state import ErrorEntry, FleetState
+from proxmox_fleet.models.state import (
+    ErrorEntry,
+    FleetState,
+    LxcRecord,
+    RemoteRecord,
+    VmRecord,
+)
 from proxmox_fleet.orchestration import run_concurrent
 
 
@@ -60,6 +68,60 @@ def _load_config(spec: HostSpec, configs_dir: str) -> CustomConfig:
     return CustomConfig.model_validate(raw)
 
 
+def _truthy(val: Any) -> bool:
+    """Coerce an extra-var value to bool — '-e' values arrive as raw strings,
+    so 'false'/'0'/'no' must be False (bool('false') is True)."""
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("true", "1", "yes")
+
+
+# Phase names accepted by run_fleet(phases=...) / the --phases flag, in run order.
+# "node" is Phase 2 (PVE node OS updates), "manager" is Phase 3 (self-update) —
+# both execute inside run_node_phase() but are individually selectable.
+PHASE_NAMES = ("remote", "custom", "lxc", "vm", "node", "manager")
+
+# Limit tokens that address the manager self-update (it is not an inventory host).
+_MANAGER_LIMIT_TOKENS = frozenset({"manager", "localhost", "Ansible-Manager"})
+
+# Status recorded for hosts whose wave was aborted by a canary failure.
+CANARY_SKIP_STATUS = "SKIPPED (canary failed)"
+
+
+def _soak_canaries(
+    settings: GlobalSettings,
+    kuma_map: Dict[str, Any],
+    tokens: Sequence[str],
+    *,
+    _sleep: Callable[[float], None] = time.sleep,
+) -> Optional[str]:
+    """Soak after a successful canary wave: wait ``canary_soak_minutes``, then
+    poll Kuma for every canary token that has a monitor mapping.
+
+    Returns None when all monitored canaries are healthy (or nothing is
+    monitored), else an error message — the caller aborts the second wave.
+    """
+    if settings.canary_soak_minutes > 0:
+        _sleep(settings.canary_soak_minutes * 60)
+    if not settings.kuma_url:
+        return None
+    url = f"{settings.kuma_url}/api/status-page/heartbeat/{settings.kuma_slug}"
+    for token in tokens:
+        monitor_id = str(kuma_map.get(token, ""))
+        if not monitor_id:
+            continue
+        try:
+            http.poll_until(
+                lambda: http.get_json(url),
+                lambda p: kuma_healthy(p, monitor_id=monitor_id),
+                retries=settings.kuma_health_check_retries,
+                delay=settings.kuma_health_check_delay,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return f"canary {token} unhealthy after soak: {exc}"
+    return None
+
+
 def run_custom_phase(
     *,
     settings: GlobalSettings,
@@ -67,12 +129,18 @@ def run_custom_phase(
     extra_vars: Optional[Dict[str, Any]] = None,
     check: bool = False,
     state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_custom_state.json",  # nosec B108 - tooling output path
+    limit: Optional[Set[str]] = None,
 ) -> FleetState:
     """Run Phase 0a dependency validation + Phase 0b custom host updates.
 
     When *state_output_path* is set, writes the resulting FleetState via
     dump_for_ansible() for tooling / the molecule harness (whose verify.yml
     loads it with include_vars). run_fleet() passes None and merges in-memory.
+
+    *limit* (host names) restricts execution to the listed hosts; everything
+    else is silently omitted (mirroring the maintenance-window skip). Dependency
+    *validation* still covers the full inventory — ordering is an inventory
+    property, not a run property.
 
     Raises SystemExit(1) on Phase 0a dependency-order problems (fail-loud on bad
     ordering). Never raises for per-host execution failures — those are captured
@@ -91,30 +159,59 @@ def run_custom_phase(
             print(f"FATAL: {p}", file=sys.stderr)
         raise SystemExit(1)
 
+    if limit is not None:
+        specs = [s for s in specs if s.name in limit]
+
     # Phase 0b: serial execution loop.
     state = FleetState()
     failed_hosts: Set[str] = set()
+    # Node name → ansible_host IP map, loaded lazily on the first config that
+    # opts into PVE snapshots (pve_vmid).
+    nodes_map: Optional[Dict[str, str]] = None
 
     for spec in specs:
         # Maintenance window gate (silently skip, mirroring role behaviour).
         if spec.maintenance_window is not None:
-            force = settings.force_window or bool(ev.get("force_window", False))
+            force = settings.force_window or _truthy(ev.get("force_window", False))
             if not window.in_window(spec.maintenance_window, force=force):
                 continue
 
         dep_failed = deps.dependency_failed(spec.name, spec.depends_on, failed_hosts)
 
-        # fleet_dry_run | custom_dry_run from settings OR from -e extra vars.
+        # check | fleet_dry_run | custom_dry_run from settings OR from -e extra vars.
         dry_run = (
-            settings.fleet_dry_run
+            check
+            or settings.fleet_dry_run
             or settings.custom_dry_run
-            or bool(ev.get("fleet_dry_run", False))
-            or bool(ev.get("custom_dry_run", False))
+            or _truthy(ev.get("fleet_dry_run", False))
+            or _truthy(ev.get("custom_dry_run", False))
         )
 
         config = _load_config(spec, settings.configs_dir)
 
         executor = RunnerExecutor(spec.name, inventory=inventory_path, check=check)
+
+        # PVE snapshot/rollback wiring (config v2): resolve the owning node's
+        # ansible_host for the snapshot API and bind a node executor for
+        # pct/qm rollback. An unknown pve_node fails loud, like config validation.
+        node_executor = None
+        api_params: Optional[Dict[str, Any]] = None
+        if config.pve_vmid.strip():
+            if nodes_map is None:
+                nodes_map = {n["name"]: n["ansible_host"] for n in inventory.load_proxmox_nodes(
+                    inventory_path, host_vars_dir=settings.host_vars_dir)}
+            api_host = nodes_map.get(config.pve_node)
+            if api_host is None:
+                print(f"FATAL: config {spec.custom_config!r}: pve_node {config.pve_node!r} "
+                      "is not in [proxmox_nodes]", file=sys.stderr)
+                raise SystemExit(1)
+            node_executor = RunnerExecutor(config.pve_node, inventory=inventory_path, check=check)
+            api_params = {
+                "api_host": api_host,
+                "api_user": settings.pve_api_user,
+                "api_token_id": settings.pve_api_token_id,
+                "api_token_secret": settings.pve_api_token_secret,
+            }
 
         outcome = run_custom_update(
             spec.name,
@@ -126,6 +223,10 @@ def run_custom_phase(
             kuma_url=settings.kuma_url,
             kuma_retries=settings.kuma_health_check_retries,
             kuma_delay=settings.kuma_health_check_delay,
+            node_executor=node_executor,
+            api_params=api_params,
+            snapshot_retries=settings.snapshot_retries,
+            snapshot_retry_delay=settings.snapshot_retry_delay,
         )
 
         if outcome.record is not None:
@@ -168,12 +269,23 @@ def run_lxc_phase(
     inventory_path: str = "hosts.ini",
     check: bool = False,
     state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_lxc_state.json",  # nosec B108 - tooling output path
+    limit: Optional[Set[str]] = None,
 ) -> FleetState:
     """Run Phase 1 (LXC container updates) via the Python driver.
 
     For each Proxmox node: discovers tagged LXCs, then updates them
     concurrently (max_workers=lxc_forks, default 20), mirroring Ansible's
     forks setting. Nodes are processed serially.
+
+    *limit* may mix node names and container ids: a node name keeps that node's
+    whole discovery, a bare id keeps just that container wherever it lives. A
+    node is skipped before discovery when it isn't named and the limit holds no
+    ids at all.
+
+    Canary staging: container ids listed in ``settings.canary_hosts`` update
+    first (across all nodes); the rest run only if no canary failed and the
+    post-soak Kuma checks pass — otherwise they are recorded as
+    ``SKIPPED (canary failed)``.
 
     When *state_output_path* is set, writes the resulting FleetState via
     dump_for_ansible() for tooling / molecule; run_fleet() passes None and
@@ -185,9 +297,20 @@ def run_lxc_phase(
     dry_run = check or settings.fleet_dry_run or settings.lxc_dry_run
     state = FleetState()
 
+    limit_has_ids = limit is not None and any(token.isdigit() for token in limit)
+
+    # Discovery pass: resolve every node's managed container ids up-front so
+    # the canary wave can span nodes. A discovery failure on one node is
+    # recorded and skips that node only — it never gates the canary waves.
+    discovered: List[Tuple[str, str, List[str]]] = []
     for node_info in nodes:
         node_name = node_info["name"]
         api_host = node_info["ansible_host"]
+
+        # Node not targeted and no container ids to look for anywhere → skip
+        # the discovery SSH round-trip entirely.
+        if limit is not None and node_name not in limit and not limit_has_ids:
+            continue
 
         # Discovery is read-only — never pass --check or pct list won't run remotely.
         discovery_executor = RunnerExecutor(node_name, inventory=inventory_path, check=False)
@@ -203,7 +326,15 @@ def run_lxc_phase(
             ))
             continue
 
+        if limit is not None and node_name not in limit:
+            lxc_ids = [i for i in lxc_ids if i in limit]
+
         print(f"[{node_name}] found {len(lxc_ids)} managed LXC(s): {', '.join(lxc_ids) or 'none'}")
+        discovered.append((node_name, api_host, lxc_ids))
+
+    def _run_node_ids(node_name: str, api_host: str, ids: List[str]) -> bool:
+        """Run one node's containers concurrently; returns True if any failed."""
+        wave_failed = False
 
         # Concurrent per-container updates (lxc_continue_on_error is the default)
         def _run_one(lxc_id: str) -> LxcFlowOutcome:
@@ -214,7 +345,7 @@ def run_lxc_phase(
             )
 
         results = run_concurrent(
-            lxc_ids,
+            ids,
             _run_one,
             max_workers=settings.lxc_forks,
         )
@@ -222,6 +353,7 @@ def run_lxc_phase(
         for lxc_id, outcome, run_err in results:
             if outcome is not None:
                 _fold_outcome(state, outcome, state.lxc)
+                wave_failed = wave_failed or outcome.failed
                 rec = outcome.record
                 if rec is not None:
                     status = "FAILED" if outcome.failed else f"app={rec.app}  os={rec.os}"
@@ -230,12 +362,53 @@ def run_lxc_phase(
                     print(f"  [{node_name}/{lxc_id}] idle (no changes)")
             elif run_err is not None:
                 state.failed = True
+                wave_failed = True
                 state.errors.append(ErrorEntry(
                     host=str(lxc_id),
                     task="run_lxc_update",
                     error=str(run_err)[:300],
                 ))
                 print(f"  [{node_name}/{lxc_id}] ERROR: {run_err}")
+        return wave_failed
+
+    canary_set = {str(c) for c in settings.canary_hosts}
+    all_ids = [i for _, _, ids in discovered for i in ids]
+    canary_ids = [i for i in all_ids if i in canary_set]
+    rest_ids = [i for i in all_ids if i not in canary_set]
+
+    if not canary_ids or not rest_ids:
+        for node_name, api_host, ids in discovered:
+            _run_node_ids(node_name, api_host, ids)
+    else:
+        print(f"[lxc phase] canary wave: {', '.join(canary_ids)}")
+        canary_failed = False
+        for node_name, api_host, ids in discovered:
+            wave = [i for i in ids if i in canary_set]
+            if wave:
+                canary_failed = _run_node_ids(node_name, api_host, wave) or canary_failed
+        abort: Optional[str] = None
+        if canary_failed:
+            abort = "a canary container failed"
+        elif not dry_run:
+            abort = _soak_canaries(settings, settings.lxc_kuma_map, canary_ids)
+            if abort is not None:
+                state.failed = True
+                state.errors.append(ErrorEntry(
+                    host="lxc-canary", task="canary soak", error=abort[:300]))
+        if abort is not None:
+            print(f"[lxc phase] canary gate failed ({abort}) — "
+                  f"skipping {len(rest_ids)} container(s)")
+            for node_name, _, ids in discovered:
+                for lxc_id in ids:
+                    if lxc_id not in canary_set:
+                        state.lxc.append(LxcRecord(node=node_name, name=lxc_id,
+                                                   id=lxc_id, app=CANARY_SKIP_STATUS,
+                                                   snap=False))
+        else:
+            for node_name, api_host, ids in discovered:
+                wave = [i for i in ids if i not in canary_set]
+                if wave:
+                    _run_node_ids(node_name, api_host, wave)
 
     if state_output_path is not None:
         state.dump_for_ansible(state_output_path)
@@ -296,11 +469,16 @@ def run_vm_phase(
     inventory_path: str = "hosts.ini",
     check: bool = False,
     state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_vm_state.json",  # nosec B108 - tooling output path
+    limit: Optional[Set[str]] = None,
 ) -> FleetState:
     """Run Phase 1b (QEMU VM updates) via the Python driver.
 
     Loads all VMs from inventory, runs them concurrently (max_workers=vm_forks).
-    When *state_output_path* is set, writes the FleetState for tooling / molecule;
+    *limit* matches inventory names or vmids; non-matching VMs are silently
+    omitted. VMs flagged ``canary`` (inventory/host_vars) or listed in
+    ``settings.canary_hosts`` (name or vmid) update first; the rest run only
+    if the canary wave succeeded and the post-soak Kuma checks pass. When
+    *state_output_path* is set, writes the FleetState for tooling / molecule;
     run_fleet() passes None and merges in-memory.
 
     Never raises for per-VM failures — those become FAILED records.
@@ -309,16 +487,22 @@ def run_vm_phase(
     nodes = inventory.load_proxmox_nodes(inventory_path, host_vars_dir=settings.host_vars_dir)
     nodes_map = {n["name"]: n["ansible_host"] for n in nodes}
 
+    if limit is not None:
+        vms = [v for v in vms if v.name in limit or v.vmid in limit]
+
     dry_run = check or settings.fleet_dry_run or settings.vm_dry_run
     state = FleetState()
 
     # Discover VM locations once up-front via pvesh. Live cluster state always
     # wins over static pve_node inventory hints — pve_node is only a fallback
     # for non-cluster / non-HA setups where discovery is unavailable.
-    vm_locations = _discover_vm_locations(nodes, inventory_path=inventory_path)
+    # Skipped when nothing is targeted (no point in the SSH round-trip).
+    vm_locations = (
+        _discover_vm_locations(nodes, inventory_path=inventory_path) if vms else {}
+    )
     if vm_locations:
         print(f"[vm phase] discovered {len(vm_locations)} VM location(s) from cluster")
-    else:
+    elif vms:
         print("[vm phase] cluster discovery unavailable — using pve_node inventory hints")
 
     def _run_one(vm_spec: VmSpec) -> VmFlowOutcome:
@@ -346,24 +530,54 @@ def run_vm_phase(
             dry_run=dry_run, api_host=api_host,
         )
 
-    results = run_concurrent(vms, _run_one, max_workers=settings.vm_forks)
+    def _run_wave(wave: List[VmSpec]) -> None:
+        results = run_concurrent(wave, _run_one, max_workers=settings.vm_forks)
+        for vm_spec, outcome, run_err in results:
+            vm_name = vm_spec.name if isinstance(vm_spec, VmSpec) else str(vm_spec)
+            if outcome is not None:
+                _fold_outcome(state, outcome, state.vm)
+                rec = outcome.record
+                if rec is not None:
+                    status = "FAILED" if outcome.failed else rec.status
+                    print(f"  [{vm_name}] {status}")
+                else:
+                    print(f"  [{vm_name}] idle (no changes)")
+            elif run_err is not None:
+                state.failed = True
+                state.errors.append(ErrorEntry(
+                    host=vm_name, task="run_vm_update", error=str(run_err)[:300]
+                ))
+                print(f"  [{vm_name}] ERROR: {run_err}")
 
-    for vm_spec, outcome, run_err in results:
-        vm_name = vm_spec.name if isinstance(vm_spec, VmSpec) else str(vm_spec)
-        if outcome is not None:
-            _fold_outcome(state, outcome, state.vm)
-            rec = outcome.record
-            if rec is not None:
-                status = "FAILED" if outcome.failed else rec.status
-                print(f"  [{vm_name}] {status}")
-            else:
-                print(f"  [{vm_name}] idle (no changes)")
-        elif run_err is not None:
-            state.failed = True
-            state.errors.append(ErrorEntry(
-                host=vm_name, task="run_vm_update", error=str(run_err)[:300]
-            ))
-            print(f"  [{vm_name}] ERROR: {run_err}")
+    canary = [v for v in vms
+              if v.canary or v.name in settings.canary_hosts
+              or v.vmid in settings.canary_hosts]
+    rest = [v for v in vms if v not in canary]
+
+    if not canary or not rest:
+        _run_wave(vms)
+    else:
+        print(f"[vm phase] canary wave: {', '.join(v.name for v in canary)}")
+        _run_wave(canary)
+        abort: Optional[str] = None
+        if state.failed:
+            abort = "a canary VM failed"
+        elif not dry_run:
+            abort = _soak_canaries(settings, settings.vm_kuma_map,
+                                   [v.name for v in canary])
+            if abort is not None:
+                state.failed = True
+                state.errors.append(ErrorEntry(
+                    host="vm-canary", task="canary soak", error=abort[:300]))
+        if abort is not None:
+            print(f"[vm phase] canary gate failed ({abort}) — skipping {len(rest)} VM(s)")
+            for v in rest:
+                # Live cluster location wins over the pve_node hint, like _run_one.
+                node_name = vm_locations.get(v.vmid, (v.pve_node or "?", ""))[0]
+                state.vm.append(VmRecord(node=node_name, vmid=v.vmid, name=v.name,
+                                         status=CANARY_SKIP_STATUS))
+        else:
+            _run_wave(rest)
 
     if state_output_path is not None:
         state.dump_for_ansible(state_output_path)
@@ -376,16 +590,23 @@ def run_remote_phase(
     inventory_path: str = "hosts.ini",
     check: bool = False,
     state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_remote_state.json",  # nosec B108 - tooling output path
+    limit: Optional[Set[str]] = None,
 ) -> FleetState:
     """Run Phase 0 (remote host updates) via the Python driver.
 
     Loads all [remote_hosts] from inventory, runs them concurrently
-    (max_workers=remote_forks). When *state_output_path* is set, writes the
-    FleetState for tooling / molecule; run_fleet() passes None and merges in-memory.
+    (max_workers=remote_forks). *limit* restricts to the named hosts. Hosts
+    flagged ``canary`` (inventory/host_vars) or listed in
+    ``settings.canary_hosts`` update first; the rest run only if the canary
+    wave succeeded and the post-soak Kuma checks pass. When
+    *state_output_path* is set, writes the FleetState for tooling / molecule;
+    run_fleet() passes None and merges in-memory.
 
     Never raises for per-host failures — those become FAILED records.
     """
     hosts = inventory.load_remote_hosts(inventory_path, host_vars_dir=settings.host_vars_dir)
+    if limit is not None:
+        hosts = [h for h in hosts if h.name in limit]
     dry_run = check or settings.fleet_dry_run or settings.remote_dry_run
     state = FleetState()
 
@@ -400,24 +621,51 @@ def run_remote_phase(
             spec.name, ex, settings, dry_run=dry_run, pre_update_cmd=spec.pre_update_cmd
         )
 
-    results = run_concurrent(hosts, _run_one, max_workers=settings.remote_forks)
+    def _run_wave(wave: List[RemoteHostSpec]) -> None:
+        results = run_concurrent(wave, _run_one, max_workers=settings.remote_forks)
+        for spec, outcome, run_err in results:
+            host_name = spec.name if isinstance(spec, RemoteHostSpec) else str(spec)
+            if outcome is not None:
+                _fold_outcome(state, outcome, state.remote)
+                rec = outcome.record
+                if rec is not None:
+                    status = "FAILED" if outcome.failed else rec.status
+                    print(f"  [{host_name}] {status}")
+                else:
+                    print(f"  [{host_name}] idle (no changes)")
+            elif run_err is not None:
+                state.failed = True
+                state.errors.append(ErrorEntry(
+                    host=host_name, task="run_remote_update", error=str(run_err)[:300]
+                ))
+                print(f"  [{host_name}] ERROR: {run_err}")
 
-    for spec, outcome, run_err in results:
-        host_name = spec.name if isinstance(spec, RemoteHostSpec) else str(spec)
-        if outcome is not None:
-            _fold_outcome(state, outcome, state.remote)
-            rec = outcome.record
-            if rec is not None:
-                status = "FAILED" if outcome.failed else rec.status
-                print(f"  [{host_name}] {status}")
-            else:
-                print(f"  [{host_name}] idle (no changes)")
-        elif run_err is not None:
-            state.failed = True
-            state.errors.append(ErrorEntry(
-                host=host_name, task="run_remote_update", error=str(run_err)[:300]
-            ))
-            print(f"  [{host_name}] ERROR: {run_err}")
+    canary = [h for h in hosts
+              if h.canary or h.name in settings.canary_hosts]
+    rest = [h for h in hosts if h not in canary]
+
+    if not canary or not rest:
+        _run_wave(hosts)
+    else:
+        print(f"[remote phase] canary wave: {', '.join(h.name for h in canary)}")
+        _run_wave(canary)
+        abort: Optional[str] = None
+        if state.failed:
+            abort = "a canary host failed"
+        elif not dry_run:
+            abort = _soak_canaries(settings, settings.remote_kuma_map,
+                                   [h.name for h in canary])
+            if abort is not None:
+                state.failed = True
+                state.errors.append(ErrorEntry(
+                    host="remote-canary", task="canary soak", error=abort[:300]))
+        if abort is not None:
+            print(f"[remote phase] canary gate failed ({abort}) — "
+                  f"skipping {len(rest)} host(s)")
+            for spec in rest:
+                state.remote.append(RemoteRecord(host=spec.name, status=CANARY_SKIP_STATUS))
+        else:
+            _run_wave(rest)
 
     if state_output_path is not None:
         state.dump_for_ansible(state_output_path)
@@ -430,6 +678,9 @@ def run_node_phase(
     inventory_path: str = "hosts.ini",
     check: bool = False,
     state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_node_state.json",  # nosec B108 - tooling output path
+    limit: Optional[Set[str]] = None,
+    include_nodes: bool = True,
+    include_manager: bool = True,
 ) -> FleetState:
     """Run Phase 2 (node OS updates) + Phase 3 (manager self-update) via the Python driver.
 
@@ -438,32 +689,42 @@ def run_node_phase(
     self-update always runs regardless of node failures (Phase 3 is independent of
     Phase 2 outcomes).
 
+    *include_nodes* / *include_manager* let run_fleet() map the ``node`` and
+    ``manager`` phase selections onto this single helper. *limit* restricts
+    Phase 2 to the named nodes; the manager (not an inventory host) runs only
+    when the limit is unset or names it via ``manager``/``localhost``/
+    ``Ansible-Manager``.
+
     When *state_output_path* is set, writes the FleetState via dump_for_ansible()
     for tooling / molecule; run_fleet() passes None and merges in-memory.
 
     Never raises for per-node failures — those become FAILED records.
     """
     nodes = inventory.load_proxmox_nodes(inventory_path, host_vars_dir=settings.host_vars_dir)
+    if limit is not None:
+        nodes = [n for n in nodes if n["name"] in limit]
     dry_run = check or settings.fleet_dry_run or settings.node_dry_run
     state = FleetState()
 
     # Phase 2: serial node loop — abort on first failure (any_errors_fatal equivalent).
-    for node_info in nodes:
-        node_name = node_info["name"]
-        executor = RunnerExecutor(node_name, inventory=inventory_path, check=check)
-        outcome = run_node_update(node_name, executor, settings, dry_run=dry_run)
-        _fold_outcome(state, outcome, state.node)
-        status = outcome.record.status if outcome.record else "?"
-        print(f"  [{node_name}] {status}")
-        if outcome.failed:
-            break  # abort remaining nodes; manager update still runs
+    if include_nodes:
+        for node_info in nodes:
+            node_name = node_info["name"]
+            executor = RunnerExecutor(node_name, inventory=inventory_path, check=check)
+            outcome = run_node_update(node_name, executor, settings, dry_run=dry_run)
+            _fold_outcome(state, outcome, state.node)
+            status = outcome.record.status if outcome.record else "?"
+            print(f"  [{node_name}] {status}")
+            if outcome.failed:
+                break  # abort remaining nodes; manager update still runs
 
     # Phase 3: manager self-update always runs — independent of node failures.
-    manager_ex = RunnerExecutor("localhost", inventory=inventory_path, check=check)
-    manager_outcome = run_manager_update(manager_ex, settings, dry_run=dry_run)
-    _fold_outcome(state, manager_outcome, state.node)
-    mgr_status = manager_outcome.record.status if manager_outcome.record else "?"
-    print(f"  [Ansible-Manager] {mgr_status}")
+    if include_manager and (limit is None or not _MANAGER_LIMIT_TOKENS.isdisjoint(limit)):
+        manager_ex = RunnerExecutor("localhost", inventory=inventory_path, check=check)
+        manager_outcome = run_manager_update(manager_ex, settings, dry_run=dry_run)
+        _fold_outcome(state, manager_outcome, state.node)
+        mgr_status = manager_outcome.record.status if manager_outcome.record else "?"
+        print(f"  [Ansible-Manager] {mgr_status}")
 
     if state_output_path is not None:
         state.dump_for_ansible(state_output_path)
@@ -544,6 +805,8 @@ def run_fleet(
     inventory_path: str = "hosts.ini",
     check: bool = False,
     extra_vars: Optional[Dict[str, Any]] = None,
+    limit: Optional[Set[str]] = None,
+    phases: Optional[Set[str]] = None,
 ) -> int:
     """End-to-end fleet update — the Python orchestrator (the sole entrypoint).
 
@@ -551,11 +814,28 @@ def run_fleet(
     (remote → custom → lxc → vm → node+manager), merging each phase's FleetState
     into one fleet-wide state, then renders/dispatches the final briefing.
 
+    *phases* (subset of :data:`PHASE_NAMES`) selects which phases run; the
+    pre-flight check and Phase 4 (notify/history) always run. *limit* restricts
+    every selected phase to the named hosts / LXC or VM ids — hosts outside it
+    are silently omitted, like maintenance-window skips. The manager
+    self-update obeys the limit too (token ``manager``/``localhost``).
+
     Returns a process exit code: 1 if any phase recorded a failure, else 0.
-    Raises SystemExit(1) on a pre-flight proxy failure or a custom dependency-order
-    problem (both fail-loud, mirroring the legacy playbook).
+    Raises SystemExit(1) on a pre-flight proxy failure, a custom dependency-order
+    problem (both fail-loud, mirroring the legacy playbook), or an unknown phase
+    name.
     """
     ev = extra_vars or {}
+
+    if phases is not None:
+        unknown = sorted(set(phases) - set(PHASE_NAMES))
+        if unknown:
+            raise SystemExit(
+                f"unknown phase(s): {', '.join(unknown)} (valid: {', '.join(PHASE_NAMES)})"
+            )
+
+    def _phase_on(name: str) -> bool:
+        return phases is None or name in phases
 
     # Pre-flight: the apt-cacher-ng proxy must be reachable or the whole run aborts
     # (port of the "Verify Apt-Cacher-NG is Online" / "Halt if Proxy is Offline" play).
@@ -572,17 +852,27 @@ def run_fleet(
             raise SystemExit(1)
 
     state = FleetState()
-    _merge_state(state, run_remote_phase(
-        settings=settings, inventory_path=inventory_path, check=check, state_output_path=None))
-    _merge_state(state, run_custom_phase(
-        settings=settings, inventory_path=inventory_path, extra_vars=ev, check=check,
-        state_output_path=None))
-    _merge_state(state, run_lxc_phase(
-        settings=settings, inventory_path=inventory_path, check=check, state_output_path=None))
-    _merge_state(state, run_vm_phase(
-        settings=settings, inventory_path=inventory_path, check=check, state_output_path=None))
-    _merge_state(state, run_node_phase(
-        settings=settings, inventory_path=inventory_path, check=check, state_output_path=None))
+    if _phase_on("remote"):
+        _merge_state(state, run_remote_phase(
+            settings=settings, inventory_path=inventory_path, check=check,
+            state_output_path=None, limit=limit))
+    if _phase_on("custom"):
+        _merge_state(state, run_custom_phase(
+            settings=settings, inventory_path=inventory_path, extra_vars=ev, check=check,
+            state_output_path=None, limit=limit))
+    if _phase_on("lxc"):
+        _merge_state(state, run_lxc_phase(
+            settings=settings, inventory_path=inventory_path, check=check,
+            state_output_path=None, limit=limit))
+    if _phase_on("vm"):
+        _merge_state(state, run_vm_phase(
+            settings=settings, inventory_path=inventory_path, check=check,
+            state_output_path=None, limit=limit))
+    if _phase_on("node") or _phase_on("manager"):
+        _merge_state(state, run_node_phase(
+            settings=settings, inventory_path=inventory_path, check=check,
+            state_output_path=None, limit=limit,
+            include_nodes=_phase_on("node"), include_manager=_phase_on("manager")))
 
     run_notify_phase(settings=settings, state=state, check=check)
 
