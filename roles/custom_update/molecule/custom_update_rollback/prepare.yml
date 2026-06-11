@@ -1,0 +1,110 @@
+---
+# Update step exits 1 with pve_vmid set → rescue fires → snapshot rollback
+# (stubbed pct on PATH) runs instead of the legacy rollback_command.
+- name: Prepare stubs for custom_update snapshot-rollback scenario
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create stubs directory
+      file:
+        path: /tmp/mol_stubs
+        state: directory
+        mode: '0755'
+
+    - name: Create temp config directory
+      file:
+        path: /tmp/mol_custom_rollback/configs
+        state: directory
+        mode: '0755'
+
+    - name: Clean up previous run state files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/mol_rollback_called
+        - /tmp/mol_custom_snap_created
+        - /tmp/mol_custom_snap_deleted
+        - /tmp/mol_custom_pct_rollback
+
+    - name: Write version stub
+      copy:
+        dest: /tmp/mol_stubs/mol_version_rollback
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          echo "2.0"
+
+    - name: Write failing update step stub
+      copy:
+        dest: /tmp/mol_stubs/mol_update_fail
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          echo "ERROR: download failed" >&2
+          exit 1
+
+    - name: Write legacy rollback stub (must NOT be called — snapshot path wins)
+      copy:
+        dest: /tmp/mol_stubs/mol_rollback
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          touch /tmp/mol_rollback_called
+          exit 0
+
+    - name: Write pct stub (stands in for the Proxmox node)
+      copy:
+        dest: /tmp/mol_stubs/pct
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          case "$1" in
+            rollback)
+              touch /tmp/mol_custom_pct_rollback
+              exit 0
+              ;;
+            status)
+              echo "status: running"
+              exit 0
+              ;;
+          esac
+          exit 0
+
+    - name: Write test config file
+      copy:
+        dest: /tmp/mol_custom_rollback/configs/mol_test_rollback.yml
+        mode: '0644'
+        content: |
+          name: "mol-rollback-app"
+          version_command: "mol_version_rollback"
+          latest_version:
+            type: none
+          update_steps:
+            - name: "failing step"
+              command: "mol_update_fail"
+          changed_when:
+            type: version
+          health_check:
+            type: none
+          reboot: false
+          rollback_command: "mol_rollback"
+          pve_vmid: "105"
+          pve_node: "pve-01"
+          pve_type: "lxc"
+
+    - name: Install proxmox_fleet package for mol_run_flow.py
+      ansible.builtin.pip:
+        name: "{{ playbook_dir }}/../../../../"
+        editable: true
+        state: present
+      ignore_errors: yes
+
+    - name: Write minimal localhost inventory for RunnerExecutor
+      copy:
+        dest: /tmp/mol_hosts.ini
+        mode: '0644'
+        content: |
+          [all]
+          localhost ansible_connection=local ansible_python_interpreter={{ ansible_python_interpreter | default('/usr/bin/python3') }}

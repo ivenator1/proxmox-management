@@ -7,8 +7,16 @@ Discord message body.
 import json
 import re
 
+import pytest
+
 from proxmox_fleet import briefing
-from proxmox_fleet.history import _ts_now, build_run_summary, write_history
+from proxmox_fleet.history import (
+    _ts_now,
+    build_run_summary,
+    history_summary,
+    read_run,
+    write_history,
+)
 from proxmox_fleet.models.state import FleetState
 
 
@@ -110,3 +118,80 @@ def test_ts_now_includes_microseconds():
     ts = _ts_now()
     # Format: YYYYMMDDTHHMMSSffffffZ (6 microsecond digits between seconds and Z)
     assert re.match(r"^\d{8}T\d{6}\d{6}Z$", ts), f"unexpected format: {ts}"
+
+
+# --- history_summary (read-back) -------------------------------------------- #
+
+def test_history_summary_newest_first(tmp_path):
+    write_history(_state(), history_dir=tmp_path, keep=0, timestamp="20260101T000000000000Z")
+    write_history(_state(fleet_changed=True), history_dir=tmp_path, keep=0,
+                  timestamp="20260102T000000000000Z")
+    rows = history_summary(tmp_path)
+    assert [r["timestamp"] for r in rows] == ["20260102T000000000000Z",
+                                              "20260101T000000000000Z"]
+    assert rows[0]["changed"] is True and rows[1]["changed"] is False
+
+
+def test_history_summary_limit(tmp_path):
+    for i in range(5):
+        write_history(_state(), history_dir=tmp_path, keep=0,
+                      timestamp=f"2026010{i}T000000000000Z")
+    assert len(history_summary(tmp_path, limit=3)) == 3
+    # limit <= 0 means "all runs".
+    assert len(history_summary(tmp_path, limit=0)) == 5
+
+
+def test_history_summary_carries_counts_and_failed(tmp_path):
+    state = _state(fleet_failed=True,
+                   fleet_lxc_data=[dict(node="n", name="a", id="1", app="FAILED")],
+                   fleet_error_log=[dict(host="a", task="update", error="boom")])
+    write_history(state, history_dir=tmp_path, keep=0, timestamp="20260101T000000000000Z")
+    row = history_summary(tmp_path)[0]
+    assert row["failed"] is True
+    assert row["counts"]["lxc"] == 1
+    assert row["counts"]["errors"] == 1
+
+
+def test_history_summary_skips_corrupt_files(tmp_path):
+    write_history(_state(), history_dir=tmp_path, keep=0, timestamp="20260101T000000000000Z")
+    (tmp_path / "run-20260102T000000000000Z.json").write_text("{truncated", encoding="utf-8")
+    rows = history_summary(tmp_path)
+    assert [r["timestamp"] for r in rows] == ["20260101T000000000000Z"]
+
+
+def test_history_summary_empty_dir(tmp_path):
+    assert history_summary(tmp_path) == []
+    assert history_summary(tmp_path / "missing") == []
+
+
+# --- read_run ---------------------------------------------------------------- #
+
+def test_read_run_latest(tmp_path):
+    state = _state(fleet_changed=True)
+    body = briefing.prepare_body(state)
+    write_history(state, history_dir=tmp_path, keep=0,
+                  timestamp="20260101T000000000000Z", briefing=body)
+    run = read_run(tmp_path, "latest")
+    assert run["timestamp"] == "20260101T000000000000Z"
+    assert run["briefing"] == body
+
+
+def test_read_run_ref_forms_equivalent(tmp_path):
+    write_history(_state(), history_dir=tmp_path, keep=0, timestamp="20260101T000000000000Z")
+    bare = read_run(tmp_path, "20260101T000000000000Z")
+    prefixed = read_run(tmp_path, "run-20260101T000000000000Z")
+    filename = read_run(tmp_path, "run-20260101T000000000000Z.json")
+    assert bare == prefixed == filename
+
+
+def test_read_run_missing_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        read_run(tmp_path, "latest")
+    with pytest.raises(FileNotFoundError):
+        read_run(tmp_path, "20990101T000000000000Z")
+
+
+def test_read_run_non_object_payload_raises(tmp_path):
+    (tmp_path / "latest.json").write_text(json.dumps([1, 2]), encoding="utf-8")
+    with pytest.raises(ValueError):
+        read_run(tmp_path, "latest")

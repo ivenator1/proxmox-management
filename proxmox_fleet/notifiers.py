@@ -2,7 +2,8 @@
 notifier-resolution shim from ``fleet-update.yml``.
 
 The briefing body is rendered once by the caller and shared verbatim across all
-notifiers; only the transport envelope differs (Discord embed vs ntfy headers).
+notifiers; only the transport envelope differs (Discord embed, ntfy headers,
+generic-webhook JSON, Telegram sendMessage).
 All HTTP goes through ``proxmox_fleet.http`` (stdlib ``urllib``). Failures are
 swallowed — notification must never abort the run (the legacy tasks use
 ``ignore_errors: yes``).
@@ -10,6 +11,7 @@ swallowed — notification must never abort the run (the legacy tasks use
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from proxmox_fleet import http
@@ -84,6 +86,38 @@ def dispatch(
                     retries=retries,
                     delay=10.0,
                     until=lambda r: r.status == 200,
+                )
+            elif ntype == "webhook":
+                extra = notifier.get("headers") or {}
+                http.post_json(
+                    notifier["url"],
+                    {
+                        "title": title,
+                        "body": body,
+                        "failed": failed,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                    headers={str(k): str(v) for k, v in extra.items()},
+                    retries=retries,
+                    delay=10.0,
+                )
+            elif ntype == "telegram":
+                api_url = str(notifier.get("api_url", "https://api.telegram.org")).rstrip("/")
+                payload = {
+                    "chat_id": notifier["chat_id"],
+                    # Plain text by default — the briefing's Discord markdown is
+                    # not valid Telegram markup and would 400 with a parse_mode.
+                    "text": f"{title}\n\n{body}",
+                }
+                parse_mode = notifier.get("parse_mode")
+                if parse_mode:
+                    payload["parse_mode"] = parse_mode
+                http.post_json(
+                    f"{api_url}/bot{notifier['bot_token']}/sendMessage",
+                    payload,
+                    retries=retries,
+                    delay=10.0,
+                    ok_statuses=(200,),
                 )
         except Exception:  # noqa: BLE001 - mirror ignore_errors: yes
             continue

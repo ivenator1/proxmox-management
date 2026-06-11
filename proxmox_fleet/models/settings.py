@@ -26,6 +26,13 @@ class GlobalSettings(BaseModel):
     fleet_dry_run: bool = False
     force_window: bool = False
 
+    # Canary / staged rollout (remote, lxc, and vm phases). Canary hosts —
+    # names/vmids listed here, or hosts with `canary: true` in inventory/
+    # host_vars — update first; the rest of the phase runs only if no canary
+    # failed and (after the soak window) every Kuma-monitored canary is healthy.
+    canary_hosts: List[str] = Field(default_factory=list)
+    canary_soak_minutes: float = 0.0
+
     # custom_update phase settings
     custom_dry_run: bool = False
     custom_allow_reboot: bool = True
@@ -95,7 +102,21 @@ class GlobalSettings(BaseModel):
     fleet_history_enabled: bool = True
     fleet_history_dir: str = "/var/log/fleet-update"
     fleet_history_keep: int = 30
+    scan_history_keep: int = 30
     force_notify: bool = False
+
+    # Web dashboard (fleet-dashboard)
+    dashboard_host: str = "0.0.0.0"  # nosec B104 - LAN-facing homelab dashboard by design
+    dashboard_port: int = 8421
+    dashboard_token: str = ""        # empty = run-trigger endpoint unauthenticated
+
+    @field_validator("canary_hosts", mode="before")
+    @classmethod
+    def _stringify_canary_hosts(cls, value: Any) -> Any:
+        """Coerce entries to str so integer vmids in vars.yml are accepted."""
+        if isinstance(value, list):
+            return [str(v) for v in value]
+        return value
 
     @field_validator("lxc_kuma_map", "vm_kuma_map", "remote_kuma_map", mode="before")
     @classmethod

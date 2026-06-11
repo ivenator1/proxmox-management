@@ -220,3 +220,142 @@ def test_health_check_command_fails_triggers_rescue():
     out = flow.run_custom_update("nas-01", cfg, ex)
     assert out.failed is True
     assert out.record.app == "FAILED"
+
+
+# --- PVE snapshot/rollback (v2) ------------------------------------------------
+
+class SnapExecutor(ScriptedExecutor):
+    """ScriptedExecutor with a scriptable snapshot() (records every call)."""
+
+    def __init__(self, script=None, default=None, snap_results=None):
+        super().__init__(script, default)
+        self.snap_results = list(snap_results or [])
+        self.snap_calls = []
+
+    def snapshot(self, vmid, *, snap_state, **api_params):
+        self.snap_calls.append({"vmid": vmid, "snap_state": snap_state, **api_params})
+        if self.snap_results:
+            return self.snap_results.pop(0)
+        return PrimitiveResult(rc=0, changed=True, failed=False)
+
+
+_API = {"api_host": "10.0.0.1", "api_user": "root@pam",
+        "api_token_id": "tk", "api_token_secret": "sec"}
+
+
+def _snap_cfg(**overrides):
+    return _cfg(pve_vmid="105", pve_node="pve-01", **overrides)
+
+
+def _run_snap(cfg, ex, node_ex, **kw):
+    # snapshot_retries=0 → exactly one snapshot attempt (retry() semantics are
+    # Ansible's: retries = additional attempts), so scripted results line up 1:1.
+    return flow.run_custom_update(
+        "nas-01", cfg, ex,
+        node_executor=node_ex, api_params=dict(_API),
+        snapshot_retries=0, snapshot_retry_delay=0,
+        _sleep=lambda s: None, **kw,
+    )
+
+
+def test_snapshot_taken_and_deleted_on_success():
+    ex = SnapExecutor(script={"gitea --version": [_ok(stdout="1.0"), _ok(stdout="1.1")]})
+    out = _run_snap(_snap_cfg(), ex, ScriptedExecutor())
+    assert out.failed is False
+    assert [c["snap_state"] for c in ex.snap_calls] == ["present", "absent"]
+    assert all(c["vmid"] == "105" for c in ex.snap_calls)
+    assert all(c["api_host"] == "10.0.0.1" for c in ex.snap_calls)
+    # Snapshot is taken before the update step runs.
+    assert ex.commands.index("do-upgrade") > 0
+
+
+def test_step_failure_rolls_back_snapshot():
+    ex = SnapExecutor(script={
+        "gitea --version": [_ok(stdout="1.0")],
+        "do-upgrade": [_fail()],
+    })
+    node_ex = ScriptedExecutor(script={
+        "pct rollback": [_ok()],
+        "pct status": [_ok(stdout="status: running")],
+    })
+    out = _run_snap(_snap_cfg(rollback_command="restore-backup"), ex, node_ex)
+    assert out.failed is True
+    assert out.record.app == "FAILED + ROLLED BACK"
+    assert any("pct rollback 105 BEFORE_UPDATE_AUTO" in c for c in node_ex.commands)
+    # Snapshot rollback wins — the legacy rollback_command must NOT run.
+    assert "restore-backup" not in ex.commands
+    # Snapshot still deleted in finally.
+    assert [c["snap_state"] for c in ex.snap_calls] == ["present", "absent"]
+
+
+def test_vm_type_uses_qm():
+    ex = SnapExecutor(script={
+        "gitea --version": [_ok(stdout="1.0")],
+        "do-upgrade": [_fail()],
+    })
+    node_ex = ScriptedExecutor(script={
+        "qm rollback": [_ok()],
+        "qm status": [_ok(stdout="status: running")],
+    })
+    out = _run_snap(_snap_cfg(pve_type="vm"), ex, node_ex)
+    assert out.record.app == "FAILED + ROLLED BACK"
+    assert any(c.startswith("qm rollback 105") for c in node_ex.commands)
+
+
+def test_snapshot_create_failure_warns_and_falls_back():
+    ex = SnapExecutor(
+        script={"gitea --version": [_ok(stdout="1.0")], "do-upgrade": [_fail()]},
+        snap_results=[PrimitiveResult(rc=1, changed=False, failed=True)],
+    )
+    node_ex = ScriptedExecutor()
+    out = _run_snap(_snap_cfg(rollback_command="restore-backup"), ex, node_ex)
+    assert any("snapshot failed" in w.warning for w in out.warnings)
+    assert out.record.app == "FAILED (NO SNAPSHOT)"
+    # No snapshot → no pct rollback, legacy rollback_command fallback fires.
+    assert node_ex.commands == []
+    assert "restore-backup" in ex.commands
+    # No snapshot was created → nothing to delete in finally.
+    assert [c["snap_state"] for c in ex.snap_calls] == ["present"]
+
+
+def test_rollback_failure_keeps_plain_failed():
+    ex = SnapExecutor(script={
+        "gitea --version": [_ok(stdout="1.0")],
+        "do-upgrade": [_fail()],
+    })
+    node_ex = ScriptedExecutor(script={"pct rollback": [_fail()]})
+    out = _run_snap(_snap_cfg(), ex, node_ex)
+    assert out.record.app == "FAILED"
+    # Snapshot still deleted in finally even when rollback failed.
+    assert [c["snap_state"] for c in ex.snap_calls] == ["present", "absent"]
+
+
+def test_rollback_not_confirmed_running_keeps_plain_failed():
+    ex = SnapExecutor(script={
+        "gitea --version": [_ok(stdout="1.0")],
+        "do-upgrade": [_fail()],
+    })
+    node_ex = ScriptedExecutor(script={
+        "pct rollback": [_ok()],
+        "pct status": [_ok(stdout="status: stopped")],
+    })
+    out = _run_snap(_snap_cfg(), ex, node_ex)
+    assert out.record.app == "FAILED"
+
+
+def test_no_snapshot_without_node_executor():
+    # pve_vmid set but the driver passed no node executor / api params →
+    # legacy behaviour, no snapshot calls.
+    ex = SnapExecutor(script={"gitea --version": [_ok(stdout="1.0"), _ok(stdout="1.1")]})
+    out = flow.run_custom_update("nas-01", _snap_cfg(), ex)
+    assert out.failed is False
+    assert ex.snap_calls == []
+
+
+def test_dry_run_takes_no_snapshot(monkeypatch):
+    monkeypatch.setattr(http_mod, "get_json", lambda url, **kw: {"tag_name": "v1.5"})
+    cfg = _snap_cfg(latest_version={"type": "github_release", "repo": "go-gitea/gitea"})
+    ex = SnapExecutor(script={"gitea --version": [_ok(stdout="1.4")]})
+    out = _run_snap(cfg, ex, ScriptedExecutor(), dry_run=True)
+    assert out.record.app == "dry-run: 1.4 → v1.5"
+    assert ex.snap_calls == []

@@ -41,6 +41,17 @@ def _parse_inline_vars(remainder: str) -> Dict[str, str]:
     return {m.group(1): m.group(2) for m in _KV_PAIR.finditer(remainder)}
 
 
+def _as_bool(val: Any) -> bool:
+    """Coerce an inline-var string or host_vars YAML value to bool.
+
+    Inline vars arrive as raw strings ('true'/'false'), where bool() would be
+    wrong; host_vars YAML gives real booleans.
+    """
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("true", "1", "yes")
+
+
 def _load_host_vars(host: str, host_vars_dir: Path) -> Dict[str, Any]:
     """Read host_vars/<host>.yml if it exists; return {} otherwise."""
     candidate = host_vars_dir / f"{host}.yml"
@@ -110,6 +121,7 @@ class VmSpec:
     vmid: str           # PVE VM ID (e.g. "200")
     pve_node: str       # inventory hostname of the Proxmox node that owns this VM
     maintenance_window: Optional[MaintenanceWindow] = None
+    canary: bool = False  # updated in the canary wave before the rest of the fleet
 
 
 @dataclass
@@ -120,6 +132,7 @@ class RemoteHostSpec:
     ansible_host: str   # SSH reachable IP
     maintenance_window: Optional[MaintenanceWindow] = None
     pre_update_cmd: str = ""
+    canary: bool = False  # updated in the canary wave before the rest of the fleet
 
 
 def load_proxmox_vms(
@@ -144,6 +157,7 @@ def load_proxmox_vms(
             vmid=str(inline.get("vmid", host_vars.get("vmid", ""))),
             pve_node=str(inline.get("pve_node", host_vars.get("pve_node", ""))),
             maintenance_window=MaintenanceWindow(**raw_mw) if isinstance(raw_mw, dict) else None,
+            canary=_as_bool(inline.get("canary", host_vars.get("canary", False))),
         ))
     return specs
 
@@ -168,6 +182,7 @@ def load_remote_hosts(
             ansible_host=str(inline.get("ansible_host", host_vars.get("ansible_host", name))),
             maintenance_window=MaintenanceWindow(**raw_mw) if isinstance(raw_mw, dict) else None,
             pre_update_cmd=str(host_vars.get("pre_update_cmd", "")),
+            canary=_as_bool(inline.get("canary", host_vars.get("canary", False))),
         ))
     return specs
 

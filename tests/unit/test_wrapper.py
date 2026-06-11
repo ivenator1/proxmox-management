@@ -48,7 +48,7 @@ def _run(argv: list, *, run_fleet_return: int = 0) -> tuple[int, GlobalSettings,
     """
     captured: Dict[str, Any] = {}
 
-    def _fake_run_fleet(*, settings, inventory_path, check, extra_vars):
+    def _fake_run_fleet(*, settings, inventory_path, check, extra_vars, **kwargs):
         captured["settings"] = settings
         captured["check"] = check
         captured["inventory_path"] = inventory_path
@@ -59,6 +59,7 @@ def _run(argv: list, *, run_fleet_return: int = 0) -> tuple[int, GlobalSettings,
         patch.object(sys, "argv", ["./fleet-update.py"] + argv),
         patch("proxmox_fleet.driver.run_fleet", side_effect=_fake_run_fleet),
         patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
     ):
         rc = _wrapper.main()
 
@@ -99,7 +100,7 @@ def test_check_alias():
 def test_dry_run_passes_check_true_to_driver():
     captured: Dict[str, Any] = {}
 
-    def _fake(*, settings, inventory_path, check, extra_vars):
+    def _fake(*, settings, inventory_path, check, extra_vars, **kwargs):
         captured["check"] = check
         return 0
 
@@ -107,6 +108,7 @@ def test_dry_run_passes_check_true_to_driver():
         patch.object(sys, "argv", ["./fleet-update.py", "--dry-run"]),
         patch("proxmox_fleet.driver.run_fleet", side_effect=_fake),
         patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
     ):
         _wrapper.main()
 
@@ -204,7 +206,7 @@ def test_extra_vars_bad_format_exits():
 def test_custom_inventory():
     captured: Dict[str, Any] = {}
 
-    def _fake(*, settings, inventory_path, check, extra_vars):
+    def _fake(*, settings, inventory_path, check, extra_vars, **kwargs):
         captured["inventory_path"] = inventory_path
         return 0
 
@@ -212,6 +214,7 @@ def test_custom_inventory():
         patch.object(sys, "argv", ["./fleet-update.py", "--inventory", "/tmp/my-hosts.ini"]),
         patch("proxmox_fleet.driver.run_fleet", side_effect=_fake),
         patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
     ):
         _wrapper.main()
 
@@ -224,13 +227,14 @@ def test_custom_vars_file(tmp_path):
 
     captured: Dict[str, Any] = {}
 
-    def _fake(*, settings, inventory_path, check, extra_vars):
+    def _fake(*, settings, inventory_path, check, extra_vars, **kwargs):
         captured["ok"] = True
         return 0
 
     with (
         patch.object(sys, "argv", ["./fleet-update.py", "--vars-file", str(vars_file)]),
         patch("proxmox_fleet.driver.run_fleet", side_effect=_fake),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
     ):
         _wrapper.main()
 
@@ -247,6 +251,95 @@ def test_exit_code_forwarded():
 
 
 # ---------------------------------------------------------------------------
+# Tests: --limit / --phases forwarding
+# ---------------------------------------------------------------------------
+
+def test_limit_and_phases_forwarded():
+    captured: Dict[str, Any] = {}
+
+    def _fake(*, settings, inventory_path, check, extra_vars, limit, phases):
+        captured["limit"] = limit
+        captured["phases"] = phases
+        return 0
+
+    with (
+        patch.object(sys, "argv",
+                     ["./fleet-update.py", "--limit", "pve-01,105", "--phases", "lxc"]),
+        patch("proxmox_fleet.driver.run_fleet", side_effect=_fake),
+        patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
+    ):
+        _wrapper.main()
+
+    assert captured["limit"] == {"pve-01", "105"}
+    assert captured["phases"] == {"lxc"}
+
+
+def test_limit_and_phases_default_none():
+    captured: Dict[str, Any] = {}
+
+    def _fake(*, settings, inventory_path, check, extra_vars, limit, phases):
+        captured["limit"] = limit
+        captured["phases"] = phases
+        return 0
+
+    with (
+        patch.object(sys, "argv", ["./fleet-update.py"]),
+        patch("proxmox_fleet.driver.run_fleet", side_effect=_fake),
+        patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
+    ):
+        _wrapper.main()
+
+    assert captured["limit"] is None
+    assert captured["phases"] is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: --history / --history-show early exit (no fleet run)
+# ---------------------------------------------------------------------------
+
+def _write_history(tmp_path, *, timestamp, briefing=None):
+    from proxmox_fleet.history import write_history
+    from proxmox_fleet.models.state import FleetState
+
+    write_history(FleetState.from_raw({}), history_dir=tmp_path, keep=0,
+                  timestamp=timestamp, briefing=briefing)
+
+
+def test_history_flag_skips_fleet_run(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z")
+
+    with (
+        patch.object(sys, "argv", ["./fleet-update.py", "--history"]),
+        patch("proxmox_fleet.driver.run_fleet") as mock_fleet,
+        patch("proxmox_fleet.models.settings.GlobalSettings.load",
+              return_value=GlobalSettings(fleet_history_dir=str(tmp_path))),
+    ):
+        rc = _wrapper.main()
+
+    mock_fleet.assert_not_called()
+    assert rc == 0
+    assert "20260101T000000000000Z" in capsys.readouterr().out
+
+
+def test_history_show_flag_prints_briefing(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z", briefing="THE BRIEFING")
+
+    with (
+        patch.object(sys, "argv", ["./fleet-update.py", "--history-show", "latest"]),
+        patch("proxmox_fleet.driver.run_fleet") as mock_fleet,
+        patch("proxmox_fleet.models.settings.GlobalSettings.load",
+              return_value=GlobalSettings(fleet_history_dir=str(tmp_path))),
+    ):
+        rc = _wrapper.main()
+
+    mock_fleet.assert_not_called()
+    assert rc == 0
+    assert "THE BRIEFING" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # Tests: cli.py force_window propagation fix
 # ---------------------------------------------------------------------------
 
@@ -256,14 +349,17 @@ def test_cli_force_window_propagates(tmp_path):
 
     captured: Dict[str, Any] = {}
 
-    def _fake_fleet(*, settings, inventory_path, check, extra_vars):
+    def _fake_fleet(*, settings, inventory_path, check, extra_vars, **kwargs):
         captured["force_window"] = settings.force_window
         return 0
 
     hosts = tmp_path / "hosts.ini"
     hosts.write_text("[proxmox_nodes]\n")
 
-    with patch("proxmox_fleet.driver.run_fleet", side_effect=_fake_fleet):
+    with (
+        patch("proxmox_fleet.driver.run_fleet", side_effect=_fake_fleet),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
+    ):
         cli.main(["--inventory", str(hosts), "-e", "force_window=true"])
 
     assert captured["force_window"] is True
@@ -275,14 +371,42 @@ def test_cli_force_window_false_by_default(tmp_path):
 
     captured: Dict[str, Any] = {}
 
-    def _fake_fleet(*, settings, inventory_path, check, extra_vars):
+    def _fake_fleet(*, settings, inventory_path, check, extra_vars, **kwargs):
         captured["force_window"] = settings.force_window
         return 0
 
     hosts = tmp_path / "hosts.ini"
     hosts.write_text("[proxmox_nodes]\n")
 
-    with patch("proxmox_fleet.driver.run_fleet", side_effect=_fake_fleet):
+    with (
+        patch("proxmox_fleet.driver.run_fleet", side_effect=_fake_fleet),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
+    ):
         cli.main(["--inventory", str(hosts)])
 
     assert captured["force_window"] is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: --scan early exit (no fleet run)
+# ---------------------------------------------------------------------------
+
+def test_scan_flag_skips_fleet_run():
+    captured: Dict[str, Any] = {}
+
+    def _fake_scan(*, settings, inventory_path, limit):
+        captured["limit"] = limit
+        return 0
+
+    with (
+        patch.object(sys, "argv", ["./fleet-update.py", "--scan", "--limit", "105"]),
+        patch("proxmox_fleet.scan.run_fleet_scan", side_effect=_fake_scan),
+        patch("proxmox_fleet.driver.run_fleet") as mock_fleet,
+        patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
+    ):
+        rc = _wrapper.main()
+
+    mock_fleet.assert_not_called()
+    assert rc == 0
+    assert captured["limit"] == {"105"}

@@ -744,3 +744,693 @@ def test_run_fleet_preflight_abort(monkeypatch):
     with pytest.raises(SystemExit):
         run_fleet(settings=GlobalSettings(apt_proxy_ip="10.0.0.1", apt_proxy_port=3142),
                   inventory_path="x")
+
+
+# --- run_fleet — --phases / --limit gating -------------------------------------
+
+def _record_phases(monkeypatch):
+    """Stub every phase helper, recording (phase, selected kwargs) per call."""
+    calls: List[Any] = []
+
+    def mk(name):
+        def _fn(**kwargs):
+            calls.append((name, {k: kwargs.get(k) for k in
+                                 ("limit", "include_nodes", "include_manager") if k in kwargs}))
+            return FleetState()
+        return _fn
+
+    monkeypatch.setattr(driver_mod, "run_remote_phase", mk("remote"))
+    monkeypatch.setattr(driver_mod, "run_custom_phase", mk("custom"))
+    monkeypatch.setattr(driver_mod, "run_lxc_phase", mk("lxc"))
+    monkeypatch.setattr(driver_mod, "run_vm_phase", mk("vm"))
+    monkeypatch.setattr(driver_mod, "run_node_phase", mk("node"))
+    monkeypatch.setattr(driver_mod, "run_notify_phase", lambda **kw: "body")
+    return calls
+
+
+def test_run_fleet_phases_none_runs_everything(monkeypatch):
+    calls = _record_phases(monkeypatch)
+    run_fleet(settings=GlobalSettings(apt_proxy_ip=""), inventory_path="x")
+    assert [c[0] for c in calls] == ["remote", "custom", "lxc", "vm", "node"]
+    node_kwargs = calls[-1][1]
+    assert node_kwargs["include_nodes"] is True
+    assert node_kwargs["include_manager"] is True
+
+
+def test_run_fleet_phases_subset(monkeypatch):
+    calls = _record_phases(monkeypatch)
+    run_fleet(settings=GlobalSettings(apt_proxy_ip=""), inventory_path="x",
+              phases={"lxc", "vm"})
+    assert [c[0] for c in calls] == ["lxc", "vm"]
+
+
+def test_run_fleet_phases_node_without_manager(monkeypatch):
+    calls = _record_phases(monkeypatch)
+    run_fleet(settings=GlobalSettings(apt_proxy_ip=""), inventory_path="x",
+              phases={"node"})
+    assert [c[0] for c in calls] == ["node"]
+    assert calls[0][1]["include_nodes"] is True
+    assert calls[0][1]["include_manager"] is False
+
+
+def test_run_fleet_phases_manager_only(monkeypatch):
+    calls = _record_phases(monkeypatch)
+    run_fleet(settings=GlobalSettings(apt_proxy_ip=""), inventory_path="x",
+              phases={"manager"})
+    assert [c[0] for c in calls] == ["node"]
+    assert calls[0][1]["include_nodes"] is False
+    assert calls[0][1]["include_manager"] is True
+
+
+def test_run_fleet_unknown_phase_exits(monkeypatch):
+    _record_phases(monkeypatch)
+    with pytest.raises(SystemExit) as exc:
+        run_fleet(settings=GlobalSettings(apt_proxy_ip=""), inventory_path="x",
+                  phases={"lxc", "bogus"})
+    assert "bogus" in str(exc.value)
+
+
+def test_run_fleet_limit_threaded_to_phases(monkeypatch):
+    calls = _record_phases(monkeypatch)
+    run_fleet(settings=GlobalSettings(apt_proxy_ip=""), inventory_path="x",
+              limit={"pve-01", "105"})
+    assert all(c[1]["limit"] == {"pve-01", "105"} for c in calls)
+
+
+def test_run_fleet_notify_runs_even_with_phase_subset(monkeypatch):
+    notified = {}
+    _stub_phases(monkeypatch)
+    monkeypatch.setattr(driver_mod, "run_notify_phase",
+                        lambda **kw: notified.setdefault("called", True))
+    run_fleet(settings=GlobalSettings(apt_proxy_ip=""), inventory_path="x",
+              phases={"remote"})
+    assert notified.get("called") is True
+
+
+# --- per-phase limit filtering --------------------------------------------------
+
+def test_custom_phase_limit_filters_hosts(tmp_path, monkeypatch):
+    inv = _write_inventory(
+        tmp_path,
+        "gitea ansible_host=10.0.0.1 custom_config=gitea\n"
+        "wiki ansible_host=10.0.0.2 custom_config=wiki",
+    )
+    for name in ("gitea", "wiki"):
+        _write_config(tmp_path, name, {
+            "name": name,
+            "version_command": "ver",
+            "update_steps": [{"name": "upgrade", "command": f"do-{name}"}],
+            "changed_when": {"type": "version"},
+            "health_check": {"type": "none"},
+        })
+    settings = _settings(tmp_path)
+
+    executor = ScriptedExecutor({"ver": [_ok("1.0"), _ok("1.1")]})
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", lambda *a, **kw: executor)
+
+    state = run_custom_phase(settings=settings, inventory_path=inv,
+                             state_output_path=None, limit={"gitea"})
+    assert [r.name for r in state.custom] == ["gitea"]
+    assert "do-wiki" not in executor.commands
+
+
+def test_node_phase_limit_filters_nodes_and_skips_manager(tmp_path, monkeypatch):
+    inv = _node_inventory(tmp_path,
+        "pve-01 ansible_host=10.0.0.1\n"
+        "pve-02 ansible_host=10.0.0.2",
+    )
+    pve02_executor = _make_node_executor()
+    mgr_executor = ScriptedNodeExecutor({
+        "dist-upgrade": [_ok(stdout=APT_NOOP)],
+        "reboot-required": [_ok(stdout="ok\n", changed=False)],
+    })
+    dispatch = {"pve-02": pve02_executor, "localhost": mgr_executor}
+
+    def _fake(host, **kw):
+        return dispatch.get(host, _make_node_executor())
+
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake)
+
+    state = run_node_phase(settings=_node_settings(), inventory_path=inv,
+                           check=False, state_output_path=None, limit={"pve-01"})
+
+    node_names = [r.node for r in state.node]
+    assert node_names == ["pve-01"]            # pve-02 filtered out
+    assert pve02_executor.commands == []
+    assert mgr_executor.commands == []         # manager not in limit → skipped
+
+
+def test_node_phase_limit_manager_token_runs_manager(tmp_path, monkeypatch):
+    inv = _node_inventory(tmp_path, "pve-01 ansible_host=10.0.0.1")
+    mgr_executor = ScriptedNodeExecutor({
+        "dist-upgrade": [_ok(stdout=APT_NOOP)],
+        "reboot-required": [_ok(stdout="ok\n", changed=False)],
+    })
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda host, **kw: mgr_executor)
+
+    state = run_node_phase(settings=_node_settings(), inventory_path=inv,
+                           check=False, state_output_path=None, limit={"manager"})
+
+    # Nodes filtered out entirely; only the manager record remains.
+    assert [r.node for r in state.node] == ["Ansible-Manager"]
+
+
+def _include_flag_fixtures(tmp_path, monkeypatch):
+    inv = _node_inventory(tmp_path, "pve-01 ansible_host=10.0.0.1")
+    node_executor = _make_node_executor()
+    mgr_executor = ScriptedNodeExecutor({
+        "dist-upgrade": [_ok(stdout=APT_NOOP)],
+        "reboot-required": [_ok(stdout="ok\n", changed=False)],
+    })
+    dispatch = {"pve-01": node_executor, "localhost": mgr_executor}
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda host, **kw: dispatch.get(host, _make_node_executor()))
+    return inv, node_executor, mgr_executor
+
+
+def test_node_phase_include_manager_false_skips_manager(tmp_path, monkeypatch):
+    inv, _node_executor, mgr_executor = _include_flag_fixtures(tmp_path, monkeypatch)
+    state = run_node_phase(settings=_node_settings(), inventory_path=inv,
+                           check=False, state_output_path=None, include_manager=False)
+    assert [r.node for r in state.node] == ["pve-01"]
+    assert mgr_executor.commands == []
+
+
+def test_node_phase_include_nodes_false_runs_manager_only(tmp_path, monkeypatch):
+    inv, node_executor, _mgr_executor = _include_flag_fixtures(tmp_path, monkeypatch)
+    state = run_node_phase(settings=_node_settings(), inventory_path=inv,
+                           check=False, state_output_path=None, include_nodes=False)
+    assert [r.node for r in state.node] == ["Ansible-Manager"]
+    assert node_executor.commands == []
+
+
+def test_remote_phase_limit_filters_hosts(tmp_path, monkeypatch):
+    p = tmp_path / "hosts.ini"
+    p.write_text("[remote_hosts]\nweb-01 ansible_host=10.0.0.1\nweb-02 ansible_host=10.0.0.2\n")
+
+    ran: List[str] = []
+
+    def _fake_remote_update(name, ex, settings, **kw):
+        ran.append(name)
+        from proxmox_fleet.flows.remote import RemoteFlowOutcome
+        return RemoteFlowOutcome()
+
+    monkeypatch.setattr(driver_mod, "run_remote_update", _fake_remote_update)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    driver_mod.run_remote_phase(settings=GlobalSettings(), inventory_path=str(p),
+                                state_output_path=None, limit={"web-02"})
+    assert ran == ["web-02"]
+
+
+def test_vm_phase_limit_matches_name_or_vmid(tmp_path, monkeypatch):
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\npve-01 ansible_host=10.0.0.1\n"
+        "[proxmox_vms]\n"
+        "media-vm ansible_host=10.0.1.1 vmid=200 pve_node=pve-01\n"
+        "db-vm ansible_host=10.0.1.2 vmid=201 pve_node=pve-01\n"
+        "game-vm ansible_host=10.0.1.3 vmid=202 pve_node=pve-01\n"
+    )
+
+    ran: List[str] = []
+
+    def _fake_vm_update(node_name, vmid, name, vm_ex, node_ex, settings, **kw):
+        ran.append(name)
+        from proxmox_fleet.flows.vm import VmFlowOutcome
+        return VmFlowOutcome()
+
+    monkeypatch.setattr(driver_mod, "run_vm_update", _fake_vm_update)
+    monkeypatch.setattr(driver_mod, "_discover_vm_locations", lambda *a, **kw: {})
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    # Limit by inventory name AND by vmid — both must match.
+    driver_mod.run_vm_phase(settings=GlobalSettings(), inventory_path=str(p),
+                            state_output_path=None, limit={"media-vm", "201"})
+    assert sorted(ran) == ["db-vm", "media-vm"]
+
+
+def test_lxc_phase_limit_node_name_keeps_all_ids(tmp_path, monkeypatch):
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\n"
+        "pve-01 ansible_host=10.0.0.1\n"
+        "pve-02 ansible_host=10.0.0.2\n"
+    )
+
+    discovered: List[str] = []
+    ran: List[str] = []
+
+    def _fake_discover(ex, settings):
+        discovered.append(ex.host)
+        return ["101", "102"]
+
+    def _fake_lxc_update(node_name, lxc_id, ex, settings, **kw):
+        ran.append(f"{node_name}/{lxc_id}")
+        from proxmox_fleet.flows.lxc import LxcFlowOutcome
+        return LxcFlowOutcome()
+
+    def _fake_executor(host, **kw):
+        ex = ScriptedExecutor()
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", _fake_discover)
+    monkeypatch.setattr(driver_mod, "run_lxc_update", _fake_lxc_update)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+
+    driver_mod.run_lxc_phase(settings=GlobalSettings(), inventory_path=str(p),
+                             state_output_path=None, limit={"pve-01"})
+
+    # Only pve-01 was discovered (pve-02 skipped before SSH); all its ids ran.
+    assert discovered == ["pve-01"]
+    assert sorted(ran) == ["pve-01/101", "pve-01/102"]
+
+
+def test_lxc_phase_limit_by_container_id(tmp_path, monkeypatch):
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\n"
+        "pve-01 ansible_host=10.0.0.1\n"
+        "pve-02 ansible_host=10.0.0.2\n"
+    )
+
+    per_node_ids = {"pve-01": ["101", "102"], "pve-02": ["201"]}
+    ran: List[str] = []
+
+    def _fake_discover(ex, settings):
+        return per_node_ids[ex.host]
+
+    def _fake_lxc_update(node_name, lxc_id, ex, settings, **kw):
+        ran.append(f"{node_name}/{lxc_id}")
+        from proxmox_fleet.flows.lxc import LxcFlowOutcome
+        return LxcFlowOutcome()
+
+    def _fake_executor(host, **kw):
+        ex = ScriptedExecutor()
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", _fake_discover)
+    monkeypatch.setattr(driver_mod, "run_lxc_update", _fake_lxc_update)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+
+    # A bare id targets the container wherever it lives — both nodes get
+    # discovered (we can't know which node holds 201 in advance).
+    driver_mod.run_lxc_phase(settings=GlobalSettings(), inventory_path=str(p),
+                             state_output_path=None, limit={"201"})
+    assert ran == ["pve-02/201"]
+
+
+# --- run_custom_phase — PVE snapshot wiring (v2) --------------------------------
+
+def _pve_custom_inventory(tmp_path: Path) -> str:
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\npve-01 ansible_host=10.0.0.9\n"
+        "[custom_hosts]\ngitea ansible_host=10.0.0.1 custom_config=gitea\n"
+    )
+    return str(p)
+
+
+def test_custom_phase_passes_snapshot_wiring(tmp_path, monkeypatch):
+    inv = _pve_custom_inventory(tmp_path)
+    _write_config(tmp_path, "gitea", {
+        "name": "Gitea",
+        "update_steps": [{"name": "upgrade", "command": "do-upgrade"}],
+        "health_check": {"type": "none"},
+        "pve_vmid": 105,
+        "pve_node": "pve-01",
+    })
+    settings = _settings(tmp_path, pve_api_user="root@pam",
+                         pve_api_token_id="tk", pve_api_token_secret="sec",
+                         snapshot_retries=2, snapshot_retry_delay=1.5)
+
+    captured: Dict[str, Any] = {}
+
+    def _fake_update(host, config, executor, **kw):
+        captured.update(kw, host=host, config=config, executor=executor)
+        from proxmox_fleet.flows.custom import CustomFlowOutcome
+        return CustomFlowOutcome()
+
+    executors: Dict[str, Any] = {}
+
+    def _fake_executor(host, **kw):
+        ex = ScriptedExecutor()
+        ex.host = host
+        executors[host] = ex
+        return ex
+
+    monkeypatch.setattr(driver_mod, "run_custom_update", _fake_update)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+
+    run_custom_phase(settings=settings, inventory_path=inv, state_output_path=None)
+
+    assert captured["api_params"] == {
+        "api_host": "10.0.0.9", "api_user": "root@pam",
+        "api_token_id": "tk", "api_token_secret": "sec",
+    }
+    assert captured["node_executor"] is executors["pve-01"]
+    assert captured["snapshot_retries"] == 2
+    assert captured["snapshot_retry_delay"] == 1.5
+
+
+def test_custom_phase_no_snapshot_wiring_without_pve_vmid(tmp_path, monkeypatch):
+    inv = _pve_custom_inventory(tmp_path)
+    _write_config(tmp_path, "gitea", {
+        "name": "Gitea",
+        "update_steps": [{"name": "upgrade", "command": "do-upgrade"}],
+        "health_check": {"type": "none"},
+    })
+    captured: Dict[str, Any] = {}
+
+    def _fake_update(host, config, executor, **kw):
+        captured.update(kw)
+        from proxmox_fleet.flows.custom import CustomFlowOutcome
+        return CustomFlowOutcome()
+
+    monkeypatch.setattr(driver_mod, "run_custom_update", _fake_update)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    run_custom_phase(settings=_settings(tmp_path), inventory_path=inv, state_output_path=None)
+
+    assert captured["node_executor"] is None
+    assert captured["api_params"] is None
+
+
+def test_custom_phase_unknown_pve_node_fails_loud(tmp_path, monkeypatch):
+    inv = _pve_custom_inventory(tmp_path)
+    _write_config(tmp_path, "gitea", {
+        "name": "Gitea",
+        "update_steps": [{"name": "upgrade", "command": "do-upgrade"}],
+        "health_check": {"type": "none"},
+        "pve_vmid": "105",
+        "pve_node": "pve-99",   # not in [proxmox_nodes]
+    })
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    with pytest.raises(SystemExit) as exc:
+        run_custom_phase(settings=_settings(tmp_path), inventory_path=inv,
+                         state_output_path=None)
+    assert exc.value.code == 1
+
+
+# --- canary / staged rollout ----------------------------------------------------
+
+def _remote_inventory(tmp_path: Path) -> str:
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[remote_hosts]\n"
+        "canary-01 ansible_host=10.0.2.1 canary=true\n"
+        "web-01 ansible_host=10.0.2.2\n"
+        "web-02 ansible_host=10.0.2.3\n"
+    )
+    return str(p)
+
+
+def _patch_remote_flow(monkeypatch, *, fail_hosts=()):
+    """Stub run_remote_update, recording the order hosts ran in."""
+    ran: List[str] = []
+
+    def _fake(name, ex, settings, **kw):
+        ran.append(name)
+        from proxmox_fleet.flows.remote import RemoteFlowOutcome
+        from proxmox_fleet.models.state import ErrorEntry, RemoteRecord
+        if name in fail_hosts:
+            return RemoteFlowOutcome(
+                record=RemoteRecord(host=name, status="FAILED"), failed=True,
+                error=ErrorEntry(host=name, task="upgrade", error="boom"))
+        return RemoteFlowOutcome(record=RemoteRecord(host=name, status="Updated"),
+                                 changed=True)
+
+    monkeypatch.setattr(driver_mod, "run_remote_update", _fake)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+    return ran
+
+
+def test_remote_canary_runs_first_then_rest(tmp_path, monkeypatch):
+    ran = _patch_remote_flow(monkeypatch)
+    soaked = {}
+    monkeypatch.setattr(driver_mod, "_soak_canaries",
+                        lambda settings, kuma_map, tokens, **kw:
+                        soaked.setdefault("tokens", list(tokens)))
+    monkeypatch.setattr(driver_mod, "_soak_canaries",
+                        lambda settings, kuma_map, tokens, **kw: soaked.update(
+                            tokens=list(tokens)) or None)
+
+    state = driver_mod.run_remote_phase(
+        settings=GlobalSettings(), inventory_path=_remote_inventory(tmp_path),
+        state_output_path=None)
+
+    assert ran[0] == "canary-01"            # canary wave first
+    assert set(ran[1:]) == {"web-01", "web-02"}
+    assert soaked["tokens"] == ["canary-01"]
+    assert state.failed is False
+
+
+def test_remote_canary_failure_skips_rest(tmp_path, monkeypatch):
+    ran = _patch_remote_flow(monkeypatch, fail_hosts={"canary-01"})
+
+    state = driver_mod.run_remote_phase(
+        settings=GlobalSettings(), inventory_path=_remote_inventory(tmp_path),
+        state_output_path=None)
+
+    assert ran == ["canary-01"]             # rest never ran
+    skipped = [r for r in state.remote if r.status == "SKIPPED (canary failed)"]
+    assert sorted(r.host for r in skipped) == ["web-01", "web-02"]
+    assert state.failed is True
+
+
+def test_remote_canary_soak_failure_skips_rest(tmp_path, monkeypatch):
+    ran = _patch_remote_flow(monkeypatch)
+    monkeypatch.setattr(driver_mod, "_soak_canaries",
+                        lambda *a, **kw: "canary canary-01 unhealthy after soak: down")
+
+    state = driver_mod.run_remote_phase(
+        settings=GlobalSettings(), inventory_path=_remote_inventory(tmp_path),
+        state_output_path=None)
+
+    assert ran == ["canary-01"]
+    assert state.failed is True
+    assert any("unhealthy after soak" in e.error for e in state.errors)
+    assert sorted(r.host for r in state.remote if "SKIPPED" in r.status) == ["web-01", "web-02"]
+
+
+def test_remote_no_canaries_single_wave(tmp_path, monkeypatch):
+    p = tmp_path / "hosts.ini"
+    p.write_text("[remote_hosts]\nweb-01 ansible_host=10.0.2.2\n")
+    ran = _patch_remote_flow(monkeypatch)
+    soak_called = {}
+    monkeypatch.setattr(driver_mod, "_soak_canaries",
+                        lambda *a, **kw: soak_called.setdefault("yes", True))
+
+    driver_mod.run_remote_phase(settings=GlobalSettings(), inventory_path=str(p),
+                                state_output_path=None)
+
+    assert ran == ["web-01"]
+    assert soak_called == {}                # no staging → no soak
+
+
+def test_remote_canary_via_settings_list(tmp_path, monkeypatch):
+    p = tmp_path / "hosts.ini"
+    p.write_text("[remote_hosts]\nweb-01 ansible_host=1.1.1.1\nweb-02 ansible_host=1.1.1.2\n")
+    ran = _patch_remote_flow(monkeypatch)
+    monkeypatch.setattr(driver_mod, "_soak_canaries", lambda *a, **kw: None)
+
+    driver_mod.run_remote_phase(
+        settings=GlobalSettings(canary_hosts=["web-02"]), inventory_path=str(p),
+        state_output_path=None)
+
+    assert ran == ["web-02", "web-01"]
+
+
+def test_remote_canary_dry_run_skips_soak(tmp_path, monkeypatch):
+    ran = _patch_remote_flow(monkeypatch)
+    monkeypatch.setattr(driver_mod, "_soak_canaries",
+                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("no soak in dry-run")))
+
+    state = driver_mod.run_remote_phase(
+        settings=GlobalSettings(fleet_dry_run=True),
+        inventory_path=_remote_inventory(tmp_path), state_output_path=None)
+
+    assert len(ran) == 3                    # both waves still ran
+    assert state.failed is False
+
+
+def test_vm_canary_failure_skips_rest_with_records(tmp_path, monkeypatch):
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\npve-01 ansible_host=10.0.0.1\n"
+        "[proxmox_vms]\n"
+        "media-vm ansible_host=10.0.1.1 vmid=200 pve_node=pve-01 canary=true\n"
+        "db-vm ansible_host=10.0.1.2 vmid=201 pve_node=pve-01\n"
+    )
+    ran: List[str] = []
+
+    def _fake_vm_update(node_name, vmid, name, vm_ex, node_ex, settings, **kw):
+        ran.append(name)
+        from proxmox_fleet.flows.vm import VmFlowOutcome
+        from proxmox_fleet.models.state import ErrorEntry, VmRecord
+        return VmFlowOutcome(record=VmRecord(node=node_name, vmid=vmid, name=name,
+                                             status="FAILED"), failed=True,
+                             error=ErrorEntry(host=name, task="upgrade", error="boom"))
+
+    monkeypatch.setattr(driver_mod, "run_vm_update", _fake_vm_update)
+    monkeypatch.setattr(driver_mod, "_discover_vm_locations", lambda *a, **kw: {})
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    state = driver_mod.run_vm_phase(settings=GlobalSettings(), inventory_path=str(p),
+                                    state_output_path=None)
+
+    assert ran == ["media-vm"]
+    skipped = [r for r in state.vm if r.status == "SKIPPED (canary failed)"]
+    assert [r.name for r in skipped] == ["db-vm"]
+    assert skipped[0].node == "pve-01"      # pve_node hint used for the record
+
+
+def test_lxc_canary_id_failure_skips_rest_across_nodes(tmp_path, monkeypatch):
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\n"
+        "pve-01 ansible_host=10.0.0.1\n"
+        "pve-02 ansible_host=10.0.0.2\n"
+    )
+    per_node_ids = {"pve-01": ["101", "102"], "pve-02": ["201"]}
+    ran: List[str] = []
+
+    def _fake_discover(ex, settings):
+        return per_node_ids[ex.host]
+
+    def _fake_lxc_update(node_name, lxc_id, ex, settings, **kw):
+        ran.append(lxc_id)
+        from proxmox_fleet.flows.lxc import LxcFlowOutcome
+        from proxmox_fleet.models.state import ErrorEntry, LxcRecord
+        return LxcFlowOutcome(
+            record=LxcRecord(node=node_name, name=f"ct{lxc_id}", id=lxc_id, app="FAILED"),
+            failed=True,
+            error=ErrorEntry(host=lxc_id, task="update", error="boom"))
+
+    def _fake_executor(host, **kw):
+        ex = ScriptedExecutor()
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", _fake_discover)
+    monkeypatch.setattr(driver_mod, "run_lxc_update", _fake_lxc_update)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+
+    state = driver_mod.run_lxc_phase(
+        settings=GlobalSettings(canary_hosts=["201"]), inventory_path=str(p),
+        state_output_path=None)
+
+    assert ran == ["201"]                   # canary wave only
+    skipped = [r for r in state.lxc if r.app == "SKIPPED (canary failed)"]
+    assert sorted(r.id for r in skipped) == ["101", "102"]
+    assert all(r.snap is False for r in skipped)
+
+
+def test_lxc_canary_success_runs_rest(tmp_path, monkeypatch):
+    p = tmp_path / "hosts.ini"
+    p.write_text("[proxmox_nodes]\npve-01 ansible_host=10.0.0.1\n")
+    ran: List[str] = []
+
+    def _fake_lxc_update(node_name, lxc_id, ex, settings, **kw):
+        ran.append(lxc_id)
+        from proxmox_fleet.flows.lxc import LxcFlowOutcome
+        return LxcFlowOutcome()
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", lambda ex, s: ["101", "102", "103"])
+    monkeypatch.setattr(driver_mod, "run_lxc_update", _fake_lxc_update)
+    monkeypatch.setattr(driver_mod, "_soak_canaries", lambda *a, **kw: None)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    state = driver_mod.run_lxc_phase(
+        settings=GlobalSettings(canary_hosts=["102"]), inventory_path=str(p),
+        state_output_path=None)
+
+    assert ran == ["102", "101", "103"]     # canary first, then the rest
+    assert state.failed is False
+
+
+def test_lxc_discovery_failure_does_not_trip_canary_gate(tmp_path, monkeypatch):
+    """A discovery error on one node must not abort the canary waves."""
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\n"
+        "pve-01 ansible_host=10.0.0.1\n"
+        "pve-bad ansible_host=10.0.0.9\n"
+    )
+    ran: List[str] = []
+
+    def _fake_discover(ex, settings):
+        if ex.host == "pve-bad":
+            raise RuntimeError("ssh down")
+        return ["101", "102"]
+
+    def _fake_lxc_update(node_name, lxc_id, ex, settings, **kw):
+        ran.append(lxc_id)
+        from proxmox_fleet.flows.lxc import LxcFlowOutcome
+        return LxcFlowOutcome()
+
+    def _fake_executor(host, **kw):
+        ex = ScriptedExecutor()
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", _fake_discover)
+    monkeypatch.setattr(driver_mod, "run_lxc_update", _fake_lxc_update)
+    monkeypatch.setattr(driver_mod, "_soak_canaries", lambda *a, **kw: None)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+
+    state = driver_mod.run_lxc_phase(
+        settings=GlobalSettings(canary_hosts=["101"]), inventory_path=str(p),
+        state_output_path=None)
+
+    assert state.failed is True             # discovery error recorded
+    assert sorted(ran) == ["101", "102"]    # both waves still ran
+    assert not any("SKIPPED" in r.app for r in state.lxc)
+
+
+# --- _soak_canaries --------------------------------------------------------------
+
+def test_soak_sleeps_then_checks(monkeypatch):
+    slept: List[float] = []
+    polled: List[str] = []
+
+    def _fake_poll(fetch, pred, **kw):
+        polled.append("x")
+        return {"heartbeatList": {}}
+
+    monkeypatch.setattr(driver_mod.http, "poll_until", _fake_poll)
+    settings = GlobalSettings(canary_soak_minutes=2, kuma_url="http://kuma",
+                              kuma_slug="fleet")
+    err = driver_mod._soak_canaries(settings, {"101": "5"}, ["101", "102"],
+                                    _sleep=slept.append)
+    assert err is None
+    assert slept == [120.0]
+    assert len(polled) == 1                 # only the mapped canary is polled
+
+
+def test_soak_returns_error_on_unhealthy(monkeypatch):
+    def _boom(fetch, pred, **kw):
+        raise TimeoutError("monitor down")
+
+    monkeypatch.setattr(driver_mod.http, "poll_until", _boom)
+    settings = GlobalSettings(kuma_url="http://kuma", kuma_slug="fleet")
+    err = driver_mod._soak_canaries(settings, {"101": "5"}, ["101"],
+                                    _sleep=lambda s: None)
+    assert err is not None and "101" in err
+
+
+def test_soak_no_kuma_url_is_noop():
+    err = driver_mod._soak_canaries(GlobalSettings(), {"101": "5"}, ["101"],
+                                    _sleep=lambda s: None)
+    assert err is None

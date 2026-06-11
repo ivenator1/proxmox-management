@@ -69,6 +69,14 @@ EXAMPLES
 
   # Pass a raw extra var (same as old 'fleet-update -e KEY=VALUE'):
   ./fleet-update.py -e custom_allow_reboot=false
+
+  # Show the last 5 persisted runs / replay the latest run's briefing:
+  ./fleet-update.py --history 5
+  ./fleet-update.py --history-show latest
+
+  # Re-run a single failed LXC (dry-run first), or only the VM phase:
+  ./fleet-update.py --dry-run --phases lxc --limit 105
+  ./fleet-update.py --phases vm --limit media-vm
 """,
     )
 
@@ -121,6 +129,48 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="PATH",
         help="Path to vars.yml used to load GlobalSettings (default: vars.yml).",
     )
+    parser.add_argument(
+        "--history",
+        nargs="?",
+        const=10,
+        type=int,
+        default=None,
+        metavar="N",
+        help="Show the last N persisted runs (default: 10) and exit — no fleet run.",
+    )
+    parser.add_argument(
+        "--history-show",
+        default=None,
+        metavar="TS|latest",
+        help="Print one persisted run's briefing (run timestamp or 'latest') and exit.",
+    )
+    parser.add_argument(
+        "--limit",
+        default=None,
+        metavar="HOST,ID,...",
+        help=(
+            "Restrict the run to these host names and/or LXC/VM ids — everything else "
+            "is silently skipped. Use 'manager' to include the manager self-update."
+        ),
+    )
+    parser.add_argument(
+        "--phases",
+        default=None,
+        metavar="P1,P2",
+        help=(
+            "Run only these phases: remote,custom,lxc,vm,node,manager. "
+            "Pre-flight and the final notify/history phase always run."
+        ),
+    )
+    parser.add_argument(
+        "--scan",
+        action="store_true",
+        help=(
+            "Read-only pending-updates scan: per-host pending OS packages plus "
+            "community-script app versions (current → latest) for managed LXCs. "
+            "Writes pending-*.json next to the run history; no changes are made."
+        ),
+    )
 
 
 def main() -> int:
@@ -130,10 +180,30 @@ def main() -> int:
 
     try:
         from proxmox_fleet import driver
-        from proxmox_fleet.cli import _parse_extra_vars, apply_extravar_overrides
+        from proxmox_fleet.cli import (
+            _parse_csv_set,
+            _parse_extra_vars,
+            apply_extravar_overrides,
+            history_main,
+            run_locked,
+        )
         from proxmox_fleet.models.settings import GlobalSettings
     except ImportError as exc:
         raise SystemExit(f"Cannot import proxmox_fleet — is the venv active? ({exc})")
+
+    if args.history is not None or args.history_show is not None:
+        return history_main(history=args.history, history_show=args.history_show,
+                            vars_file=args.vars_file)
+
+    if args.scan:
+        from proxmox_fleet import scan as scan_mod
+
+        scan_settings = GlobalSettings.load(args.vars_file)
+        return run_locked(scan_settings, lambda: scan_mod.run_fleet_scan(
+            settings=scan_settings,
+            inventory_path=args.inventory,
+            limit=_parse_csv_set(args.limit),
+        ))
 
     extravars = _parse_extra_vars(args.extra_vars)
 
@@ -153,12 +223,14 @@ def main() -> int:
     if args.force_window:
         settings = settings.model_copy(update={"force_window": True})
 
-    return driver.run_fleet(
+    return run_locked(settings, lambda: driver.run_fleet(
         settings=settings,
         inventory_path=args.inventory,
         check=args.dry_run,
         extra_vars=extravars,
-    )
+        limit=_parse_csv_set(args.limit),
+        phases=_parse_csv_set(args.phases),
+    ))
 
 
 if __name__ == "__main__":

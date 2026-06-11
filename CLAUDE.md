@@ -16,6 +16,11 @@ flags. `fleet-update` (pip console command) is the programmatic/cron interface.
 ./fleet-update.py --force-notify               # full run, forced notification
 ./fleet-update.py --force-window               # bypass maintenance windows
 ./fleet-update.py -e custom_allow_reboot=false # raw extra vars (old -e interface)
+./fleet-update.py --history 5                  # table of the last 5 persisted runs (no fleet run)
+./fleet-update.py --history-show latest        # replay a stored run's briefing (TS or 'latest')
+./fleet-update.py --limit pve-01,105           # target host names and/or LXC/VM ids only
+./fleet-update.py --phases lxc,vm              # run only these phases (pre-flight+notify always run)
+./fleet-update.py --scan                       # read-only pending-updates scan → pending-*.json
 fleet-update --check -e force_notify=true      # console command (needs active venv)
 
 ansible-galaxy collection install community.proxmox community.general
@@ -83,8 +88,9 @@ proxmox_fleet/
   changes.py               # change-detection helpers (lxc_os_changed, dpkg_hash_differs, ...)
   window.py                # in_window() — zoneinfo port of check-window.yml
   briefing.py              # render_briefing() byte-parity port of discord_briefing.j2
-  history.py               # build_run_summary() + write_history()
-  notifiers.py             # resolve_notifiers(), dispatch() (discord/ntfy), ping_deadmans()
+  history.py               # build_run_summary() + write_history(); history_summary()/read_run() readers
+  notifiers.py             # resolve_notifiers(), dispatch() (discord/ntfy/webhook/telegram), ping_deadmans()
+  scan.py                  # --scan: read-only pending-updates walk → pending-*.json (next to history)
   cli.py                   # fleet-update CLI: parses flags, calls driver.run_fleet()
 config_templates/custom_system.yml.example   # full commented schema → copy to configs/<name>.yml
 configs/                   # real configs/*.yml gitignored; commit *.yml.example only
@@ -95,7 +101,7 @@ ansible/primitives/        # thin single-purpose playbooks: run_shell, reboot_ho
 tests/unit/                # plain pytest, no Ansible/PVE; data/briefing_golden.json locks parity
 roles/                     # molecule scenarios ONLY — drive Python flows via mol_run_flow.py
   lxc_update/molecule/{lxc_update_normal,lxc_update_rollback,lxc_update_snapfail}
-  custom_update/molecule/{custom_update_normal,_noop,_rescue,_dry_run,_uptodate,_per_step}
+  custom_update/molecule/{custom_update_normal,_noop,_rescue,_rollback,_dry_run,_uptodate,_per_step}
 ```
 
 ## Architecture
@@ -119,6 +125,26 @@ returned state in):
 Returns exit code 1 if any phase recorded a failure. Each phase's dry-run flag is
 `check or fleet_dry_run or <phase>_dry_run`; `fleet_dry_run` also forces a notification.
 
+**Targeting**: `run_fleet(phases=...)` (`--phases`) selects phases by name
+(`driver.PHASE_NAMES`: remote/custom/lxc/vm/node/manager — node and manager map onto
+`run_node_phase(include_nodes=, include_manager=)`); pre-flight and Phase 4 always run; unknown
+names `SystemExit`. `run_fleet(limit=...)` (`--limit`) restricts every phase to the named
+hosts/ids — silently omitted like window skips. LXC limit mixes node names (whole node) and bare
+ids (that container anywhere; nodes are skipped pre-discovery only when the limit holds no ids);
+VM limit matches name or vmid; custom dep *validation* still covers the full inventory. The
+manager self-update obeys limit via the tokens `manager`/`localhost`/`Ansible-Manager`.
+
+**Canary staging** (remote/lxc/vm phases): hosts flagged `canary=true` (inventory/host_vars,
+remote+vm) or listed in `canary_hosts` (names and/or LXC/VM ids, str-coerced) form wave 1; the
+rest run only if no canary failed AND `driver._soak_canaries()` passes (sleep
+`canary_soak_minutes`, then poll Kuma for each canary with a `*_kuma_map` entry — injectable
+`_sleep`). On a failed gate the remainder get `SKIPPED (canary failed)` records
+(`driver.CANARY_SKIP_STATUS`) and the phase is failed. The LXC phase discovers all nodes
+up-front so the canary wave spans nodes; a discovery error never trips the gate (per-wave
+failure tracking, not `state.failed`). Soak is skipped in dry-run; no canaries → single wave,
+identical to pre-canary behaviour. Custom (dependency-ordered) and node (serial,
+abort-on-first-failure) phases stage themselves already.
+
 ### State accumulation
 
 Each `flows/*` call returns a per-host outcome → `run_*_phase()` folds it into a `FleetState`
@@ -131,13 +157,25 @@ merges purely in-memory.
 ### Phase 4 subsystems (`driver.run_notify_phase()`)
 
 - **Notifiers**: `briefing.prepare_body()` renders the body once; `notifiers.dispatch()` fans
-  it to a `notifiers` list (`discord`/`ntfy`). Back-compat `resolve_notifiers()`: if
-  `settings.notifiers` is unset (`None`) but `discord_webhook` is set, synthesize one Discord
-  notifier; an explicit `[]` means "none". ntfy reuses the same body, different envelope.
+  it to a `notifiers` list (`discord`/`ntfy`/`webhook`/`telegram`). Back-compat
+  `resolve_notifiers()`: if `settings.notifiers` is unset (`None`) but `discord_webhook` is set,
+  synthesize one Discord notifier; an explicit `[]` means "none". All types reuse the same body,
+  different envelope: ntfy headers, generic-webhook `{title, body, failed, timestamp}` JSON,
+  Telegram `sendMessage` (plain text by default — briefing markdown is Discord-flavoured).
 - **Run history** (`history.py`): `write_history()` writes `run-<UTC-ts>.json` + `latest.json`
   to `fleet_history_dir`, pruned to `fleet_history_keep`; gated on `fleet_history_enabled`.
+  Read back via `history_summary()`/`read_run()` — surfaced as `--history [N]` /
+  `--history-show <ts|latest>` (`cli.history_main()`, shared by both entry points, early-exits
+  before any driver import).
 - **Dead-man's switch**: `notifiers.ping_deadmans()` pings `fleet_deadmans_url` (`/fail` on
   failure) so its absence alerts when the orchestrator stops running.
+- **Pending-updates scan** (`scan.py`, `--scan`): strictly read-only fleet walk — pending OS
+  packages per host (apt `-s dist-upgrade` / `dnf check-update` rc-100-tolerant / `apk version
+  -l '<'`, parsed by `parse_pending()`) plus per-LXC app current→latest (the lxc dry-check
+  detect chain, reused). Stopped CTs/templates are skipped, never started. Writes
+  `pending-<ts>.json` + `pending-latest.json` to `fleet_history_dir` (pruned to
+  `scan_history_keep`); obeys `--limit`; exit 1 if any scan errored. Bypasses `run_fleet()`
+  entirely (no phases, no notify).
 
 ### Cross-cutting subsystems
 
@@ -172,9 +210,16 @@ snapshots). Outcomes are folded by `driver._fold_outcome()`.
 - Config load is **outside** the flow (fail loud): `driver._load_config()` reads
   `configs/<name>.yml` (`settings.configs_dir`), deep-merges `custom_overrides` from host_vars,
   validates via `CustomConfig`.
-- Flow body: detect (`version_command` + latest lookup) → backup (if `backup_command`) →
-  `steps.run_steps()` → change detection → reboot → health → report.
-- `except`: run `rollback_command` (errors ignored) → record `FAILED`. No `finally` (v1, no snapshot).
+- Flow body: detect (`version_command` + latest lookup) → backup (`backup_command`, then a PVE
+  snapshot when enabled) → `steps.run_steps()` → change detection → reboot → health → report.
+- **PVE snapshot/rollback (v2)**: a config with `pve_vmid` + `pve_node` (`pve_type: lxc|vm`)
+  gets the lxc/vm-style safety net — `BEFORE_UPDATE_AUTO` snapshot before the steps,
+  `pct/qm rollback` on the node in rescue (status `FAILED + ROLLED BACK` /
+  `FAILED (NO SNAPSHOT)` via `status.custom_rescue_status()`), delete in `finally`.
+  `run_custom_phase()` resolves `pve_node` → `ansible_host` (unknown node fails loud) and
+  passes `node_executor` + `api_params`; without them the flow never snapshots.
+- `except` (no `pve_vmid`, legacy): run `rollback_command` (errors ignored) → record `FAILED`.
+  When a snapshot was taken, the snapshot rollback wins and `rollback_command` is NOT run.
 - Each `[custom_hosts]` host needs `custom_config=<name>`; optional `custom_overrides: {...}`.
 - `configs/*.yml` is gitignored — commit `*.yml.example`. Schema: `config_templates/custom_system.yml.example`.
 
@@ -306,7 +351,7 @@ includes the **golden byte-parity** test against `tests/unit/data/briefing_golde
 
 **Molecule** drives the Python flows (not roles): `roles/lxc_update/molecule/` has
 `normal`/`rollback`/`snapfail`; `roles/custom_update/molecule/` has `normal`/`noop`/`rescue`/
-`dry_run`/`uptodate`/`per_step`. Each `converge.yml` runs `mol_run_flow.py` → a stub executor →
+`rollback`/`dry_run`/`uptodate`/`per_step`. Each `converge.yml` runs `mol_run_flow.py` → a stub executor →
 the flow function → `verify.yml` `include_vars`s the dumped JSON. Idempotency is disabled
 (backup/update are intentionally non-idempotent). `roles/` contains **only** these harnesses.
 

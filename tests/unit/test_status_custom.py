@@ -5,7 +5,7 @@ These mirror tests/unit/test_custom_report.py case-for-case to lock byte-parity
 with the Jinja `tmp_custom` / `custom_changed` / `custom_is_outdated` expressions.
 """
 from proxmox_fleet.changes import custom_changed, is_outdated, normalize_version
-from proxmox_fleet.status import custom_should_report, custom_status
+from proxmox_fleet.status import custom_rescue_status, custom_should_report, custom_status
 
 # --- custom_status (tmp_custom) -----------------------------------------------
 
@@ -142,3 +142,27 @@ def test_outdated_fail_open_when_latest_unresolved():
 def test_normalize_version():
     assert normalize_version("v1.2.3") == "1.2.3"
     assert normalize_version("  1.2.3  ") == "1.2.3"
+
+
+# --- custom_rescue_status (PVE snapshot path, v2) --------------------------------
+
+def test_rescue_rolled_back():
+    assert custom_rescue_status(rollback_done=True) == "FAILED + ROLLED BACK"
+
+
+def test_rescue_no_snapshot():
+    assert custom_rescue_status(snapshot_failed=True) == "FAILED (NO SNAPSHOT)"
+
+
+def test_rescue_plain_failed():
+    assert custom_rescue_status() == "FAILED"
+
+
+def test_rescue_rollback_wins_over_snapshot_failed():
+    # Mirrors vm_rescue_status precedence.
+    assert custom_rescue_status(rollback_done=True, snapshot_failed=True) == "FAILED + ROLLED BACK"
+
+
+def test_rescue_statuses_are_reportable():
+    for status in ("FAILED + ROLLED BACK", "FAILED (NO SNAPSHOT)", "FAILED"):
+        assert custom_should_report(status, dry_run=False) is True

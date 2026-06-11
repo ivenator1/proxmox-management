@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from proxmox_fleet.models.state import FleetState
 
@@ -98,3 +98,60 @@ def write_history(
             stale.unlink(missing_ok=True)
 
     return run_file
+
+
+def history_summary(
+    history_dir: Union[str, Path],
+    *,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """Read back the newest *limit* run summaries, newest first.
+
+    Returns one dict per run with ``timestamp``/``changed``/``failed``/``counts``
+    (the table-level fields of :func:`build_run_summary`). Unreadable or corrupt
+    run files are skipped — history viewing must not fail because one file was
+    truncated mid-write. ``limit <= 0`` means "all runs".
+    """
+    directory = Path(history_dir)
+    runs = sorted(directory.glob("run-*.json"), reverse=True)
+    if limit > 0:
+        runs = runs[:limit]
+
+    out: List[Dict[str, Any]] = []
+    for run_file in runs:
+        try:
+            data = json.loads(run_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        out.append({
+            # run_file.stem is "run-<ts>" — strip the prefix as a fallback.
+            "timestamp": data.get("timestamp", run_file.stem[4:]),
+            "changed": bool(data.get("changed", False)),
+            "failed": bool(data.get("failed", False)),
+            "counts": data.get("counts", {}),
+        })
+    return out
+
+
+def read_run(
+    history_dir: Union[str, Path],
+    ref: str = "latest",
+) -> Dict[str, Any]:
+    """Read one persisted run summary by reference.
+
+    *ref* is ``latest`` (→ ``latest.json``) or a run timestamp — bare
+    (``20260101T000000000000Z``), prefixed (``run-<ts>``), or a full filename;
+    all resolve to the same file. Raises ``FileNotFoundError`` when absent.
+    """
+    directory = Path(history_dir)
+    if ref == "latest":
+        path = directory / "latest.json"
+    else:
+        name = ref if ref.startswith("run-") else f"run-{ref}"
+        if not name.endswith(".json"):
+            name += ".json"
+        path = directory / name
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"unexpected history payload in {path}: not a JSON object")
+    return data

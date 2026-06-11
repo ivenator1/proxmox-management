@@ -6,7 +6,7 @@ discord_webhook: "discord_webhook" #Change with your Discord Webook URL
 # --- NOTIFIERS ---
 # Pluggable notifier list. If omitted, the legacy `discord_webhook` above is used
 # as a single Discord notifier (back-compat). Define `notifiers` to fan the same
-# briefing out to multiple targets. Supported types: discord, ntfy.
+# briefing out to multiple targets. Supported types: discord, ntfy, webhook, telegram.
 # notifiers:
 #   - type: discord
 #     enabled: true
@@ -17,6 +17,17 @@ discord_webhook: "discord_webhook" #Change with your Discord Webook URL
 #     token: ""                                # optional bearer token for protected topics
 #     priority: 3                              # 1-5 (default: 5 on failure, else 3)
 #     tags: "package"                          # optional ntfy tags/emoji
+#   - type: webhook                            # generic JSON POST — Slack/Mattermost/HA/n8n intakes
+#     enabled: true
+#     url: "https://hooks.example.com/fleet"   # receives {title, body, failed, timestamp}
+#     headers:                                 # optional extra HTTP headers
+#       X-Api-Key: "secret"
+#   - type: telegram
+#     enabled: true
+#     bot_token: "123456:ABC-bot-token"        # from @BotFather
+#     chat_id: "-1001234567890"                # target chat/channel id
+#     # parse_mode: ""                         # optional; default is plain text (briefing
+#     #                                        # markdown is Discord-flavoured, not Telegram's)
 
 #Apt-Cacher NG
 apt_proxy_ip: "10.10.10.12" #Apt Procy IP
@@ -31,6 +42,22 @@ kuma_slug: "slug"
 # Mapping: "LXC_ID": KUMA_MONITOR_ID
 lxc_kuma_map:
   "100": "5" #Pi-Hole
+
+# --- CANARY / STAGED ROLLOUT ---
+# Optional: update these hosts first (remote/lxc/vm phases). The rest of each
+# phase runs only if no canary failed and — after the soak window — every
+# Kuma-monitored canary is healthy; otherwise the remaining hosts are recorded
+# as "SKIPPED (canary failed)". Entries are inventory names and/or LXC/VM ids;
+# remote hosts and VMs can also be flagged with `canary=true` in hosts.ini or
+# host_vars. Empty list = no staging (everything runs in one wave).
+canary_hosts: []
+# canary_hosts: ["101", "media-vm", "web-01"]
+canary_soak_minutes: 0      # wait this long after the canary wave before the Kuma check
+
+# --- PENDING-UPDATES SCAN (--scan) ---
+# `fleet-update --scan` is read-only: it writes pending-<ts>.json +
+# pending-latest.json to fleet_history_dir. Keep the newest N scan snapshots.
+scan_history_keep: 30
 
 # --- LXC TAG DISCOVERY ---
 lxc_tags:

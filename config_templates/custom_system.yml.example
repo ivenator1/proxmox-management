@@ -113,5 +113,18 @@ reboot: false
 # ── Rollback on failure (optional) ────────────────────────────────────────────
 # Shell run on the target host inside the rescue block when any step fails.
 # Errors from rollback_command are ignored (ignore_errors: yes).
+# Used only when pve_vmid (below) is unset — PVE snapshot rollback wins otherwise.
 rollback_command: ""
 # Example: "cp /usr/local/bin/my-app.bak /usr/local/bin/my-app && systemctl start my-app"
+
+# ── PVE snapshot/rollback (optional, v2) ──────────────────────────────────────
+# When this host is an LXC or VM on a Proxmox node, set pve_vmid + pve_node to
+# get the same safety net as the lxc/vm flows: a BEFORE_UPDATE_AUTO snapshot is
+# taken before update_steps, rolled back automatically if any step / health
+# check fails (status: "FAILED + ROLLED BACK"), and deleted afterwards. A failed
+# snapshot is a non-fatal warning (status on failure: "FAILED (NO SNAPSHOT)").
+# Uses the pve_api_* credentials from vars.yml for the snapshot API and SSH to
+# pve_node for pct/qm rollback. Overridable per-host via custom_overrides.
+pve_vmid: ""          # the guest's VMID on the PVE node, e.g. "105"
+pve_node: ""          # [proxmox_nodes] inventory name hosting the guest (required with pve_vmid)
+pve_type: "lxc"       # "lxc" (pct rollback) or "vm" (qm rollback)
