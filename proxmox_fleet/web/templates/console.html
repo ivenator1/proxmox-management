@@ -1,34 +1,111 @@
 {% extends "base.html" %}
 {% block title %}Run {{ run.id }} — Fleet Dashboard{% endblock %}
 {% block content %}
-<h1>Run <code>{{ run.id }}</code></h1>
-<p>
-  <code>{{ run.args | join(" ") if run.args else "(full run)" }}</code>
-  — <span id="status">
-  {% if run.finished is none %}<span class="warn">running</span>
-  {% elif run.rc is none %}<span class="muted">finished (rc unknown)</span>
-  {% elif run.rc == 0 %}<span class="ok">finished (rc 0)</span>
-  {% else %}<span class="fail">finished (rc {{ run.rc }})</span>{% endif %}
-  </span>
-  — <a href="/runs/{{ run.id }}/log">raw log</a>
-</p>
-<pre class="console" id="log"></pre>
+<div class="page-head">
+  <h1>Live console</h1>
+  <span class="sub"><code>{{ run.args | join(" ") if run.args else "(full run)" }}</code></span>
+</div>
+
+<div class="terminal">
+  <div class="terminal-chrome">
+    <span class="title">fleet-update · {{ run.id }}</span>
+    <span id="status">
+      {% if run.finished is none %}<span class="pill warn pulse">running</span>
+      {% elif run.rc is none %}<span class="pill muted">finished (rc unknown)</span>
+      {% elif run.rc == 0 %}<span class="pill ok">finished (rc 0)</span>
+      {% else %}<span class="pill fail">finished (rc {{ run.rc }})</span>{% endif %}
+    </span>
+    <span id="elapsed" class="mono"></span>
+    <span class="spacer"></span>
+    <button id="copy-log" class="icon-btn" type="button" title="Copy log" aria-label="Copy log">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+    </button>
+    <a href="/runs/{{ run.id }}/log">raw log</a>
+  </div>
+  <pre class="console" id="log"></pre>
+</div>
+
 <script>
-  const log = document.getElementById("log");
-  const status = document.getElementById("status");
+(() => {
+  const logEl = document.getElementById("log");
+  const statusEl = document.getElementById("status");
+  const elapsedEl = document.getElementById("elapsed");
+  const running = {{ "true" if run.finished is none else "false" }};
+  const startedMs = Date.parse({{ (run.started or "") | ts_iso | tojson }});
+  let autoscroll = true;
+  let done = false;
+
+  /* elapsed ticker while the run is live */
+  function tickElapsed() {
+    if (done || Number.isNaN(startedMs)) return;
+    const s = Math.max(0, Math.floor((Date.now() - startedMs) / 1000));
+    elapsedEl.textContent =
+      `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+  }
+  if (running) { tickElapsed(); var elapsedTimer = setInterval(tickElapsed, 1000); }
+
+  /* minimal ANSI SGR → span renderer (colors, bold, dim) */
+  const ANSI_CLASS = { 30: "ansi-black", 31: "ansi-red", 32: "ansi-green",
+    33: "ansi-yellow", 34: "ansi-blue", 35: "ansi-magenta", 36: "ansi-cyan",
+    37: "ansi-white", 90: "ansi-black", 91: "ansi-red", 92: "ansi-green",
+    93: "ansi-yellow", 94: "ansi-blue", 95: "ansi-magenta", 96: "ansi-cyan",
+    97: "ansi-white" };
+  let openClasses = [];
+
+  function appendLine(text) {
+    const line = document.createElement("span");
+    const parts = text.split(/\x1b\[([0-9;]*)m/);
+    for (let i = 0; i < parts.length; i++) {
+      if (i % 2 === 0) {
+        if (!parts[i]) continue;
+        const span = document.createElement("span");
+        if (openClasses.length) span.className = openClasses.join(" ");
+        span.textContent = parts[i];
+        line.appendChild(span);
+      } else {
+        for (const code of (parts[i] || "0").split(";")) {
+          const n = parseInt(code || "0", 10);
+          if (n === 0) openClasses = [];
+          else if (n === 1) openClasses.push("ansi-bold");
+          else if (n === 2) openClasses.push("ansi-dim");
+          else if (ANSI_CLASS[n]) {
+            openClasses = openClasses.filter((c) => c.indexOf("ansi-") !== 0 || c === "ansi-bold" || c === "ansi-dim");
+            openClasses.push(ANSI_CLASS[n]);
+          }
+        }
+      }
+    }
+    line.appendChild(document.createTextNode("\n"));
+    logEl.appendChild(line);
+    if (autoscroll) logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  /* pause autoscroll when the user scrolls up; resume at the bottom */
+  logEl.addEventListener("scroll", () => {
+    autoscroll = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 30;
+  });
+
+  document.getElementById("copy-log").addEventListener("click", () => {
+    navigator.clipboard && navigator.clipboard.writeText(logEl.textContent);
+  });
+
   const es = new EventSource("/runs/{{ run.id }}/stream");
-  es.onmessage = (e) => {
-    log.textContent += e.data + "\n";
-    log.scrollTop = log.scrollHeight;
-  };
+  es.onmessage = (e) => appendLine(e.data);
   es.addEventListener("done", (e) => {
     es.close();
+    done = true;
+    if (typeof elapsedTimer !== "undefined") clearInterval(elapsedTimer);
     const rc = e.data;
-    if (rc === "") { status.textContent = "finished (rc unknown)"; }
-    else { status.innerHTML = rc === "0"
-      ? '<span class="ok">finished (rc 0)</span>'
-      : '<span class="fail">finished (rc ' + rc + ')</span>'; }
+    if (rc === "") {
+      statusEl.innerHTML = '<span class="pill muted">finished (rc unknown)</span>';
+    } else if (rc === "0") {
+      statusEl.innerHTML = '<span class="pill ok">finished (rc 0)</span>';
+      if (running && window.fleetConfetti) window.fleetConfetti();
+    } else {
+      statusEl.innerHTML = '<span class="pill fail">finished (rc ' + rc + ")</span>";
+    }
   });
   es.onerror = () => { es.close(); };
+})();
 </script>
 {% endblock %}

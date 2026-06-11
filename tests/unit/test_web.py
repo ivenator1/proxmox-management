@@ -23,7 +23,15 @@ from proxmox_fleet.history import write_history  # noqa: E402
 from proxmox_fleet.lock import acquire_run_lock  # noqa: E402
 from proxmox_fleet.models.settings import GlobalSettings  # noqa: E402
 from proxmox_fleet.models.state import FleetState  # noqa: E402
-from proxmox_fleet.web.app import build_run_args, create_app  # noqa: E402
+from proxmox_fleet.web.app import (  # noqa: E402
+    _activity_weeks,
+    _health_score,
+    build_run_args,
+    create_app,
+    spark_points,
+    ts_human,
+    ts_iso,
+)
 from proxmox_fleet.web.runs import RunActive, RunManager  # noqa: E402
 
 
@@ -362,3 +370,69 @@ def test_console_unknown_run_404(history_dir):
     assert client.get("/runs/nope").status_code == 404
     assert client.get("/runs/nope/stream").status_code == 404
     assert client.get("/runs/nope/log").status_code == 404
+
+
+# --- template helpers (filters + flare) ---------------------------------------- #
+
+def test_ts_human_and_iso():
+    assert ts_human("20260102T153045123456Z") == "2026-01-02 15:30 UTC"
+    assert ts_iso("20260102T153045123456Z") == "2026-01-02T15:30:45Z"
+    # malformed input falls back loudly-visible but never raises
+    assert ts_human("not-a-ts") == "not-a-ts"
+    assert ts_iso("not-a-ts") == ""
+
+
+def test_spark_points():
+    pts = spark_points([0, 5, 10], 100, 20)
+    pairs = [tuple(float(n) for n in p.split(",")) for p in pts.split()]
+    assert len(pairs) == 3
+    assert pairs[0][0] < pairs[1][0] < pairs[2][0]   # x advances
+    assert pairs[0][1] > pairs[2][1]                 # larger value plots higher
+    assert spark_points([]) == ""
+    assert len(spark_points([7]).split()) == 2       # single value → flat line
+    assert spark_points(["a", "b"]) == ""            # non-numeric → empty
+
+
+def test_health_score():
+    assert _health_score(None, None) == 100
+    failed = {"failed": True, "counts": {"errors": 2, "warnings": 1}}
+    assert _health_score(failed, None) == 100 - 25 - 10 - 2
+    assert _health_score(None, {"outdated_apps": 3}) == 97
+    floor = {"failed": True, "counts": {"errors": 50, "warnings": 0}}
+    assert _health_score(floor, None) == 0   # clamped
+
+
+def test_activity_weeks_grid_shape_and_levels():
+    from datetime import date
+    rows = [
+        {"timestamp": "20260601T000000000000Z", "failed": False},
+        {"timestamp": "20260601T120000000000Z", "failed": True},
+        {"timestamp": "20260603T000000000000Z", "failed": False},
+        {"timestamp": "bogus", "failed": False},   # ignored, never raises
+    ]
+    grid = _activity_weeks(rows, weeks=4, today=date(2026, 6, 11))
+    assert len(grid) == 4 and all(len(week) == 7 for week in grid)
+    by_date = {day["date"]: day for week in grid for day in week}
+    assert by_date["2026-06-01"]["count"] == 2
+    assert by_date["2026-06-01"]["failed"] is True
+    assert by_date["2026-06-01"]["level"] == 2
+    assert by_date["2026-06-03"]["level"] == 1
+    assert by_date["2026-06-02"]["count"] == 0
+    assert by_date["2026-06-12"]["future"] is True   # day after `today`
+    # last column contains today
+    assert any(day["date"] == "2026-06-11" for day in grid[-1])
+
+
+def test_index_renders_health_gauge_and_pulse_strip(history_dir):
+    resp = _client(history_dir).get("/")
+    assert resp.status_code == 200
+    assert "Fleet health" in resp.text
+    assert "pulse-strip" in resp.text
+    assert "palette-data" in resp.text   # command-palette blob on every page
+
+
+def test_history_renders_activity_heatmap(history_dir):
+    resp = _client(history_dir).get("/history")
+    assert resp.status_code == 200
+    assert "Activity" in resp.text
+    assert "heatmap" in resp.text

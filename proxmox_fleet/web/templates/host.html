@@ -1,33 +1,40 @@
 {% extends "base.html" %}
 {% block title %}{{ name }} — Fleet Dashboard{% endblock %}
 {% block content %}
-<h1>Host <code>{{ name }}</code></h1>
+<div class="page-head">
+  <h1>Host <code>{{ name }}</code></h1>
+  {% if records %}<span class="sub">{{ records | length }} record(s) across persisted runs</span>{% endif %}
+</div>
+
 {% if records %}
-<p class="muted">Records across all persisted runs, newest first. Idle hosts are
+<p class="muted" style="font-size: 0.85rem;">Newest first. Idle hosts are
 suppressed from run records, so gaps mean "nothing changed that run".</p>
-<table>
-  <thead><tr><th>Run</th><th>Type</th><th>Record</th></tr></thead>
-  <tbody>
+<div class="timeline">
   {% for entry in records %}
-    <tr>
-      <td><a href="/history/{{ entry.timestamp }}">{{ entry.timestamp }}</a></td>
-      <td>{{ entry.bucket }}</td>
-      <td>
-        {% for col in entry.columns %}
-          {% set val = entry.record.get(col) %}
-          {% if val is not none and val != "" %}
-            <small><strong>{{ col }}</strong>:
-            {% if col == "error" %}<span class="fail">{{ val }}</span>
-            {% elif col == "warning" %}<span class="warn">{{ val }}</span>
-            {% else %}{{ val }}{% endif %}</small>
-          {% endif %}
-        {% endfor %}
-      </td>
-    </tr>
+  {% set has_error = entry.record.get("error") %}
+  <div class="timeline-item{% if has_error %} fail{% endif %}">
+    <span class="when">
+      <a class="mono" href="/history/{{ entry.timestamp }}" title="{{ entry.timestamp }}">{{ entry.timestamp | ts_human }}</a>
+      · <span class="pill {% if entry.bucket == 'errors' %}fail{% elif entry.bucket == 'warnings' %}warn{% else %}muted{% endif %}">{{ entry.bucket }}</span>
+    </span>
+    <div class="body">
+      {% for col in entry.columns %}
+        {% set val = entry.record.get(col) %}
+        {% if val is not none and val != "" %}
+          <small style="margin-right: 0.8rem; display: inline-block;"><strong class="muted">{{ col }}</strong>
+          {% if col == "error" %}<span class="fail">{{ val }}</span>
+          {% elif col == "warning" %}<span class="warn">{{ val }}</span>
+          {% else %}{{ val }}{% endif %}</small>
+        {% endif %}
+      {% endfor %}
+    </div>
+  </div>
   {% endfor %}
-  </tbody>
-</table>
+</div>
 {% else %}
-<p class="muted">No records for this host in any persisted run.</p>
+<div class="empty">
+  <span class="glyph" aria-hidden="true">⌑</span>
+  <p>No records for this host in any persisted run.</p>
+</div>
 {% endif %}
 {% endblock %}
