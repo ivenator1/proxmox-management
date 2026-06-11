@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}Pending updates — Fleet Dashboard{% endblock %}
+{% block content %}
+<h1>Pending updates</h1>
+
+{% if snapshot %}
+  <p>Snapshot <code>{{ snapshot.timestamp }}</code>{% if ref == "latest" %} (latest){% endif %}</p>
+
+  <h2>Hosts</h2>
+  {% if hosts %}
+  <table>
+    <thead><tr><th>Host</th><th>Kind</th><th>Pkg mgr</th><th>Pending</th><th>Packages / error</th></tr></thead>
+    <tbody>
+    {% for name, entry in hosts %}
+      <tr>
+        <td><a href="/hosts/{{ name }}">{{ name }}</a></td>
+        <td>{{ entry.get("kind", "") }}</td>
+        <td>{{ entry.get("pkg_mgr", "") }}</td>
+        <td>{{ entry.get("pending_count", 0) }}</td>
+        <td>
+          {% if entry.get("error") %}<span class="fail">{{ entry.error }}</span>
+          {% else %}<small class="muted">{{ entry.get("pending", []) | join(", ") }}</small>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="muted">No host scans in this snapshot.</p>{% endif %}
+
+  <h2>LXC containers</h2>
+  {% if lxc %}
+  <table>
+    <thead><tr><th>Node</th><th>ID</th><th>Name</th><th>OS pending</th><th>App</th><th>Notes</th></tr></thead>
+    <tbody>
+    {% for lxc_id, entry in lxc %}
+      <tr>
+        <td>{{ entry.get("node", "") }}</td>
+        <td>{{ lxc_id }}</td>
+        <td><a href="/hosts/{{ entry.get('name', lxc_id) }}">{{ entry.get("name", lxc_id) }}</a></td>
+        <td>{{ entry.get("os_pending_count", 0) }}
+            {% if entry.get("os_pending") %}<br><small class="muted">{{ entry.os_pending | join(", ") }}</small>{% endif %}
+        </td>
+        <td>
+          {% set app = entry.get("app") %}
+          {% if app %}
+            {{ app.get("script", "") }}: {{ app.get("current") or "?" }} → {{ app.get("latest") or "?" }}
+            {% if app.get("outdated") %}<span class="warn">(outdated)</span>{% endif %}
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td>
+          {% if entry.get("skipped") %}<span class="muted">skipped ({{ entry.skipped }})</span>{% endif %}
+          {% if entry.get("error") %}<span class="fail">{{ entry.error }}</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="muted">No container scans in this snapshot.</p>{% endif %}
+{% else %}
+  <p class="muted">No pending scan yet — run <code>fleet-update --scan</code> or
+  <a href="/trigger">trigger one</a>.</p>
+{% endif %}
+
+<h2>Past scans</h2>
+{% if scans %}
+<table>
+  <thead><tr><th>Timestamp</th><th>Host pkgs</th><th>LXC OS pkgs</th><th>Outdated apps</th><th>Errors</th></tr></thead>
+  <tbody>
+  {% for row in scans %}
+    <tr>
+      <td><a href="/pending?ref={{ row.timestamp }}">{{ row.timestamp }}</a></td>
+      <td>{{ row.hosts_pending }}</td>
+      <td>{{ row.lxc_os_pending }}</td>
+      <td>{{ row.outdated_apps }}</td>
+      <td>{% if row.errors %}<span class="fail">{{ row.errors }}</span>{% else %}0{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="muted">None recorded.</p>{% endif %}
+{% endblock %}

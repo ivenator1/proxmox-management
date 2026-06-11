@@ -23,13 +23,27 @@ dev = [
     "types-PyYAML",
     "pydantic>=2,<3",
     "ruff>=0.4",
+    # web extra mirrored here so mypy/tests cover proxmox_fleet/web in CI
+    "fastapi>=0.110",
+    "uvicorn>=0.23",
+    "python-multipart>=0.0.7",
+    "httpx>=0.27",
+]
+web = [
+    "fastapi>=0.110",
+    "uvicorn>=0.23",
+    "python-multipart>=0.0.7",  # starlette form parsing (the trigger form)
 ]
 
 [project.scripts]
 fleet-update = "proxmox_fleet.cli:main"
+fleet-dashboard = "proxmox_fleet.web.main:main"
 
 [tool.setuptools.packages.find]
 include = ["proxmox_fleet*"]
+
+[tool.setuptools.package-data]
+"proxmox_fleet.web" = ["templates/*.html", "static/*"]
 
 [tool.ruff]
 line-length = 120

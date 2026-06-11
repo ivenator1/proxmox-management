@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Run history — Fleet Dashboard{% endblock %}
+{% block content %}
+<h1>Run history</h1>
+{% if rows %}
+<table>
+  <thead>
+    <tr>
+      <th>Timestamp</th><th>Result</th>
+      {% for key in count_keys %}<th>{{ key }}</th>{% endfor %}
+      <th>Δ vs previous</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td><a href="/history/{{ row.timestamp }}">{{ row.timestamp }}</a></td>
+      <td>
+        {% if row.failed %}<span class="fail">failed</span>
+        {% elif row.changed %}<span class="ok">changed</span>
+        {% else %}<span class="muted">clean</span>{% endif %}
+      </td>
+      {% for key in count_keys %}<td>{{ (row.counts or {}).get(key, 0) }}</td>{% endfor %}
+      <td><small class="muted">{{ row.delta }}</small></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No run history yet.</p>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Overview — Fleet Dashboard{% endblock %}
+{% block content %}
+<h1>Overview</h1>
+
+{% if lock_holder is not none %}
+  <p class="warn">A fleet run is in flight (pid {{ lock_holder.get('pid', '?') }},
+     started {{ lock_holder.get('started', '?') }}).
+     {% if active_run %}<a href="/runs/{{ active_run }}">Watch live output</a>{% endif %}</p>
+{% elif active_run %}
+  <p class="warn">Dashboard run {{ active_run }} is in flight —
+     <a href="/runs/{{ active_run }}">watch live output</a>.</p>
+{% endif %}
+
+<h2>Latest run</h2>
+{% if latest_run %}
+  <p>
+    <code>{{ latest_run.timestamp }}</code> —
+    {% if latest_run.failed %}<span class="fail">FAILED</span>
+    {% elif latest_run.changed %}<span class="ok">changed</span>
+    {% else %}<span class="muted">clean</span>{% endif %}
+    — <a href="/history/{{ latest_run.timestamp }}">details</a>
+  </p>
+  <table>
+    <thead><tr>{% for key in count_keys %}<th>{{ key }}</th>{% endfor %}</tr></thead>
+    <tbody><tr>
+      {% for key in count_keys %}<td>{{ (latest_run.counts or {}).get(key, 0) }}</td>{% endfor %}
+    </tr></tbody>
+  </table>
+{% else %}
+  <p class="muted">No run history yet — run <code>fleet-update</code> or use the
+  <a href="/trigger">trigger</a>.</p>
+{% endif %}
+
+<h2>Latest pending scan</h2>
+{% if pending_row %}
+  <p>
+    <code>{{ pending_row.timestamp }}</code> —
+    {{ pending_row.hosts_pending }} host OS package(s),
+    {{ pending_row.lxc_os_pending }} LXC OS package(s),
+    {{ pending_row.outdated_apps }} outdated app(s)
+    {% if pending_row.errors %}<span class="fail">, {{ pending_row.errors }} error(s)</span>{% endif %}
+    — <a href="/pending">details</a>
+  </p>
+{% else %}
+  <p class="muted">No pending scan yet — run <code>fleet-update --scan</code> or trigger one.</p>
+{% endif %}
+{% endblock %}
