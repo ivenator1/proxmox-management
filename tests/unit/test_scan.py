@@ -331,3 +331,70 @@ def test_run_fleet_scan_error_sets_exit_code(tmp_path, monkeypatch):
     settings = GlobalSettings(fleet_history_enabled=False)
     rc = scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv))
     assert rc == 1
+
+
+# --- pending_summary / read_pending (readers) ------------------------------------
+
+def _write_scan(tmp_path, *, ts, hosts=None, lxc=None):
+    scan_mod.write_pending({"timestamp": ts, "hosts": hosts or {}, "lxc": lxc or {}},
+                           history_dir=tmp_path, keep=0)
+
+
+def test_pending_summary_newest_first_with_aggregates(tmp_path):
+    _write_scan(tmp_path, ts="20260101T000000000000Z")
+    _write_scan(
+        tmp_path, ts="20260102T000000000000Z",
+        hosts={"web-01": {"kind": "remote", "pkg_mgr": "apt", "pending_count": 3,
+                          "pending": ["a", "b", "c"], "error": None},
+               "pve-01": {"kind": "node", "pkg_mgr": "apt", "pending_count": 1,
+                          "pending": ["d"], "error": "ssh down"}},
+        lxc={"101": {"node": "pve-01", "name": "sonarr", "skipped": None,
+                     "os_pending_count": 2, "os_pending": ["x", "y"],
+                     "app": {"script": "sonarr", "current": "1", "latest": "2",
+                             "outdated": True}, "error": None}},
+    )
+    rows = scan_mod.pending_summary(tmp_path)
+    assert [r["timestamp"] for r in rows] == ["20260102T000000000000Z",
+                                              "20260101T000000000000Z"]
+    newest = rows[0]
+    assert newest["hosts_pending"] == 4
+    assert newest["lxc_os_pending"] == 2
+    assert newest["outdated_apps"] == 1
+    assert newest["errors"] == 1
+
+
+def test_pending_summary_excludes_latest_and_limit(tmp_path):
+    for i in range(4):
+        _write_scan(tmp_path, ts=f"2026010{i}T000000000000Z")
+    rows = scan_mod.pending_summary(tmp_path, limit=2)
+    assert len(rows) == 2
+    # limit <= 0 → all timestamped scans, latest.json never double-counted.
+    assert len(scan_mod.pending_summary(tmp_path, limit=0)) == 4
+
+
+def test_pending_summary_skips_corrupt(tmp_path):
+    _write_scan(tmp_path, ts="20260101T000000000000Z")
+    (tmp_path / "pending-20260102T000000000000Z.json").write_text("{nope", encoding="utf-8")
+    rows = scan_mod.pending_summary(tmp_path)
+    assert [r["timestamp"] for r in rows] == ["20260101T000000000000Z"]
+
+
+def test_pending_summary_empty_dir(tmp_path):
+    assert scan_mod.pending_summary(tmp_path) == []
+    assert scan_mod.pending_summary(tmp_path / "missing") == []
+
+
+def test_read_pending_ref_forms(tmp_path):
+    _write_scan(tmp_path, ts="20260101T000000000000Z")
+    latest = scan_mod.read_pending(tmp_path, "latest")
+    bare = scan_mod.read_pending(tmp_path, "20260101T000000000000Z")
+    prefixed = scan_mod.read_pending(tmp_path, "pending-20260101T000000000000Z")
+    filename = scan_mod.read_pending(tmp_path, "pending-20260101T000000000000Z.json")
+    assert latest == bare == prefixed == filename
+    assert latest["timestamp"] == "20260101T000000000000Z"
+
+
+def test_read_pending_missing_raises(tmp_path):
+    import pytest
+    with pytest.raises(FileNotFoundError):
+        scan_mod.read_pending(tmp_path, "latest")

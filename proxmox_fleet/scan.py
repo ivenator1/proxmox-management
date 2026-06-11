@@ -206,6 +206,71 @@ def write_pending(
     return scan_file
 
 
+def pending_summary(
+    history_dir: Union[str, Path],
+    *,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """Read back the newest *limit* pending-scan summaries, newest first.
+
+    Mirrors :func:`proxmox_fleet.history.history_summary`: one row per scan
+    with the table-level aggregates, unreadable/corrupt files skipped,
+    ``limit <= 0`` meaning "all scans". ``pending-latest.json`` is excluded
+    (it duplicates the newest timestamped file).
+    """
+    directory = Path(history_dir)
+    scans = sorted(
+        (p for p in directory.glob("pending-*.json") if p.name != "pending-latest.json"),
+        reverse=True,
+    )
+    if limit > 0:
+        scans = scans[:limit]
+
+    out: List[Dict[str, Any]] = []
+    for scan_file in scans:
+        try:
+            data = json.loads(scan_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        hosts = data.get("hosts", {}) or {}
+        lxc = data.get("lxc", {}) or {}
+        out.append({
+            # scan_file.stem is "pending-<ts>" — strip the prefix as a fallback.
+            "timestamp": data.get("timestamp", scan_file.stem[8:]),
+            "hosts_pending": sum(int(h.get("pending_count", 0)) for h in hosts.values()),
+            "lxc_os_pending": sum(int(c.get("os_pending_count", 0)) for c in lxc.values()),
+            "outdated_apps": sum(1 for c in lxc.values()
+                                 if (c.get("app") or {}).get("outdated")),
+            "errors": sum(1 for entry in (*hosts.values(), *lxc.values())
+                          if entry.get("error")),
+        })
+    return out
+
+
+def read_pending(
+    history_dir: Union[str, Path],
+    ref: str = "latest",
+) -> Dict[str, Any]:
+    """Read one persisted pending-scan snapshot by reference.
+
+    *ref* is ``latest`` (→ ``pending-latest.json``) or a scan timestamp — bare,
+    ``pending-<ts>`` prefixed, or a full filename. Raises ``FileNotFoundError``
+    when absent (parity with :func:`proxmox_fleet.history.read_run`).
+    """
+    directory = Path(history_dir)
+    if ref == "latest":
+        path = directory / "pending-latest.json"
+    else:
+        name = ref if ref.startswith("pending-") else f"pending-{ref}"
+        if not name.endswith(".json"):
+            name += ".json"
+        path = directory / name
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"unexpected pending payload in {path}: not a JSON object")
+    return data
+
+
 def run_fleet_scan(
     *,
     settings: GlobalSettings,

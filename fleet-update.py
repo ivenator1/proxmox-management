@@ -185,6 +185,7 @@ def main() -> int:
             _parse_extra_vars,
             apply_extravar_overrides,
             history_main,
+            run_locked,
         )
         from proxmox_fleet.models.settings import GlobalSettings
     except ImportError as exc:
@@ -197,11 +198,12 @@ def main() -> int:
     if args.scan:
         from proxmox_fleet import scan as scan_mod
 
-        return scan_mod.run_fleet_scan(
-            settings=GlobalSettings.load(args.vars_file),
+        scan_settings = GlobalSettings.load(args.vars_file)
+        return run_locked(scan_settings, lambda: scan_mod.run_fleet_scan(
+            settings=scan_settings,
             inventory_path=args.inventory,
             limit=_parse_csv_set(args.limit),
-        )
+        ))
 
     extravars = _parse_extra_vars(args.extra_vars)
 
@@ -221,14 +223,14 @@ def main() -> int:
     if args.force_window:
         settings = settings.model_copy(update={"force_window": True})
 
-    return driver.run_fleet(
+    return run_locked(settings, lambda: driver.run_fleet(
         settings=settings,
         inventory_path=args.inventory,
         check=args.dry_run,
         extra_vars=extravars,
         limit=_parse_csv_set(args.limit),
         phases=_parse_csv_set(args.phases),
-    )
+    ))
 
 
 if __name__ == "__main__":

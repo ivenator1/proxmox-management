@@ -119,7 +119,20 @@ Tests: `test_driver.py` wave/abort/soak cases with monkeypatched sleep.
 
 ### L2. Fleet web dashboard: pending updates (PatchMon-style) + run history + run trigger
 
-**Status: 🚧 Partially implemented — `--scan` (pillar 1's data source) is done; the FastAPI app remains.**
+**Status: 🚧 In progress — `--scan` (pillar 1's data source), the fleet-wide run lock
+(`proxmox_fleet/lock.py`, honored by both CLI entry points for runs and scans), and the
+pending-snapshot readers (`scan.pending_summary()`/`read_pending()`) are done. The FastAPI app
+itself remains, per the approved design below.**
+
+**Approved dashboard design** (decided): `proxmox_fleet/web/` package behind a
+`pip install -e '.[web]'` extra (fastapi + uvicorn; jinja2 already core), console entrypoint
+`fleet-dashboard`, listening on `0.0.0.0:8421` by default (`dashboard_host`/`dashboard_port`).
+Read-only pages are open on the LAN; the run-trigger endpoint requires a bearer token
+(`dashboard_token`). Runs launch `python -m proxmox_fleet.cli` as a subprocess (one at a time,
+guarded by the shared run lock; live stdout via SSE; a dashboard restart never kills a
+mid-flight run). Built from scratch — admin templates don't fit a five-page server-rendered
+tool — but styled with vendored classless Pico.css (single MIT-licensed file, offline, no build
+step).
 
 **Gap**: the only visibility is a Discord/ntfy message and raw JSON files; no way to see what is
 *pending* across the fleet, browse past runs, or kick off a run remotely. PatchMon covers the

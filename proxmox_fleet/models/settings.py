@@ -105,6 +105,11 @@ class GlobalSettings(BaseModel):
     scan_history_keep: int = 30
     force_notify: bool = False
 
+    # Web dashboard (fleet-dashboard)
+    dashboard_host: str = "0.0.0.0"  # nosec B104 - LAN-facing homelab dashboard by design
+    dashboard_port: int = 8421
+    dashboard_token: str = ""        # empty = run-trigger endpoint unauthenticated
+
     @field_validator("canary_hosts", mode="before")
     @classmethod
     def _stringify_canary_hosts(cls, value: Any) -> Any:

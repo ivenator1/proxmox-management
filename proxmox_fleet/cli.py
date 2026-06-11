@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import argparse
 import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+import sys
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
+
+from proxmox_fleet.lock import FleetLockHeld, acquire_run_lock
 
 if TYPE_CHECKING:
     from proxmox_fleet.models.settings import GlobalSettings
@@ -111,6 +114,25 @@ def history_main(
     return 0
 
 
+def run_locked(settings: "GlobalSettings", fn: Callable[[], int]) -> int:
+    """Run *fn* under the fleet-wide run lock; rc 1 with a loud message when held.
+
+    Shared by this CLI and the ``fleet-update.py`` wrapper so every mutating
+    entrypoint (fleet run, ``--scan``, dashboard-triggered subprocess) refuses
+    to overlap an active run. Read-only paths (``--history``) skip this.
+    """
+    try:
+        with acquire_run_lock(settings.fleet_history_dir, argv=sys.argv):
+            return fn()
+    except FleetLockHeld as exc:
+        print(
+            f"another fleet run is active (pid {exc.pid}, started {exc.started}); "
+            "refusing to overlap",
+            file=sys.stderr,
+        )
+        return 1
+
+
 def apply_extravar_overrides(
     settings: "GlobalSettings", extravars: Dict[str, str]
 ) -> "GlobalSettings":
@@ -161,11 +183,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         from proxmox_fleet import scan as scan_mod
         from proxmox_fleet.models.settings import GlobalSettings as _Settings
 
-        return scan_mod.run_fleet_scan(
-            settings=_Settings.load(args.vars_file),
+        scan_settings = _Settings.load(args.vars_file)
+        return run_locked(scan_settings, lambda: scan_mod.run_fleet_scan(
+            settings=scan_settings,
             inventory_path=args.inventory,
             limit=_parse_csv_set(args.limit),
-        )
+        ))
 
     extravars = _parse_extra_vars(args.extra_vars)
 
@@ -180,14 +203,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Propagate CLI extravars that affect driver behaviour into settings.
     settings = apply_extravar_overrides(settings, extravars)
 
-    return driver.run_fleet(
+    return run_locked(settings, lambda: driver.run_fleet(
         settings=settings,
         inventory_path=args.inventory,
         check=args.check,
         extra_vars=extravars,
         limit=_parse_csv_set(args.limit),
         phases=_parse_csv_set(args.phases),
-    )
+    ))
 
 
 if __name__ == "__main__":
