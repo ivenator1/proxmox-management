@@ -26,6 +26,7 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 * **Accurate Change Detection:** OS packages are updated before the community script runs, so each line is correctly attributed. For apps without a version file, a `dpkg-query` package-state hash is taken before and after the community script — if it matches, the container is silent even if the script produced output. This prevents false-positive "UPDATED" reports caused by `PHS_SILENT=1` suppressing apt's stdout inside community scripts.
 * **Consolidated Reporting:** Aggregates results from every node and container into exactly one Discord (or ntfy) notification, with a structured error log showing which host, which task, and what the error was.
 * **Maintenance Windows:** Per-host time/day windows in `host_vars`; `force_window=true` bypasses. Invalid window config fails loud at load time.
+* **Web Dashboard:** Optional `fleet-dashboard` web UI (`pip install -e '.[web]'`) — pending updates across the fleet (agentless, PatchMon-style, including community-script app versions), browsable run history with per-host drill-down, and a token-protected run trigger with live console output (SSE). Triggered runs launch the CLI as a detached subprocess under the shared fleet run lock, so dashboard, cron, and shell runs can never collide.
 
 ## 🐍 Python Control Plane
 A typed-Python "brain" (`proxmox_fleet/`) owns all decision logic, config/state

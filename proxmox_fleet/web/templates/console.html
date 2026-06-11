@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Run {{ run.id }} — Fleet Dashboard{% endblock %}
+{% block content %}
+<h1>Run <code>{{ run.id }}</code></h1>
+<p>
+  <code>{{ run.args | join(" ") if run.args else "(full run)" }}</code>
+  — <span id="status">
+  {% if run.finished is none %}<span class="warn">running</span>
+  {% elif run.rc is none %}<span class="muted">finished (rc unknown)</span>
+  {% elif run.rc == 0 %}<span class="ok">finished (rc 0)</span>
+  {% else %}<span class="fail">finished (rc {{ run.rc }})</span>{% endif %}
+  </span>
+  — <a href="/runs/{{ run.id }}/log">raw log</a>
+</p>
+<pre class="console" id="log"></pre>
+<script>
+  const log = document.getElementById("log");
+  const status = document.getElementById("status");
+  const es = new EventSource("/runs/{{ run.id }}/stream");
+  es.onmessage = (e) => {
+    log.textContent += e.data + "\n";
+    log.scrollTop = log.scrollHeight;
+  };
+  es.addEventListener("done", (e) => {
+    es.close();
+    const rc = e.data;
+    if (rc === "") { status.textContent = "finished (rc unknown)"; }
+    else { status.innerHTML = rc === "0"
+      ? '<span class="ok">finished (rc 0)</span>'
+      : '<span class="fail">finished (rc ' + rc + ')</span>'; }
+  });
+  es.onerror = () => { es.close(); };
+</script>
+{% endblock %}

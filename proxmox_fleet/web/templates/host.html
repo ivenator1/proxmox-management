@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}{{ name }} — Fleet Dashboard{% endblock %}
+{% block content %}
+<h1>Host <code>{{ name }}</code></h1>
+{% if records %}
+<p class="muted">Records across all persisted runs, newest first. Idle hosts are
+suppressed from run records, so gaps mean "nothing changed that run".</p>
+<table>
+  <thead><tr><th>Run</th><th>Type</th><th>Record</th></tr></thead>
+  <tbody>
+  {% for entry in records %}
+    <tr>
+      <td><a href="/history/{{ entry.timestamp }}">{{ entry.timestamp }}</a></td>
+      <td>{{ entry.bucket }}</td>
+      <td>
+        {% for col in entry.columns %}
+          {% set val = entry.record.get(col) %}
+          {% if val is not none and val != "" %}
+            <small><strong>{{ col }}</strong>:
+            {% if col == "error" %}<span class="fail">{{ val }}</span>
+            {% elif col == "warning" %}<span class="warn">{{ val }}</span>
+            {% else %}{{ val }}{% endif %}</small>
+          {% endif %}
+        {% endfor %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No records for this host in any persisted run.</p>
+{% endif %}
+{% endblock %}

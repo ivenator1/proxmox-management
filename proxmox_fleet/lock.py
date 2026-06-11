@@ -49,9 +49,7 @@ class FleetLockHeld(RuntimeError):
 
 
 def _lock_path(history_dir: Union[str, Path]) -> Path:
-    directory = Path(history_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory / _LOCK_FILENAME
+    return Path(history_dir) / _LOCK_FILENAME
 
 
 def _read_holder_info(path: Path) -> Dict[str, Any]:
@@ -76,6 +74,7 @@ def acquire_run_lock(
     process's pid/start-time/argv for contenders to report.
     """
     path = _lock_path(history_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd = open(path, "a+", encoding="utf-8")
     try:
         try:
@@ -111,6 +110,8 @@ def probe_lock(history_dir: Union[str, Path]) -> Optional[Dict[str, Any]]:
     that need the lock must still :func:`acquire_run_lock`.
     """
     path = _lock_path(history_dir)
+    if not path.parent.exists():
+        return None
     with open(path, "a+", encoding="utf-8") as fd:
         try:
             fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

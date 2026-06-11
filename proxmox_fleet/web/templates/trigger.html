@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Trigger a run — Fleet Dashboard{% endblock %}
+{% block content %}
+<h1>Trigger a run</h1>
+
+{% if lock_holder is not none %}
+<p class="warn">A fleet run is already in flight (pid {{ lock_holder.get('pid', '?') }},
+   started {{ lock_holder.get('started', '?') }}) — a new trigger will be refused
+   until it finishes.</p>
+{% endif %}
+
+<form method="post" action="/runs">
+  <fieldset>
+    <label><input type="checkbox" name="dry_run" value="true"> Dry run (<code>--check</code> — no changes)</label>
+    <label><input type="checkbox" name="scan" value="true"> Pending-updates scan only (<code>--scan</code>, read-only)</label>
+    <label><input type="checkbox" name="force_notify" value="true"> Force notification even when idle</label>
+    <label><input type="checkbox" name="force_window" value="true"> Bypass maintenance windows</label>
+  </fieldset>
+  <label>Limit to hosts/ids (comma-separated, optional)
+    <input type="text" name="limit" placeholder="pve-01,105,media-vm">
+  </label>
+  <label>Phases (comma-separated, optional: {{ phase_names | join(", ") }})
+    <input type="text" name="phases" placeholder="lxc,vm">
+  </label>
+  {% if token_required %}
+  <label>Dashboard token
+    <input type="password" name="token" required>
+  </label>
+  {% endif %}
+  <button type="submit">Start run</button>
+</form>
+
+<h2>Dashboard-triggered runs</h2>
+{% if runs %}
+<table>
+  <thead><tr><th>Started</th><th>Arguments</th><th>Status</th><th></th></tr></thead>
+  <tbody>
+  {% for run in runs %}
+    <tr>
+      <td>{{ run.started }}</td>
+      <td><code>{{ run.args | join(" ") if run.args else "(full run)" }}</code></td>
+      <td>
+        {% if run.finished is none %}<span class="warn">running</span>
+        {% elif run.rc is none %}<span class="muted">finished (rc unknown)</span>
+        {% elif run.rc == 0 %}<span class="ok">finished (rc 0)</span>
+        {% else %}<span class="fail">finished (rc {{ run.rc }})</span>{% endif %}
+      </td>
+      <td><a href="/runs/{{ run.id }}">output</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No runs triggered from the dashboard yet.</p>
+{% endif %}
+{% endblock %}

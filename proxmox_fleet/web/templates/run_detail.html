@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Run {{ run.timestamp }} — Fleet Dashboard{% endblock %}
+{% block content %}
+<h1>Run <code>{{ run.timestamp }}</code></h1>
+<p>
+  {% if run.failed %}<span class="fail">FAILED</span>
+  {% elif run.changed %}<span class="ok">changed</span>
+  {% else %}<span class="muted">clean</span>{% endif %}
+</p>
+
+{% for bucket, columns, records in buckets %}
+  {% if records %}
+  <h2>{{ bucket }} ({{ records | length }})</h2>
+  <table>
+    <thead><tr>{% for col in columns %}<th>{{ col }}</th>{% endfor %}</tr></thead>
+    <tbody>
+    {% for record in records %}
+      <tr>
+        {% for col in columns %}
+        <td>
+          {% set val = record.get(col) %}
+          {% if col in ("host", "name") and val %}<a href="/hosts/{{ val }}">{{ val }}</a>
+          {% elif col == "error" %}<span class="fail">{{ val }}</span>
+          {% elif col == "warning" %}<span class="warn">{{ val }}</span>
+          {% else %}{{ val if val is not none else "" }}{% endif %}
+        </td>
+        {% endfor %}
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+{% endfor %}
+
+{% if run.briefing %}
+<h2>Briefing</h2>
+<pre class="briefing">{{ run.briefing }}</pre>
+{% endif %}
+{% endblock %}

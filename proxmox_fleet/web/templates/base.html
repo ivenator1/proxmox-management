@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Fleet Dashboard{% endblock %}</title>
+  <link rel="stylesheet" href="/static/pico.classless.min.css">
+  <style>
+    /* Small additions on top of classless Pico */
+    body > header nav a { margin-right: 1.25rem; text-decoration: none; }
+    table { font-size: 0.85rem; }
+    .ok { color: var(--pico-ins-color, #2e7d32); }
+    .fail { color: var(--pico-del-color, #c62828); font-weight: bold; }
+    .warn { color: #b26a00; }
+    .muted { color: var(--pico-muted-color, #777); }
+    pre.console {
+      background: #111; color: #ddd; padding: 1rem; border-radius: 6px;
+      max-height: 70vh; overflow-y: auto; font-size: 0.8rem; white-space: pre-wrap;
+    }
+    pre.briefing { white-space: pre-wrap; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <nav>
+      <strong>Fleet Dashboard</strong>
+      <a href="/">Overview</a>
+      <a href="/pending">Pending</a>
+      <a href="/history">History</a>
+      <a href="/trigger">Trigger</a>
+    </nav>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>
