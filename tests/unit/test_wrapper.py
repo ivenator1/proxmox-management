@@ -59,6 +59,7 @@ def _run(argv: list, *, run_fleet_return: int = 0) -> tuple[int, GlobalSettings,
         patch.object(sys, "argv", ["./fleet-update.py"] + argv),
         patch("proxmox_fleet.driver.run_fleet", side_effect=_fake_run_fleet),
         patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
     ):
         rc = _wrapper.main()
 
@@ -107,6 +108,7 @@ def test_dry_run_passes_check_true_to_driver():
         patch.object(sys, "argv", ["./fleet-update.py", "--dry-run"]),
         patch("proxmox_fleet.driver.run_fleet", side_effect=_fake),
         patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
     ):
         _wrapper.main()
 
@@ -212,6 +214,7 @@ def test_custom_inventory():
         patch.object(sys, "argv", ["./fleet-update.py", "--inventory", "/tmp/my-hosts.ini"]),
         patch("proxmox_fleet.driver.run_fleet", side_effect=_fake),
         patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
     ):
         _wrapper.main()
 
@@ -231,6 +234,7 @@ def test_custom_vars_file(tmp_path):
     with (
         patch.object(sys, "argv", ["./fleet-update.py", "--vars-file", str(vars_file)]),
         patch("proxmox_fleet.driver.run_fleet", side_effect=_fake),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
     ):
         _wrapper.main()
 
@@ -263,6 +267,7 @@ def test_limit_and_phases_forwarded():
                      ["./fleet-update.py", "--limit", "pve-01,105", "--phases", "lxc"]),
         patch("proxmox_fleet.driver.run_fleet", side_effect=_fake),
         patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
     ):
         _wrapper.main()
 
@@ -282,6 +287,7 @@ def test_limit_and_phases_default_none():
         patch.object(sys, "argv", ["./fleet-update.py"]),
         patch("proxmox_fleet.driver.run_fleet", side_effect=_fake),
         patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
     ):
         _wrapper.main()
 
@@ -350,7 +356,10 @@ def test_cli_force_window_propagates(tmp_path):
     hosts = tmp_path / "hosts.ini"
     hosts.write_text("[proxmox_nodes]\n")
 
-    with patch("proxmox_fleet.driver.run_fleet", side_effect=_fake_fleet):
+    with (
+        patch("proxmox_fleet.driver.run_fleet", side_effect=_fake_fleet),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
+    ):
         cli.main(["--inventory", str(hosts), "-e", "force_window=true"])
 
     assert captured["force_window"] is True
@@ -369,7 +378,10 @@ def test_cli_force_window_false_by_default(tmp_path):
     hosts = tmp_path / "hosts.ini"
     hosts.write_text("[proxmox_nodes]\n")
 
-    with patch("proxmox_fleet.driver.run_fleet", side_effect=_fake_fleet):
+    with (
+        patch("proxmox_fleet.driver.run_fleet", side_effect=_fake_fleet),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
+    ):
         cli.main(["--inventory", str(hosts)])
 
     assert captured["force_window"] is False
@@ -391,6 +403,7 @@ def test_scan_flag_skips_fleet_run():
         patch("proxmox_fleet.scan.run_fleet_scan", side_effect=_fake_scan),
         patch("proxmox_fleet.driver.run_fleet") as mock_fleet,
         patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
     ):
         rc = _wrapper.main()
 
