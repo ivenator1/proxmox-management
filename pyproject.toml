@@ -29,16 +29,20 @@ dev = [
     "python-multipart>=0.0.7",
     "httpx>=0.27",
     "ruamel.yaml>=0.18",
-    "fastapi-users[sqlalchemy,bcrypt]>=12",
+    "fastapi-users[sqlalchemy]>=12",
     "sqlalchemy>=2",
+    "bcrypt>=4",
+    "passlib>=1.7",
 ]
 web = [
     "fastapi>=0.110",
     "uvicorn>=0.23",
     "python-multipart>=0.0.7",  # starlette form parsing (the trigger form)
     "ruamel.yaml>=0.18",        # comment-preserving vars.yml edits (settings/enroll pages)
-    "fastapi-users[sqlalchemy,bcrypt]>=12",  # session auth, user management, password hashing
+    "fastapi-users[sqlalchemy]>=12",  # session auth, user management
     "sqlalchemy>=2",            # ORM for user database
+    "bcrypt>=4",                # password hashing
+    "passlib>=1.7",             # password utilities
 ]
 
 [project.scripts]
