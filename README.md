@@ -31,7 +31,7 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 * **Pending-Updates Scan:** `fleet-update --scan` is a strictly read-only fleet walk (pending OS packages per host plus community-script app current → latest per LXC) that feeds the dashboard's pending view. `install.sh` schedules it every 6 hours via `fleet-scan.timer`.
 * **Run History & Replay:** Every run persists a JSON record to `fleet_history_dir`; `--history [N]` tables recent runs and `--history-show latest` replays a stored briefing.
 * **Fleet Run Lock:** A fleet-wide `flock` guarantees the dashboard trigger, the systemd timer, cron, and manual shell runs can never mutate the fleet concurrently.
-* **Web Dashboard:** Optional `fleet-dashboard` web UI (`pip install -e '.[web]'`, or via `install.sh`) — pending updates across the fleet (agentless, PatchMon-style, including community-script app versions), browsable run history with per-host drill-down, a token-protected run trigger with live console output (SSE), an inventory & enrollment page (add hosts to `hosts.ini`, generate/push/test SSH keys from the browser — no manual `ssh-copy-id` needed), and a comment-preserving `vars.yml` settings editor. Triggered runs launch the CLI as a detached subprocess under the shared fleet run lock.
+* **Web Dashboard:** Optional `fleet-dashboard` web UI (`pip install -e '.[web]'`, or via `install.sh`) — session-based login (admin account, password set during install), pending updates across the fleet (agentless, PatchMon-style, including community-script app versions), browsable run history with per-host drill-down, a run trigger with live console output (SSE), an inventory & enrollment page (add hosts to `hosts.ini`, generate/push/test SSH keys from the browser — no manual `ssh-copy-id` needed), and a comment-preserving `vars.yml` settings editor. Triggered runs launch the CLI as a detached subprocess under the shared fleet run lock.
 * **One-Shot Installer:** `./install.sh` sets up the venv, all dependencies, and reboot-persistent systemd units for the dashboard and the scan timer; `--update` and `--uninstall` round-trip it.
 
 ## 🐍 Python Control Plane
@@ -160,18 +160,18 @@ All previously-hardcoded timeouts and retry counts are overridable per environme
 
 ### 🖥️ Web Dashboard
 * `dashboard_host` / `dashboard_port`: Bind address and port for `fleet-dashboard` (default `0.0.0.0:8421`).
-* `dashboard_token`: Bearer token protecting every mutating endpoint (run trigger, inventory enrollment, SSH key actions, settings editor). Read-only pages are open on the LAN; an empty token leaves the mutating endpoints unauthenticated — set one.
+* **Authentication:** All pages require login. Single `admin` account with password set during `install.sh`. Session-based auth via HTTP-only cookies (SQLite database in `fleet_history_dir/.fleet-users.db`). No configuration needed — password is prompted during installation.
 
 ## 🚀 Setup Instructions
 To set up this project from scratch on a brand-new Manager LXC, follow these steps in order. This ensures all dependencies are met and SSH trust between your Manager and your Proxmox nodes is established correctly.
 
 ### ⚡ Quick Install (install.sh)
 On a fresh Manager LXC, `install.sh` automates steps 2 and 6 below and wires everything into
-systemd — it creates the `.venv`, installs the package (with the web-dashboard extras),
-ansible-core and the Ansible collections, seeds `vars.yml`/`hosts.ini` from the `.example`
-templates if missing, and installs + enables two units that persist across reboots:
-`fleet-dashboard.service` (the web UI on port 8421) and `fleet-scan.timer`
-(`fleet-update --scan` every 6 hours).
+systemd — it prompts for a dashboard admin password, creates the `.venv`, installs the
+package (with the web-dashboard extras), ansible-core and the Ansible collections, seeds
+`vars.yml`/`hosts.ini` from the `.example` templates if missing, initializes the login
+database, and installs + enables two units that persist across reboots: `fleet-dashboard.service`
+(the web UI on port 8421, login required) and `fleet-scan.timer` (`fleet-update --scan` every 6 hours).
 
 ```bash
 git clone https://github.com/ivenator1/proxmox-management.git
