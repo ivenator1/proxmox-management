@@ -74,6 +74,39 @@ seed_config() {
     fi
 }
 
+init_admin_user() {
+    local db_path="$HISTORY_DIR/.fleet-users.db"
+
+    # Check if database already exists
+    if [ -f "$db_path" ]; then
+        info "Dashboard database already exists — skipping password setup"
+        return 0
+    fi
+
+    # Prompt for admin password
+    printf '%s' "Dashboard admin password: "
+    read -rs password1
+    printf '\n'
+
+    printf '%s' "Confirm password: "
+    read -rs password2
+    printf '\n'
+
+    if [ "$password1" != "$password2" ]; then
+        die "Passwords do not match"
+    fi
+
+    if [ -z "$password1" ]; then
+        die "Password cannot be empty"
+    fi
+
+    # Initialize the database and create admin user
+    info "Initializing dashboard database"
+    "$VENV/bin/python" -m proxmox_fleet.web.init_db \
+        --password "$password1" \
+        --db-path "$db_path" || die "Failed to initialize database"
+}
+
 write_units() {
     info "Writing systemd units to $UNIT_DIR"
 
@@ -135,16 +168,15 @@ print_summary() {
 
 Install complete.
 
-  Dashboard:   http://${host_ip:-<this-host>}:${port:-8421}  ($DASH_SERVICE)
+  Dashboard:   http://${host_ip:-<this-host>}:${port:-8421}  ($DASH_SERVICE, login required)
   Scan timer:  every 6 hours ($SCAN_TIMER -> fleet-update --scan)
   History:     $HISTORY_DIR
   Both units are enabled and persist across reboots.
 
 Next steps:
-  1. Edit $REPO_DIR/hosts.ini with your real inventory.
-  2. Edit $REPO_DIR/vars.yml (set dashboard_token — the run trigger is unauthenticated without it).
-  3. Set up SSH trust to your nodes (see README "Establish SSH Trust").
-  4. systemctl restart $DASH_SERVICE after changing vars.yml.
+  1. Access the dashboard at http://${host_ip:-<this-host>}:${port:-8421} (admin@localhost, password set during install)
+  2. From the "Inventory & enrollment" page in the dashboard, add hosts and set up SSH keys
+  3. Or: Edit $REPO_DIR/hosts.ini manually and set up SSH trust per the README
 
 Until hosts.ini/vars.yml point at real hosts, scans will report errors — that's expected.
 Maintenance: ./install.sh --update | ./install.sh --uninstall
@@ -156,6 +188,7 @@ do_install() {
     install_python_deps
     seed_config
     mkdir -p "$HISTORY_DIR"
+    init_admin_user
     write_units
     enable_units
     print_summary

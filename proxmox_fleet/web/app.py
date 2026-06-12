@@ -4,27 +4,28 @@ Pages: overview (``/``), pending updates (``/pending``), run history
 (``/history`` + per-run detail), per-host drill-down (``/hosts/{name}``), and
 the run trigger (``/trigger`` → ``POST /runs`` → live console with SSE).
 
-Read-only pages are open on the LAN; ``POST /runs`` requires the
-``dashboard_token`` bearer token when one is configured. All data comes from
-``fleet_history_dir`` via the readers in :mod:`proxmox_fleet.history` and
-:mod:`proxmox_fleet.scan` — the dashboard never reaches the fleet itself; it
+All pages and endpoints require user login (session-based auth via FastAPI-Users).
+All data comes from ``fleet_history_dir`` via the readers in :mod:`proxmox_fleet.history`
+and :mod:`proxmox_fleet.scan` — the dashboard never reaches the fleet itself; it
 only launches the CLI.
 """
 
 from __future__ import annotations
 
 import re
-import secrets
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from fastapi_users.db import SQLAlchemyUserDatabase
 
 from proxmox_fleet import history as history_mod
 from proxmox_fleet import inventory_edit, vars_edit
@@ -35,6 +36,8 @@ from proxmox_fleet.models.config import MaintenanceWindow
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.vars_edit import VarsEditError
 from proxmox_fleet.web import sshsetup
+from proxmox_fleet.web.auth import current_active_user, fastapi_users, get_user_db, get_user_manager
+from proxmox_fleet.web.models import User
 from proxmox_fleet.web.runs import RunActive, RunManager
 from proxmox_fleet.web.sshsetup import SshSetupError
 
@@ -316,19 +319,6 @@ def build_run_args(form: Mapping[str, Any]) -> List[str]:
     return args
 
 
-def _token_ok(settings: GlobalSettings, request: Request, form: Mapping[str, Any]) -> bool:
-    """Bearer-token check for the run trigger. Empty configured token = open
-    (the settings field documents this); accepts the Authorization header or
-    a `token` form field (HTML forms can't set headers without JS)."""
-    token = settings.dashboard_token
-    if not token:
-        return True
-    header = request.headers.get("authorization", "")
-    if header.startswith("Bearer ") and secrets.compare_digest(header[7:], token):
-        return True
-    supplied = str(form.get("token") or "")
-    return bool(supplied) and secrets.compare_digest(supplied, token)
-
 
 def _lxc_sort_key(item: Tuple[str, Dict[str, Any]]) -> Tuple[str, int, str]:
     key, entry = item
@@ -387,12 +377,49 @@ def create_app(
     manager = run_manager or RunManager(settings.fleet_history_dir)
     history_dir = settings.fleet_history_dir
 
+    # Database setup for FastAPI-Users authentication
+    db_path = Path(history_dir) / ".fleet-users.db"
+    db_url = f"sqlite+aiosqlite:///{db_path}"
+    engine = create_async_engine(db_url, echo=False)
+    async_session_maker = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)  # type: ignore
+
+    async def get_async_session() -> AsyncSession:  # type: ignore
+        """Dependency for async database session."""
+        async with async_session_maker() as session:
+            yield session
+
     app = FastAPI(title="Fleet Dashboard", docs_url=None, redoc_url=None)
+
+    # Mount FastAPI-Users routers for authentication
+    app.include_router(
+        fastapi_users.get_auth_router("session"),
+        prefix="/auth",
+        tags=["auth"],
+    )
+    app.include_router(
+        fastapi_users.get_verify_router("http://localhost:8421"),  # unused but required
+        prefix="/auth",
+        tags=["auth"],
+    )
+
+    # Override the get_user_db dependency
+    async def get_user_db_override(session: AsyncSession = Depends(get_async_session)):  # type: ignore
+        yield SQLAlchemyUserDatabase(session, User)
+
+    app.dependency_overrides[get_user_db] = get_user_db_override  # type: ignore
+
     app.mount("/static", StaticFiles(directory=str(_PACKAGE_DIR / "static")), name="static")
     templates = Jinja2Templates(directory=str(_PACKAGE_DIR / "templates"))
     templates.env.filters["ts_human"] = ts_human
     templates.env.filters["ts_iso"] = ts_iso
     templates.env.filters["spark_points"] = spark_points
+
+    # Exception handler: redirect 403 (unauthenticated) to login for HTML requests
+    @app.exception_handler(HTTPException)
+    async def http_exception_handler(request: Request, exc: HTTPException):  # type: ignore
+        if exc.status_code == 403 and "text/html" in request.headers.get("accept", ""):
+            return RedirectResponse(url="/auth/login", status_code=303)
+        raise exc
 
     def _read_run_or_none(ref: str) -> Optional[Dict[str, Any]]:
         try:
@@ -446,7 +473,7 @@ def create_app(
     templates.env.globals["palette_items"] = _palette_items
 
     @app.get("/")
-    def index(request: Request) -> Any:
+    def index(request: Request, _: User = Depends(current_active_user)) -> Any:
         latest_run = _read_run_or_none("latest")
         latest_pending = _read_pending_or_none("latest")
         pending_rows = scan_mod.pending_summary(history_dir, limit=1)
@@ -466,7 +493,7 @@ def create_app(
         })
 
     @app.get("/pending")
-    def pending(request: Request, ref: str = "latest") -> Any:
+    def pending(request: Request, ref: str = "latest", _: User = Depends(current_active_user)) -> Any:
         snapshot = _read_pending_or_none(ref)
         if snapshot is None and ref != "latest":
             raise HTTPException(404, f"no pending snapshot {ref!r}")
@@ -481,7 +508,7 @@ def create_app(
         })
 
     @app.get("/history")
-    def history(request: Request) -> Any:
+    def history(request: Request, _: User = Depends(current_active_user)) -> Any:
         rows = _history_rows_with_deltas(history_dir)
         return templates.TemplateResponse(request, "history.html", {
             "rows": rows,
@@ -505,26 +532,21 @@ def create_app(
         })
 
     @app.get("/hosts/{name}")
-    def host_detail(request: Request, name: str) -> Any:
+    def host_detail(request: Request, name: str, _: User = Depends(current_active_user)) -> Any:
         return templates.TemplateResponse(request, "host.html", {
             "name": name,
             "records": _host_records(history_dir, name),
         })
 
     @app.get("/trigger")
-    def trigger(request: Request) -> Any:
+    def trigger(request: Request, _: User = Depends(current_active_user)) -> Any:
         return templates.TemplateResponse(request, "trigger.html", {
             "phase_names": PHASE_NAMES,
-            "token_required": bool(settings.dashboard_token),
             "lock_holder": probe_lock(history_dir),
             "runs": manager.list_runs(),
         })
 
     # ----- inventory enrollment + settings + ssh setup ----------------- #
-
-    def _require_token(request: Request, form: Mapping[str, Any]) -> None:
-        if not _token_ok(settings, request, form):
-            raise HTTPException(401, "missing or invalid dashboard token")
 
     def _redirect(url: str, *, ok: str = "", err: str = "") -> RedirectResponse:
         if ok:
@@ -577,7 +599,6 @@ def create_app(
             },
             "public_keys": sshsetup.list_public_keys(),
             "ssh_result": ssh_result,
-            "token_required": bool(settings.dashboard_token),
             "group_names": inventory_edit.GROUPS,
             "ok": request.query_params.get("ok", ""),
             "err": request.query_params.get("err", ""),
@@ -591,7 +612,6 @@ def create_app(
     @app.post("/inventory/create")
     async def inventory_create(request: Request) -> Any:
         form = await request.form()
-        _require_token(request, form)
         created = inventory_edit.ensure_inventory(inventory_path)
         return _redirect("/inventory",
                          ok="hosts.ini created" if created else "hosts.ini already exists")
@@ -599,7 +619,6 @@ def create_app(
     @app.post("/inventory/add")
     async def inventory_add(request: Request) -> Any:
         form = await request.form()
-        _require_token(request, form)
         group = str(form.get("group") or "")
         name = str(form.get("name") or "").strip()
         ansible_host = str(form.get("ansible_host") or "").strip()
@@ -668,7 +687,6 @@ def create_app(
     @app.post("/inventory/remove")
     async def inventory_remove(request: Request) -> Any:
         form = await request.form()
-        _require_token(request, form)
         group = str(form.get("group") or "")
         name = str(form.get("name") or "").strip()
         cleanup = _truthy(form.get("cleanup"))
@@ -697,7 +715,7 @@ def create_app(
         return _redirect("/inventory", ok=f"removed {name} from [{group}]{suffix}")
 
     @app.get("/settings")
-    def settings_page(request: Request) -> Any:
+    def settings_page(request: Request, _: User = Depends(current_active_user)) -> Any:
         file_data = dict(vars_edit.load_data(vars_path))
         known = set(GlobalSettings.model_fields)
         return templates.TemplateResponse(request, "settings.html", {
@@ -705,15 +723,13 @@ def create_app(
             "raw": vars_edit.read_raw(vars_path),
             "vars_path": vars_path,
             "extra_keys": sorted(k for k in file_data if k not in known),
-            "token_required": bool(settings.dashboard_token),
             "ok": request.query_params.get("ok", ""),
             "err": request.query_params.get("err", ""),
         })
 
     @app.post("/settings")
-    async def settings_save(request: Request) -> Any:
+    async def settings_save(request: Request, _: User = Depends(current_active_user)) -> Any:
         form = await request.form()
-        _require_token(request, form)
         file_data = dict(vars_edit.load_data(vars_path))
         try:
             changes = parse_settings_form(form, file_data)
@@ -726,9 +742,8 @@ def create_app(
         return _redirect("/settings", ok=msg)
 
     @app.post("/settings/raw")
-    async def settings_save_raw(request: Request) -> Any:
+    async def settings_save_raw(request: Request, _: User = Depends(current_active_user)) -> Any:
         form = await request.form()
-        _require_token(request, form)
         try:
             vars_edit.replace_raw(vars_path, str(form.get("content") or ""))
         except VarsEditError as exc:
@@ -736,9 +751,8 @@ def create_app(
         return _redirect("/settings", ok=f"{vars_path} replaced (backup written)")
 
     @app.post("/ssh/generate")
-    async def ssh_generate(request: Request) -> Any:
+    async def ssh_generate(request: Request, _: User = Depends(current_active_user)) -> Any:
         form = await request.form()
-        _require_token(request, form)
         try:
             ok, output = sshsetup.generate_key()
         except SshSetupError as exc:
@@ -747,9 +761,8 @@ def create_app(
             request, ssh_result={"action": "generate", "ok": ok, "output": output}))
 
     @app.post("/ssh/push")
-    async def ssh_push(request: Request) -> Any:
+    async def ssh_push(request: Request, _: User = Depends(current_active_user)) -> Any:
         form = await request.form()
-        _require_token(request, form)
         try:
             ok, output = sshsetup.push_key(
                 str(form.get("host") or ""), str(form.get("user") or "root"),
@@ -762,9 +775,8 @@ def create_app(
             request, ssh_result={"action": "push", "ok": ok, "output": output}))
 
     @app.post("/ssh/test")
-    async def ssh_test(request: Request) -> Any:
+    async def ssh_test(request: Request, _: User = Depends(current_active_user)) -> Any:
         form = await request.form()
-        _require_token(request, form)
         try:
             ok, output = sshsetup.test_key(
                 str(form.get("host") or ""), str(form.get("user") or "root"),
@@ -776,7 +788,7 @@ def create_app(
             request, ssh_result={"action": "test", "ok": ok, "output": output}))
 
     @app.post("/runs")
-    async def start_run(request: Request) -> Any:
+    async def start_run(request: Request, _: User = Depends(current_active_user)) -> Any:
         form = await request.form()
         if not _token_ok(settings, request, form):
             raise HTTPException(401, "missing or invalid dashboard token")

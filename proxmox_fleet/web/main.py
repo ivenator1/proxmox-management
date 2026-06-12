@@ -38,8 +38,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     from proxmox_fleet.web.app import create_app
 
     settings = GlobalSettings.load(args.vars_file)
-    if not settings.dashboard_token:
-        print("WARNING: dashboard_token is empty — the run trigger is unauthenticated")
 
     uvicorn.run(
         create_app(settings, vars_path=args.vars_file),
