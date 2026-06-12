@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}Pending updates — Fleet Dashboard{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Pending updates</h1>
+  {% if snapshot %}
+  <span class="sub">snapshot <span class="mono" title="{{ snapshot.timestamp }}">{{ snapshot.timestamp | ts_human }}</span>{% if ref == "latest" %} (latest){% endif %}</span>
+  {% endif %}
+</div>
+
+{% if snapshot %}
+  <h2>Hosts</h2>
+  {% if hosts %}
+  <div class="table-card">
+  <table>
+    <thead><tr><th>Host</th><th>Kind</th><th>Pkg mgr</th><th class="num">Pending</th><th>Packages / error</th></tr></thead>
+    <tbody>
+    {% for name, entry in hosts %}
+      {% set count = entry.get("pending_count", 0) %}
+      <tr>
+        <td><a href="/hosts/{{ name }}">{{ name }}</a></td>
+        <td>{{ entry.get("kind", "") }}</td>
+        <td><code>{{ entry.get("pkg_mgr", "") }}</code></td>
+        <td class="num {% if not count %}zero{% endif %}">{{ count }}</td>
+        <td>
+          {% if entry.get("error") %}<span class="fail">{{ entry.error }}</span>
+          {% elif entry.get("pending") %}
+            <details class="pkg-list">
+              <summary>{{ entry.pending | length }} package(s)</summary>
+              <div class="pkg-body">{{ entry.pending | join(", ") }}</div>
+            </details>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}<p class="muted">No host scans in this snapshot.</p>{% endif %}
+
+  <h2>LXC containers</h2>
+  {% if lxc %}
+  <div class="table-card">
+  <table>
+    <thead><tr><th>Node</th><th class="num">ID</th><th>Name</th><th class="num">OS pending</th><th>App</th><th>Notes</th></tr></thead>
+    <tbody>
+    {% for lxc_id, entry in lxc %}
+      {% set os_count = entry.get("os_pending_count", 0) %}
+      <tr>
+        <td>{{ entry.get("node", "") }}</td>
+        <td class="num">{{ lxc_id }}</td>
+        <td><a href="/hosts/{{ entry.get('name', lxc_id) }}">{{ entry.get("name", lxc_id) }}</a></td>
+        <td class="num {% if not os_count %}zero{% endif %}">{{ os_count }}
+            {% if entry.get("os_pending") %}
+            <details class="pkg-list">
+              <summary>show</summary>
+              <div class="pkg-body">{{ entry.os_pending | join(", ") }}</div>
+            </details>
+            {% endif %}
+        </td>
+        <td>
+          {% set app = entry.get("app") %}
+          {% if app %}
+            <code>{{ app.get("script", "") }}</code>
+            <span class="mono">{{ app.get("current") or "?" }} → {{ app.get("latest") or "?" }}</span>
+            {% if app.get("outdated") %}<span class="pill warn">outdated</span>{% endif %}
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td>
+          {% if entry.get("skipped") %}<span class="pill muted">skipped ({{ entry.skipped }})</span>{% endif %}
+          {% if entry.get("error") %}<span class="fail">{{ entry.error }}</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}<p class="muted">No container scans in this snapshot.</p>{% endif %}
+{% else %}
+<div class="empty">
+  <span class="glyph" aria-hidden="true">⌁</span>
+  <p>No pending scan yet — run <code>fleet-update --scan</code> or
+  <a href="/trigger">trigger one</a>.</p>
+</div>
+{% endif %}
+
+<h2>Past scans</h2>
+{% if scans %}
+<div class="table-card">
+<table>
+  <thead><tr><th>Timestamp</th><th class="num">Host pkgs</th><th class="num">LXC OS pkgs</th><th class="num">Outdated apps</th><th class="num">Errors</th></tr></thead>
+  <tbody>
+  {% for row in scans %}
+    <tr>
+      <td><a class="mono" href="/pending?ref={{ row.timestamp }}" title="{{ row.timestamp }}">{{ row.timestamp | ts_human }}</a></td>
+      <td class="num {% if not row.hosts_pending %}zero{% endif %}">{{ row.hosts_pending }}</td>
+      <td class="num {% if not row.lxc_os_pending %}zero{% endif %}">{{ row.lxc_os_pending }}</td>
+      <td class="num {% if not row.outdated_apps %}zero{% endif %}">{{ row.outdated_apps }}</td>
+      <td class="num {% if not row.errors %}zero{% endif %}">{% if row.errors %}<span class="fail">{{ row.errors }}</span>{% else %}0{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}<p class="muted">None recorded.</p>{% endif %}
+{% endblock %}

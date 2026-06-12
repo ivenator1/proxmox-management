@@ -23,9 +23,13 @@ flags. `fleet-update` (pip console command) is the programmatic/cron interface.
 ./fleet-update.py --scan                       # read-only pending-updates scan → pending-*.json
 fleet-update --check -e force_notify=true      # console command (needs active venv)
 
+pip install -e '.[web]'              # fastapi + uvicorn for the dashboard
+fleet-dashboard                      # web UI on dashboard_host:dashboard_port (default 0.0.0.0:8421);
+                                     # run from the project root (the trigger subprocess needs CWD here)
+
 ansible-galaxy collection install community.proxmox community.general
 
-pip install -e '.[dev]'              # mypy, pytest, pydantic, types-PyYAML
+pip install -e '.[dev]'              # mypy, pytest, pydantic, types-PyYAML (+ web deps for test_web)
 pytest tests/unit/ -v
 pytest tests/unit/test_briefing.py -v
 pytest tests/unit/ -k "run_fleet"
@@ -59,6 +63,8 @@ Activate the venv at the start of each session: `source .venv/bin/activate`
 
 ```
 fleet-update.py            # wrapper: --dry-run/--force-notify/--verbose/--force-window/-e K=V; bootstraps .venv
+install.sh                 # root installer: venv + deps + systemd units (fleet-dashboard.service,
+                           # fleet-scan.timer every 6h); --update / --uninstall
 ansible.cfg                # forks=20, pipelining=true, inventory=./hosts.ini
 vars.yml / hosts.ini       # secrets + inventory (gitignored; copy from *.example)
 .github/workflows/ci.yml   # lint, unit tests (3.10-3.12), mypy, ruff, bandit, molecule matrices
@@ -91,7 +97,11 @@ proxmox_fleet/
   history.py               # build_run_summary() + write_history(); history_summary()/read_run() readers
   notifiers.py             # resolve_notifiers(), dispatch() (discord/ntfy/webhook/telegram), ping_deadmans()
   scan.py                  # --scan: read-only pending-updates walk → pending-*.json (next to history)
+  lock.py                  # fleet-wide run lock (flock in fleet_history_dir); acquire_run_lock()/probe_lock()
   cli.py                   # fleet-update CLI: parses flags, calls driver.run_fleet()
+  web/                     # fleet-dashboard ('.[web]' extra): app.py (FastAPI pages + SSE), runs.py
+                           # (RunManager: detached CLI subprocess + log tail), main.py (entrypoint),
+                           # templates/*.html + static/ (custom dashboard.css design system + dashboard.js)
 config_templates/custom_system.yml.example   # full commented schema → copy to configs/<name>.yml
 configs/                   # real configs/*.yml gitignored; commit *.yml.example only
 ansible/primitives/        # thin single-purpose playbooks: run_shell, reboot_host, discover_lxcs,
@@ -176,6 +186,22 @@ merges purely in-memory.
   `pending-<ts>.json` + `pending-latest.json` to `fleet_history_dir` (pruned to
   `scan_history_keep`); obeys `--limit`; exit 1 if any scan errored. Bypasses `run_fleet()`
   entirely (no phases, no notify).
+
+### Web dashboard (`web/`, `fleet-dashboard`)
+
+Optional `.[web]` extra (fastapi + uvicorn + python-multipart). `web/app.py` serves five
+server-rendered pages (overview / pending / history+run detail / per-host drill-down / trigger)
+purely from `fleet_history_dir` via the `history.py`/`scan.py` readers — the dashboard never
+reaches the fleet. `POST /runs` (bearer `dashboard_token`; empty token = open) launches
+`python -u -m proxmox_fleet.cli <flags>` via `web/runs.py`'s `RunManager`: detached
+(`start_new_session`), stdout → `dashboard-runs/<id>.log` + `<id>.json` meta, so a dashboard
+restart never kills a run (orphaned metas are finalized on read with `rc: null`). SSE
+(`/runs/{id}/stream`) re-tails the log from byte 0 each connect. Single-flight is double-checked:
+`RunManager.start()` probes the fleet lock + its own children, and the CLI child re-acquires the
+same `lock.py` flock. Trigger args are composed only from validated tokens
+(`build_run_args()` — never raw strings into argv). Start the dashboard from the project root
+(the subprocess inherits CWD; `invoke_primitive` needs it). Tests: `test_web.py`
+(fastapi.testclient + stub subprocess commands).
 
 ### Cross-cutting subsystems
 

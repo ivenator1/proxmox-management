@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}Run history — Fleet Dashboard{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Run history</h1>
+  {% if rows %}<span class="sub">{{ rows | length }} persisted run(s)</span>{% endif %}
+</div>
+
+{% if rows %}
+<div class="card heatmap">
+  <div class="card-head">
+    <h2 style="margin: 0;">Activity</h2>
+    <span class="muted" style="font-size: 0.78rem;">runs per day · red ring = a failed run that day</span>
+  </div>
+  <svg width="{{ heatmap | length * 13 + 4 }}" height="105" role="img" aria-label="Run activity calendar">
+    {% for week in heatmap %}
+    {% set wx = loop.index0 * 13 + 2 %}
+    {% if week[0].month %}<text x="{{ wx }}" y="9">{{ week[0].month }}</text>{% endif %}
+    {% for day in week %}
+    {% if not day.future %}
+    <rect x="{{ wx }}" y="{{ loop.index0 * 13 + 13 }}" width="11" height="11"
+          class="l{{ day.level }}{% if day.failed %} failed{% endif %}">
+      <title>{{ day.date }} — {{ day.count }} run(s){% if day.failed %}, failed{% endif %}</title>
+    </rect>
+    {% endif %}
+    {% endfor %}
+    {% endfor %}
+  </svg>
+</div>
+
+<div class="table-card" style="margin-top: var(--sp-4);">
+<table>
+  <thead>
+    <tr>
+      <th>Timestamp</th><th>Result</th>
+      {% for key in count_keys %}
+      <th class="num">{{ key }}
+        {% set series = rows | reverse | map(attribute="counts." ~ key, default=0) | list %}
+        {% if rows | length > 1 %}
+        <svg class="spark{% if key == 'errors' %} fail{% endif %}" width="48" height="14" viewBox="0 0 48 14" aria-hidden="true" style="margin-top: 2px;">
+          <polyline points="{{ series | spark_points(48, 14) }}"/>
+        </svg>
+        {% endif %}
+      </th>
+      {% endfor %}
+      <th>Δ vs previous</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td><a class="mono" href="/history/{{ row.timestamp }}" title="{{ row.timestamp }}">{{ row.timestamp | ts_human }}</a></td>
+      <td>
+        {% if row.failed %}<span class="pill fail">failed</span>
+        {% elif row.changed %}<span class="pill info">changed</span>
+        {% else %}<span class="pill muted">clean</span>{% endif %}
+      </td>
+      {% for key in count_keys %}
+      {% set n = (row.counts or {}).get(key, 0) %}
+      <td class="num {% if not n %}zero{% endif %}">{{ n }}</td>
+      {% endfor %}
+      <td>
+        {% if row.delta %}
+          {% for part in row.delta.split(", ") %}
+          <span class="chip {% if '+' in part %}up{% else %}down{% endif %}">{{ part }}</span>
+          {% endfor %}
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<div class="empty">
+  <span class="glyph" aria-hidden="true">⟡</span>
+  <p>No run history yet.</p>
+</div>
+{% endif %}
+{% endblock %}

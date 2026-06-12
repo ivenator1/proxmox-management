@@ -1,0 +1,212 @@
+{% extends "base.html" %}
+{% block title %}Inventory — Fleet Dashboard{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Inventory &amp; enrollment</h1>
+  <span class="sub">edits <code>{{ inventory_path }}</code> (+ vars.yml / host_vars)</span>
+</div>
+
+{% if ok %}<div class="banner ok-banner"><span>✓ {{ ok }}</span></div>{% endif %}
+{% if err %}<div class="banner warn"><span>{{ err }}</span></div>{% endif %}
+
+{% if not inventory_exists %}
+<div class="empty">
+  <span class="glyph" aria-hidden="true">⌑</span>
+  <p><code>{{ inventory_path }}</code> doesn't exist yet.</p>
+  <form method="post" action="/inventory/create" style="margin-top: 1rem;">
+    {% if token_required %}
+    <input type="password" name="token" placeholder="dashboard token" required
+           style="max-width: 14rem; display: inline-block; margin-right: 0.5rem;">
+    {% endif %}
+    <button class="btn-primary" type="submit">Create hosts.ini</button>
+  </form>
+</div>
+{% else %}
+
+{% for entry in groups %}
+<div class="card-head" style="margin-top: var(--sp-5);">
+  <h2 style="margin: 0;"><code>[{{ entry.group }}]</code></h2>
+  <span class="pill muted">{{ entry.hosts | length }}</span>
+</div>
+{% if entry.hosts %}
+<div class="table-card">
+<table>
+  <thead><tr><th>Host</th><th>Vars</th><th>Flags</th><th></th></tr></thead>
+  <tbody>
+  {% for host in entry.hosts %}
+    <tr>
+      <td><a href="/hosts/{{ host.name }}">{{ host.name }}</a></td>
+      <td>
+        {% for k, v in host.vars.items() %}<span class="chip">{{ k }}={{ v }}</span>{% endfor %}
+      </td>
+      <td>
+        {% if host.canary %}<span class="pill warn">canary</span>{% endif %}
+        {% if host.kuma %}<span class="pill info">kuma {{ host.kuma }}</span>{% endif %}
+        {% if host.has_host_vars %}<span class="pill muted">host_vars</span>{% endif %}
+      </td>
+      <td style="text-align: right; white-space: nowrap;">
+        <form method="post" action="/inventory/remove" class="remove-form"
+              data-host="{{ host.name }}" style="display: inline-flex; gap: 0.4rem; align-items: center;">
+          <input type="hidden" name="group" value="{{ entry.group }}">
+          <input type="hidden" name="name" value="{{ host.name }}">
+          <label style="font-size: 0.72rem; display: inline-flex; gap: 0.25rem; align-items: center;">
+            <input type="checkbox" name="cleanup" value="true" checked> clean vars
+          </label>
+          {% if token_required %}<input type="password" name="token" placeholder="token" required style="width: 6.5rem; margin: 0; padding: 0.25rem 0.5rem; font-size: 0.75rem;">{% endif %}
+          <button type="submit" class="btn-sm">remove</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="muted" style="font-size: 0.85rem;">No hosts in this group.</p>
+{% endif %}
+{% endfor %}
+
+<h2>Enroll a host</h2>
+<div class="grid cols-2">
+<form class="card" method="post" action="/inventory/add" id="enroll-form">
+  <div class="field">
+    <label>Group
+      <select name="group" id="enroll-group" style="width: 100%; margin-top: 0.3rem; padding: 0.55rem 0.75rem; font: inherit; color: var(--fg-strong); background: var(--bg-inset); border: 1px solid var(--border); border-radius: var(--radius-sm);">
+        {% for g in group_names %}<option value="{{ g }}">{{ g }}</option>{% endfor %}
+      </select>
+    </label>
+  </div>
+  <div class="field">
+    <label>Host name <input type="text" name="name" placeholder="media-vm" required></label>
+    <p class="hint">inventory name — letters/digits/._- only</p>
+  </div>
+  <div class="field">
+    <label>IP / address <input type="text" name="ansible_host" placeholder="10.10.10.50"></label>
+    <p class="hint">required (proxmox nodes may omit it and resolve by name)</p>
+  </div>
+  <div class="field" data-groups="proxmox_vms">
+    <label>VM id <input type="text" name="vmid" placeholder="200"></label>
+  </div>
+  <div class="field" data-groups="proxmox_vms">
+    <label>PVE node <input type="text" name="pve_node" placeholder="pve-01"></label>
+    <p class="hint">inventory name of the owning node (fallback hint — discovery is HA-aware)</p>
+  </div>
+  <div class="field" data-groups="custom_hosts">
+    <label>Custom config <input type="text" name="custom_config" placeholder="gitea"></label>
+    <p class="hint">configs/&lt;name&gt;.yml must exist on the manager</p>
+  </div>
+  <div class="field" data-groups="remote_hosts">
+    <label>Pre-update command <input type="text" name="pre_update_cmd" placeholder="systemctl stop myapp"></label>
+    <p class="hint">optional hook, stored in host_vars/&lt;host&gt;.yml</p>
+  </div>
+  <label class="option-row" data-groups="proxmox_vms remote_hosts">
+    <span class="switch"><input type="checkbox" name="canary" value="true"><span class="track"></span></span>
+    <span class="option-text">
+      <span class="option-title">Canary host</span>
+      <span class="option-desc">updates in wave 1; the rest wait for the soak + health gate</span>
+    </span>
+  </label>
+  <div class="field" data-groups="proxmox_vms remote_hosts" style="margin-top: var(--sp-3);">
+    <label>Uptime-Kuma monitor id <input type="text" name="kuma_id" placeholder="7"></label>
+    <p class="hint">written to vm_kuma_map / remote_kuma_map in vars.yml</p>
+  </div>
+  <div data-groups="proxmox_vms remote_hosts custom_hosts">
+    <p style="font-size: 0.85rem; font-weight: 600; margin-bottom: var(--sp-2);">Maintenance window <span class="muted">(optional — host_vars)</span></p>
+    <div style="display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: var(--sp-2);">
+      <label style="font-size: 0.78rem;">days <input type="text" name="mw_days" placeholder="Sat,Sun"></label>
+      <label style="font-size: 0.78rem;">start <input type="text" name="mw_start" placeholder="02:00"></label>
+      <label style="font-size: 0.78rem;">end <input type="text" name="mw_end" placeholder="05:00"></label>
+      <label style="font-size: 0.78rem;">tz <input type="text" name="mw_tz" placeholder="UTC"></label>
+    </div>
+  </div>
+  {% if token_required %}
+  <div class="field" style="margin-top: var(--sp-3);">
+    <label>Dashboard token <input type="password" name="token" required></label>
+  </div>
+  {% endif %}
+  <button class="btn-primary" type="submit" style="margin-top: var(--sp-2);">Enroll host</button>
+</form>
+
+<div>
+  <div class="card">
+    <h3>LXC lists <span class="muted" style="font-weight: 400;">(vars.yml — edit in <a href="/settings">Settings</a>)</span></h3>
+    <table class="shortcuts-table" style="margin: 0;">
+      <tr><td class="keys">canary_hosts</td><td>{{ lxc_lists.canary_hosts | join(", ") or "—" }}</td></tr>
+      <tr><td class="keys">os_only_lxc_list</td><td>{{ lxc_lists.os_only_lxc_list | join(", ") or "—" }}</td></tr>
+      <tr><td class="keys">exclude_list</td><td>{{ lxc_lists.exclude_list | join(", ") or "—" }}</td></tr>
+      <tr><td class="keys">app_update_exclude_list</td><td>{{ lxc_lists.app_update_exclude_list | join(", ") or "—" }}</td></tr>
+      <tr><td class="keys">lxc_kuma_map</td><td>{% for k, v in lxc_lists.lxc_kuma_map.items() %}<span class="chip">{{ k }}→{{ v }}</span>{% else %}—{% endfor %}</td></tr>
+    </table>
+    <p class="muted" style="font-size: 0.78rem; margin: var(--sp-3) 0 0;">
+      LXCs aren't enrolled here — they're discovered by PVE tag
+      (<code>community-script</code> / <code>proxmox-helper-scripts</code>).
+    </p>
+  </div>
+</div>
+</div>
+{% endif %}
+
+<h2>SSH access</h2>
+<div class="grid cols-2">
+  <div class="card">
+    <div class="card-head"><h3 style="margin: 0;">Manager public key</h3></div>
+    {% if public_keys %}
+      {% for key in public_keys %}
+      <p class="muted" style="font-size: 0.78rem; margin-bottom: 0.2rem;"><code>{{ key.path }}</code> ({{ key.type }}{% if key.comment %} — {{ key.comment }}{% endif %})</p>
+      <pre class="briefing" style="font-size: 0.7rem; margin-bottom: var(--sp-3);">{{ key.key }}</pre>
+      {% endfor %}
+    {% else %}
+      <p class="muted">No public key found in <code>~/.ssh</code>.</p>
+      <form method="post" action="/ssh/generate">
+        {% if token_required %}<input type="password" name="token" placeholder="dashboard token" required style="max-width: 14rem; display: inline-block; margin-right: 0.5rem;">{% endif %}
+        <button class="btn-primary" type="submit">Generate ed25519 key</button>
+      </form>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h3 style="margin: 0;">Push key to a host</h3></div>
+    <p class="muted" style="font-size: 0.8rem;">ssh-copy-id with a one-time password —
+      enables passwordless Ansible logins. The password is used once and never stored.</p>
+    <form method="post" action="/ssh/push">
+      <div style="display: grid; grid-template-columns: 2fr 1fr; gap: var(--sp-2);">
+        <label style="font-size: 0.8rem;">host / IP <input type="text" name="host" placeholder="10.10.10.50" required></label>
+        <label style="font-size: 0.8rem;">port <input type="text" name="port" placeholder="22"></label>
+      </div>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); margin-top: var(--sp-2);">
+        <label style="font-size: 0.8rem;">user <input type="text" name="user" placeholder="root"></label>
+        <label style="font-size: 0.8rem;">password <input type="password" name="password" required autocomplete="off"></label>
+      </div>
+      {% if token_required %}
+      <label style="font-size: 0.8rem; display: block; margin-top: var(--sp-2);">dashboard token <input type="password" name="token" required></label>
+      {% endif %}
+      <div style="display: flex; gap: var(--sp-2); margin-top: var(--sp-3);">
+        <button class="btn-primary" type="submit">Push key</button>
+        <button class="btn-sm" type="submit" formaction="/ssh/test" formnovalidate>Test passwordless login</button>
+      </div>
+    </form>
+    {% if ssh_result %}
+    <div style="margin-top: var(--sp-3);">
+      <span class="pill {{ 'ok' if ssh_result.ok else 'fail' }}">{{ ssh_result.action }} {{ 'succeeded' if ssh_result.ok else 'failed' }}</span>
+      {% if ssh_result.output %}<pre class="briefing" style="margin-top: var(--sp-2); font-size: 0.72rem;">{{ ssh_result.output }}</pre>{% endif %}
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<script>
+  /* enroll form: show only the fields relevant to the selected group */
+  (() => {
+    const sel = document.getElementById("enroll-group");
+    if (!sel) return;
+    const update = () => {
+      document.querySelectorAll("#enroll-form [data-groups]").forEach((el) => {
+        el.style.display =
+          el.dataset.groups.split(" ").includes(sel.value) ? "" : "none";
+      });
+    };
+    sel.addEventListener("change", update);
+    update();
+  })();
+</script>
+{% endblock %}

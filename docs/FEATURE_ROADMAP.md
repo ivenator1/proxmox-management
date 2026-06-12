@@ -119,10 +119,12 @@ Tests: `test_driver.py` wave/abort/soak cases with monkeypatched sleep.
 
 ### L2. Fleet web dashboard: pending updates (PatchMon-style) + run history + run trigger
 
-**Status: 🚧 In progress — `--scan` (pillar 1's data source), the fleet-wide run lock
-(`proxmox_fleet/lock.py`, honored by both CLI entry points for runs and scans), and the
-pending-snapshot readers (`scan.pending_summary()`/`read_pending()`) are done. The FastAPI app
-itself remains, per the approved design below.**
+**Status: ✅ Implemented.** `--scan` (pillar 1's data source), the fleet-wide run lock
+(`proxmox_fleet/lock.py`, honored by both CLI entry points for runs and scans), the
+pending-snapshot readers (`scan.pending_summary()`/`read_pending()`), and the FastAPI app
+(`proxmox_fleet/web/` — `pip install -e '.[web]'`, `fleet-dashboard` entrypoint) are all done,
+per the approved design below. The run trigger launches `python -m proxmox_fleet.cli` as a
+detached subprocess with live output via SSE; runs survive dashboard restarts.
 
 **Approved dashboard design** (decided): `proxmox_fleet/web/` package behind a
 `pip install -e '.[web]'` extra (fastapi + uvicorn; jinja2 already core), console entrypoint
@@ -131,8 +133,8 @@ Read-only pages are open on the LAN; the run-trigger endpoint requires a bearer 
 (`dashboard_token`). Runs launch `python -m proxmox_fleet.cli` as a subprocess (one at a time,
 guarded by the shared run lock; live stdout via SSE; a dashboard restart never kills a
 mid-flight run). Built from scratch — admin templates don't fit a five-page server-rendered
-tool — but styled with vendored classless Pico.css (single MIT-licensed file, offline, no build
-step).
+tool — styled with a custom hand-rolled design system (`static/dashboard.css` +
+`static/dashboard.js`, dark/light themes, offline, no CDN, no build step).
 
 **Gap**: the only visibility is a Discord/ntfy message and raw JSON files; no way to see what is
 *pending* across the fleet, browse past runs, or kick off a run remotely. PatchMon covers the
@@ -181,3 +183,5 @@ from M1 (`--limit` exposed in the trigger UI).
 S1 → S2 → M1 → M2 → L1 → L2. S1's history reader and M1's `--limit` are direct prerequisites for
 L2's dashboard (and within L2, the `--scan` CLI mode lands before the web app); M2 is independent
 and can go any time.
+
+**All roadmap items are now implemented.**
