@@ -372,6 +372,265 @@ def test_console_unknown_run_404(history_dir):
     assert client.get("/runs/nope/log").status_code == 404
 
 
+# --- inventory enrollment + settings + ssh ------------------------------------ #
+
+import subprocess  # noqa: E402
+
+from proxmox_fleet.web import sshsetup  # noqa: E402
+from proxmox_fleet.web.sshsetup import SshSetupError, push_key  # noqa: E402
+from proxmox_fleet.web.sshsetup import test_key as ssh_test_key  # noqa: E402
+
+INI = """\
+[proxmox_nodes]
+pve-01 ansible_host=10.0.0.10
+
+[proxmox_vms]
+
+[remote_hosts]
+
+[custom_hosts]
+"""
+
+VARS = """\
+# hand-written comment that must survive
+lxc_forks: 20
+canary_hosts: []
+"""
+
+
+@pytest.fixture
+def project(tmp_path):
+    """Temp project dir: hosts.ini + vars.yml + seeded history."""
+    (tmp_path / "hosts.ini").write_text(INI)
+    (tmp_path / "vars.yml").write_text(VARS)
+    _seed_history(tmp_path / "history")
+    return tmp_path
+
+
+def _project_client(project, **kw) -> TestClient:
+    settings = GlobalSettings(fleet_history_dir=str(project / "history"),
+                              host_vars_dir=str(project / "host_vars"), **kw)
+    app = create_app(settings, vars_path=str(project / "vars.yml"),
+                     inventory_path=str(project / "hosts.ini"))
+    return TestClient(app)
+
+
+def test_inventory_page_lists_groups(project):
+    resp = _project_client(project).get("/inventory")
+    assert resp.status_code == 200
+    assert "proxmox_nodes" in resp.text
+    assert "pve-01" in resp.text
+    assert "Enroll a host" in resp.text
+
+
+def test_inventory_mutations_require_token(project):
+    client = _project_client(project, dashboard_token="hush")
+    assert client.post("/inventory/add", data={"group": "remote_hosts",
+                                               "name": "x"}).status_code == 401
+    assert client.post("/inventory/remove", data={}).status_code == 401
+    assert client.post("/settings", data={}).status_code == 401
+    assert client.post("/settings/raw", data={}).status_code == 401
+    assert client.post("/ssh/push", data={}).status_code == 401
+
+
+def test_enroll_vm_writes_ini_and_vars(project):
+    client = _project_client(project, dashboard_token="hush")
+    resp = client.post("/inventory/add", data={
+        "token": "hush", "group": "proxmox_vms", "name": "media-vm",
+        "ansible_host": "10.0.0.50", "vmid": "200", "pve_node": "pve-01",
+        "canary": "true", "kuma_id": "7",
+    }, follow_redirects=False)
+    assert resp.status_code == 303
+    ini = (project / "hosts.ini").read_text()
+    assert "media-vm" in ini and "vmid=200" in ini and "canary=true" in ini
+    vars_text = (project / "vars.yml").read_text()
+    assert "# hand-written comment that must survive" in vars_text
+    assert "vm_kuma_map" in vars_text and "'200': '7'" in vars_text.replace('"', "'")
+    # and the page reflects it
+    page = client.get("/inventory").text
+    assert "media-vm" in page and "canary" in page
+
+
+def test_enroll_with_maintenance_window_writes_host_vars(project):
+    client = _project_client(project)
+    resp = client.post("/inventory/add", data={
+        "group": "remote_hosts", "name": "web-01", "ansible_host": "10.0.0.5",
+        "pre_update_cmd": "systemctl stop app",
+        "mw_days": "Sat,Sun", "mw_start": "02:00", "mw_end": "05:00",
+    }, follow_redirects=False)
+    assert resp.status_code == 303
+    import yaml as _yaml
+    hv = _yaml.safe_load((project / "host_vars" / "web-01.yml").read_text())
+    assert hv["pre_update_cmd"] == "systemctl stop app"
+    assert hv["maintenance_window"] == {"days": ["Sat", "Sun"],
+                                        "start": "02:00", "end": "05:00"}
+
+
+def test_enroll_validation_errors_400(project):
+    client = _project_client(project)
+    # custom host without custom_config
+    assert client.post("/inventory/add", data={
+        "group": "custom_hosts", "name": "db-01", "ansible_host": "10.0.0.9",
+    }).status_code == 400
+    # vm without vmid
+    assert client.post("/inventory/add", data={
+        "group": "proxmox_vms", "name": "v", "ansible_host": "10.0.0.9",
+        "pve_node": "pve-01",
+    }).status_code == 400
+    # bad maintenance window key time format is accepted as str, but bad day
+    # set is not validated here — bad host name is:
+    assert client.post("/inventory/add", data={
+        "group": "remote_hosts", "name": "bad name", "ansible_host": "10.0.0.9",
+    }).status_code == 400
+    # duplicate
+    assert client.post("/inventory/add", data={
+        "group": "proxmox_nodes", "name": "pve-01", "ansible_host": "10.0.0.9",
+    }).status_code == 400
+
+
+def test_remove_with_cleanup(project):
+    client = _project_client(project)
+    client.post("/inventory/add", data={
+        "group": "proxmox_vms", "name": "media-vm", "ansible_host": "10.0.0.50",
+        "vmid": "200", "pve_node": "pve-01", "kuma_id": "7",
+        "mw_days": "Sat",
+    }, follow_redirects=False)
+    resp = client.post("/inventory/remove", data={
+        "group": "proxmox_vms", "name": "media-vm", "cleanup": "true",
+    }, follow_redirects=False)
+    assert resp.status_code == 303
+    assert "media-vm" not in (project / "hosts.ini").read_text()
+    import yaml as _yaml
+    data = _yaml.safe_load((project / "vars.yml").read_text())
+    assert data.get("vm_kuma_map", {}) == {}
+    assert not (project / "host_vars" / "media-vm.yml").exists()
+
+
+def test_remove_missing_400(project):
+    assert _project_client(project).post("/inventory/remove", data={
+        "group": "remote_hosts", "name": "ghost"}).status_code == 400
+
+
+def test_inventory_bootstrap_when_missing(project):
+    (project / "hosts.ini").unlink()
+    client = _project_client(project)
+    page = client.get("/inventory").text
+    assert "Create hosts.ini" in page
+    assert client.post("/inventory/create", data={},
+                       follow_redirects=False).status_code == 303
+    assert "[proxmox_vms]" in (project / "hosts.ini").read_text()
+
+
+def test_settings_page_and_diffed_save(project):
+    client = _project_client(project)
+    page = client.get("/settings").text
+    assert "lxc_forks" in page and "dashboard_token" in page
+    resp = client.post("/settings", data={
+        "lxc_forks": "5",            # changed
+        "vm_forks": "2",             # unchanged (default)
+        "lxc_dry_run": "false",      # unchanged
+        "dashboard_token": "",       # secret left blank → keep
+        "canary_hosts": "105\nmedia-vm",
+    }, follow_redirects=False)
+    assert resp.status_code == 303
+    assert "lxc_forks" in resp.headers["location"]
+    assert "vm_forks" not in resp.headers["location"]
+    import yaml as _yaml
+    data = _yaml.safe_load((project / "vars.yml").read_text())
+    assert data["lxc_forks"] == 5
+    assert data["canary_hosts"] == ["105", "media-vm"]
+    assert "vm_forks" not in data            # untouched fields never written
+    assert "dashboard_token" not in data     # blank secret kept
+    text = (project / "vars.yml").read_text()
+    assert "# hand-written comment that must survive" in text
+
+
+def test_settings_invalid_value_400(project):
+    assert _project_client(project).post("/settings", data={
+        "lxc_forks": "banana"}).status_code == 400
+
+
+def test_settings_raw_replace_and_reject(project):
+    client = _project_client(project)
+    assert client.post("/settings/raw", data={
+        "content": "key: [unclosed"}).status_code == 400
+    assert client.post("/settings/raw", data={
+        "content": "lxc_forks: nope"}).status_code == 400
+    resp = client.post("/settings/raw", data={
+        "content": "# replaced\nlxc_forks: 9\n"}, follow_redirects=False)
+    assert resp.status_code == 303
+    assert (project / "vars.yml").read_text() == "# replaced\nlxc_forks: 9\n"
+    backups = list(project.glob("vars.yml.bak-*"))
+    assert backups and "hand-written comment" in backups[-1].read_text()
+
+
+class _FakeRun:
+    def __init__(self, rc=0, out="ok\n"):
+        self.rc, self.out, self.calls = rc, out, []
+
+    def __call__(self, argv, **kw):
+        self.calls.append((argv, kw))
+        return subprocess.CompletedProcess(argv, self.rc, stdout=self.out, stderr="")
+
+
+def test_push_key_password_via_env_never_argv(tmp_path):
+    pub = tmp_path / "id_ed25519.pub"
+    pub.write_text("ssh-ed25519 AAAA fleet-manager\n")
+    fake = _FakeRun()
+    ok, out = push_key("10.0.0.5", "root", "s3cret!", port=2222,
+                       pubkey_path=str(pub), run=fake)
+    assert ok and out == "ok\n"
+    argv, kw = fake.calls[0]
+    assert argv[0] == "ssh-copy-id"
+    assert "root@10.0.0.5" in argv and "2222" in argv
+    assert all("s3cret!" not in a for a in argv)         # never on the cmdline
+    assert kw["env"]["FLEET_SSH_PW"] == "s3cret!"        # only in the env
+    assert kw["env"]["SSH_ASKPASS_REQUIRE"] == "force"
+    assert kw["start_new_session"] is True
+
+
+def test_push_key_validation():
+    with pytest.raises(SshSetupError):
+        push_key("bad host;rm", "root", "pw", run=_FakeRun())
+    with pytest.raises(SshSetupError):
+        push_key("10.0.0.5", "root;x", "pw", run=_FakeRun())
+    with pytest.raises(SshSetupError, match="password"):
+        push_key("10.0.0.5", "root", "", run=_FakeRun())
+    with pytest.raises(SshSetupError, match="port"):
+        push_key("10.0.0.5", "root", "pw", port="99999", run=_FakeRun())
+
+
+def test_test_key_batchmode(tmp_path):
+    fake = _FakeRun(rc=0, out="")
+    ok, out = ssh_test_key("10.0.0.5", "root", key_path=str(tmp_path / "nokey"), run=fake)
+    assert ok and "OK" in out
+    argv, _ = fake.calls[0]
+    assert "BatchMode=yes" in argv and argv[-1] == "true"
+    fake_fail = _FakeRun(rc=255, out="Permission denied")
+    ok, out = ssh_test_key("10.0.0.5", "root", run=fake_fail)
+    assert not ok and "Permission denied" in out
+
+
+def test_ssh_routes_render_result(project, monkeypatch):
+    monkeypatch.setattr(sshsetup, "push_key",
+                        lambda *a, **kw: (True, "key installed"))
+    monkeypatch.setattr(sshsetup, "test_key",
+                        lambda *a, **kw: (False, "Permission denied"))
+    client = _project_client(project)
+    resp = client.post("/ssh/push", data={"host": "10.0.0.5", "user": "root",
+                                          "password": "pw"})
+    assert resp.status_code == 200
+    assert "key installed" in resp.text and "push succeeded" in resp.text
+    resp = client.post("/ssh/test", data={"host": "10.0.0.5"})
+    assert resp.status_code == 200
+    assert "test failed" in resp.text and "Permission denied" in resp.text
+
+
+def test_ssh_push_invalid_host_400(project):
+    assert _project_client(project).post("/ssh/push", data={
+        "host": "bad;host", "password": "pw"}).status_code == 400
+
+
 # --- template helpers (filters + flare) ---------------------------------------- #
 
 def test_ts_human_and_iso():

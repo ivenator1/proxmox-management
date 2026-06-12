@@ -396,6 +396,7 @@ code {
   font-size: 0.9rem;
 }
 .banner.warn { background: var(--warn-dim); border-color: color-mix(in srgb, var(--warn) 40%, transparent); color: var(--fg); }
+.banner.ok-banner { background: var(--ok-dim); border-color: color-mix(in srgb, var(--ok) 40%, transparent); color: var(--fg); }
 .banner .dot {
   width: 0.55rem; height: 0.55rem; border-radius: 50%;
   background: var(--warn); flex: none;
@@ -470,7 +471,7 @@ details.pkg-list .pkg-body {
 
 label { display: block; font-size: 0.875rem; color: var(--fg); }
 
-input[type="text"], input[type="password"] {
+input[type="text"], input[type="password"], input[type="number"], select, textarea {
   width: 100%;
   margin-top: 0.3rem;
   padding: 0.55rem 0.75rem;
@@ -482,15 +483,35 @@ input[type="text"], input[type="password"] {
   border-radius: var(--radius-sm);
   transition: border-color 120ms, box-shadow 120ms;
 }
-input[type="text"]:focus, input[type="password"]:focus {
+input[type="text"]:focus, input[type="password"]:focus, input[type="number"]:focus,
+select:focus, textarea:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-dim);
 }
-input::placeholder { color: var(--fg-faint); }
+input::placeholder, textarea::placeholder { color: var(--fg-faint); }
+textarea { font-family: var(--font-mono); resize: vertical; }
 
 .field { margin-bottom: var(--sp-4); }
 .field .hint { font-size: 0.78rem; color: var(--fg-muted); margin-top: 0.25rem; }
+
+/* settings page */
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  gap: var(--sp-3) var(--sp-4);
+  margin: var(--sp-4) 0;
+}
+.setting-wide { grid-column: 1 / -1; }
+.setting .setting-name {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--fg-strong);
+  margin-bottom: 0.15rem;
+}
 
 /* toggle-switch option rows */
 .option-row {

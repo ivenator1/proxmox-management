@@ -34,6 +34,8 @@
         <a href="/pending" {% if path.startswith("/pending") %}class="active"{% endif %}>Pending</a>
         <a href="/history" {% if path.startswith("/history") %}class="active"{% endif %}>History</a>
         <a href="/trigger" {% if path.startswith("/trigger") or path.startswith("/runs") %}class="active"{% endif %}>Trigger</a>
+        <a href="/inventory" {% if path.startswith("/inventory") or path.startswith("/ssh") %}class="active"{% endif %}>Inventory</a>
+        <a href="/settings" {% if path.startswith("/settings") %}class="active"{% endif %}>Settings</a>
       </nav>
       <div class="nav-actions">
         <span class="kbd-hint" title="Command palette (ctrl+K or /)">⌃K</span>

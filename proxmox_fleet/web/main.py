@@ -42,7 +42,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("WARNING: dashboard_token is empty — the run trigger is unauthenticated")
 
     uvicorn.run(
-        create_app(settings),
+        create_app(settings, vars_path=args.vars_file),
         host=args.host if args.host is not None else settings.dashboard_host,
         port=args.port if args.port is not None else settings.dashboard_port,
     )

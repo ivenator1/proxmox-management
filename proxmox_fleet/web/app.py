@@ -19,16 +19,24 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
+from urllib.parse import quote
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from proxmox_fleet import history as history_mod
+from proxmox_fleet import inventory_edit, vars_edit
 from proxmox_fleet import scan as scan_mod
+from proxmox_fleet.inventory_edit import InventoryEditError
 from proxmox_fleet.lock import probe_lock
+from proxmox_fleet.models.config import MaintenanceWindow
 from proxmox_fleet.models.settings import GlobalSettings
+from proxmox_fleet.vars_edit import VarsEditError
+from proxmox_fleet.web import sshsetup
 from proxmox_fleet.web.runs import RunActive, RunManager
+from proxmox_fleet.web.sshsetup import SshSetupError
 
 _PACKAGE_DIR = Path(__file__).parent
 
@@ -160,6 +168,111 @@ def _activity_weeks(rows: Sequence[Mapping[str, Any]], weeks: int = 17,
     return grid
 
 
+# Settings-page form: fields whose names smell like credentials render as
+# password inputs (blank = keep current). Over-matching (pve_api_token_id)
+# only costs a masked input, never a leak.
+_SECRET_FIELD_RE = re.compile(r"(token|secret|pass|webhook|deadmans)", re.IGNORECASE)
+# Structured editing can't represent these faithfully — raw editor only.
+_RAW_ONLY_FIELDS = {"notifiers"}
+
+
+def settings_form_fields(file_data: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """One row per GlobalSettings field for the /settings form: name, kind
+    (bool/int/float/str/list/map), current value + its text rendering, whether
+    vars.yml sets it explicitly, and the secret flag. Unknown extra keys in
+    vars.yml (extra="allow") are raw-editor-only."""
+    defaults = GlobalSettings()
+    rows: List[Dict[str, Any]] = []
+    for name in GlobalSettings.model_fields:
+        if name in _RAW_ONLY_FIELDS:
+            continue
+        default_val = getattr(defaults, name)
+        if isinstance(default_val, bool):
+            kind = "bool"
+        elif isinstance(default_val, int):
+            kind = "int"
+        elif isinstance(default_val, float):
+            kind = "float"
+        elif isinstance(default_val, list):
+            kind = "list"
+        elif isinstance(default_val, dict):
+            kind = "map"
+        else:
+            kind = "str"
+        value = file_data.get(name, default_val)
+        secret = bool(_SECRET_FIELD_RE.search(name))
+        if kind == "list":
+            text = "\n".join(str(v) for v in (value or []))
+        elif kind == "map":
+            text = "\n".join(f"{k}={v}" for k, v in (value or {}).items())
+        elif kind == "bool":
+            text = "true" if value else "false"
+        else:
+            text = "" if value is None else str(value)
+        rows.append({
+            "name": name, "kind": kind, "value": value,
+            "text": "" if secret else text,
+            "set_in_file": name in file_data, "secret": secret,
+        })
+    return rows
+
+
+def parse_settings_form(form: Mapping[str, Any],
+                        file_data: Mapping[str, Any]) -> Dict[str, Any]:
+    """Diff the submitted /settings form against the file: only fields whose
+    parsed value differs are returned (so an untouched form writes nothing).
+    Blank secret fields mean "keep current". Raises VarsEditError on bad input."""
+    getlist = getattr(form, "getlist", lambda k: [form[k]] if k in form else [])
+    changes: Dict[str, Any] = {}
+    for row in settings_form_fields(file_data):
+        name, kind = row["name"], row["kind"]
+        submitted = getlist(name)
+        if not submitted:
+            continue
+        raw = str(submitted[-1])
+        if row["secret"] and raw == "":
+            continue
+        new: Any
+        try:
+            if kind == "bool":
+                new = raw.strip().lower() in ("true", "1", "yes", "on")
+            elif kind == "int":
+                new = int(raw.strip())
+            elif kind == "float":
+                new = float(raw.strip())
+            elif kind == "list":
+                new = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            elif kind == "map":
+                new = {}
+                for ln in raw.splitlines():
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    if "=" not in ln:
+                        raise ValueError(f"{name}: expected key=value, got {ln!r}")
+                    k, v = ln.split("=", 1)
+                    new[k.strip()] = v.strip()
+            else:
+                new = raw
+        except ValueError as exc:
+            raise VarsEditError(f"invalid value for {name}: {exc}")
+        cur = row["value"]
+        if kind == "list":
+            if [str(v) for v in new] != [str(v) for v in (cur or [])]:
+                changes[name] = new
+        elif kind == "map":
+            if {str(k): str(v) for k, v in new.items()} != \
+                    {str(k): str(v) for k, v in (cur or {}).items()}:
+                changes[name] = new
+        elif kind in ("int", "float", "bool"):
+            if new != cur:
+                changes[name] = new
+        else:
+            if str(new) != ("" if cur is None else str(cur)):
+                changes[name] = new
+    return changes
+
+
 def _truthy(value: Any) -> bool:
     return str(value or "").lower() in ("true", "1", "yes", "on")
 
@@ -264,8 +377,12 @@ def create_app(
     settings: Optional[GlobalSettings] = None,
     *,
     run_manager: Optional[RunManager] = None,
+    vars_path: str = "vars.yml",
+    inventory_path: str = "hosts.ini",
 ) -> FastAPI:
-    """Build the dashboard app. *run_manager* is injectable for tests."""
+    """Build the dashboard app. *run_manager* is injectable for tests;
+    *vars_path*/*inventory_path* are the files the enrollment and settings
+    pages edit (main.py passes its ``--vars-file``)."""
     settings = settings or GlobalSettings.load()
     manager = run_manager or RunManager(settings.fleet_history_dir)
     history_dir = settings.fleet_history_dir
@@ -298,6 +415,8 @@ def create_app(
             {"kind": "page", "label": "Pending updates", "url": "/pending"},
             {"kind": "page", "label": "Run history", "url": "/history"},
             {"kind": "page", "label": "Trigger a run", "url": "/trigger"},
+            {"kind": "page", "label": "Inventory & enrollment", "url": "/inventory"},
+            {"kind": "page", "label": "Settings (vars.yml)", "url": "/settings"},
         ]
         seen: set = set()
 
@@ -400,6 +519,261 @@ def create_app(
             "lock_holder": probe_lock(history_dir),
             "runs": manager.list_runs(),
         })
+
+    # ----- inventory enrollment + settings + ssh setup ----------------- #
+
+    def _require_token(request: Request, form: Mapping[str, Any]) -> None:
+        if not _token_ok(settings, request, form):
+            raise HTTPException(401, "missing or invalid dashboard token")
+
+    def _redirect(url: str, *, ok: str = "", err: str = "") -> RedirectResponse:
+        if ok:
+            url += f"?ok={quote(ok)}"
+        elif err:
+            url += f"?err={quote(err)}"
+        return RedirectResponse(url=url, status_code=303)
+
+    def _inventory_context(request: Request,
+                           ssh_result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Context shared by GET /inventory and the ssh POSTs (which re-render
+        the page with the action's output instead of redirecting)."""
+        exists = Path(inventory_path).exists()
+        live = GlobalSettings.load(vars_path)   # fresh — edits land on the file
+        canary_ids = {str(c) for c in live.canary_hosts}
+        host_vars_dir = Path(settings.host_vars_dir)
+        groups: List[Dict[str, Any]] = []
+        if exists:
+            for group, hosts in inventory_edit.list_hosts(inventory_path).items():
+                rows = []
+                for host in hosts:
+                    name = str(host["name"])
+                    hvars: Dict[str, str] = dict(host["vars"])
+                    vmid = hvars.get("vmid", "")
+                    kuma = ""
+                    if group == "proxmox_vms":
+                        kuma = str(live.vm_kuma_map.get(vmid)
+                                   or live.vm_kuma_map.get(name) or "")
+                    elif group == "remote_hosts":
+                        kuma = str(live.remote_kuma_map.get(name) or "")
+                    rows.append({
+                        "name": name,
+                        "vars": hvars,
+                        "canary": (_truthy(hvars.get("canary"))
+                                   or name in canary_ids or vmid in canary_ids),
+                        "kuma": kuma,
+                        "has_host_vars": (host_vars_dir / f"{name}.yml").is_file(),
+                    })
+                groups.append({"group": group, "hosts": rows})
+        return {
+            "inventory_exists": exists,
+            "inventory_path": inventory_path,
+            "groups": groups,
+            "lxc_lists": {
+                "canary_hosts": live.canary_hosts,
+                "os_only_lxc_list": live.os_only_lxc_list,
+                "exclude_list": live.exclude_list,
+                "app_update_exclude_list": live.app_update_exclude_list,
+                "lxc_kuma_map": live.lxc_kuma_map,
+            },
+            "public_keys": sshsetup.list_public_keys(),
+            "ssh_result": ssh_result,
+            "token_required": bool(settings.dashboard_token),
+            "group_names": inventory_edit.GROUPS,
+            "ok": request.query_params.get("ok", ""),
+            "err": request.query_params.get("err", ""),
+        }
+
+    @app.get("/inventory")
+    def inventory_page(request: Request) -> Any:
+        return templates.TemplateResponse(
+            request, "inventory.html", _inventory_context(request))
+
+    @app.post("/inventory/create")
+    async def inventory_create(request: Request) -> Any:
+        form = await request.form()
+        _require_token(request, form)
+        created = inventory_edit.ensure_inventory(inventory_path)
+        return _redirect("/inventory",
+                         ok="hosts.ini created" if created else "hosts.ini already exists")
+
+    @app.post("/inventory/add")
+    async def inventory_add(request: Request) -> Any:
+        form = await request.form()
+        _require_token(request, form)
+        group = str(form.get("group") or "")
+        name = str(form.get("name") or "").strip()
+        ansible_host = str(form.get("ansible_host") or "").strip()
+        try:
+            if group not in inventory_edit.GROUPS:
+                raise InventoryEditError(f"unknown group {group!r}")
+            inline: Dict[str, str] = {}
+            if ansible_host:
+                inline["ansible_host"] = ansible_host
+            elif group != "proxmox_nodes":   # nodes fall back to their name
+                raise InventoryEditError("ansible_host is required")
+            if group == "proxmox_vms":
+                vmid = str(form.get("vmid") or "").strip()
+                pve_node = str(form.get("pve_node") or "").strip()
+                if not vmid.isdigit():
+                    raise InventoryEditError("vmid is required (digits)")
+                if not pve_node:
+                    raise InventoryEditError("pve_node is required")
+                inline["vmid"], inline["pve_node"] = vmid, pve_node
+            if group == "custom_hosts":
+                custom_config = str(form.get("custom_config") or "").strip()
+                if not custom_config:
+                    raise InventoryEditError("custom_config is required")
+                inline["custom_config"] = custom_config
+            if _truthy(form.get("canary")) and group in ("proxmox_vms", "remote_hosts"):
+                inline["canary"] = "true"
+
+            inventory_edit.ensure_inventory(inventory_path)
+            inventory_edit.add_host(inventory_path, group, name, inline)
+
+            # vars.yml extras: Uptime-Kuma monitor mapping for this host
+            kuma_id = str(form.get("kuma_id") or "").strip()
+            if kuma_id:
+                if not _TOKEN_RE.match(kuma_id):
+                    raise VarsEditError(f"invalid kuma monitor id {kuma_id!r}")
+                if group == "proxmox_vms":
+                    vars_edit.apply_changes(
+                        vars_path, map_set={"vm_kuma_map": {inline["vmid"]: kuma_id}})
+                elif group == "remote_hosts":
+                    vars_edit.apply_changes(
+                        vars_path, map_set={"remote_kuma_map": {name: kuma_id}})
+
+            # host_vars/<name>.yml: pre_update_cmd + maintenance window
+            host_vars: Dict[str, Any] = {}
+            pre_cmd = str(form.get("pre_update_cmd") or "").strip()
+            if pre_cmd and group == "remote_hosts":
+                host_vars["pre_update_cmd"] = pre_cmd
+            mw_fields = {k: str(form.get(f"mw_{k}") or "").strip()
+                         for k in ("days", "start", "end", "tz")}
+            if any(mw_fields.values()) and group != "proxmox_nodes":
+                mw: Dict[str, Any] = {}
+                days = [d.strip() for d in mw_fields["days"].split(",") if d.strip()]
+                if days:
+                    mw["days"] = days
+                for k in ("start", "end", "tz"):
+                    if mw_fields[k]:
+                        mw[k] = mw_fields[k]
+                MaintenanceWindow(**mw)   # fail loud before writing
+                host_vars["maintenance_window"] = mw
+            if host_vars:
+                vars_edit.host_vars_write(settings.host_vars_dir, name, host_vars)
+        except (InventoryEditError, VarsEditError, ValueError) as exc:
+            raise HTTPException(400, str(exc))
+        return _redirect("/inventory", ok=f"enrolled {name} in [{group}]")
+
+    @app.post("/inventory/remove")
+    async def inventory_remove(request: Request) -> Any:
+        form = await request.form()
+        _require_token(request, form)
+        group = str(form.get("group") or "")
+        name = str(form.get("name") or "").strip()
+        cleanup = _truthy(form.get("cleanup"))
+        try:
+            vmid = ""
+            for host in inventory_edit.list_hosts(inventory_path).get(group, []):
+                if host["name"] == name:
+                    vmid = dict(host["vars"]).get("vmid", "")
+                    break
+            inventory_edit.remove_host(inventory_path, group, name)
+            if cleanup:
+                ids = [name] + ([vmid] if vmid else [])
+                vars_edit.apply_changes(
+                    vars_path,
+                    list_remove={key: ids for key in (
+                        "canary_hosts", "os_only_lxc_list", "exclude_list",
+                        "os_update_exclude_list", "app_update_exclude_list",
+                        "snapshot_exclude_list")},
+                    map_remove={key: ids for key in (
+                        "lxc_kuma_map", "vm_kuma_map", "remote_kuma_map")},
+                )
+                vars_edit.host_vars_delete(settings.host_vars_dir, name)
+        except (InventoryEditError, VarsEditError) as exc:
+            raise HTTPException(400, str(exc))
+        suffix = " (vars.yml + host_vars cleaned)" if cleanup else ""
+        return _redirect("/inventory", ok=f"removed {name} from [{group}]{suffix}")
+
+    @app.get("/settings")
+    def settings_page(request: Request) -> Any:
+        file_data = dict(vars_edit.load_data(vars_path))
+        known = set(GlobalSettings.model_fields)
+        return templates.TemplateResponse(request, "settings.html", {
+            "fields": settings_form_fields(file_data),
+            "raw": vars_edit.read_raw(vars_path),
+            "vars_path": vars_path,
+            "extra_keys": sorted(k for k in file_data if k not in known),
+            "token_required": bool(settings.dashboard_token),
+            "ok": request.query_params.get("ok", ""),
+            "err": request.query_params.get("err", ""),
+        })
+
+    @app.post("/settings")
+    async def settings_save(request: Request) -> Any:
+        form = await request.form()
+        _require_token(request, form)
+        file_data = dict(vars_edit.load_data(vars_path))
+        try:
+            changes = parse_settings_form(form, file_data)
+            if changes:
+                vars_edit.apply_changes(vars_path, set_keys=changes)
+        except VarsEditError as exc:
+            raise HTTPException(400, str(exc))
+        msg = (f"updated {len(changes)} setting(s): " + ", ".join(sorted(changes))
+               if changes else "no changes")
+        return _redirect("/settings", ok=msg)
+
+    @app.post("/settings/raw")
+    async def settings_save_raw(request: Request) -> Any:
+        form = await request.form()
+        _require_token(request, form)
+        try:
+            vars_edit.replace_raw(vars_path, str(form.get("content") or ""))
+        except VarsEditError as exc:
+            raise HTTPException(400, str(exc))
+        return _redirect("/settings", ok=f"{vars_path} replaced (backup written)")
+
+    @app.post("/ssh/generate")
+    async def ssh_generate(request: Request) -> Any:
+        form = await request.form()
+        _require_token(request, form)
+        try:
+            ok, output = sshsetup.generate_key()
+        except SshSetupError as exc:
+            raise HTTPException(400, str(exc))
+        return templates.TemplateResponse(request, "inventory.html", _inventory_context(
+            request, ssh_result={"action": "generate", "ok": ok, "output": output}))
+
+    @app.post("/ssh/push")
+    async def ssh_push(request: Request) -> Any:
+        form = await request.form()
+        _require_token(request, form)
+        try:
+            ok, output = sshsetup.push_key(
+                str(form.get("host") or ""), str(form.get("user") or "root"),
+                str(form.get("password") or ""), port=form.get("port") or 22,
+                pubkey_path=str(form.get("pubkey") or sshsetup.DEFAULT_KEY + ".pub"),
+            )
+        except SshSetupError as exc:
+            raise HTTPException(400, str(exc))
+        return templates.TemplateResponse(request, "inventory.html", _inventory_context(
+            request, ssh_result={"action": "push", "ok": ok, "output": output}))
+
+    @app.post("/ssh/test")
+    async def ssh_test(request: Request) -> Any:
+        form = await request.form()
+        _require_token(request, form)
+        try:
+            ok, output = sshsetup.test_key(
+                str(form.get("host") or ""), str(form.get("user") or "root"),
+                port=form.get("port") or 22,
+            )
+        except SshSetupError as exc:
+            raise HTTPException(400, str(exc))
+        return templates.TemplateResponse(request, "inventory.html", _inventory_context(
+            request, ssh_result={"action": "test", "ok": ok, "output": output}))
 
     @app.post("/runs")
     async def start_run(request: Request) -> Any:
