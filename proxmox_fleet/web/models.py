@@ -1,8 +1,7 @@
 """SQLAlchemy user model for FastAPI-Users authentication."""
 from __future__ import annotations
 
-from fastapi_users_db_sqlalchemy import SQLAlchemyBaseUserTable
-from sqlalchemy import Column, String
+from fastapi_users.db import SQLAlchemyBaseUserTable
 from sqlalchemy.orm import DeclarativeBase
 
 
