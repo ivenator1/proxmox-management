@@ -99,7 +99,7 @@ proxmox_fleet/
   cli.py                   # fleet-update CLI: parses flags, calls driver.run_fleet()
   web/                     # fleet-dashboard ('.[web]' extra): app.py (FastAPI pages + SSE), runs.py
                            # (RunManager: detached CLI subprocess + log tail), main.py (entrypoint),
-                           # templates/*.html + static/ (vendored classless Pico.css)
+                           # templates/*.html + static/ (custom dashboard.css design system + dashboard.js)
 config_templates/custom_system.yml.example   # full commented schema → copy to configs/<name>.yml
 configs/                   # real configs/*.yml gitignored; commit *.yml.example only
 ansible/primitives/        # thin single-purpose playbooks: run_shell, reboot_host, discover_lxcs,

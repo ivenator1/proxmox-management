@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}Settings — Fleet Dashboard{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Settings</h1>
+  <span class="sub">edits <code>{{ vars_path }}</code> — comments preserved, backup before every write</span>
+</div>
+
+{% if ok %}<div class="banner ok-banner"><span>✓ {{ ok }}</span></div>{% endif %}
+{% if err %}<div class="banner warn"><span>{{ err }}</span></div>{% endif %}
+
+<form method="post" action="/settings" class="card">
+  <p class="muted" style="font-size: 0.8rem;">
+    Every <code>GlobalSettings</code> field. Only changed fields are written.
+    Secret fields show blank — leave blank to keep the current value.
+    Lists: one entry per line. Maps: <code>key=value</code> per line.
+  </p>
+  <div class="settings-grid">
+  {% for field in fields %}
+    <div class="setting {% if field.kind in ('list', 'map') %}setting-wide{% endif %}">
+      <label>
+        <span class="setting-name">{{ field.name }}
+          {% if field.set_in_file %}<span class="pill info" style="font-size: 0.62rem; padding: 0.05em 0.5em;">set</span>
+          {% else %}<span class="pill muted" style="font-size: 0.62rem; padding: 0.05em 0.5em;">default</span>{% endif %}
+        </span>
+        {% if field.kind == "bool" %}
+        <select name="{{ field.name }}">
+          <option value="true" {% if field.value %}selected{% endif %}>true</option>
+          <option value="false" {% if not field.value %}selected{% endif %}>false</option>
+        </select>
+        {% elif field.kind in ("list", "map") %}
+        <textarea name="{{ field.name }}" rows="{{ [2, (field.text.splitlines() | length) + 1] | max }}"
+                  spellcheck="false">{{ field.text }}</textarea>
+        {% elif field.secret %}
+        <input type="password" name="{{ field.name }}" value=""
+               placeholder="{% if field.set_in_file %}(unchanged){% else %}(not set){% endif %}" autocomplete="off">
+        {% elif field.kind in ("int", "float") %}
+        <input type="number" name="{{ field.name }}" value="{{ field.text }}" step="any">
+        {% else %}
+        <input type="text" name="{{ field.name }}" value="{{ field.text }}">
+        {% endif %}
+      </label>
+    </div>
+  {% endfor %}
+  </div>
+  {% if extra_keys %}
+  <p class="muted" style="font-size: 0.78rem;">
+    Extra keys in {{ vars_path }} (editable in the raw editor below):
+    {% for key in extra_keys %}<code>{{ key }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+    {% if "notifiers" not in extra_keys %} — <code>notifiers</code> is also raw-editor-only.{% endif %}
+  </p>
+  {% else %}
+  <p class="muted" style="font-size: 0.78rem;"><code>notifiers</code> is raw-editor-only (nested structure).</p>
+  {% endif %}
+  {% if token_required %}
+  <div class="field"><label>Dashboard token <input type="password" name="token" required style="max-width: 20rem;"></label></div>
+  {% endif %}
+  <button class="btn-primary" type="submit">Save changed settings</button>
+</form>
+
+<details class="card" style="margin-top: var(--sp-4);">
+  <summary style="cursor: pointer; font-weight: 600; color: var(--warn);">Raw editor — full {{ vars_path }} (danger zone)</summary>
+  <form method="post" action="/settings/raw" style="margin-top: var(--sp-3);">
+    <textarea name="content" rows="24" spellcheck="false"
+              style="width: 100%; font-family: var(--font-mono); font-size: 0.78rem; background: var(--bg-inset); color: var(--fg); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: var(--sp-3);">{{ raw }}</textarea>
+    <p class="muted" style="font-size: 0.78rem;">Validated against the settings schema before
+      writing; a timestamped backup of the old file is kept (last 10).</p>
+    {% if token_required %}
+    <div class="field"><label>Dashboard token <input type="password" name="token" required style="max-width: 20rem;"></label></div>
+    {% endif %}
+    <button class="btn-primary" type="submit">Replace file</button>
+  </form>
+</details>
+{% endblock %}

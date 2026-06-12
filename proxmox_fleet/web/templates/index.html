@@ -1,48 +1,142 @@
 {% extends "base.html" %}
 {% block title %}Overview — Fleet Dashboard{% endblock %}
 {% block content %}
-<h1>Overview</h1>
 
 {% if lock_holder is not none %}
-  <p class="warn">A fleet run is in flight (pid {{ lock_holder.get('pid', '?') }},
-     started {{ lock_holder.get('started', '?') }}).
-     {% if active_run %}<a href="/runs/{{ active_run }}">Watch live output</a>{% endif %}</p>
+<div class="banner warn" data-autorefresh>
+  <span class="dot" aria-hidden="true"></span>
+  <span>A fleet run is in flight (pid {{ lock_holder.get('pid', '?') }},
+    started {{ lock_holder.get('started', '?') }}).
+    {% if active_run %}<a href="/runs/{{ active_run }}">Watch live output →</a>{% endif %}</span>
+</div>
 {% elif active_run %}
-  <p class="warn">Dashboard run {{ active_run }} is in flight —
-     <a href="/runs/{{ active_run }}">watch live output</a>.</p>
+<div class="banner warn" data-autorefresh>
+  <span class="dot" aria-hidden="true"></span>
+  <span>Dashboard run {{ active_run }} is in flight —
+    <a href="/runs/{{ active_run }}">watch live output →</a></span>
+</div>
 {% endif %}
 
-<h2>Latest run</h2>
+<div class="page-head">
+  <h1>Overview</h1>
+  {% if latest_run %}
+  <span class="sub">last run <span class="mono">{{ latest_run.timestamp | ts_human }}</span>
+    {% if latest_run.timestamp | ts_iso %}· <span data-ts="{{ latest_run.timestamp | ts_iso }}"></span>{% endif %}
+  </span>
+  {% endif %}
+</div>
+
 {% if latest_run %}
-  <p>
-    <code>{{ latest_run.timestamp }}</code> —
-    {% if latest_run.failed %}<span class="fail">FAILED</span>
-    {% elif latest_run.changed %}<span class="ok">changed</span>
-    {% else %}<span class="muted">clean</span>{% endif %}
-    — <a href="/history/{{ latest_run.timestamp }}">details</a>
-  </p>
-  <table>
-    <thead><tr>{% for key in count_keys %}<th>{{ key }}</th>{% endfor %}</tr></thead>
-    <tbody><tr>
-      {% for key in count_keys %}<td>{{ (latest_run.counts or {}).get(key, 0) }}</td>{% endfor %}
-    </tr></tbody>
-  </table>
+<div class="grid cols-2">
+  <div class="card">
+    <div class="card-head">
+      <h2>Latest run</h2>
+      {% if latest_run.failed %}<span class="pill fail big">FAILED</span>
+      {% elif latest_run.changed %}<span class="pill info big">Changed</span>
+      {% else %}<span class="pill ok big">Clean</span>{% endif %}
+    </div>
+    <p class="muted" style="font-size: 0.85rem;">
+      <a href="/history/{{ latest_run.timestamp }}">{{ latest_run.timestamp | ts_human }}</a>
+      — full record, briefing and per-host results.
+    </p>
+    <div class="stat-grid">
+      {% for key in count_keys %}
+      {% set n = (latest_run.counts or {}).get(key, 0) %}
+      <div class="stat {% if not n %}zero{% endif %} {% if key == 'errors' and n %}tint-fail{% elif key == 'warnings' and n %}tint-warn{% endif %}">
+        <span class="label">{{ key }}</span>
+        <span class="value">{{ n }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Fleet health</h2></div>
+    <div class="gauge-wrap">
+      {% set ring = (health / 100 * 264) | round(1) %}
+      {% set tone = "ok" if health >= 80 else ("warn" if health >= 50 else "fail") %}
+      <svg class="gauge" width="110" height="110" viewBox="0 0 100 100" role="img"
+           aria-label="Fleet health {{ health }} out of 100">
+        <circle class="track" cx="50" cy="50" r="42" fill="none" stroke-width="9"/>
+        <circle class="arc" cx="50" cy="50" r="42" fill="none" stroke-width="9"
+                stroke="var(--{{ tone }})" stroke-linecap="round"
+                stroke-dasharray="{{ ring }} 264" stroke-dashoffset="0"
+                transform="rotate(-90 50 50)"/>
+        <text x="50" y="54" text-anchor="middle" font-size="24">{{ health }}<tspan class="unit">/100</tspan></text>
+      </svg>
+      <div>
+        <p class="muted" style="font-size: 0.82rem; margin: 0;">
+          Scored from the latest run and pending scan: failures, errors,
+          warnings and outdated apps all pull it down.
+        </p>
+        {% if recent %}
+        <div class="pulse-strip" style="margin-top: 0.75rem;" aria-label="Recent runs">
+          {% for row in recent %}
+          <a href="/history/{{ row.timestamp }}"
+             class="{% if row.failed %}fail{% elif row.changed %}info{% else %}ok{% endif %}"
+             title="{{ row.timestamp | ts_human }} — {% if row.failed %}failed{% elif row.changed %}changed{% else %}clean{% endif %}"></a>
+          {% endfor %}
+        </div>
+        <p class="muted" style="font-size: 0.72rem; margin: 0.3rem 0 0;">last {{ recent | length }} runs, oldest → newest</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+{% if recent | length > 1 %}
+<div class="card" style="margin-top: var(--sp-4);">
+  <div class="card-head">
+    <h2>Error trend</h2>
+    <span class="muted" style="font-size: 0.78rem;">errors per run, oldest → newest</span>
+  </div>
+  <svg class="spark fail" width="100%" height="44" viewBox="0 0 400 44" preserveAspectRatio="none" role="img" aria-label="Errors per run trend">
+    <polyline points="{{ recent | map(attribute='counts.errors', default=0) | list | spark_points(400, 44) }}"/>
+  </svg>
+</div>
+{% endif %}
+
 {% else %}
-  <p class="muted">No run history yet — run <code>fleet-update</code> or use the
+<div class="empty">
+  <span class="glyph" aria-hidden="true">⟡</span>
+  <p>No run history yet — run <code>fleet-update</code> or use the
   <a href="/trigger">trigger</a>.</p>
+</div>
 {% endif %}
 
 <h2>Latest pending scan</h2>
 {% if pending_row %}
-  <p>
-    <code>{{ pending_row.timestamp }}</code> —
-    {{ pending_row.hosts_pending }} host OS package(s),
-    {{ pending_row.lxc_os_pending }} LXC OS package(s),
-    {{ pending_row.outdated_apps }} outdated app(s)
-    {% if pending_row.errors %}<span class="fail">, {{ pending_row.errors }} error(s)</span>{% endif %}
-    — <a href="/pending">details</a>
-  </p>
+<div class="card">
+  <div class="card-head">
+    <span class="muted" style="font-size: 0.85rem;">
+      <a href="/pending?ref={{ pending_row.timestamp }}">{{ pending_row.timestamp | ts_human }}</a>
+    </span>
+    <a class="btn btn-sm" href="/pending">details →</a>
+  </div>
+  <div class="stat-grid">
+    <div class="stat {% if not pending_row.hosts_pending %}zero{% endif %}">
+      <span class="label">host OS pkgs</span>
+      <span class="value">{{ pending_row.hosts_pending }}</span>
+    </div>
+    <div class="stat {% if not pending_row.lxc_os_pending %}zero{% endif %}">
+      <span class="label">LXC OS pkgs</span>
+      <span class="value">{{ pending_row.lxc_os_pending }}</span>
+    </div>
+    <div class="stat {% if not pending_row.outdated_apps %}zero{% endif %} {% if pending_row.outdated_apps %}tint-warn{% endif %}">
+      <span class="label">outdated apps</span>
+      <span class="value">{{ pending_row.outdated_apps }}</span>
+    </div>
+    <div class="stat {% if not pending_row.errors %}zero{% endif %} {% if pending_row.errors %}tint-fail{% endif %}">
+      <span class="label">scan errors</span>
+      <span class="value">{{ pending_row.errors }}</span>
+    </div>
+  </div>
+</div>
 {% else %}
-  <p class="muted">No pending scan yet — run <code>fleet-update --scan</code> or trigger one.</p>
+<div class="empty">
+  <span class="glyph" aria-hidden="true">⌁</span>
+  <p>No pending scan yet — run <code>fleet-update --scan</code> or
+  <a href="/trigger">trigger one</a>.</p>
+</div>
 {% endif %}
 {% endblock %}

@@ -133,8 +133,8 @@ Read-only pages are open on the LAN; the run-trigger endpoint requires a bearer 
 (`dashboard_token`). Runs launch `python -m proxmox_fleet.cli` as a subprocess (one at a time,
 guarded by the shared run lock; live stdout via SSE; a dashboard restart never kills a
 mid-flight run). Built from scratch — admin templates don't fit a five-page server-rendered
-tool — but styled with vendored classless Pico.css (single MIT-licensed file, offline, no build
-step).
+tool — styled with a custom hand-rolled design system (`static/dashboard.css` +
+`static/dashboard.js`, dark/light themes, offline, no CDN, no build step).
 
 **Gap**: the only visibility is a Discord/ntfy message and raw JSON files; no way to see what is
 *pending* across the fleet, browse past runs, or kick off a run remotely. PatchMon covers the
