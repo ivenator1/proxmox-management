@@ -7,3 +7,5 @@ httpx>=0.27
 uvicorn>=0.23
 python-multipart>=0.0.7
 ruamel.yaml>=0.18
+fastapi-users[sqlalchemy]>=14
+aiosqlite>=0.19
