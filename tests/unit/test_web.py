@@ -23,6 +23,7 @@ from proxmox_fleet.history import write_history  # noqa: E402
 from proxmox_fleet.lock import acquire_run_lock  # noqa: E402
 from proxmox_fleet.models.settings import GlobalSettings  # noqa: E402
 from proxmox_fleet.models.state import FleetState  # noqa: E402
+from proxmox_fleet.web import auth  # noqa: E402
 from proxmox_fleet.web.app import (  # noqa: E402
     _activity_weeks,
     _health_score,
@@ -33,6 +34,21 @@ from proxmox_fleet.web.app import (  # noqa: E402
     ts_iso,
 )
 from proxmox_fleet.web.runs import RunActive, RunManager  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def fresh_auth_state():
+    """auth holds module-level engine/secret state — isolate per test."""
+    auth.reset_for_tests()
+    yield
+    auth.reset_for_tests()
+
+
+def _logged_in(app):
+    """Bypass the session check — these tests cover the pages, not the login
+    flow (test_web_auth.py exercises the real cookie auth)."""
+    app.dependency_overrides[auth.current_active_user] = lambda: None
+    return app
 
 
 # --- fixtures --------------------------------------------------------------- #
@@ -80,8 +96,10 @@ def _settings(history_dir, **kw) -> GlobalSettings:
     return GlobalSettings(fleet_history_dir=str(history_dir), **kw)
 
 
-def _client(history_dir, *, run_manager=None, **kw) -> TestClient:
+def _client(history_dir, *, run_manager=None, login=True, **kw) -> TestClient:
     app = create_app(_settings(history_dir, **kw), run_manager=run_manager)
+    if login:
+        _logged_in(app)
     return TestClient(app)
 
 
@@ -222,36 +240,28 @@ class FakeManager:
                 "pid": 0, "finished": run_id, "rc": 0}
 
 
-def test_trigger_requires_token_when_configured(history_dir):
-    client = _client(history_dir, run_manager=FakeManager(), dashboard_token="sekrit")
-    assert client.post("/runs", data={}).status_code == 401
-    assert client.post("/runs", data={"token": "wrong"}).status_code == 401
-
-
-def test_trigger_accepts_bearer_header(history_dir):
+def test_trigger_requires_login(history_dir):
     fake = FakeManager()
-    client = _client(history_dir, run_manager=fake, dashboard_token="sekrit")
-    resp = client.post("/runs", data={"dry_run": "on"},
-                       headers={"Authorization": "Bearer sekrit"},
-                       follow_redirects=False)
+    client = _client(history_dir, run_manager=fake, login=False)
+    assert client.post("/runs", data={}).status_code == 401
+    assert fake.started == []
+
+
+def test_trigger_starts_run_when_logged_in(history_dir):
+    fake = FakeManager()
+    client = _client(history_dir, run_manager=fake)
+    resp = client.post("/runs", data={"dry_run": "on"}, follow_redirects=False)
     assert resp.status_code == 303
     assert resp.headers["location"] == "/runs/RUNID"
     assert fake.started == [["--check"]]
 
 
-def test_trigger_accepts_form_token(history_dir):
-    fake = FakeManager()
-    client = _client(history_dir, run_manager=fake, dashboard_token="sekrit")
-    resp = client.post("/runs", data={"token": "sekrit", "scan": "on"},
-                       follow_redirects=False)
-    assert resp.status_code == 303
-    assert fake.started == [["--scan"]]
-
-
-def test_trigger_open_when_no_token_configured(history_dir):
+def test_trigger_scan_when_logged_in(history_dir):
     fake = FakeManager()
     client = _client(history_dir, run_manager=fake)
-    assert client.post("/runs", data={}, follow_redirects=False).status_code == 303
+    resp = client.post("/runs", data={"scan": "on"}, follow_redirects=False)
+    assert resp.status_code == 303
+    assert fake.started == [["--scan"]]
 
 
 def test_trigger_invalid_args_400(history_dir):
@@ -407,11 +417,13 @@ def project(tmp_path):
     return tmp_path
 
 
-def _project_client(project, **kw) -> TestClient:
+def _project_client(project, *, login=True, **kw) -> TestClient:
     settings = GlobalSettings(fleet_history_dir=str(project / "history"),
                               host_vars_dir=str(project / "host_vars"), **kw)
     app = create_app(settings, vars_path=str(project / "vars.yml"),
                      inventory_path=str(project / "hosts.ini"))
+    if login:
+        _logged_in(app)
     return TestClient(app)
 
 
@@ -423,8 +435,8 @@ def test_inventory_page_lists_groups(project):
     assert "Enroll a host" in resp.text
 
 
-def test_inventory_mutations_require_token(project):
-    client = _project_client(project, dashboard_token="hush")
+def test_inventory_mutations_require_login(project):
+    client = _project_client(project, login=False)
     assert client.post("/inventory/add", data={"group": "remote_hosts",
                                                "name": "x"}).status_code == 401
     assert client.post("/inventory/remove", data={}).status_code == 401
@@ -434,9 +446,9 @@ def test_inventory_mutations_require_token(project):
 
 
 def test_enroll_vm_writes_ini_and_vars(project):
-    client = _project_client(project, dashboard_token="hush")
+    client = _project_client(project)
     resp = client.post("/inventory/add", data={
-        "token": "hush", "group": "proxmox_vms", "name": "media-vm",
+        "group": "proxmox_vms", "name": "media-vm",
         "ansible_host": "10.0.0.50", "vmid": "200", "pve_node": "pve-01",
         "canary": "true", "kuma_id": "7",
     }, follow_redirects=False)

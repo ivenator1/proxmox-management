@@ -135,7 +135,7 @@ async def create_admin_user(db_path: Union[str, Path], password: str) -> Any:
     await create_db_and_tables()
     assert _session_maker is not None
     async with _session_maker() as session:
-        user_db = SQLAlchemyUserDatabase(session, User)
+        user_db: SQLAlchemyUserDatabase[User, int] = SQLAlchemyUserDatabase(session, User)
         manager = UserManager(user_db)
         try:
             return await manager.get_by_email(ADMIN_EMAIL)

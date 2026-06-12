@@ -596,7 +596,6 @@ def create_app(
 
     @app.post("/inventory/create")
     async def inventory_create(request: Request, _: User = Depends(current_active_user)) -> Any:
-        form = await request.form()
         created = inventory_edit.ensure_inventory(inventory_path)
         return _redirect("/inventory",
                          ok="hosts.ini created" if created else "hosts.ini already exists")
@@ -737,7 +736,6 @@ def create_app(
 
     @app.post("/ssh/generate")
     async def ssh_generate(request: Request, _: User = Depends(current_active_user)) -> Any:
-        form = await request.form()
         try:
             ok, output = sshsetup.generate_key()
         except SshSetupError as exc:
