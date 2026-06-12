@@ -63,6 +63,8 @@ Activate the venv at the start of each session: `source .venv/bin/activate`
 
 ```
 fleet-update.py            # wrapper: --dry-run/--force-notify/--verbose/--force-window/-e K=V; bootstraps .venv
+install.sh                 # root installer: venv + deps + systemd units (fleet-dashboard.service,
+                           # fleet-scan.timer every 6h); --update / --uninstall
 ansible.cfg                # forks=20, pipelining=true, inventory=./hosts.ini
 vars.yml / hosts.ini       # secrets + inventory (gitignored; copy from *.example)
 .github/workflows/ci.yml   # lint, unit tests (3.10-3.12), mypy, ruff, bandit, molecule matrices

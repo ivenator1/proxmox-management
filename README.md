@@ -144,6 +144,27 @@ All previously-hardcoded timeouts and retry counts are overridable per environme
 ## 🚀 Setup Instructions
 To set up this project from scratch on a brand-new Manager LXC, follow these steps in order. This ensures all dependencies are met and SSH trust between your Manager and your Proxmox nodes is established correctly.
 
+### ⚡ Quick Install (install.sh)
+On a fresh Manager LXC, `install.sh` automates steps 2 and 6 below and wires everything into
+systemd — it creates the `.venv`, installs the package (with the web-dashboard extras),
+ansible-core and the Ansible collections, seeds `vars.yml`/`hosts.ini` from the `.example`
+templates if missing, and installs + enables two units that persist across reboots:
+`fleet-dashboard.service` (the web UI on port 8421) and `fleet-scan.timer`
+(`fleet-update --scan` every 6 hours).
+
+```bash
+git clone https://github.com/ivenator1/proxmox-management.git
+cd proxmox-management
+./install.sh                  # as root
+
+./install.sh --update         # later: git pull + reinstall deps + restart services
+./install.sh --uninstall      # remove units + venv (keeps vars.yml/hosts.ini; asks about history)
+```
+
+You still need steps 1 (create the LXC), 3 (SSH trust), and 5 (edit `hosts.ini`/`vars.yml`)
+— the installer reminds you at the end. The manual steps below remain valid if you prefer
+to set things up by hand.
+
 ### 1. Create the Manager LXC
 * **OS:** Debian 12+ (recommended) or Ubuntu 22.04/24.04.
 * **Resources:** 1 CPU, 1 GB RAM, 8 GB Disk.
