@@ -2,17 +2,18 @@
 from __future__ import annotations
 
 from fastapi_users.db import SQLAlchemyBaseUserTable
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy import Integer
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
     """SQLAlchemy declarative base."""
-    pass
 
 
 class User(SQLAlchemyBaseUserTable[int], Base):
-    """User model for FastAPI-Users with SQLAlchemy.
+    """Dashboard user (single ``admin@fleet.lan`` account, password set at
+    install time). ``SQLAlchemyBaseUserTable`` provides email/hashed_password/
+    is_active/is_superuser/is_verified; the integer PK is declared here (only
+    the UUID variant ships one)."""
 
-    Single admin user (email='admin@localhost', password set at install time).
-    """
-    pass
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

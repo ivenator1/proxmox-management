@@ -20,12 +20,10 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
-from fastapi_users.db import SQLAlchemyUserDatabase
 
 from proxmox_fleet import history as history_mod
 from proxmox_fleet import inventory_edit, vars_edit
@@ -35,8 +33,8 @@ from proxmox_fleet.lock import probe_lock
 from proxmox_fleet.models.config import MaintenanceWindow
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.vars_edit import VarsEditError
-from proxmox_fleet.web import sshsetup
-from proxmox_fleet.web.auth import current_active_user, fastapi_users, get_user_db, get_user_manager
+from proxmox_fleet.web import auth, sshsetup
+from proxmox_fleet.web.auth import auth_backend, current_active_user, fastapi_users
 from proxmox_fleet.web.models import User
 from proxmox_fleet.web.runs import RunActive, RunManager
 from proxmox_fleet.web.sshsetup import SshSetupError
@@ -377,36 +375,18 @@ def create_app(
     manager = run_manager or RunManager(settings.fleet_history_dir)
     history_dir = settings.fleet_history_dir
 
-    # Database setup for FastAPI-Users authentication
-    db_path = Path(history_dir) / ".fleet-users.db"
-    db_url = f"sqlite+aiosqlite:///{db_path}"
-    engine = create_async_engine(db_url, echo=False)
-    async_session_maker = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)  # type: ignore
+    # Configure FastAPI-Users authentication
+    auth.configure(Path(history_dir) / ".fleet-users.db")
 
-    async def get_async_session() -> AsyncSession:  # type: ignore
-        """Dependency for async database session."""
-        async with async_session_maker() as session:
-            yield session
-
-    app = FastAPI(title="Fleet Dashboard", docs_url=None, redoc_url=None)
+    app = FastAPI(title="Fleet Dashboard", docs_url=None, redoc_url=None,
+                  on_startup=[auth.create_db_and_tables])
 
     # Mount FastAPI-Users routers for authentication
     app.include_router(
-        fastapi_users.get_auth_router("session"),
+        fastapi_users.get_auth_router(auth_backend),
         prefix="/auth",
         tags=["auth"],
     )
-    app.include_router(
-        fastapi_users.get_verify_router("http://localhost:8421"),  # unused but required
-        prefix="/auth",
-        tags=["auth"],
-    )
-
-    # Override the get_user_db dependency
-    async def get_user_db_override(session: AsyncSession = Depends(get_async_session)):  # type: ignore
-        yield SQLAlchemyUserDatabase(session, User)
-
-    app.dependency_overrides[get_user_db] = get_user_db_override  # type: ignore
 
     app.mount("/static", StaticFiles(directory=str(_PACKAGE_DIR / "static")), name="static")
     templates = Jinja2Templates(directory=str(_PACKAGE_DIR / "templates"))
@@ -414,12 +394,12 @@ def create_app(
     templates.env.filters["ts_iso"] = ts_iso
     templates.env.filters["spark_points"] = spark_points
 
-    # Exception handler: redirect 403 (unauthenticated) to login for HTML requests
+    # Exception handler: redirect 401 (unauthenticated) to login for HTML requests
     @app.exception_handler(HTTPException)
-    async def http_exception_handler(request: Request, exc: HTTPException):  # type: ignore
-        if exc.status_code == 403 and "text/html" in request.headers.get("accept", ""):
-            return RedirectResponse(url="/auth/login", status_code=303)
-        raise exc
+    async def http_exception_handler_override(request: Request, exc: HTTPException):  # type: ignore
+        if exc.status_code == 401 and "text/html" in request.headers.get("accept", ""):
+            return RedirectResponse(url="/login", status_code=303)
+        return await http_exception_handler(request, exc)
 
     def _read_run_or_none(ref: str) -> Optional[Dict[str, Any]]:
         try:
@@ -472,6 +452,11 @@ def create_app(
 
     templates.env.globals["palette_items"] = _palette_items
 
+    @app.get("/login")
+    def login_page(request: Request) -> Any:
+        """Login form (FastAPI-Users will handle the actual /auth/login POST)."""
+        return templates.TemplateResponse(request, "login.html", {})
+
     @app.get("/")
     def index(request: Request, _: User = Depends(current_active_user)) -> Any:
         latest_run = _read_run_or_none("latest")
@@ -517,7 +502,7 @@ def create_app(
         })
 
     @app.get("/history/{ref}")
-    def history_show(request: Request, ref: str) -> Any:
+    def history_show(request: Request, ref: str, _: User = Depends(current_active_user)) -> Any:
         run = _read_run_or_none(ref)
         if run is None:
             raise HTTPException(404, f"no history record {ref!r}")
@@ -605,19 +590,18 @@ def create_app(
         }
 
     @app.get("/inventory")
-    def inventory_page(request: Request) -> Any:
+    def inventory_page(request: Request, _: User = Depends(current_active_user)) -> Any:
         return templates.TemplateResponse(
             request, "inventory.html", _inventory_context(request))
 
     @app.post("/inventory/create")
-    async def inventory_create(request: Request) -> Any:
-        form = await request.form()
+    async def inventory_create(request: Request, _: User = Depends(current_active_user)) -> Any:
         created = inventory_edit.ensure_inventory(inventory_path)
         return _redirect("/inventory",
                          ok="hosts.ini created" if created else "hosts.ini already exists")
 
     @app.post("/inventory/add")
-    async def inventory_add(request: Request) -> Any:
+    async def inventory_add(request: Request, _: User = Depends(current_active_user)) -> Any:
         form = await request.form()
         group = str(form.get("group") or "")
         name = str(form.get("name") or "").strip()
@@ -685,7 +669,7 @@ def create_app(
         return _redirect("/inventory", ok=f"enrolled {name} in [{group}]")
 
     @app.post("/inventory/remove")
-    async def inventory_remove(request: Request) -> Any:
+    async def inventory_remove(request: Request, _: User = Depends(current_active_user)) -> Any:
         form = await request.form()
         group = str(form.get("group") or "")
         name = str(form.get("name") or "").strip()
@@ -752,7 +736,6 @@ def create_app(
 
     @app.post("/ssh/generate")
     async def ssh_generate(request: Request, _: User = Depends(current_active_user)) -> Any:
-        form = await request.form()
         try:
             ok, output = sshsetup.generate_key()
         except SshSetupError as exc:
@@ -790,8 +773,6 @@ def create_app(
     @app.post("/runs")
     async def start_run(request: Request, _: User = Depends(current_active_user)) -> Any:
         form = await request.form()
-        if not _token_ok(settings, request, form):
-            raise HTTPException(401, "missing or invalid dashboard token")
         try:
             args = build_run_args(form)
         except ValueError as exc:

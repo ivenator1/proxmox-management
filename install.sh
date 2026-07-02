@@ -174,7 +174,7 @@ Install complete.
   Both units are enabled and persist across reboots.
 
 Next steps:
-  1. Access the dashboard at http://${host_ip:-<this-host>}:${port:-8421} (admin@localhost, password set during install)
+  1. Access the dashboard at http://${host_ip:-<this-host>}:${port:-8421} (admin@fleet.lan, password set during install)
   2. From the "Inventory & enrollment" page in the dashboard, add hosts and set up SSH keys
   3. Or: Edit $REPO_DIR/hosts.ini manually and set up SSH trust per the README
 

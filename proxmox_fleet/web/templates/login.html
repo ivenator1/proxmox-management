@@ -96,14 +96,12 @@
         <h1>Fleet Dashboard</h1>
         <p class="subtitle">Proxmox Cluster Orchestrator</p>
 
-        {% if error %}
-            <div class="error">{{ error }}</div>
-        {% endif %}
+        <div class="error" id="error" hidden>Invalid credentials</div>
 
-        <form method="POST" action="/auth/login">
+        <form id="login-form" method="POST" action="/auth/login">
             <div class="form-group">
                 <label for="email">Username</label>
-                <input type="text" id="email" name="username" value="admin@localhost" readonly required>
+                <input type="text" id="email" name="username" value="admin@fleet.lan" readonly required>
             </div>
 
             <div class="form-group">
@@ -114,5 +112,22 @@
             <button type="submit">Sign in</button>
         </form>
     </div>
+    <script>
+        // /auth/login replies 204 + Set-Cookie on success (no redirect), so a
+        // plain form POST would leave the browser parked on this page.
+        document.getElementById("login-form").addEventListener("submit", async (ev) => {
+            ev.preventDefault();
+            const resp = await fetch("/auth/login", {
+                method: "POST",
+                body: new URLSearchParams(new FormData(ev.target)),
+            });
+            if (resp.ok) {
+                window.location.href = "/";
+            } else {
+                document.getElementById("error").hidden = false;
+                document.getElementById("password").select();
+            }
+        });
+    </script>
 </body>
 </html>
