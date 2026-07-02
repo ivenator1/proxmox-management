@@ -184,9 +184,9 @@ cd proxmox-management
 
 You still need step 1 (create the LXC) first, and afterwards your inventory and SSH trust —
 both of which can be done entirely from the dashboard's **Inventory & enrollment** page
-(generate a key, push it to each host with its password once, test the login) after setting
-`dashboard_token` in `vars.yml`. The manual steps below remain valid if you prefer to set
-things up by hand.
+(generate a key, push it to each host with its password once, test the login) after signing
+in with the admin account created during install. The manual steps below remain valid if you
+prefer to set things up by hand.
 
 ### 1. Create the Manager LXC
 * **OS:** Debian 12+ (recommended) or Ubuntu 22.04/24.04.

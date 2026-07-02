@@ -129,8 +129,8 @@ detached subprocess with live output via SSE; runs survive dashboard restarts.
 **Approved dashboard design** (decided): `proxmox_fleet/web/` package behind a
 `pip install -e '.[web]'` extra (fastapi + uvicorn; jinja2 already core), console entrypoint
 `fleet-dashboard`, listening on `0.0.0.0:8421` by default (`dashboard_host`/`dashboard_port`).
-Read-only pages are open on the LAN; the run-trigger endpoint requires a bearer token
-(`dashboard_token`). Runs launch `python -m proxmox_fleet.cli` as a subprocess (one at a time,
+Every page requires session login (fastapi-users cookie auth; superseded the original
+bearer-token design). Runs launch `python -m proxmox_fleet.cli` as a subprocess (one at a time,
 guarded by the shared run lock; live stdout via SSE; a dashboard restart never kills a
 mid-flight run). Built from scratch — admin templates don't fit a five-page server-rendered
 tool — styled with a custom hand-rolled design system (`static/dashboard.css` +
@@ -169,7 +169,7 @@ three pillars:
 **How**: optional dependency group `pip install -e '.[web]'` (fastapi + uvicorn); Jinja/static
 HTML, no JS build step. `--scan` lives in `cli.py`/`driver.py` as a read-only phase variant
 reusing each flow's detect helpers — worth landing as its own PR before the web app. New
-settings: `dashboard_bind`, `dashboard_token`, `scan_history_keep`. Tests: scan parsing in
+settings: `dashboard_host`, `dashboard_port`, `scan_history_keep`. Tests: scan parsing in
 `tests/unit` (scripted executors, like `test_flow_lxc.py`), web via `fastapi.testclient` against
 fixture history/pending dirs; the subprocess trigger tested with a stub `fleet-update` script.
 

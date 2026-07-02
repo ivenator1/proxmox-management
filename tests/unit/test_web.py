@@ -348,6 +348,22 @@ def test_runmanager_stream_unknown_id_raises(tmp_path):
         list(mgr.stream("nope"))
 
 
+def test_runmanager_astream_matches_stream(tmp_path):
+    """The async tail (SSE endpoint) must yield the same events as stream()."""
+    import asyncio
+
+    mgr = _manager(tmp_path, "print('one'); print('two')")
+    run_id = mgr.start([])
+    _wait_finished(mgr, run_id)
+
+    async def _collect():
+        return [event async for event in mgr.astream(run_id, poll=0.01)]
+
+    events = asyncio.run(_collect())
+    assert events == list(mgr.stream(run_id, sleep=lambda s: None))
+    assert events[-1] == {"event": "done", "data": "0"}
+
+
 # --- end-to-end: trigger → console → SSE -------------------------------------- #
 
 def test_trigger_to_sse_roundtrip(history_dir, tmp_path):
@@ -536,12 +552,12 @@ def test_inventory_bootstrap_when_missing(project):
 def test_settings_page_and_diffed_save(project):
     client = _project_client(project)
     page = client.get("/settings").text
-    assert "lxc_forks" in page and "dashboard_token" in page
+    assert "lxc_forks" in page and "discord_webhook" in page
     resp = client.post("/settings", data={
         "lxc_forks": "5",            # changed
         "vm_forks": "2",             # unchanged (default)
         "lxc_dry_run": "false",      # unchanged
-        "dashboard_token": "",       # secret left blank → keep
+        "discord_webhook": "",       # secret left blank → keep
         "canary_hosts": "105\nmedia-vm",
     }, follow_redirects=False)
     assert resp.status_code == 303
@@ -552,7 +568,7 @@ def test_settings_page_and_diffed_save(project):
     assert data["lxc_forks"] == 5
     assert data["canary_hosts"] == ["105", "media-vm"]
     assert "vm_forks" not in data            # untouched fields never written
-    assert "dashboard_token" not in data     # blank secret kept
+    assert "discord_webhook" not in data     # blank secret kept
     text = (project / "vars.yml").read_text()
     assert "# hand-written comment that must survive" in text
 

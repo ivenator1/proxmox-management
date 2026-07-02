@@ -57,11 +57,10 @@ canary_soak_minutes: 0      # wait this long after the canary wave before the Ku
 # --- WEB DASHBOARD (fleet-dashboard) ---
 # Optional web UI: pending updates, run history, run trigger. Install with
 # `pip install -e '.[web]'` and start `fleet-dashboard` from the project root.
-# Read-only pages are open on the LAN; POST /runs (the trigger) requires this
-# bearer token — leave empty to run the trigger unauthenticated (not advised).
+# Every page requires session login (admin account created by install.sh, or
+# manually via `python -m proxmox_fleet.web.init_db`).
 dashboard_host: "0.0.0.0"
 dashboard_port: 8421
-dashboard_token: ""
 
 # --- PENDING-UPDATES SCAN (--scan) ---
 # `fleet-update --scan` is read-only: it writes pending-<ts>.json +

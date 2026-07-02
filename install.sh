@@ -14,7 +14,10 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$REPO_DIR/.venv"
 PIP="$VENV/bin/pip"
 UNIT_DIR="/etc/systemd/system"
-HISTORY_DIR="/var/log/fleet-update"
+# Fallback when the venv/vars.yml don't exist yet (e.g. --uninstall after a
+# broken install); everywhere else the value comes from the package via
+# resolve_setting fleet_history_dir, so a custom dir in vars.yml is honored.
+HISTORY_DIR_DEFAULT="/var/log/fleet-update"
 SCAN_SERVICE="fleet-scan.service"
 SCAN_TIMER="fleet-scan.timer"
 DASH_SERVICE="fleet-dashboard.service"
@@ -23,6 +26,19 @@ SYSTEMCTL="${SYSTEMCTL:-systemctl}"   # overridable for testing without systemd
 info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33mWARNING:\033[0m %s\n' "$*" >&2; }
 die()   { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Ask the installed package for a GlobalSettings value (single source of
+# truth — vars.yml + model defaults). Usage: resolve_setting <field> <fallback>
+resolve_setting() {
+    local field="$1" fallback="$2" value
+    value=$(cd "$REPO_DIR" && "$VENV/bin/python" - "$field" <<'PYEOF' 2>/dev/null
+import sys
+from proxmox_fleet.models.settings import GlobalSettings
+print(getattr(GlobalSettings.load(), sys.argv[1]))
+PYEOF
+    ) || value=""
+    printf '%s' "${value:-$fallback}"
+}
 
 usage() {
     sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -75,7 +91,10 @@ seed_config() {
 }
 
 init_admin_user() {
-    local db_path="$HISTORY_DIR/.fleet-users.db"
+    # init_db resolves the DB location itself (fleet_history_dir from
+    # vars.yml, same as the running dashboard) — only probe it here to skip
+    # the password prompt on re-runs.
+    local db_path="$1/.fleet-users.db"
 
     # Check if database already exists
     if [ -f "$db_path" ]; then
@@ -100,11 +119,13 @@ init_admin_user() {
         die "Password cannot be empty"
     fi
 
-    # Initialize the database and create admin user
+    # Initialize the database and create admin user. The password travels in
+    # the environment, not on argv (argv is world-readable in `ps`); init_db
+    # resolves the DB path from vars.yml itself.
     info "Initializing dashboard database"
-    "$VENV/bin/python" -m proxmox_fleet.web.init_db \
-        --password "$password1" \
-        --db-path "$db_path" || die "Failed to initialize database"
+    (cd "$REPO_DIR" && FLEET_ADMIN_PASSWORD="$password1" \
+        "$VENV/bin/python" -m proxmox_fleet.web.init_db) \
+        || die "Failed to initialize database"
 }
 
 write_units() {
@@ -161,8 +182,9 @@ enable_units() {
 }
 
 print_summary() {
+    local history_dir="$1"
     local port host_ip
-    port=$(sed -n 's/^dashboard_port:[[:space:]]*\([0-9]*\).*/\1/p' "$REPO_DIR/vars.yml" | head -1)
+    port=$(resolve_setting dashboard_port 8421)
     host_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
     cat <<EOF
 
@@ -170,7 +192,7 @@ Install complete.
 
   Dashboard:   http://${host_ip:-<this-host>}:${port:-8421}  ($DASH_SERVICE, login required)
   Scan timer:  every 6 hours ($SCAN_TIMER -> fleet-update --scan)
-  History:     $HISTORY_DIR
+  History:     $history_dir
   Both units are enabled and persist across reboots.
 
 Next steps:
@@ -187,11 +209,13 @@ do_install() {
     ensure_system_packages
     install_python_deps
     seed_config
-    mkdir -p "$HISTORY_DIR"
-    init_admin_user
+    local history_dir
+    history_dir=$(resolve_setting fleet_history_dir "$HISTORY_DIR_DEFAULT")
+    mkdir -p "$history_dir"
+    init_admin_user "$history_dir"
     write_units
     enable_units
-    print_summary
+    print_summary "$history_dir"
 }
 
 # --- update ------------------------------------------------------------------
@@ -211,6 +235,10 @@ do_update() {
 # --- uninstall ---------------------------------------------------------------
 
 do_uninstall() {
+    # Resolve while the venv still exists; falls back to the default dir.
+    local history_dir
+    history_dir=$(resolve_setting fleet_history_dir "$HISTORY_DIR_DEFAULT")
+
     info "Stopping and disabling units"
     "$SYSTEMCTL" disable --now "$SCAN_TIMER" "$DASH_SERVICE" "$SCAN_SERVICE" 2>/dev/null || true
     rm -f "$UNIT_DIR/$SCAN_SERVICE" "$UNIT_DIR/$SCAN_TIMER" "$UNIT_DIR/$DASH_SERVICE"
@@ -220,11 +248,11 @@ do_uninstall() {
     info "Removing virtualenv $VENV"
     rm -rf "$VENV"
 
-    if [ -d "$HISTORY_DIR" ]; then
-        read -r -p "Delete run/scan history in $HISTORY_DIR? [y/N] " answer || answer=n
+    if [ -d "$history_dir" ]; then
+        read -r -p "Delete run/scan history in $history_dir? [y/N] " answer || answer=n
         case "$answer" in
-            [yY]*) rm -rf "$HISTORY_DIR"; info "Removed $HISTORY_DIR" ;;
-            *)     info "Kept $HISTORY_DIR" ;;
+            [yY]*) rm -rf "$history_dir"; info "Removed $history_dir" ;;
+            *)     info "Kept $history_dir" ;;
         esac
     fi
 

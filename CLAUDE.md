@@ -189,10 +189,15 @@ merges purely in-memory.
 
 ### Web dashboard (`web/`, `fleet-dashboard`)
 
-Optional `.[web]` extra (fastapi + uvicorn + python-multipart). `web/app.py` serves five
-server-rendered pages (overview / pending / history+run detail / per-host drill-down / trigger)
-purely from `fleet_history_dir` via the `history.py`/`scan.py` readers — the dashboard never
-reaches the fleet. `POST /runs` (bearer `dashboard_token`; empty token = open) launches
+Optional `.[web]` extra (fastapi + uvicorn + python-multipart + fastapi-users + aiosqlite).
+`web/app.py` serves five server-rendered pages (overview / pending / history+run detail /
+per-host drill-down / trigger) purely from `fleet_history_dir` via the `history.py`/`scan.py`
+readers — the dashboard never runs fleet operations itself (its only direct host contact is
+the SSH-enrollment helpers `/ssh/push`/`/ssh/test`). Every route except `/login`, `/static`
+and `/auth/*` hangs off one auth-protected `APIRouter` (session cookie via fastapi-users:
+`CookieTransport` + `JWTStrategy`, single `admin@fleet.lan` user in
+`<fleet_history_dir>/.fleet-users.db` — path owned by `auth.user_db_path()`, account created
+by `install.sh`/`python -m proxmox_fleet.web.init_db`). `POST /runs` launches
 `python -u -m proxmox_fleet.cli <flags>` via `web/runs.py`'s `RunManager`: detached
 (`start_new_session`), stdout → `dashboard-runs/<id>.log` + `<id>.json` meta, so a dashboard
 restart never kills a run (orphaned metas are finalized on read with `rc: null`). SSE

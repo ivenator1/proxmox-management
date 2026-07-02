@@ -14,16 +14,17 @@ fleet run lock held, and the CLI subprocess itself re-acquires the same lock
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess  # nosec B404 - the dashboard's whole job is launching the CLI
 import sys
 import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Union
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
+from proxmox_fleet.history import _ts_now
 from proxmox_fleet.lock import probe_lock
 
 _RUNS_SUBDIR = "dashboard-runs"
@@ -31,10 +32,6 @@ _RUNS_SUBDIR = "dashboard-runs"
 
 class RunActive(RuntimeError):
     """A fleet run is already in flight — refuse to overlap."""
-
-
-def _ts_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def _pid_alive(pid: int) -> bool:
@@ -181,6 +178,33 @@ class RunManager:
 
     # --- streaming ----------------------------------------------------------
 
+    def _drain_log(self, log_path: Path, pos: int,
+                   pending: str) -> Tuple[List[Dict[str, str]], int, str]:
+        """Read new bytes since *pos*, split into complete-line events; the
+        trailing partial line stays in *pending* for the next poll."""
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(pos)
+                pending += fh.read()
+                pos = fh.tell()
+        except FileNotFoundError:
+            pass
+        events: List[Dict[str, str]] = []
+        while "\n" in pending:
+            line, pending = pending.split("\n", 1)
+            events.append({"event": "line", "data": line})
+        return events, pos, pending
+
+    @staticmethod
+    def _done_events(meta: Dict[str, Any], pending: str) -> List[Dict[str, str]]:
+        """The final flush: the unterminated last line (if any) + one done."""
+        events: List[Dict[str, str]] = []
+        if pending:
+            events.append({"event": "line", "data": pending})
+        rc = meta.get("rc")
+        events.append({"event": "done", "data": "" if rc is None else str(rc)})
+        return events
+
     def stream(
         self,
         run_id: str,
@@ -200,22 +224,31 @@ class RunManager:
         pos = 0
         pending = ""
         while True:
-            try:
-                with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
-                    fh.seek(pos)
-                    chunk = fh.read()
-                    pos = fh.tell()
-            except FileNotFoundError:
-                chunk = ""
-            pending += chunk
-            while "\n" in pending:
-                line, pending = pending.split("\n", 1)
-                yield {"event": "line", "data": line}
+            events, pos, pending = self._drain_log(log_path, pos, pending)
+            yield from events
             if meta.get("finished") is not None:
-                if pending:
-                    yield {"event": "line", "data": pending}
-                rc = meta.get("rc")
-                yield {"event": "done", "data": "" if rc is None else str(rc)}
+                yield from self._done_events(meta, pending)
                 return
             sleep(poll)
+            meta = self.read_meta(run_id)
+
+    async def astream(
+        self, run_id: str, *, poll: float = 0.5,
+    ) -> AsyncIterator[Dict[str, str]]:
+        """`stream()` for async consumers (the SSE endpoint): identical events,
+        but waits with ``asyncio.sleep`` so a live tail never pins a worker
+        thread for the duration of the run."""
+        meta = self.read_meta(run_id)
+        log_path = self._log_path(run_id)
+        pos = 0
+        pending = ""
+        while True:
+            events, pos, pending = self._drain_log(log_path, pos, pending)
+            for event in events:
+                yield event
+            if meta.get("finished") is not None:
+                for event in self._done_events(meta, pending):
+                    yield event
+                return
+            await asyncio.sleep(poll)
             meta = self.read_meta(run_id)

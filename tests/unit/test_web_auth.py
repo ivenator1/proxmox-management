@@ -72,16 +72,31 @@ def test_init_db_cli_creates_db(history_dir):
     assert db.is_file()
 
 
-def test_init_db_cli_rejects_empty_password(history_dir):
+def test_init_db_cli_rejects_empty_password(history_dir, monkeypatch):
+    monkeypatch.delenv("FLEET_ADMIN_PASSWORD", raising=False)
     rc = init_db_main(["--password", "", "--db-path",
                        str(history_dir / ".fleet-users.db")])
     assert rc == 1
 
 
-def test_init_db_cli_missing_args():
-    with pytest.raises(SystemExit) as exc:
-        init_db_main(["--password", "x"])
-    assert exc.value.code == 2
+def test_init_db_cli_password_from_env(history_dir, monkeypatch):
+    """install.sh passes the password via the environment (argv shows in ps)."""
+    monkeypatch.setenv("FLEET_ADMIN_PASSWORD", PASSWORD)
+    db = history_dir / ".fleet-users.db"
+    rc = init_db_main(["--db-path", str(db)])
+    assert rc == 0
+    assert db.is_file()
+
+
+def test_init_db_cli_resolves_db_path_from_vars(history_dir, tmp_path):
+    """Without --db-path the DB lands at user_db_path(fleet_history_dir) —
+    the same resolution create_app uses, so a custom history dir can never
+    strand the admin account in the wrong directory."""
+    vars_file = tmp_path / "vars.yml"
+    vars_file.write_text(f"fleet_history_dir: {history_dir}\n", encoding="utf-8")
+    rc = init_db_main(["--password", PASSWORD, "--vars-file", str(vars_file)])
+    assert rc == 0
+    assert auth.user_db_path(history_dir).is_file()
 
 
 def test_auth_secret_persisted(history_dir):
@@ -136,12 +151,16 @@ def test_logout_clears_session(history_dir):
 def test_every_page_locked_without_login(history_dir):
     _create_admin(history_dir)
     client = _client(history_dir)
-    pages = ("/", "/pending", "/history",
-             "/trigger", "/inventory", "/settings")
+    pages = ("/", "/pending", "/history", "/history/latest", "/hosts/somehost",
+             "/trigger", "/inventory", "/settings",
+             # the run console/log/stream leak fleet output if left open —
+             # 401 must win over 404 even for unknown run ids
+             "/runs/20260101T000000000000Z", "/runs/20260101T000000000000Z/log",
+             "/runs/20260101T000000000000Z/stream")
     for page in pages:
         assert client.get(page).status_code == 401, page
-    posts = ("/runs", "/inventory/add", "/inventory/remove", "/settings",
-             "/settings/raw", "/ssh/generate", "/ssh/push", "/ssh/test")
+    posts = ("/runs", "/inventory/add", "/inventory/remove", "/inventory/create",
+             "/settings", "/settings/raw", "/ssh/generate", "/ssh/push", "/ssh/test")
     for page in posts:
         assert client.post(page, data={}).status_code == 401, page
 

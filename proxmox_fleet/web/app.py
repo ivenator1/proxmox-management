@@ -4,22 +4,26 @@ Pages: overview (``/``), pending updates (``/pending``), run history
 (``/history`` + per-run detail), per-host drill-down (``/hosts/{name}``), and
 the run trigger (``/trigger`` → ``POST /runs`` → live console with SSE).
 
-All pages and endpoints require user login (session-based auth via FastAPI-Users).
-All data comes from ``fleet_history_dir`` via the readers in :mod:`proxmox_fleet.history`
-and :mod:`proxmox_fleet.scan` — the dashboard never reaches the fleet itself; it
-only launches the CLI.
+Every route except ``/login``, ``/static`` and the FastAPI-Users ``/auth``
+router hangs off a single auth-protected APIRouter (session cookie login) —
+new pages are protected by default. All fleet data comes from
+``fleet_history_dir`` via the readers in :mod:`proxmox_fleet.history` and
+:mod:`proxmox_fleet.scan` — the dashboard never runs fleet operations itself;
+updates go through the CLI subprocess, and the only direct host contact is
+the SSH-enrollment helpers (``/ssh/push``, ``/ssh/test``).
 """
 
 from __future__ import annotations
 
 import re
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -35,7 +39,6 @@ from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.vars_edit import VarsEditError
 from proxmox_fleet.web import auth, sshsetup
 from proxmox_fleet.web.auth import auth_backend, current_active_user, fastapi_users
-from proxmox_fleet.web.models import User
 from proxmox_fleet.web.runs import RunActive, RunManager
 from proxmox_fleet.web.sshsetup import SshSetupError
 
@@ -46,8 +49,9 @@ _PACKAGE_DIR = Path(__file__).parent
 PHASE_NAMES = ("remote", "custom", "lxc", "vm", "node", "manager")
 
 # --limit / --phases tokens are passed to a subprocess: allow only inventory
-# name / vmid shaped tokens, nothing shell-meaningful.
-_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# name / vmid shaped tokens, nothing shell-meaningful. Shared with the
+# inventory editor so the two layers can never drift apart.
+_TOKEN_RE = inventory_edit._NAME_RE
 
 # Per-bucket table columns for the run-detail and host drill-down pages.
 BUCKET_COLUMNS: Dict[str, Tuple[str, ...]] = {
@@ -376,7 +380,7 @@ def create_app(
     history_dir = settings.fleet_history_dir
 
     # Configure FastAPI-Users authentication
-    auth.configure(Path(history_dir) / ".fleet-users.db")
+    auth.configure(auth.user_db_path(history_dir))
 
     app = FastAPI(title="Fleet Dashboard", docs_url=None, redoc_url=None,
                   on_startup=[auth.create_db_and_tables])
@@ -387,6 +391,11 @@ def create_app(
         prefix="/auth",
         tags=["auth"],
     )
+
+    # Everything except /login, /static and the /auth router hangs off this
+    # router, so authentication is default-on: a new page added without
+    # thinking about auth is protected, not silently public.
+    protected = APIRouter(dependencies=[Depends(current_active_user)])
 
     app.mount("/static", StaticFiles(directory=str(_PACKAGE_DIR / "static")), name="static")
     templates = Jinja2Templates(directory=str(_PACKAGE_DIR / "templates"))
@@ -413,10 +422,9 @@ def create_app(
         except (OSError, ValueError):
             return None
 
-    def _palette_items() -> List[Dict[str, str]]:
+    def _build_palette_items() -> List[Dict[str, str]]:
         """Command-palette entries (pages, hosts, recent runs), rendered into
-        a JSON blob in base.html on every page. Called at render time so it
-        always reflects the current history dir."""
+        a JSON blob in base.html on every page."""
         items: List[Dict[str, str]] = [
             {"kind": "page", "label": "Overview", "url": "/"},
             {"kind": "page", "label": "Pending updates", "url": "/pending"},
@@ -450,6 +458,21 @@ def create_app(
                           "url": f"/history/{ts}"})
         return items
 
+    # base.html calls palette_items() on every page render; rebuilding it
+    # means re-reading latest.json + the pending snapshot + the history
+    # summaries each hit, so cache it briefly (staleness is invisible at
+    # human browsing speed; races just rebuild twice).
+    _palette_cache: Tuple[float, List[Dict[str, str]]] = (0.0, [])
+    _PALETTE_TTL = 5.0
+
+    def _palette_items() -> List[Dict[str, str]]:
+        nonlocal _palette_cache
+        expires, items = _palette_cache
+        if time.monotonic() >= expires:
+            items = _build_palette_items()
+            _palette_cache = (time.monotonic() + _PALETTE_TTL, items)
+        return items
+
     templates.env.globals["palette_items"] = _palette_items
 
     @app.get("/login")
@@ -457,8 +480,8 @@ def create_app(
         """Login form (FastAPI-Users will handle the actual /auth/login POST)."""
         return templates.TemplateResponse(request, "login.html", {})
 
-    @app.get("/")
-    def index(request: Request, _: User = Depends(current_active_user)) -> Any:
+    @protected.get("/")
+    def index(request: Request) -> Any:
         latest_run = _read_run_or_none("latest")
         latest_pending = _read_pending_or_none("latest")
         pending_rows = scan_mod.pending_summary(history_dir, limit=1)
@@ -477,8 +500,8 @@ def create_app(
             "health": _health_score(latest_run, pending_row),
         })
 
-    @app.get("/pending")
-    def pending(request: Request, ref: str = "latest", _: User = Depends(current_active_user)) -> Any:
+    @protected.get("/pending")
+    def pending(request: Request, ref: str = "latest") -> Any:
         snapshot = _read_pending_or_none(ref)
         if snapshot is None and ref != "latest":
             raise HTTPException(404, f"no pending snapshot {ref!r}")
@@ -492,8 +515,8 @@ def create_app(
             "scans": scan_mod.pending_summary(history_dir, limit=0),
         })
 
-    @app.get("/history")
-    def history(request: Request, _: User = Depends(current_active_user)) -> Any:
+    @protected.get("/history")
+    def history(request: Request) -> Any:
         rows = _history_rows_with_deltas(history_dir)
         return templates.TemplateResponse(request, "history.html", {
             "rows": rows,
@@ -501,8 +524,8 @@ def create_app(
             "heatmap": _activity_weeks(rows),
         })
 
-    @app.get("/history/{ref}")
-    def history_show(request: Request, ref: str, _: User = Depends(current_active_user)) -> Any:
+    @protected.get("/history/{ref}")
+    def history_show(request: Request, ref: str) -> Any:
         run = _read_run_or_none(ref)
         if run is None:
             raise HTTPException(404, f"no history record {ref!r}")
@@ -516,15 +539,15 @@ def create_app(
             "buckets": buckets,
         })
 
-    @app.get("/hosts/{name}")
-    def host_detail(request: Request, name: str, _: User = Depends(current_active_user)) -> Any:
+    @protected.get("/hosts/{name}")
+    def host_detail(request: Request, name: str) -> Any:
         return templates.TemplateResponse(request, "host.html", {
             "name": name,
             "records": _host_records(history_dir, name),
         })
 
-    @app.get("/trigger")
-    def trigger(request: Request, _: User = Depends(current_active_user)) -> Any:
+    @protected.get("/trigger")
+    def trigger(request: Request) -> Any:
         return templates.TemplateResponse(request, "trigger.html", {
             "phase_names": PHASE_NAMES,
             "lock_holder": probe_lock(history_dir),
@@ -589,19 +612,19 @@ def create_app(
             "err": request.query_params.get("err", ""),
         }
 
-    @app.get("/inventory")
-    def inventory_page(request: Request, _: User = Depends(current_active_user)) -> Any:
+    @protected.get("/inventory")
+    def inventory_page(request: Request) -> Any:
         return templates.TemplateResponse(
             request, "inventory.html", _inventory_context(request))
 
-    @app.post("/inventory/create")
-    async def inventory_create(request: Request, _: User = Depends(current_active_user)) -> Any:
+    @protected.post("/inventory/create")
+    async def inventory_create(request: Request) -> Any:
         created = inventory_edit.ensure_inventory(inventory_path)
         return _redirect("/inventory",
                          ok="hosts.ini created" if created else "hosts.ini already exists")
 
-    @app.post("/inventory/add")
-    async def inventory_add(request: Request, _: User = Depends(current_active_user)) -> Any:
+    @protected.post("/inventory/add")
+    async def inventory_add(request: Request) -> Any:
         form = await request.form()
         group = str(form.get("group") or "")
         name = str(form.get("name") or "").strip()
@@ -668,8 +691,8 @@ def create_app(
             raise HTTPException(400, str(exc))
         return _redirect("/inventory", ok=f"enrolled {name} in [{group}]")
 
-    @app.post("/inventory/remove")
-    async def inventory_remove(request: Request, _: User = Depends(current_active_user)) -> Any:
+    @protected.post("/inventory/remove")
+    async def inventory_remove(request: Request) -> Any:
         form = await request.form()
         group = str(form.get("group") or "")
         name = str(form.get("name") or "").strip()
@@ -698,8 +721,8 @@ def create_app(
         suffix = " (vars.yml + host_vars cleaned)" if cleanup else ""
         return _redirect("/inventory", ok=f"removed {name} from [{group}]{suffix}")
 
-    @app.get("/settings")
-    def settings_page(request: Request, _: User = Depends(current_active_user)) -> Any:
+    @protected.get("/settings")
+    def settings_page(request: Request) -> Any:
         file_data = dict(vars_edit.load_data(vars_path))
         known = set(GlobalSettings.model_fields)
         return templates.TemplateResponse(request, "settings.html", {
@@ -711,8 +734,8 @@ def create_app(
             "err": request.query_params.get("err", ""),
         })
 
-    @app.post("/settings")
-    async def settings_save(request: Request, _: User = Depends(current_active_user)) -> Any:
+    @protected.post("/settings")
+    async def settings_save(request: Request) -> Any:
         form = await request.form()
         file_data = dict(vars_edit.load_data(vars_path))
         try:
@@ -725,8 +748,8 @@ def create_app(
                if changes else "no changes")
         return _redirect("/settings", ok=msg)
 
-    @app.post("/settings/raw")
-    async def settings_save_raw(request: Request, _: User = Depends(current_active_user)) -> Any:
+    @protected.post("/settings/raw")
+    async def settings_save_raw(request: Request) -> Any:
         form = await request.form()
         try:
             vars_edit.replace_raw(vars_path, str(form.get("content") or ""))
@@ -734,44 +757,40 @@ def create_app(
             raise HTTPException(400, str(exc))
         return _redirect("/settings", ok=f"{vars_path} replaced (backup written)")
 
-    @app.post("/ssh/generate")
-    async def ssh_generate(request: Request, _: User = Depends(current_active_user)) -> Any:
+    def _ssh_action(request: Request, action: str,
+                    call: Callable[[], Tuple[bool, str]]) -> Any:
+        """Shared tail of the three ssh POSTs: run the action, map bad input
+        to 400, re-render the inventory page with the action's output."""
         try:
-            ok, output = sshsetup.generate_key()
+            ok, output = call()
         except SshSetupError as exc:
             raise HTTPException(400, str(exc))
         return templates.TemplateResponse(request, "inventory.html", _inventory_context(
-            request, ssh_result={"action": "generate", "ok": ok, "output": output}))
+            request, ssh_result={"action": action, "ok": ok, "output": output}))
 
-    @app.post("/ssh/push")
-    async def ssh_push(request: Request, _: User = Depends(current_active_user)) -> Any:
+    @protected.post("/ssh/generate")
+    async def ssh_generate(request: Request) -> Any:
+        return _ssh_action(request, "generate", sshsetup.generate_key)
+
+    @protected.post("/ssh/push")
+    async def ssh_push(request: Request) -> Any:
         form = await request.form()
-        try:
-            ok, output = sshsetup.push_key(
-                str(form.get("host") or ""), str(form.get("user") or "root"),
-                str(form.get("password") or ""), port=form.get("port") or 22,
-                pubkey_path=str(form.get("pubkey") or sshsetup.DEFAULT_KEY + ".pub"),
-            )
-        except SshSetupError as exc:
-            raise HTTPException(400, str(exc))
-        return templates.TemplateResponse(request, "inventory.html", _inventory_context(
-            request, ssh_result={"action": "push", "ok": ok, "output": output}))
+        return _ssh_action(request, "push", lambda: sshsetup.push_key(
+            str(form.get("host") or ""), str(form.get("user") or "root"),
+            str(form.get("password") or ""), port=form.get("port") or 22,
+            pubkey_path=str(form.get("pubkey") or sshsetup.DEFAULT_KEY + ".pub"),
+        ))
 
-    @app.post("/ssh/test")
-    async def ssh_test(request: Request, _: User = Depends(current_active_user)) -> Any:
+    @protected.post("/ssh/test")
+    async def ssh_test(request: Request) -> Any:
         form = await request.form()
-        try:
-            ok, output = sshsetup.test_key(
-                str(form.get("host") or ""), str(form.get("user") or "root"),
-                port=form.get("port") or 22,
-            )
-        except SshSetupError as exc:
-            raise HTTPException(400, str(exc))
-        return templates.TemplateResponse(request, "inventory.html", _inventory_context(
-            request, ssh_result={"action": "test", "ok": ok, "output": output}))
+        return _ssh_action(request, "test", lambda: sshsetup.test_key(
+            str(form.get("host") or ""), str(form.get("user") or "root"),
+            port=form.get("port") or 22,
+        ))
 
-    @app.post("/runs")
-    async def start_run(request: Request, _: User = Depends(current_active_user)) -> Any:
+    @protected.post("/runs")
+    async def start_run(request: Request) -> Any:
         form = await request.form()
         try:
             args = build_run_args(form)
@@ -783,7 +802,7 @@ def create_app(
             raise HTTPException(409, str(exc))
         return RedirectResponse(url=f"/runs/{run_id}", status_code=303)
 
-    @app.get("/runs/{run_id}")
+    @protected.get("/runs/{run_id}")
     def run_console(request: Request, run_id: str) -> Any:
         try:
             meta = manager.read_meta(run_id)
@@ -791,7 +810,7 @@ def create_app(
             raise HTTPException(404, f"no dashboard run {run_id!r}")
         return templates.TemplateResponse(request, "console.html", {"run": meta})
 
-    @app.get("/runs/{run_id}/log")
+    @protected.get("/runs/{run_id}/log")
     def run_log(run_id: str) -> Any:
         try:
             manager.read_meta(run_id)
@@ -799,15 +818,17 @@ def create_app(
             raise HTTPException(404, f"no dashboard run {run_id!r}")
         return PlainTextResponse(manager.read_log(run_id))
 
-    @app.get("/runs/{run_id}/stream")
-    def run_stream(run_id: str) -> Any:
+    @protected.get("/runs/{run_id}/stream")
+    async def run_stream(run_id: str) -> Any:
         try:
             manager.read_meta(run_id)
         except (OSError, ValueError):
             raise HTTPException(404, f"no dashboard run {run_id!r}")
 
-        def _sse() -> Iterator[str]:
-            for event in manager.stream(run_id):
+        # async tail: a sync generator here would pin one threadpool worker
+        # per open console tab for the whole run.
+        async def _sse() -> AsyncIterator[str]:
+            async for event in manager.astream(run_id):
                 if event["event"] == "done":
                     yield f"event: done\ndata: {event['data']}\n\n"
                 else:
@@ -815,4 +836,5 @@ def create_app(
 
         return StreamingResponse(_sse(), media_type="text/event-stream")
 
+    app.include_router(protected)
     return app

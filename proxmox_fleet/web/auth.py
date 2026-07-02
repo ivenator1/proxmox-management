@@ -26,6 +26,16 @@ from proxmox_fleet.web.models import Base, User
 COOKIE_NAME = "fleet_auth"
 SESSION_LIFETIME_SECONDS = 7 * 24 * 3600  # 7 days
 ADMIN_EMAIL = "admin@fleet.lan"
+USER_DB_FILENAME = ".fleet-users.db"
+
+
+def user_db_path(history_dir: Union[str, Path]) -> Path:
+    """The one canonical user-DB location: ``<fleet_history_dir>/.fleet-users.db``.
+
+    Every consumer (create_app, init_db, install.sh via init_db) must resolve
+    the path through here — a second copy of the filename or directory default
+    puts the admin account where the dashboard won't look."""
+    return Path(history_dir) / USER_DB_FILENAME
 
 # Set by configure(); dependencies below read them lazily.
 _engine: Optional[AsyncEngine] = None
