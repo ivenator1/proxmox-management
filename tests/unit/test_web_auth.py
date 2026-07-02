@@ -109,6 +109,14 @@ def test_auth_secret_persisted(history_dir):
     assert secret_file.read_text() == first  # reused, not regenerated
 
 
+def test_credential_files_owner_only(history_dir):
+    """Both the JWT secret and the user DB (password hash) must be 0600."""
+    _create_admin(history_dir)
+    for name in (".fleet-auth-secret", ".fleet-users.db"):
+        mode = (history_dir / name).stat().st_mode & 0o777
+        assert mode == 0o600, f"{name} is {oct(mode)}"
+
+
 # --- login flow --------------------------------------------------------------#
 
 def test_login_sets_cookie_and_grants_access(history_dir):

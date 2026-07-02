@@ -41,6 +41,7 @@ def user_db_path(history_dir: Union[str, Path]) -> Path:
 _engine: Optional[AsyncEngine] = None
 _session_maker: Optional[async_sessionmaker[AsyncSession]] = None
 _secret: str = ""
+_db_path: Optional[Path] = None
 
 
 class UserCreate(schemas.BaseUserCreate):
@@ -63,8 +64,9 @@ def _load_or_create_secret(path: Path) -> str:
 
 def configure(db_path: Union[str, Path]) -> None:
     """Point the auth layer at the SQLite user DB (idempotent)."""
-    global _engine, _session_maker, _secret
+    global _engine, _session_maker, _secret, _db_path
     db_path = Path(db_path)
+    _db_path = db_path
     _secret = _load_or_create_secret(db_path.parent / ".fleet-auth-secret")
     if _engine is None:
         _engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False)
@@ -76,6 +78,11 @@ async def create_db_and_tables() -> None:
     assert _engine is not None, "auth.configure() must be called first"
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    # The DB holds the admin password hash — owner-only, like the JWT secret.
+    # Done here (not just init_db) so a DB first created by app startup is
+    # equally tightened; chmod on every call also repairs a pre-existing file.
+    if _db_path is not None and _db_path.exists():
+        _db_path.chmod(0o600)
 
 
 async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
@@ -162,7 +169,8 @@ async def create_admin_user(db_path: Union[str, Path], password: str) -> Any:
 
 def reset_for_tests() -> None:
     """Drop module state so tests can re-configure against a fresh temp DB."""
-    global _engine, _session_maker, _secret
+    global _engine, _session_maker, _secret, _db_path
     _engine = None
     _session_maker = None
     _secret = ""
+    _db_path = None
