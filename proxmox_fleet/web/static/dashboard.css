@@ -693,8 +693,48 @@ pre.briefing {
   stroke-linecap: round;
 }
 .spark.fail polyline { stroke: var(--fail); }
+.spark.ok polyline { stroke: var(--ok); }
 .spark .fill { fill: var(--accent-dim); stroke: none; }
 .spark.fail .fill { fill: var(--fail-dim); }
+
+/* ------------------------------------------------- trend tiles (overview) */
+
+.trend-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: var(--sp-3);
+}
+.trend {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--sp-3) var(--sp-4);
+  transition: border-color 120ms;
+}
+.trend:hover { border-color: var(--border-strong); }
+.trend-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 0.4rem;
+}
+.trend .label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-muted);
+}
+.trend .value {
+  font-size: 1.3rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-strong);
+  line-height: 1.2;
+}
+.trend.zero .value { color: var(--fg-faint); }
+.trend.tint-fail { border-color: color-mix(in srgb, var(--fail) 45%, var(--border)); background: linear-gradient(var(--fail-dim), transparent 70%), var(--bg-raised); }
+.trend.tint-fail .value { color: var(--fail); }
 
 /* ---------------------------------------------------------- health gauge */
 

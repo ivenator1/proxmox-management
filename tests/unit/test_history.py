@@ -13,6 +13,7 @@ from proxmox_fleet import briefing
 from proxmox_fleet.history import (
     _ts_now,
     build_run_summary,
+    count_updates,
     history_summary,
     read_run,
     write_history,
@@ -150,6 +151,41 @@ def test_history_summary_carries_counts_and_failed(tmp_path):
     assert row["failed"] is True
     assert row["counts"]["lxc"] == 1
     assert row["counts"]["errors"] == 1
+
+
+def test_count_updates_os_and_app():
+    summary = build_run_summary(_state(
+        fleet_lxc_data=[
+            # app updated, OS updated → counts in both
+            dict(node="n", name="a", id="1",
+                 app="Updated: v4.0 → v4.1", os="Updated (3 upgraded)"),
+            # rescue statuses count in neither
+            dict(node="n", name="b", id="2", app="FAILED + ROLLED BACK", os="OK"),
+            # OS-only update ("& Rebooted" variant), no script
+            dict(node="n", name="c", id="3", app="NO SCRIPT",
+                 os="Updated (1 upgraded) & Rebooted"),
+        ],
+        fleet_vm_data=[dict(node="n", vmid="200", name="vm", status="UPDATED & REBOOTED"),
+                       # dry-run "WOULD UPDATE" is not an applied update
+                       dict(node="n", vmid="201", name="vm2", status="WOULD UPDATE")],
+        fleet_remote_data=[dict(host="web", status="UPDATED")],
+        fleet_node_data=[dict(node="pve", status="UPDATED (MANUAL REBOOT REQ)"),
+                         dict(node="pve2", status="OK")],
+    ), timestamp="T")
+    assert count_updates(summary) == {"os": 5, "app": 1}
+
+
+def test_count_updates_empty_run():
+    assert count_updates(build_run_summary(_state(), timestamp="T")) == {"os": 0, "app": 0}
+
+
+def test_history_summary_carries_update_counts(tmp_path):
+    state = _state(fleet_lxc_data=[dict(node="n", name="a", id="1",
+                                        app="UPDATED", os="OK")],
+                   fleet_remote_data=[dict(host="web", status="UPDATED & REBOOTED")])
+    write_history(state, history_dir=tmp_path, keep=0, timestamp="20260101T000000000000Z")
+    row = history_summary(tmp_path)[0]
+    assert row["updates"] == {"os": 1, "app": 1}
 
 
 def test_history_summary_skips_corrupt_files(tmp_path):

@@ -115,6 +115,24 @@ def spark_points(values: Sequence[Any], w: int = 120, h: int = 28) -> str:
     )
 
 
+def _endpoint_counts(inventory_path: str,
+                     latest_pending: Optional[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """Currently known update endpoints for the overview card.
+
+    VM/PVE-host/remote/custom counts come from the inventory groups (what the
+    fleet is configured to update); LXCs have no inventory entry — they are
+    tag-discovered — so their count comes from the latest pending scan.
+    """
+    groups = inventory_edit.list_hosts(inventory_path)
+    return [
+        {"label": "LXCs", "value": len((latest_pending or {}).get("lxc") or {})},
+        {"label": "VMs", "value": len(groups.get("proxmox_vms") or [])},
+        {"label": "PVE hosts", "value": len(groups.get("proxmox_nodes") or [])},
+        {"label": "remote hosts", "value": len(groups.get("remote_hosts") or [])},
+        {"label": "custom systems", "value": len(groups.get("custom_hosts") or [])},
+    ]
+
+
 def _health_score(latest_run: Optional[Mapping[str, Any]],
                   pending_row: Optional[Mapping[str, Any]]) -> int:
     """Fleet health 0–100 for the overview gauge: start at 100; −25 if the
@@ -495,7 +513,7 @@ def create_app(
             "pending_row": pending_row,
             "lock_holder": probe_lock(history_dir),
             "active_run": manager.active_run(),
-            "count_keys": _COUNT_KEYS,
+            "endpoints": _endpoint_counts(inventory_path, latest_pending),
             "recent": recent,
             "health": _health_score(latest_run, pending_row),
         })

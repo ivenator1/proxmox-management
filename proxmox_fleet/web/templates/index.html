@@ -20,36 +20,37 @@
 <div class="page-head">
   <h1>Overview</h1>
   {% if latest_run %}
-  <span class="sub">last run <span class="mono">{{ latest_run.timestamp | ts_human }}</span>
+  <span class="sub">last run
+    <a class="mono" href="/history/{{ latest_run.timestamp }}">{{ latest_run.timestamp | ts_human }}</a>
+    {% if latest_run.failed %}<span class="pill fail">FAILED</span>
+    {% elif latest_run.changed %}<span class="pill info">Changed</span>
+    {% else %}<span class="pill ok">Clean</span>{% endif %}
     {% if latest_run.timestamp | ts_iso %}· <span data-ts="{{ latest_run.timestamp | ts_iso }}"></span>{% endif %}
   </span>
   {% endif %}
 </div>
 
-{% if latest_run %}
 <div class="grid cols-2">
   <div class="card">
     <div class="card-head">
-      <h2>Latest run</h2>
-      {% if latest_run.failed %}<span class="pill fail big">FAILED</span>
-      {% elif latest_run.changed %}<span class="pill info big">Changed</span>
-      {% else %}<span class="pill ok big">Clean</span>{% endif %}
+      <h2>Update endpoints</h2>
+      <a class="btn btn-sm" href="/inventory">inventory →</a>
     </div>
     <p class="muted" style="font-size: 0.85rem;">
-      <a href="/history/{{ latest_run.timestamp }}">{{ latest_run.timestamp | ts_human }}</a>
-      — full record, briefing and per-host results.
+      Configured in the <a href="/inventory">inventory</a>; LXCs are
+      {% if latest_pending %}discovered by the <a href="/pending">latest scan</a>{% else %}discovered by scans (none yet){% endif %}.
     </p>
     <div class="stat-grid">
-      {% for key in count_keys %}
-      {% set n = (latest_run.counts or {}).get(key, 0) %}
-      <div class="stat {% if not n %}zero{% endif %} {% if key == 'errors' and n %}tint-fail{% elif key == 'warnings' and n %}tint-warn{% endif %}">
-        <span class="label">{{ key }}</span>
-        <span class="value">{{ n }}</span>
+      {% for ep in endpoints %}
+      <div class="stat {% if not ep.value %}zero{% endif %}">
+        <span class="label">{{ ep.label }}</span>
+        <span class="value">{{ ep.value }}</span>
       </div>
       {% endfor %}
     </div>
   </div>
 
+  {% if latest_run %}
   <div class="card">
     <div class="card-head"><h2>Fleet health</h2></div>
     <div class="gauge-wrap">
@@ -82,20 +83,38 @@
       </div>
     </div>
   </div>
+  {% endif %}
 </div>
 
-{% if recent | length > 1 %}
+{% if recent %}
+{% set latest_row = recent[-1] %}
 <div class="card" style="margin-top: var(--sp-4);">
   <div class="card-head">
-    <h2>Error trend</h2>
-    <span class="muted" style="font-size: 0.78rem;">errors per run, oldest → newest</span>
+    <h2>Update trends</h2>
+    <span class="muted" style="font-size: 0.78rem;">last {{ recent | length }} run{{ '' if recent | length == 1 else 's' }}, oldest → newest</span>
   </div>
-  <svg class="spark fail" width="100%" height="44" viewBox="0 0 400 44" preserveAspectRatio="none" role="img" aria-label="Errors per run trend">
-    <polyline points="{{ recent | map(attribute='counts.errors', default=0) | list | spark_points(400, 44) }}"/>
-  </svg>
+  <div class="trend-grid">
+    {% for label, series, latest_n, tone in [
+        ("package updates", recent | map(attribute="updates.os", default=0) | list,
+         (latest_row.updates or {}).get("os", 0), ""),
+        ("LXC app updates", recent | map(attribute="updates.app", default=0) | list,
+         (latest_row.updates or {}).get("app", 0), "ok"),
+        ("errors", recent | map(attribute="counts.errors", default=0) | list,
+         (latest_row.counts or {}).get("errors", 0), "fail"),
+    ] %}
+    <div class="trend {% if not latest_n %}zero{% endif %} {% if tone == 'fail' and latest_n %}tint-fail{% endif %}">
+      <div class="trend-head">
+        <span class="label">{{ label }}</span>
+        <span class="value">{{ latest_n }}</span>
+      </div>
+      <svg class="spark {{ tone }}" width="100%" height="36" viewBox="0 0 400 36"
+           preserveAspectRatio="none" role="img" aria-label="{{ label }} per run trend">
+        <polyline points="{{ series | spark_points(400, 36) }}"/>
+      </svg>
+    </div>
+    {% endfor %}
+  </div>
 </div>
-{% endif %}
-
 {% else %}
 <div class="empty">
   <span class="glyph" aria-hidden="true">⟡</span>
