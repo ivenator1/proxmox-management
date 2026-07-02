@@ -26,6 +26,7 @@ from proxmox_fleet.models.state import FleetState  # noqa: E402
 from proxmox_fleet.web import auth  # noqa: E402
 from proxmox_fleet.web.app import (  # noqa: E402
     _activity_weeks,
+    _endpoint_counts,
     _health_score,
     build_run_args,
     create_app,
@@ -159,6 +160,53 @@ def test_index_renders_empty_dirs(tmp_path):
     resp = _client(tmp_path / "empty").get("/")
     assert resp.status_code == 200
     assert "No run history yet" in resp.text
+
+
+_INVENTORY = """\
+[proxmox_nodes]
+pve-01
+pve-02
+
+[proxmox_vms]
+vm-01 vmid=200
+
+[remote_hosts]
+web-01
+
+[custom_hosts]
+"""
+
+
+def test_endpoint_counts_from_inventory_and_scan(tmp_path):
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(_INVENTORY, encoding="utf-8")
+    pending = {"lxc": {"101": {}, "102": {}}, "hosts": {}}
+    eps = {e["label"]: e["value"] for e in _endpoint_counts(str(inv), pending)}
+    assert eps == {"LXCs": 2, "VMs": 1, "PVE hosts": 2,
+                   "remote hosts": 1, "custom systems": 0}
+
+
+def test_endpoint_counts_missing_inventory_and_scan(tmp_path):
+    eps = _endpoint_counts(str(tmp_path / "nope.ini"), None)
+    assert {e["label"] for e in eps} == {"LXCs", "VMs", "PVE hosts",
+                                         "remote hosts", "custom systems"}
+    assert all(e["value"] == 0 for e in eps)
+
+
+def test_index_shows_endpoints_and_update_trends(history_dir, tmp_path):
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(_INVENTORY, encoding="utf-8")
+    app = create_app(_settings(history_dir), inventory_path=str(inv))
+    _logged_in(app)
+    resp = TestClient(app).get("/")
+    assert resp.status_code == 200
+    assert "Update endpoints" in resp.text
+    assert "PVE hosts" in resp.text and "custom systems" in resp.text
+    # the error-trend card is gone; the update-trends card replaces it
+    assert "Error trend" not in resp.text
+    assert "Update trends" in resp.text
+    assert "package updates" in resp.text
+    assert "LXC app updates" in resp.text
 
 
 def test_history_list_with_delta(history_dir):

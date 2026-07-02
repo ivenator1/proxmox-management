@@ -9,9 +9,10 @@ so each history file carries the exact briefing that was (or would be) sent.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 from proxmox_fleet.models.state import FleetState
 
@@ -100,6 +101,35 @@ def write_history(
     return run_file
 
 
+# "Applied" statuses all contain the word "updated" ("UPDATED",
+# "Updated (3 upgraded) & Rebooted", "UPDATED (MANUAL REBOOT REQ)", ...);
+# dry-run's "WOULD UPDATE" and the FAILED/ROLLED BACK strings do not.
+_UPDATED_RE = re.compile(r"updated", re.IGNORECASE)
+
+
+def count_updates(run: Mapping[str, Any]) -> Dict[str, int]:
+    """Derived per-run counts for one persisted run summary.
+
+    ``os``: hosts/containers whose OS packages were updated (lxc ``os`` line
+    plus vm/remote/node ``status``); ``app``: LXCs whose community-script app
+    was updated (lxc ``app`` line). Counts records, not packages.
+    """
+    os_updates = sum(
+        1 for rec in run.get("lxc") or []
+        if _UPDATED_RE.search(str(rec.get("os") or ""))
+    ) + sum(
+        1
+        for bucket in ("vm", "remote", "node")
+        for rec in run.get(bucket) or []
+        if _UPDATED_RE.search(str(rec.get("status") or ""))
+    )
+    app_updates = sum(
+        1 for rec in run.get("lxc") or []
+        if _UPDATED_RE.search(str(rec.get("app") or ""))
+    )
+    return {"os": os_updates, "app": app_updates}
+
+
 def history_summary(
     history_dir: Union[str, Path],
     *,
@@ -108,8 +138,9 @@ def history_summary(
     """Read back the newest *limit* run summaries, newest first.
 
     Returns one dict per run with ``timestamp``/``changed``/``failed``/``counts``
-    (the table-level fields of :func:`build_run_summary`). Unreadable or corrupt
-    run files are skipped — history viewing must not fail because one file was
+    (the table-level fields of :func:`build_run_summary`) plus the derived
+    ``updates`` counts (:func:`count_updates`). Unreadable or corrupt run
+    files are skipped — history viewing must not fail because one file was
     truncated mid-write. ``limit <= 0`` means "all runs".
     """
     directory = Path(history_dir)
@@ -129,6 +160,7 @@ def history_summary(
             "changed": bool(data.get("changed", False)),
             "failed": bool(data.get("failed", False)),
             "counts": data.get("counts", {}),
+            "updates": count_updates(data),
         })
     return out
 
