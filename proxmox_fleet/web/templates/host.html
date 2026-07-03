@@ -14,7 +14,7 @@ suppressed from run records, so gaps mean "nothing changed that run".</p>
   {% set has_error = entry.record.get("error") %}
   <div class="timeline-item{% if has_error %} fail{% endif %}">
     <span class="when">
-      <a class="mono" href="/history/{{ entry.timestamp }}" title="{{ entry.timestamp }}">{{ entry.timestamp | ts_human }}</a>
+      <a class="mono" href="/history/{{ entry.timestamp }}" title="{{ entry.timestamp }}">{{ entry.timestamp | ts_span }}</a>
       · <span class="pill {% if entry.bucket == 'errors' %}fail{% elif entry.bucket == 'warnings' %}warn{% else %}muted{% endif %}">{{ entry.bucket }}</span>
     </span>
     <div class="body">

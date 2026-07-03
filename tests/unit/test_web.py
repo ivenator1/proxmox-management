@@ -32,6 +32,7 @@ from proxmox_fleet.web.app import (  # noqa: E402
     create_app,
     spark_points,
     ts_human,
+    ts_span,
     ts_iso,
 )
 from proxmox_fleet.web.runs import RunActive, RunManager  # noqa: E402
@@ -213,6 +214,8 @@ def test_index_shows_endpoints_and_update_trends(history_dir, tmp_path):
     assert "trend-chart" in resp.text
     assert 'id="trend-data"' in resp.text
     assert "chart-legend" in resp.text
+    # timestamps carry data-utc so dashboard.js can localize them
+    assert 'class="ts" data-utc="' in resp.text
 
 
 def test_static_assets_must_revalidate(history_dir):
@@ -730,6 +733,14 @@ def test_ts_human_and_iso():
     # malformed input falls back loudly-visible but never raises
     assert ts_human("not-a-ts") == "not-a-ts"
     assert ts_iso("not-a-ts") == ""
+
+
+def test_ts_span_wraps_for_client_localization():
+    html = str(ts_span("20260102T153045123456Z"))
+    assert html == ('<span class="ts" data-utc="2026-01-02T15:30:45Z">'
+                    "2026-01-02 15:30 UTC</span>")
+    # malformed input degrades to plain escaped text, no span
+    assert str(ts_span("<not-a-ts>")) == "&lt;not-a-ts&gt;"
 
 
 def test_spark_points():

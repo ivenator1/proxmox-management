@@ -49,7 +49,7 @@
   <tbody>
   {% for row in rows %}
     <tr>
-      <td><a class="mono" href="/history/{{ row.timestamp }}" title="{{ row.timestamp }}">{{ row.timestamp | ts_human }}</a></td>
+      <td><a class="mono" href="/history/{{ row.timestamp }}" title="{{ row.timestamp }}">{{ row.timestamp | ts_span }}</a></td>
       <td>
         {% if row.failed %}<span class="pill fail">failed</span>
         {% elif row.changed %}<span class="pill info">changed</span>
