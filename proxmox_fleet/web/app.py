@@ -44,6 +44,22 @@ from proxmox_fleet.web.sshsetup import SshSetupError
 
 _PACKAGE_DIR = Path(__file__).parent
 
+
+class RevalidatingStaticFiles(StaticFiles):
+    """StaticFiles that forbids heuristic freshness caching.
+
+    Plain StaticFiles sends ETag/Last-Modified but no Cache-Control, so
+    browsers guess a freshness lifetime and keep serving stale CSS/JS after
+    a deploy (missing features, broken styling) until a hard refresh.
+    ``no-cache`` means "revalidate every time" — with the ETag already
+    there, an unchanged file is a cheap 304, not a re-download.
+    """
+
+    def file_response(self, *args: Any, **kwargs: Any) -> Any:
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
 # Phase names accepted by `fleet-update --phases` (mirrors driver.PHASE_NAMES,
 # which is not imported here — the driver needs ansible-runner installed).
 PHASE_NAMES = ("remote", "custom", "lxc", "vm", "node", "manager")
@@ -421,7 +437,8 @@ def create_app(
     # thinking about auth is protected, not silently public.
     protected = APIRouter(dependencies=[Depends(current_active_user)])
 
-    app.mount("/static", StaticFiles(directory=str(_PACKAGE_DIR / "static")), name="static")
+    app.mount("/static", RevalidatingStaticFiles(directory=str(_PACKAGE_DIR / "static")),
+              name="static")
     templates = Jinja2Templates(directory=str(_PACKAGE_DIR / "templates"))
     templates.env.filters["ts_human"] = ts_human
     templates.env.filters["ts_iso"] = ts_iso
