@@ -92,6 +92,8 @@ def write_history(
     run_file.write_text(payload, encoding="utf-8")
     (directory / "latest.json").write_text(payload, encoding="utf-8")
 
+    _accumulate_totals(directory, summary)
+
     if keep > 0:
         # Timestamps sort lexically; newest last. Keep the newest `keep`, drop the rest.
         runs = sorted(directory.glob("run-*.json"))
@@ -128,6 +130,103 @@ def count_updates(run: Mapping[str, Any]) -> Dict[str, int]:
         if _UPDATED_RE.search(str(rec.get("app") or ""))
     )
     return {"os": os_updates, "app": app_updates}
+
+
+# "Updated (12 upgraded)" — the only place package counts survive into the
+# persisted record for LXC/remote/node; VM records carry `pkg_count` directly.
+_PKG_COUNT_RE = re.compile(r"\((\d+) upgraded\)")
+
+
+def count_packages(run: Mapping[str, Any]) -> int:
+    """Total OS packages upgraded in one persisted run summary.
+
+    LXC records embed the apt count in the ``os`` string; VM records carry a
+    ``pkg_count`` field (with the status string as fallback). Records without
+    a count (remote/node flows don't parse one) contribute 0 — this is a
+    lower bound, never an estimate.
+    """
+    total = 0
+    for rec in run.get("lxc") or []:
+        m = _PKG_COUNT_RE.search(str(rec.get("os") or ""))
+        if m:
+            total += int(m.group(1))
+    for bucket in ("vm", "remote", "node", "custom"):
+        for rec in run.get(bucket) or []:
+            pkg_count = rec.get("pkg_count")
+            if isinstance(pkg_count, int):
+                total += pkg_count
+                continue
+            m = _PKG_COUNT_RE.search(str(rec.get("status") or ""))
+            if m:
+                total += int(m.group(1))
+    return total
+
+
+def _seed_totals(directory: Path) -> Dict[str, Any]:
+    """Build all-time totals by summing every retained run file."""
+    totals: Dict[str, Any] = {"packages": 0, "app_updates": 0, "runs": 0, "since": None}
+    for run_file in sorted(directory.glob("run-*.json")):
+        try:
+            data = json.loads(run_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if totals["since"] is None:
+            totals["since"] = data.get("timestamp", run_file.stem[4:])
+        totals["runs"] += 1
+        totals["packages"] += count_packages(data)
+        totals["app_updates"] += count_updates(data)["app"]
+    return totals
+
+
+def _accumulate_totals(directory: Path, summary: Mapping[str, Any]) -> None:
+    """Fold one just-written run into ``totals.json``.
+
+    The accumulator exists because run files are pruned to
+    ``fleet_history_keep`` — summing retained files undercounts as soon as
+    the first prune happens. Missing/corrupt totals reseed from whatever run
+    files still exist (the just-written run included, so it is not re-added).
+    """
+    path = directory / "totals.json"
+    totals: Any = None
+    try:
+        totals = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        pass
+    if isinstance(totals, dict):
+        totals["packages"] = int(totals.get("packages") or 0) + count_packages(summary)
+        totals["app_updates"] = (
+            int(totals.get("app_updates") or 0) + count_updates(summary)["app"]
+        )
+        totals["runs"] = int(totals.get("runs") or 0) + 1
+        totals.setdefault("since", summary.get("timestamp"))
+    else:
+        totals = _seed_totals(directory)
+    path.write_text(
+        json.dumps(totals, indent=4, sort_keys=True, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def read_totals(history_dir: Union[str, Path]) -> Dict[str, Any]:
+    """All-time update counters for *history_dir*.
+
+    Prefers ``totals.json`` (maintained by :func:`write_history`); until the
+    first run writes one, falls back to summing the retained run files —
+    read-only, so the dashboard never writes into the history directory.
+    """
+    directory = Path(history_dir)
+    try:
+        data = json.loads((directory / "totals.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = None
+    if isinstance(data, dict):
+        return {
+            "packages": int(data.get("packages") or 0),
+            "app_updates": int(data.get("app_updates") or 0),
+            "runs": int(data.get("runs") or 0),
+            "since": data.get("since"),
+        }
+    return _seed_totals(directory)
 
 
 def history_summary(

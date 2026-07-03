@@ -205,8 +205,14 @@ def test_index_shows_endpoints_and_update_trends(history_dir, tmp_path):
     # the error-trend card is gone; the update-trends card replaces it
     assert "Error trend" not in resp.text
     assert "Update trends" in resp.text
-    assert "package updates" in resp.text
-    assert "LXC app updates" in resp.text
+    # all-time counters (seeded history: one app update, no pkg counts)
+    assert "LXC app updates · all time" in resp.text
+    assert "pkgs upgraded · all time" in resp.text
+    assert "runs recorded" in resp.text
+    # one combined chart with a JSON data island for the hover layer
+    assert "trend-chart" in resp.text
+    assert 'id="trend-data"' in resp.text
+    assert "chart-legend" in resp.text
 
 
 def test_history_list_with_delta(history_dir):
