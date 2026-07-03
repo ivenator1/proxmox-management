@@ -215,6 +215,15 @@ def test_index_shows_endpoints_and_update_trends(history_dir, tmp_path):
     assert "chart-legend" in resp.text
 
 
+def test_static_assets_must_revalidate(history_dir):
+    # no-cache stops browsers heuristically serving stale CSS/JS after a
+    # deploy; the ETag keeps revalidation a cheap 304
+    resp = _client(history_dir).get("/static/dashboard.css")
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-cache"
+    assert "etag" in resp.headers
+
+
 def test_history_list_with_delta(history_dir):
     resp = _client(history_dir).get("/history")
     assert resp.status_code == 200
