@@ -121,10 +121,9 @@ def ts_span(ts: str) -> Markup:
     human = ts_human(ts)
     iso = ts_iso(ts)
     if not iso:
-        return Markup(escape(human))
-    return Markup(
-        f'<span class="ts" data-utc="{escape(iso)}">{escape(human)}</span>'
-    )
+        return escape(human)
+    # Markup(literal).format() escapes its arguments (bandit B704-clean)
+    return Markup('<span class="ts" data-utc="{}">{}</span>').format(iso, human)
 
 
 def spark_points(values: Sequence[Any], w: int = 120, h: int = 28,
