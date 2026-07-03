@@ -32,10 +32,11 @@
   --info: #6c9ef8;
   --info-dim: rgba(108, 158, 248, 0.13);
 
-  /* combined-chart series (validator-passing dark variants of accent/ok/fail) */
+  /* combined-chart series (validator-passing dark variants of accent/ok/fail/warn) */
   --chart-os: #5b8def;
   --chart-app: #2fa869;
   --chart-err: #e05252;
+  --chart-warn: #c08a20;
 
   /* console (stays dark in both themes) */
   --console-bg: #0a0c10;
@@ -94,6 +95,7 @@
   --chart-os: #3567d6;
   --chart-app: #1f8a4d;
   --chart-err: #c43b3b;
+  --chart-warn: #9a6a00;
 
   --shadow: 0 1px 2px rgba(23, 32, 56, 0.06), 0 8px 24px -12px rgba(23, 32, 56, 0.12);
   --shadow-pop: 0 4px 12px rgba(23, 32, 56, 0.10), 0 24px 64px -24px rgba(23, 32, 56, 0.25);
@@ -717,6 +719,7 @@ pre.briefing {
 .s-os { --series: var(--chart-os); }
 .s-app { --series: var(--chart-app); }
 .s-err { --series: var(--chart-err); }
+.s-warn { --series: var(--chart-warn); }
 
 .trend-chart {
   position: relative;
@@ -747,6 +750,12 @@ pre.briefing {
   vector-effect: non-scaling-stroke;
 }
 .chart-svg polyline.s-err { stroke-dasharray: 6 4; }
+.chart-svg polyline.s-warn { stroke-dasharray: 2 5; }
+/* series toggled off via the legend (dashboard.js sets .hide-<key>) */
+.trend-chart.hide-os polyline.s-os,
+.trend-chart.hide-app polyline.s-app,
+.trend-chart.hide-err polyline.s-err,
+.trend-chart.hide-warn polyline.s-warn { display: none; }
 .chart-ymax {
   position: absolute;
   top: -2px;
@@ -771,15 +780,43 @@ pre.briefing {
   font-size: 0.75rem;
   color: var(--fg-muted);
 }
+/* legend keys are toggle <button>s — reset the base button chrome (which
+   would otherwise pad/bold them and flex-shrink the swatch SVGs) */
 .chart-legend .key {
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
+  font: inherit;
+  font-weight: 400;
+  padding: 0.1rem 0.2rem;
+  margin: -0.1rem -0.2rem;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+}
+.chart-legend .key:hover { background: var(--bg-hover); border: none; }
+.chart-legend .key:active { transform: none; }
+.chart-legend .key:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-dim);
 }
 .chart-legend .key small { color: var(--fg-faint); font-size: 0.68rem; }
 .chart-legend .key svg { flex: none; }
 .chart-legend .key line { stroke: var(--series); stroke-width: 2; }
 .chart-legend .key.s-err line { stroke-dasharray: 4 3; }
+.chart-legend .key.s-warn line { stroke-dasharray: 1.5 3.5; }
+/* toggled-off series: dim the entry and strike the label */
+.chart-legend .key[aria-pressed="false"] {
+  color: var(--fg-faint);
+  text-decoration: line-through;
+}
+.chart-legend .key[aria-pressed="false"] line { stroke: var(--fg-faint); }
+.chart-hint {
+  font-size: 0.68rem;
+  align-self: center;
+  margin-left: auto;
+}
 
 /* hover layer (built by dashboard.js) */
 .chart-hover {
@@ -843,6 +880,7 @@ pre.briefing {
   border-radius: 1px;
 }
 .chart-tip .tip-key.s-err { border-top-style: dashed; }
+.chart-tip .tip-key.s-warn { border-top-style: dotted; }
 
 /* ---------------------------------------------------------- health gauge */
 

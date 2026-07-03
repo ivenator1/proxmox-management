@@ -115,7 +115,7 @@
   {% endif %}
 
   <div id="trend-chart" class="trend-chart" tabindex="0"
-       aria-label="Per-run trend for the last {{ trend | length }} run{{ '' if trend | length == 1 else 's' }}: OS updates, LXC app updates and errors. Use arrow keys to step through runs.">
+       aria-label="Per-run trend for the last {{ trend | length }} run{{ '' if trend | length == 1 else 's' }}: OS updates, LXC app updates, errors and warnings. Use arrow keys to step through runs.">
     <span class="chart-ymax mono" aria-hidden="true">{{ trend_max }}</span>
     <svg class="chart-svg" viewBox="0 0 1000 100" preserveAspectRatio="none" aria-hidden="true">
       <g class="grid">
@@ -126,6 +126,7 @@
       <polyline class="s-os" points="{{ trend | map(attribute='os') | list | spark_points(1000, 100, lo=0, hi=trend_max) }}"/>
       <polyline class="s-app" points="{{ trend | map(attribute='app') | list | spark_points(1000, 100, lo=0, hi=trend_max) }}"/>
       <polyline class="s-err" points="{{ trend | map(attribute='err') | list | spark_points(1000, 100, lo=0, hi=trend_max) }}"/>
+      <polyline class="s-warn" points="{{ trend | map(attribute='warn') | list | spark_points(1000, 100, lo=0, hi=trend_max) }}"/>
     </svg>
   </div>
   <div class="chart-x muted">
@@ -133,9 +134,11 @@
     <span class="ts" data-utc="{{ trend[-1].ts | ts_iso }}">{{ trend[-1].label }}</span>
   </div>
   <div class="chart-legend">
-    <span class="key s-os"><svg width="16" height="4" aria-hidden="true"><line x1="1" y1="2" x2="15" y2="2"/></svg>OS updates <small>hosts</small></span>
-    <span class="key s-app"><svg width="16" height="4" aria-hidden="true"><line x1="1" y1="2" x2="15" y2="2"/></svg>app updates <small>LXCs</small></span>
-    <span class="key s-err"><svg width="16" height="4" aria-hidden="true"><line x1="1" y1="2" x2="15" y2="2"/></svg>errors</span>
+    <button type="button" class="key s-os" data-series="os" aria-pressed="true"><svg width="16" height="4" aria-hidden="true"><line x1="1" y1="2" x2="15" y2="2"/></svg>OS updates <small>hosts</small></button>
+    <button type="button" class="key s-app" data-series="app" aria-pressed="true"><svg width="16" height="4" aria-hidden="true"><line x1="1" y1="2" x2="15" y2="2"/></svg>app updates <small>LXCs</small></button>
+    <button type="button" class="key s-err" data-series="err" aria-pressed="true"><svg width="16" height="4" aria-hidden="true"><line x1="1" y1="2" x2="15" y2="2"/></svg>errors</button>
+    <button type="button" class="key s-warn" data-series="warn" aria-pressed="true"><svg width="16" height="4" aria-hidden="true"><line x1="1" y1="2" x2="15" y2="2"/></svg>warnings</button>
+    <span class="chart-hint muted" hidden>click a series to show/hide · y-axis fits visible series</span>
   </div>
   <script type="application/json" id="trend-data">{{ {"max": trend_max, "runs": trend} | tojson }}</script>
 </div>
