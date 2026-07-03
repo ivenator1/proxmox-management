@@ -21,7 +21,7 @@
   <h1>Overview</h1>
   {% if latest_run %}
   <span class="sub">last run
-    <a class="mono" href="/history/{{ latest_run.timestamp }}">{{ latest_run.timestamp | ts_human }}</a>
+    <a class="mono" href="/history/{{ latest_run.timestamp }}">{{ latest_run.timestamp | ts_span }}</a>
     {% if latest_run.failed %}<span class="pill fail">FAILED</span>
     {% elif latest_run.changed %}<span class="pill info">Changed</span>
     {% else %}<span class="pill ok">Clean</span>{% endif %}
@@ -75,6 +75,8 @@
           {% for row in recent %}
           <a href="/history/{{ row.timestamp }}"
              class="{% if row.failed %}fail{% elif row.changed %}info{% else %}ok{% endif %}"
+             data-utc-title="{{ row.timestamp | ts_iso }}"
+             data-title-tail="{% if row.failed %}failed{% elif row.changed %}changed{% else %}clean{% endif %}"
              title="{{ row.timestamp | ts_human }} — {% if row.failed %}failed{% elif row.changed %}changed{% else %}clean{% endif %}"></a>
           {% endfor %}
         </div>
@@ -109,7 +111,7 @@
   </div>
   {% if totals.since %}
   <p class="muted" style="font-size: 0.7rem; margin: calc(-1 * var(--sp-3)) 0 var(--sp-4);">
-    counting since {{ totals.since | ts_human }}</p>
+    counting since {{ totals.since | ts_span }}</p>
   {% endif %}
 
   <div id="trend-chart" class="trend-chart" tabindex="0"
@@ -127,8 +129,8 @@
     </svg>
   </div>
   <div class="chart-x muted">
-    <span>{{ trend[0].label }}</span>
-    <span>{{ trend[-1].label }}</span>
+    <span class="ts" data-utc="{{ trend[0].ts | ts_iso }}">{{ trend[0].label }}</span>
+    <span class="ts" data-utc="{{ trend[-1].ts | ts_iso }}">{{ trend[-1].label }}</span>
   </div>
   <div class="chart-legend">
     <span class="key s-os"><svg width="16" height="4" aria-hidden="true"><line x1="1" y1="2" x2="15" y2="2"/></svg>OS updates <small>hosts</small></span>
@@ -150,7 +152,7 @@
 <div class="card">
   <div class="card-head">
     <span class="muted" style="font-size: 0.85rem;">
-      <a href="/pending?ref={{ pending_row.timestamp }}">{{ pending_row.timestamp | ts_human }}</a>
+      <a href="/pending?ref={{ pending_row.timestamp }}">{{ pending_row.timestamp | ts_span }}</a>
     </span>
     <a class="btn btn-sm" href="/pending">details →</a>
   </div>

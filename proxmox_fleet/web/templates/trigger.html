@@ -89,7 +89,7 @@
   <tbody>
   {% for run in runs %}
     <tr>
-      <td class="mono" title="{{ run.started }}">{{ run.started | ts_human }}</td>
+      <td class="mono" title="{{ run.started }}">{{ run.started | ts_span }}</td>
       <td><code>{{ run.args | join(" ") if run.args else "(full run)" }}</code></td>
       <td>
         {% if run.finished is none %}<span class="pill warn pulse">running</span>

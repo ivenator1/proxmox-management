@@ -4,7 +4,7 @@
 <div class="page-head">
   <h1>Pending updates</h1>
   {% if snapshot %}
-  <span class="sub">snapshot <span class="mono" title="{{ snapshot.timestamp }}">{{ snapshot.timestamp | ts_human }}</span>{% if ref == "latest" %} (latest){% endif %}</span>
+  <span class="sub">snapshot <span class="mono" title="{{ snapshot.timestamp }}">{{ snapshot.timestamp | ts_span }}</span>{% if ref == "latest" %} (latest){% endif %}</span>
   {% endif %}
 </div>
 
@@ -92,7 +92,7 @@
   <tbody>
   {% for row in scans %}
     <tr>
-      <td><a class="mono" href="/pending?ref={{ row.timestamp }}" title="{{ row.timestamp }}">{{ row.timestamp | ts_human }}</a></td>
+      <td><a class="mono" href="/pending?ref={{ row.timestamp }}" title="{{ row.timestamp }}">{{ row.timestamp | ts_span }}</a></td>
       <td class="num {% if not row.hosts_pending %}zero{% endif %}">{{ row.hosts_pending }}</td>
       <td class="num {% if not row.lxc_os_pending %}zero{% endif %}">{{ row.lxc_os_pending }}</td>
       <td class="num {% if not row.outdated_apps %}zero{% endif %}">{{ row.outdated_apps }}</td>

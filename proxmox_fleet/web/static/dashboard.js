@@ -2,9 +2,9 @@
    enhancement only (every page works with JS disabled).
 
    Features: theme toggle, command palette (Ctrl+K or /), keyboard shortcuts
-   (g+key navigation, ? cheat sheet), live relative timestamps, auto-refresh
-   while a run is in flight, the overview trend-chart hover layer, and the
-   Konami-code CRT easter egg. The live
+   (g+key navigation, ? cheat sheet), browser-local + live relative
+   timestamps, auto-refresh while a run is in flight, the overview
+   trend-chart hover layer, and the Konami-code CRT easter egg. The live
    console (ANSI rendering, autoscroll, confetti) lives in console.html since
    it is tied to that page's EventSource. */
 
@@ -26,6 +26,42 @@
     root.dataset.theme = next;
     try { localStorage.setItem("fleet-theme", next); } catch (e) { /* private mode */ }
   }
+
+  /* ---------------------------------------------- browser-local timestamps */
+
+  /* Server renders "YYYY-MM-DD HH:MM UTC" as the no-JS fallback; every
+     .ts[data-utc] span is rewritten here into the viewer's timezone in the
+     same shape ("YYYY-MM-DD HH:MM AEST"). [data-utc-title] elements get
+     their title attribute rebuilt the same way. */
+
+  const tsFormatter = (() => {
+    try {
+      return new Intl.DateTimeFormat(undefined, {
+        year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+        timeZoneName: "short",
+      });
+    } catch (e) { return null; }
+  })();
+
+  function fmtLocal(iso) {
+    if (!tsFormatter || !iso) return null;
+    const t = Date.parse(iso);
+    if (Number.isNaN(t)) return null;
+    const p = {};
+    for (const part of tsFormatter.formatToParts(t)) p[part.type] = part.value;
+    return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute} ${p.timeZoneName}`;
+  }
+
+  document.querySelectorAll(".ts[data-utc]").forEach((el) => {
+    const local = fmtLocal(el.dataset.utc);
+    if (local) el.textContent = local;
+  });
+  document.querySelectorAll("[data-utc-title]").forEach((el) => {
+    const local = fmtLocal(el.dataset.utcTitle);
+    if (!local) return;
+    el.title = el.dataset.titleTail ? `${local} — ${el.dataset.titleTail}` : local;
+  });
 
   /* ------------------------------------------------- relative timestamps */
 
@@ -233,7 +269,7 @@
       tip.textContent = "";
       const head = document.createElement("div");
       head.className = "tip-head";
-      head.textContent = run.label || run.ts;
+      head.textContent = fmtLocal(run.iso) || run.label || run.ts;
       tip.appendChild(head);
       for (const s of series) {
         const row = document.createElement("div");

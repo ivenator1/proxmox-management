@@ -28,6 +28,7 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from markupsafe import Markup, escape
 
 from proxmox_fleet import history as history_mod
 from proxmox_fleet import inventory_edit, vars_edit
@@ -109,6 +110,20 @@ def ts_iso(ts: str) -> str:
     times rendered client-side); empty string if malformed."""
     dt = _parse_ts(ts)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ") if dt else ""
+
+
+def ts_span(ts: str) -> Markup:
+    """Jinja filter: human timestamp wrapped for client-side localization.
+
+    dashboard.js rewrites every ``.ts[data-utc]`` span into the viewer's
+    browser timezone; the server-rendered UTC text is the no-JS fallback.
+    Malformed timestamps degrade to plain (escaped) text."""
+    human = ts_human(ts)
+    iso = ts_iso(ts)
+    if not iso:
+        return escape(human)
+    # Markup(literal).format() escapes its arguments (bandit B704-clean)
+    return Markup('<span class="ts" data-utc="{}">{}</span>').format(iso, human)
 
 
 def spark_points(values: Sequence[Any], w: int = 120, h: int = 28,
@@ -442,6 +457,7 @@ def create_app(
     templates = Jinja2Templates(directory=str(_PACKAGE_DIR / "templates"))
     templates.env.filters["ts_human"] = ts_human
     templates.env.filters["ts_iso"] = ts_iso
+    templates.env.filters["ts_span"] = ts_span
     templates.env.filters["spark_points"] = spark_points
 
     # Exception handler: redirect 401 (unauthenticated) to login for HTML requests
@@ -537,6 +553,7 @@ def create_app(
             {
                 "ts": row["timestamp"],
                 "label": ts_human(row["timestamp"]),
+                "iso": ts_iso(row["timestamp"]),
                 "os": (row.get("updates") or {}).get("os", 0),
                 "app": (row.get("updates") or {}).get("app", 0),
                 "err": (row.get("counts") or {}).get("errors", 0),
