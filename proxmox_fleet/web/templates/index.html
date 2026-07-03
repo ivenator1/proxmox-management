@@ -87,33 +87,55 @@
 </div>
 
 {% if recent %}
-{% set latest_row = recent[-1] %}
 <div class="card" style="margin-top: var(--sp-4);">
   <div class="card-head">
     <h2>Update trends</h2>
     <span class="muted" style="font-size: 0.78rem;">last {{ recent | length }} run{{ '' if recent | length == 1 else 's' }}, oldest → newest</span>
   </div>
-  <div class="trend-grid">
-    {% for label, series, latest_n, tone in [
-        ("package updates", recent | map(attribute="updates.os", default=0) | list,
-         (latest_row.updates or {}).get("os", 0), ""),
-        ("LXC app updates", recent | map(attribute="updates.app", default=0) | list,
-         (latest_row.updates or {}).get("app", 0), "ok"),
-        ("errors", recent | map(attribute="counts.errors", default=0) | list,
-         (latest_row.counts or {}).get("errors", 0), "fail"),
-    ] %}
-    <div class="trend {% if not latest_n %}zero{% endif %} {% if tone == 'fail' and latest_n %}tint-fail{% endif %}">
-      <div class="trend-head">
-        <span class="label">{{ label }}</span>
-        <span class="value">{{ latest_n }}</span>
-      </div>
-      <svg class="spark {{ tone }}" width="100%" height="36" viewBox="0 0 400 36"
-           preserveAspectRatio="none" role="img" aria-label="{{ label }} per run trend">
-        <polyline points="{{ series | spark_points(400, 36) }}"/>
-      </svg>
+
+  <div class="stat-grid" style="margin-bottom: var(--sp-4);">
+    <div class="stat {% if not totals.packages %}zero{% endif %}">
+      <span class="label">pkgs upgraded · all time</span>
+      <span class="value">{{ totals.packages }}</span>
     </div>
-    {% endfor %}
+    <div class="stat {% if not totals.app_updates %}zero{% endif %}">
+      <span class="label">LXC app updates · all time</span>
+      <span class="value">{{ totals.app_updates }}</span>
+    </div>
+    <div class="stat {% if not totals.runs %}zero{% endif %}">
+      <span class="label">runs recorded</span>
+      <span class="value">{{ totals.runs }}</span>
+    </div>
   </div>
+  {% if totals.since %}
+  <p class="muted" style="font-size: 0.7rem; margin: calc(-1 * var(--sp-3)) 0 var(--sp-4);">
+    counting since {{ totals.since | ts_human }}</p>
+  {% endif %}
+
+  <div id="trend-chart" class="trend-chart" tabindex="0"
+       aria-label="Per-run trend for the last {{ trend | length }} run{{ '' if trend | length == 1 else 's' }}: OS updates, LXC app updates and errors. Use arrow keys to step through runs.">
+    <span class="chart-ymax mono" aria-hidden="true">{{ trend_max }}</span>
+    <svg class="chart-svg" viewBox="0 0 1000 100" preserveAspectRatio="none" aria-hidden="true">
+      <g class="grid">
+        <line x1="0" x2="1000" y1="2" y2="2"/>
+        <line x1="0" x2="1000" y1="50" y2="50"/>
+        <line x1="0" x2="1000" y1="98" y2="98"/>
+      </g>
+      <polyline class="s-os" points="{{ trend | map(attribute='os') | list | spark_points(1000, 100, lo=0, hi=trend_max) }}"/>
+      <polyline class="s-app" points="{{ trend | map(attribute='app') | list | spark_points(1000, 100, lo=0, hi=trend_max) }}"/>
+      <polyline class="s-err" points="{{ trend | map(attribute='err') | list | spark_points(1000, 100, lo=0, hi=trend_max) }}"/>
+    </svg>
+  </div>
+  <div class="chart-x muted">
+    <span>{{ trend[0].label }}</span>
+    <span>{{ trend[-1].label }}</span>
+  </div>
+  <div class="chart-legend">
+    <span class="key s-os"><svg width="16" height="4" aria-hidden="true"><line x1="1" y1="2" x2="15" y2="2"/></svg>OS updates <small>hosts</small></span>
+    <span class="key s-app"><svg width="16" height="4" aria-hidden="true"><line x1="1" y1="2" x2="15" y2="2"/></svg>app updates <small>LXCs</small></span>
+    <span class="key s-err"><svg width="16" height="4" aria-hidden="true"><line x1="1" y1="2" x2="15" y2="2"/></svg>errors</span>
+  </div>
+  <script type="application/json" id="trend-data">{{ {"max": trend_max, "runs": trend} | tojson }}</script>
 </div>
 {% else %}
 <div class="empty">

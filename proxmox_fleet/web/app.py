@@ -95,8 +95,13 @@ def ts_iso(ts: str) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ") if dt else ""
 
 
-def spark_points(values: Sequence[Any], w: int = 120, h: int = 28) -> str:
-    """Jinja filter: numeric series (oldest→newest) → SVG polyline ``points``."""
+def spark_points(values: Sequence[Any], w: int = 120, h: int = 28,
+                 lo: Optional[float] = None, hi: Optional[float] = None) -> str:
+    """Jinja filter: numeric series (oldest→newest) → SVG polyline ``points``.
+
+    *lo*/*hi* pin the Y scale so several series can share one axis (the
+    combined trend chart); left unset, the series scales to its own range.
+    """
     pad = 2.0
     try:
         vals = [float(v or 0) for v in values]
@@ -106,7 +111,8 @@ def spark_points(values: Sequence[Any], w: int = 120, h: int = 28) -> str:
         return ""
     if len(vals) == 1:
         vals = vals * 2
-    top, bot = max(vals), min(vals)
+    top = float(hi) if hi is not None else max(vals)
+    bot = float(lo) if lo is not None else min(vals)
     span = (top - bot) or 1.0
     step = (w - 2 * pad) / (len(vals) - 1)
     return " ".join(
@@ -507,6 +513,22 @@ def create_app(
         # newest first from history_summary; reversed → oldest first for the
         # pulse strip / sparkline (time flows left → right)
         recent = list(reversed(history_mod.history_summary(history_dir, limit=30)))
+        # combined trend chart: one point per run, all three series on one
+        # shared count axis (max across every series, floor 1 so a flat-zero
+        # history still draws a baseline)
+        trend = [
+            {
+                "ts": row["timestamp"],
+                "label": ts_human(row["timestamp"]),
+                "os": (row.get("updates") or {}).get("os", 0),
+                "app": (row.get("updates") or {}).get("app", 0),
+                "err": (row.get("counts") or {}).get("errors", 0),
+            }
+            for row in recent
+        ]
+        trend_max = max(
+            (max(p["os"], p["app"], p["err"]) for p in trend), default=0,
+        ) or 1
         return templates.TemplateResponse(request, "index.html", {
             "latest_run": latest_run,
             "latest_pending": latest_pending,
@@ -515,6 +537,9 @@ def create_app(
             "active_run": manager.active_run(),
             "endpoints": _endpoint_counts(inventory_path, latest_pending),
             "recent": recent,
+            "trend": trend,
+            "trend_max": trend_max,
+            "totals": history_mod.read_totals(history_dir),
             "health": _health_score(latest_run, pending_row),
         })
 

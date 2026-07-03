@@ -32,6 +32,11 @@
   --info: #6c9ef8;
   --info-dim: rgba(108, 158, 248, 0.13);
 
+  /* combined-chart series (validator-passing dark variants of accent/ok/fail) */
+  --chart-os: #5b8def;
+  --chart-app: #2fa869;
+  --chart-err: #e05252;
+
   /* console (stays dark in both themes) */
   --console-bg: #0a0c10;
   --console-fg: #c8d0dd;
@@ -85,6 +90,10 @@
   --fail-dim: rgba(196, 59, 59, 0.10);
   --info: #3567d6;
   --info-dim: rgba(53, 103, 214, 0.10);
+
+  --chart-os: #3567d6;
+  --chart-app: #1f8a4d;
+  --chart-err: #c43b3b;
 
   --shadow: 0 1px 2px rgba(23, 32, 56, 0.06), 0 8px 24px -12px rgba(23, 32, 56, 0.12);
   --shadow-pop: 0 4px 12px rgba(23, 32, 56, 0.10), 0 24px 64px -24px rgba(23, 32, 56, 0.25);
@@ -219,6 +228,9 @@ code {
   justify-content: center;
   width: 2rem;
   height: 2rem;
+  /* the base `button` rule's 0.55rem/1.1rem padding would swallow the whole
+     2rem border-box and flex-shrink the svg to zero width */
+  padding: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--bg-raised);
@@ -227,7 +239,7 @@ code {
   transition: color 120ms, border-color 120ms, background 120ms;
 }
 .icon-btn:hover { color: var(--fg-strong); border-color: var(--border-strong); }
-.icon-btn svg { display: block; }
+.icon-btn svg { display: block; flex: none; }
 [data-theme="light"] .theme-icon-sun { display: none; }
 :root:not([data-theme="light"]) .theme-icon-moon { display: none; }
 
@@ -697,44 +709,140 @@ pre.briefing {
 .spark .fill { fill: var(--accent-dim); stroke: none; }
 .spark.fail .fill { fill: var(--fail-dim); }
 
-/* ------------------------------------------------- trend tiles (overview) */
+/* --------------------------------------- combined trend chart (overview) */
+/* Series colors are chart-specific: the shared status tokens sit outside the
+   dark lightness band and red/green fail deutan separation on the dark
+   surface — these variants pass the palette validator in both modes. */
 
-.trend-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
-  gap: var(--sp-3);
+.s-os { --series: var(--chart-os); }
+.s-app { --series: var(--chart-app); }
+.s-err { --series: var(--chart-err); }
+
+.trend-chart {
+  position: relative;
+  cursor: crosshair;
+  outline: none;
 }
-.trend {
+.trend-chart:focus-visible {
+  border-radius: 4px;
+  box-shadow: 0 0 0 2px var(--accent-dim);
+}
+.trend-chart .chart-svg {
+  display: block;
+  width: 100%;
+  height: 130px;
+  overflow: visible;
+}
+.chart-svg .grid line {
+  stroke: var(--border);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.chart-svg polyline {
+  fill: none;
+  stroke: var(--series);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+.chart-svg polyline.s-err { stroke-dasharray: 6 4; }
+.chart-ymax {
+  position: absolute;
+  top: -2px;
+  left: 0;
+  padding: 0 3px;
+  font-size: 0.65rem;
+  color: var(--fg-faint);
   background: var(--bg-raised);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: var(--sp-3) var(--sp-4);
-  transition: border-color 120ms;
+  z-index: 1;
 }
-.trend:hover { border-color: var(--border-strong); }
-.trend-head {
+.chart-x {
   display: flex;
   justify-content: space-between;
-  align-items: baseline;
-  margin-bottom: 0.4rem;
+  font-size: 0.7rem;
+  margin-top: 0.3rem;
 }
-.trend .label {
-  font-size: 0.72rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-4);
+  margin-top: var(--sp-2);
+  font-size: 0.75rem;
   color: var(--fg-muted);
 }
-.trend .value {
-  font-size: 1.3rem;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-  color: var(--fg-strong);
-  line-height: 1.2;
+.chart-legend .key {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
 }
-.trend.zero .value { color: var(--fg-faint); }
-.trend.tint-fail { border-color: color-mix(in srgb, var(--fail) 45%, var(--border)); background: linear-gradient(var(--fail-dim), transparent 70%), var(--bg-raised); }
-.trend.tint-fail .value { color: var(--fail); }
+.chart-legend .key small { color: var(--fg-faint); font-size: 0.68rem; }
+.chart-legend .key svg { flex: none; }
+.chart-legend .key line { stroke: var(--series); stroke-width: 2; }
+.chart-legend .key.s-err line { stroke-dasharray: 4 3; }
+
+/* hover layer (built by dashboard.js) */
+.chart-hover {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 100ms;
+}
+.chart-hover .hair {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border-strong);
+}
+.chart-hover .dot {
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  background: var(--series);
+  border: 2px solid var(--bg-raised);
+}
+.chart-tip {
+  position: absolute;
+  top: 4px;
+  min-width: 9.5rem;
+  padding: 0.45rem 0.6rem;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow-pop);
+  font-size: 0.78rem;
+  z-index: 5;
+}
+.chart-tip .tip-head {
+  color: var(--fg-muted);
+  font-size: 0.7rem;
+  margin-bottom: 0.3rem;
+  white-space: nowrap;
+}
+.chart-tip .tip-row {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  line-height: 1.55;
+}
+.chart-tip .tip-row strong {
+  font-variant-numeric: tabular-nums;
+  min-width: 2ch;
+  text-align: right;
+}
+.chart-tip .tip-name { color: var(--fg-muted); }
+.chart-tip .tip-key {
+  flex: none;
+  width: 12px;
+  height: 0;
+  border-top: 2px solid var(--series);
+  border-radius: 1px;
+}
+.chart-tip .tip-key.s-err { border-top-style: dashed; }
 
 /* ---------------------------------------------------------- health gauge */
 

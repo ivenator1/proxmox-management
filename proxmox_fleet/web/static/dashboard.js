@@ -3,7 +3,8 @@
 
    Features: theme toggle, command palette (Ctrl+K or /), keyboard shortcuts
    (g+key navigation, ? cheat sheet), live relative timestamps, auto-refresh
-   while a run is in flight, and the Konami-code CRT easter egg. The live
+   while a run is in flight, the overview trend-chart hover layer, and the
+   Konami-code CRT easter egg. The live
    console (ANSI rendering, autoscroll, confetti) lives in console.html since
    it is tied to that page's EventSource. */
 
@@ -177,6 +178,113 @@
     if (e.key === "g") { pendingG = true; setTimeout(() => { pendingG = false; }, 800); return; }
     if (e.key === "t") toggleTheme();
   });
+
+  /* ------------------------------------- combined trend chart hover layer */
+
+  (function initTrendChart() {
+    const el = $("#trend-chart");
+    const blob = $("#trend-data");
+    if (!el || !blob) return;
+    let data;
+    try { data = JSON.parse(blob.textContent); } catch (e) { return; }
+    const runs = (data && data.runs) || [];
+    const max = (data && data.max) || 1;
+    if (!runs.length) return;
+
+    // must mirror the server-rendered SVG geometry (viewBox 0 0 1000 100, pad 2)
+    const W = 1000, H = 100, PAD = 2;
+    const series = [
+      { key: "os", label: "OS updates", cls: "s-os" },
+      { key: "app", label: "app updates", cls: "s-app" },
+      { key: "err", label: "errors", cls: "s-err" },
+    ];
+
+    const layer = document.createElement("div");
+    layer.className = "chart-hover";
+    const hair = document.createElement("div");
+    hair.className = "hair";
+    layer.appendChild(hair);
+    const dots = series.map((s) => {
+      const d = document.createElement("div");
+      d.className = "dot " + s.cls;
+      layer.appendChild(d);
+      return d;
+    });
+    const tip = document.createElement("div");
+    tip.className = "chart-tip";
+    layer.appendChild(tip);
+    el.appendChild(layer);
+
+    let idx = -1;
+
+    function render() {
+      if (idx < 0) { layer.style.opacity = "0"; return; }
+      const w = el.clientWidth, h = el.clientHeight;
+      const run = runs[idx];
+      const step = runs.length > 1 ? (W - 2 * PAD) / (runs.length - 1) : 0;
+      const px = runs.length === 1 ? w / 2 : (PAD + idx * step) / W * w;
+      layer.style.opacity = "1";
+      hair.style.left = px + "px";
+      series.forEach((s, k) => {
+        const v = run[s.key] || 0;
+        dots[k].style.left = px + "px";
+        dots[k].style.top = (PAD + (max - v) / max * (H - 2 * PAD)) / H * h + "px";
+      });
+      tip.textContent = "";
+      const head = document.createElement("div");
+      head.className = "tip-head";
+      head.textContent = run.label || run.ts;
+      tip.appendChild(head);
+      for (const s of series) {
+        const row = document.createElement("div");
+        row.className = "tip-row";
+        const key = document.createElement("span");
+        key.className = "tip-key " + s.cls;
+        const val = document.createElement("strong");
+        val.textContent = String(run[s.key] || 0);
+        const name = document.createElement("span");
+        name.className = "tip-name";
+        name.textContent = s.label;
+        row.append(key, val, name);
+        tip.appendChild(row);
+      }
+      // keep the tooltip on the roomy side of the crosshair
+      tip.style.left = "auto";
+      tip.style.right = "auto";
+      if (px > w / 2) tip.style.right = (w - px + 10) + "px";
+      else tip.style.left = (px + 10) + "px";
+    }
+
+    el.addEventListener("pointermove", (e) => {
+      if (runs.length === 1) { idx = 0; render(); return; }
+      const r = el.getBoundingClientRect();
+      const padPx = PAD / W * r.width;
+      const frac = (e.clientX - r.left - padPx) / (r.width - 2 * padPx);
+      idx = Math.max(0, Math.min(runs.length - 1, Math.round(frac * (runs.length - 1))));
+      render();
+    });
+    el.addEventListener("pointerleave", () => { idx = -1; render(); });
+    el.addEventListener("focus", () => { if (idx < 0) idx = runs.length - 1; render(); });
+    el.addEventListener("blur", () => { idx = -1; render(); });
+    el.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        idx = Math.max(0, (idx < 0 ? runs.length - 1 : idx) - 1);
+        render();
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        idx = Math.min(runs.length - 1, (idx < 0 ? runs.length - 1 : idx) + 1);
+        render();
+      } else if (e.key === "Enter" && idx >= 0 && runs[idx].ts) {
+        window.location.href = "/history/" + encodeURIComponent(runs[idx].ts);
+      }
+    });
+    el.addEventListener("click", () => {
+      if (idx >= 0 && runs[idx].ts) {
+        window.location.href = "/history/" + encodeURIComponent(runs[idx].ts);
+      }
+    });
+  })();
 
   /* ------------------------------------------------- Konami code CRT mode */
 
