@@ -546,7 +546,7 @@ def create_app(
         # newest first from history_summary; reversed → oldest first for the
         # pulse strip / sparkline (time flows left → right)
         recent = list(reversed(history_mod.history_summary(history_dir, limit=30)))
-        # combined trend chart: one point per run, all three series on one
+        # combined trend chart: one point per run, all four series on one
         # shared count axis (max across every series, floor 1 so a flat-zero
         # history still draws a baseline)
         trend = [
@@ -557,11 +557,13 @@ def create_app(
                 "os": (row.get("updates") or {}).get("os", 0),
                 "app": (row.get("updates") or {}).get("app", 0),
                 "err": (row.get("counts") or {}).get("errors", 0),
+                "warn": (row.get("counts") or {}).get("warnings", 0),
             }
             for row in recent
         ]
         trend_max = max(
-            (max(p["os"], p["app"], p["err"]) for p in trend), default=0,
+            (max(p["os"], p["app"], p["err"], p["warn"]) for p in trend),
+            default=0,
         ) or 1
         return templates.TemplateResponse(request, "index.html", {
             "latest_run": latest_run,

@@ -70,6 +70,8 @@ def _seed_history(history_dir):
     newer = _state(fleet_lxc_data=[dict(node="pve-01", name="sonarr", id="101",
                                         app="FAILED + ROLLED BACK", os="OK")],
                    fleet_error_log=[dict(host="sonarr", task="app update", error="boom")],
+                   fleet_warning_log=[dict(host="sonarr", task="snapshot",
+                                           warning="snapshot slow")],
                    fleet_changed=True, fleet_failed=True)
     write_history(newer, history_dir=history_dir, keep=0,
                   timestamp="20260102T000000000000Z",
@@ -214,6 +216,17 @@ def test_index_shows_endpoints_and_update_trends(history_dir, tmp_path):
     assert "trend-chart" in resp.text
     assert 'id="trend-data"' in resp.text
     assert "chart-legend" in resp.text
+    # all four series render server-side (no-JS fallback shows everything)
+    for cls in ("s-os", "s-app", "s-err", "s-warn"):
+        assert f'<polyline class="{cls}"' in resp.text
+    # legend entries are show/hide toggles, all pressed by default
+    for key in ("os", "app", "err", "warn"):
+        assert f'data-series="{key}" aria-pressed="true"' in resp.text
+    # per-run warning counts flow into the hover-layer data island
+    island = resp.text.split('id="trend-data">', 1)[1].split("</script>", 1)[0]
+    runs = json.loads(island)["runs"]
+    assert [r["warn"] for r in runs] == [0, 1]
+    assert [r["err"] for r in runs] == [0, 1]
     # timestamps carry data-utc so dashboard.js can localize them
     assert 'class="ts" data-utc="' in resp.text
 

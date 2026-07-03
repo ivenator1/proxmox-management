@@ -233,7 +233,69 @@
       { key: "os", label: "OS updates", cls: "s-os" },
       { key: "app", label: "app updates", cls: "s-app" },
       { key: "err", label: "errors", cls: "s-err" },
+      { key: "warn", label: "warnings", cls: "s-warn" },
     ];
+
+    /* ---- legend show/hide toggles -------------------------------------
+       Hidden series drop out of the chart, the tooltip, and the shared Y
+       scale: the axis re-fits to what is visible (hide the big OS line to
+       actually read the flat error/warning lines). The re-fit is announced
+       by the updating y-max label and the .chart-hint line. Selection
+       persists like the theme toggle (localStorage). */
+
+    const HIDE_STORE = "fleet-trend-hidden";
+    const hidden = new Set();
+    try {
+      const stored = JSON.parse(localStorage.getItem(HIDE_STORE) || "[]");
+      if (Array.isArray(stored)) {
+        stored.filter((k) => series.some((s) => s.key === k))
+          .forEach((k) => hidden.add(k));
+      }
+    } catch (e) { /* corrupt/private mode → show everything */ }
+    if (hidden.size >= series.length) hidden.clear();
+
+    // JS port of app.py's spark_points(w=1000, h=100, lo=0, hi=max) — keep
+    // the two in sync or the hover dots drift off the lines
+    function seriesPoints(key, max) {
+      let vals = runs.map((r) => Number(r[key]) || 0);
+      if (vals.length === 1) vals = vals.concat(vals);
+      const step = (W - 2 * PAD) / (vals.length - 1);
+      return vals.map((v, i) =>
+        `${(PAD + i * step).toFixed(1)},${(PAD + (max - v) / max * (H - 2 * PAD)).toFixed(1)}`
+      ).join(" ");
+    }
+
+    let curMax = max;
+    const keyBtns = Array.from(document.querySelectorAll(".chart-legend .key[data-series]"));
+    const ymaxEl = $(".chart-ymax", el);
+
+    function applyVisibility() {
+      curMax = Math.max(...series.filter((s) => !hidden.has(s.key))
+        .flatMap((s) => runs.map((r) => Number(r[s.key]) || 0)), 0) || 1;
+      for (const s of series) {
+        el.classList.toggle("hide-" + s.key, hidden.has(s.key));
+        const line = $(".chart-svg polyline." + s.cls, el);
+        if (line) line.setAttribute("points", seriesPoints(s.key, curMax));
+      }
+      for (const btn of keyBtns) {
+        btn.setAttribute("aria-pressed", hidden.has(btn.dataset.series) ? "false" : "true");
+      }
+      if (ymaxEl) ymaxEl.textContent = String(curMax);
+    }
+
+    for (const btn of keyBtns) {
+      btn.addEventListener("click", () => {
+        const key = btn.dataset.series;
+        if (!hidden.has(key) && hidden.size === series.length - 1) return; // keep one visible
+        hidden.has(key) ? hidden.delete(key) : hidden.add(key);
+        try { localStorage.setItem(HIDE_STORE, JSON.stringify([...hidden])); } catch (e) { /* ok */ }
+        applyVisibility();
+        render();
+      });
+    }
+    const hint = $(".chart-legend .chart-hint");
+    if (hint && keyBtns.length) hint.hidden = false;
+    if (hidden.size) applyVisibility();
 
     const layer = document.createElement("div");
     layer.className = "chart-hover";
@@ -263,8 +325,9 @@
       hair.style.left = px + "px";
       series.forEach((s, k) => {
         const v = run[s.key] || 0;
+        dots[k].style.display = hidden.has(s.key) ? "none" : "";
         dots[k].style.left = px + "px";
-        dots[k].style.top = (PAD + (max - v) / max * (H - 2 * PAD)) / H * h + "px";
+        dots[k].style.top = (PAD + (curMax - v) / curMax * (H - 2 * PAD)) / H * h + "px";
       });
       tip.textContent = "";
       const head = document.createElement("div");
@@ -272,6 +335,7 @@
       head.textContent = fmtLocal(run.iso) || run.label || run.ts;
       tip.appendChild(head);
       for (const s of series) {
+        if (hidden.has(s.key)) continue;
         const row = document.createElement("div");
         row.className = "tip-row";
         const key = document.createElement("span");
