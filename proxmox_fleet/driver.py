@@ -422,31 +422,37 @@ def _discover_vm_locations(
 ) -> Dict[str, Tuple[str, str]]:
     """Query the Proxmox cluster for current VM locations via pvesh over SSH.
 
-    Runs ``pvesh get /cluster/resources --type vm`` on the first available node.
+    Runs ``pvesh get /cluster/resources --type vm`` on each node in inventory
+    order until one answers — a powered-off first node must not blind the whole
+    phase (cluster resources are visible from any member).
     Returns {vmid_str: (node_name, ansible_host_ip)}.
-    Returns an empty dict on any failure (caller falls back to pve_node hint).
+    Returns an empty dict when every node fails (caller falls back to pve_node hint).
 
     Rationale: pvesh reuses the existing SSH executor pattern, adds no new
     SSL/auth surface, and runs as root so no API token is needed.
     """
-    if not nodes:
-        return {}
-
     nodes_map = {n["name"]: n["ansible_host"] for n in nodes}
-    # Use the first node — cluster resources are visible from any member.
-    first_node = nodes[0]["name"]
-    # check=False: discovery is read-only and must run even in dry-run mode.
-    disc_executor = RunnerExecutor(first_node, inventory=inventory_path, check=False)
 
-    try:
-        res = disc_executor.run_shell(
-            "pvesh get /cluster/resources --type vm --output-format json 2>/dev/null",
-            changed_when=False,
-            ignore_errors=True,
-        )
-        if res.failed or not res.stdout.strip():
-            return {}
-        resources = json.loads(res.stdout)
+    for candidate in nodes:
+        disc_node = candidate["name"]
+        # check=False: discovery is read-only and must run even in dry-run mode.
+        disc_executor = RunnerExecutor(disc_node, inventory=inventory_path, check=False)
+        try:
+            res = disc_executor.run_shell(
+                "pvesh get /cluster/resources --type vm --output-format json 2>/dev/null",
+                changed_when=False,
+                ignore_errors=True,
+            )
+            if res.failed or not res.stdout.strip():
+                raise RuntimeError(res.stderr.strip() or "pvesh returned no output")
+            resources = json.loads(res.stdout)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[vm phase] WARNING: cluster VM discovery via {disc_node} failed "
+                f"({exc!s}), trying next node",
+                file=sys.stderr,
+            )
+            continue
         result: Dict[str, Tuple[str, str]] = {}
         for item in (resources if isinstance(resources, list) else []):
             vmid = str(item.get("vmid", ""))
@@ -454,13 +460,7 @@ def _discover_vm_locations(
             if vmid and node_name:
                 result[vmid] = (node_name, nodes_map.get(node_name, node_name))
         return result
-    except Exception as exc:  # noqa: BLE001
-        print(
-            f"[vm phase] WARNING: cluster VM discovery failed ({exc!s}), "
-            "falling back to pve_node inventory hints",
-            file=sys.stderr,
-        )
-        return {}
+    return {}
 
 
 def run_vm_phase(

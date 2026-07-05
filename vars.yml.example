@@ -54,6 +54,14 @@ canary_hosts: []
 # canary_hosts: ["101", "media-vm", "web-01"]
 canary_soak_minutes: 0      # wait this long after the canary wave before the Kuma check
 
+# --- WEB DASHBOARD (fleet-dashboard) ---
+# Optional web UI: pending updates, run history, run trigger. Install with
+# `pip install -e '.[web]'` and start `fleet-dashboard` from the project root.
+# Every page requires session login (admin account created by install.sh, or
+# manually via `python -m proxmox_fleet.web.init_db`).
+dashboard_host: "0.0.0.0"
+dashboard_port: 8421
+
 # --- PENDING-UPDATES SCAN (--scan) ---
 # `fleet-update --scan` is read-only: it writes pending-<ts>.json +
 # pending-latest.json to fleet_history_dir. Keep the newest N scan snapshots.

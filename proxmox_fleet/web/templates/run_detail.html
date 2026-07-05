@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Run {{ run.timestamp }} — Fleet Dashboard{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Run <span class="mono">{{ run.timestamp | ts_span }}</span></h1>
+  {% if run.failed %}<span class="pill fail big">FAILED</span>
+  {% elif run.changed %}<span class="pill info big">Changed</span>
+  {% else %}<span class="pill ok big">Clean</span>{% endif %}
+</div>
+<p class="muted" style="font-size: 0.82rem;">record <code>{{ run.timestamp }}</code></p>
+
+{% for bucket, columns, records in buckets %}
+  {% if records %}
+  <div class="card-head" style="margin-top: var(--sp-5);">
+    <h2 style="margin: 0;">{{ bucket }}</h2>
+    <span class="pill {% if bucket == 'errors' %}fail{% elif bucket == 'warnings' %}warn{% else %}muted{% endif %}">{{ records | length }}</span>
+  </div>
+  <div class="table-card">
+  <table>
+    <thead><tr>{% for col in columns %}<th>{{ col }}</th>{% endfor %}</tr></thead>
+    <tbody>
+    {% for record in records %}
+      <tr>
+        {% for col in columns %}
+        <td>
+          {% set val = record.get(col) %}
+          {% if col in ("host", "name") and val %}<a href="/hosts/{{ val }}">{{ val }}</a>
+          {% elif col == "error" %}<span class="fail">{{ val }}</span>
+          {% elif col == "warning" %}<span class="warn">{{ val }}</span>
+          {% else %}{{ val if val is not none else "" }}{% endif %}
+        </td>
+        {% endfor %}
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+{% endfor %}
+
+{% if run.briefing %}
+<h2>Briefing</h2>
+<pre class="briefing">{{ run.briefing }}</pre>
+{% endif %}
+{% endblock %}

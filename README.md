@@ -26,6 +26,13 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 * **Accurate Change Detection:** OS packages are updated before the community script runs, so each line is correctly attributed. For apps without a version file, a `dpkg-query` package-state hash is taken before and after the community script — if it matches, the container is silent even if the script produced output. This prevents false-positive "UPDATED" reports caused by `PHS_SILENT=1` suppressing apt's stdout inside community scripts.
 * **Consolidated Reporting:** Aggregates results from every node and container into exactly one Discord (or ntfy) notification, with a structured error log showing which host, which task, and what the error was.
 * **Maintenance Windows:** Per-host time/day windows in `host_vars`; `force_window=true` bypasses. Invalid window config fails loud at load time.
+* **Canary Staging:** Hosts flagged `canary=true` (or listed in `canary_hosts`) update first in the remote/LXC/VM phases; the rest run only if every canary succeeded and — after a configurable soak window — its Uptime Kuma monitor is healthy. A failed gate records the remainder as `SKIPPED (canary failed)`.
+* **Targeted Runs:** `--phases lxc,vm` runs only the named phases; `--limit pve-01,105` restricts every phase to specific host names and/or LXC/VM ids — ideal for re-running a single failed container.
+* **Pending-Updates Scan:** `fleet-update --scan` is a strictly read-only fleet walk (pending OS packages per host plus community-script app current → latest per LXC) that feeds the dashboard's pending view. `install.sh` schedules it every 6 hours via `fleet-scan.timer`.
+* **Run History & Replay:** Every run persists a JSON record to `fleet_history_dir`; `--history [N]` tables recent runs and `--history-show latest` replays a stored briefing.
+* **Fleet Run Lock:** A fleet-wide `flock` guarantees the dashboard trigger, the systemd timer, cron, and manual shell runs can never mutate the fleet concurrently.
+* **Web Dashboard:** Optional `fleet-dashboard` web UI (`pip install -e '.[web]'`, or via `install.sh`) — session-based login (admin account, password set during install), pending updates across the fleet (agentless, PatchMon-style, including community-script app versions), browsable run history with per-host drill-down, a run trigger with live console output (SSE), an inventory & enrollment page (add hosts to `hosts.ini`, generate/push/test SSH keys from the browser — no manual `ssh-copy-id` needed), and a comment-preserving `vars.yml` settings editor. Triggered runs launch the CLI as a detached subprocess under the shared fleet run lock.
+* **One-Shot Installer:** `./install.sh` sets up the venv, all dependencies, and reboot-persistent systemd units for the dashboard and the scan timer; `--update` and `--uninstall` round-trip it.
 
 ## 🐍 Python Control Plane
 A typed-Python "brain" (`proxmox_fleet/`) owns all decision logic, config/state
@@ -61,18 +68,20 @@ lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
 
 ## 🛠 Prerequisites
 * **Manager LXC:** A dedicated LXC (e.g., Debian 12+, VMID 121) with a static IP.
-* **SSH Trust:** Passwordless SSH keys distributed from the Manager to all Proxmox Nodes (`ssh-copy-id`).
+* **SSH Trust:** Passwordless SSH keys distributed from the Manager to all Proxmox Nodes — via `ssh-copy-id` or the dashboard's Inventory & enrollment page (see step 3).
 * **API Token:** A Proxmox API Token for `root@pam` with "Privilege Separation" unchecked.
+* **proxmoxer ≥ 2.3:** required by the `community.proxmox` collection (2.x); installed into the project venv together with `ansible-core` (step 2 / `install.sh`).
 * **Uptime Kuma:** A Public Status Page (e.g., slug: `proxmox-sg1`) containing the monitors to be validated.
 
 ## 📂 Project Structure
 ```text
 ~/proxmox-management/
-├── fleet-update.py                  # Runnable wrapper — ./fleet-update.py [--dry-run|--force-notify|…]
+├── fleet-update.py                  # Runnable wrapper — ./fleet-update.py [--dry-run|--scan|--limit|…]
+├── install.sh                       # Root installer: venv + deps + systemd units (dashboard service, 6h scan timer)
 ├── ansible.cfg                      # Performance & connection settings
 ├── hosts.ini                        # List of nodes (gitignored — copy from .example)
 ├── vars.yml                         # Credentials and cluster config (gitignored — copy from .example)
-├── pyproject.toml                   # Package config + the fleet-update console-command entrypoint
+├── pyproject.toml                   # Package config + fleet-update / fleet-dashboard console entrypoints
 ├── .ansible-lint                    # Lint profile and skip rules
 ├── .yamllint.yml                    # YAML style rules
 ├── .github/workflows/ci.yml         # CI: yamllint, ansible-lint, syntax-check, pytest, mypy, ruff, molecule
@@ -82,11 +91,16 @@ lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
 │   ├── executor.py                  # Executor protocol + RunnerExecutor + snapshot_with_retry()
 │   ├── status.py / changes.py       # Decision trees + change detection
 │   ├── briefing.py / notifiers.py / history.py   # Phase 4 (briefing/notify/history)
+│   ├── scan.py / lock.py            # Read-only pending-updates scan + fleet-wide run lock
+│   ├── web/                         # fleet-dashboard FastAPI app ('.[web]' extra): pages, run trigger,
+│   │                                # inventory enrollment, SSH key setup, vars.yml settings editor
 │   └── models/                      # Pydantic schemas (config, state, settings)
 ├── ansible/primitives/             # Single-purpose Ansible execution primitives (no logic); includes batched read primitives (lxc_introspect, lxc_post_update)
 ├── configs/                         # custom_update config files (gitignored; *.example committed)
+├── config_templates/                # Full commented custom_update schema (custom_system.yml.example)
+├── docs/                            # migration-roadmap.md, FEATURE_ROADMAP.md
 ├── tests/
-│   ├── requirements.txt             # pytest, pyyaml
+│   ├── requirements.txt             # pytest, pyyaml, web deps for test_web
 │   └── unit/                        # pytest tests — no Ansible or PVE required
 └── roles/
     ├── lxc_update/molecule/        # Molecule scenarios driving flows/lxc.py
@@ -99,7 +113,7 @@ The `vars.yml` file is the central intelligence of the orchestrator.
 ### 🔑 Authentication & Notifications
 * `pve_api_...`: Credentials for the Proxmox API. Required for snapshots and rollbacks.
 * `discord_webhook`: Your unique Discord Webhook URL for the morning briefing.
-* `notifiers`: List of notifier configs (type `discord` or `ntfy`). If unset, `discord_webhook` is used as a back-compat single notifier; an explicit `[]` means no notifications.
+* `notifiers`: List of notifier configs (types: `discord`, `ntfy`, `webhook`, `telegram`) — the same briefing body is fanned out to every enabled target. If unset, `discord_webhook` is used as a back-compat single notifier; an explicit `[]` means no notifications.
 
 ### 🌐 Networking (Apt-Cacher NG)
 * `apt_proxy_ip` / `apt_proxy_port`: If the node hosting your proxy reboots, the orchestrator will pause and wait for this IP/Port to respond before continuing.
@@ -135,13 +149,45 @@ All previously-hardcoded timeouts and retry counts are overridable per environme
 * `notifier_retries` / `deadmans_retries`: Retry attempts for notifier dispatch and dead-man's-switch pings.
 * `node_apt_retries` / `node_apt_retry_delay`: Retry attempts and delay for the Phase 2 node OS update.
 
+### 🐤 Canary Staging
+* `canary_hosts`: Inventory names and/or LXC/VM ids that form wave 1 of the remote/LXC/VM phases; remote hosts and VMs can also be flagged `canary=true` in `hosts.ini`/`host_vars`.
+* `canary_soak_minutes`: How long to wait after the canary wave before checking each Kuma-monitored canary; the remaining hosts run only if no canary failed and every monitored one is healthy.
+
 ### 📨 Notifications, History & Dead-Man's Switch
-* `force_notify`: Send a Discord/ntfy notification even if nothing changed (same as `--force-notify`).
-* `fleet_history_enabled` / `fleet_history_dir` / `fleet_history_keep`: Each run writes `<dir>/run-<UTC-timestamp>.json` and overwrites `<dir>/latest.json`, pruned to the newest N (`0` = keep all).
+* `force_notify`: Send a notification even if nothing changed (same as `--force-notify`).
+* `fleet_history_enabled` / `fleet_history_dir` / `fleet_history_keep`: Each run writes `<dir>/run-<UTC-timestamp>.json` and overwrites `<dir>/latest.json`, pruned to the newest N (`0` = keep all). Read back with `--history` / `--history-show`.
+* `scan_history_keep`: How many `pending-*.json` scan snapshots (`--scan`) to keep in the same directory.
 * `fleet_deadmans_url`: Pinged at the end of every run (e.g. a [healthchecks.io](https://healthchecks.io)-style URL) so its *absence* alerts you if the orchestrator stops running; `<url>/fail` is pinged on failure.
+
+### 🖥️ Web Dashboard
+* `dashboard_host` / `dashboard_port`: Bind address and port for `fleet-dashboard` (default `0.0.0.0:8421`).
+* **Authentication:** All pages require login. Single `admin` account with password set during `install.sh`. Session-based auth via HTTP-only cookies (SQLite database in `fleet_history_dir/.fleet-users.db`). No configuration needed — password is prompted during installation.
 
 ## 🚀 Setup Instructions
 To set up this project from scratch on a brand-new Manager LXC, follow these steps in order. This ensures all dependencies are met and SSH trust between your Manager and your Proxmox nodes is established correctly.
+
+### ⚡ Quick Install (install.sh)
+On a fresh Manager LXC, `install.sh` automates steps 2 and 6 below and wires everything into
+systemd — it prompts for a dashboard admin password, creates the `.venv`, installs the
+package (with the web-dashboard extras), ansible-core and the Ansible collections, seeds
+`vars.yml`/`hosts.ini` from the `.example` templates if missing, initializes the login
+database, and installs + enables two units that persist across reboots: `fleet-dashboard.service`
+(the web UI on port 8421, login required) and `fleet-scan.timer` (`fleet-update --scan` every 6 hours).
+
+```bash
+git clone https://github.com/ivenator1/proxmox-management.git
+cd proxmox-management
+./install.sh                  # as root
+
+./install.sh --update         # later: git pull + reinstall deps + restart services
+./install.sh --uninstall      # remove units + venv (keeps vars.yml/hosts.ini; asks about history)
+```
+
+You still need step 1 (create the LXC) first, and afterwards your inventory and SSH trust —
+both of which can be done entirely from the dashboard's **Inventory & enrollment** page
+(generate a key, push it to each host with its password once, test the login) after signing
+in with the admin account created during install. The manual steps below remain valid if you
+prefer to set things up by hand.
 
 ### 1. Create the Manager LXC
 * **OS:** Debian 12+ (recommended) or Ubuntu 22.04/24.04.
@@ -163,12 +209,22 @@ source .venv/bin/activate
 # (run after cloning — see step 4)
 pip install -e .
 
+# Ansible itself + proxmoxer live in the venv too — community.proxmox 2.x
+# needs proxmoxer >= 2.3 importable by the interpreter Ansible runs under.
+pip install ansible-core 'proxmoxer>=2.3'
+
 # Install required Ansible Collections (for the execution primitives)
 ansible-galaxy collection install community.proxmox community.general
 ```
 
 ### 3. Establish SSH Trust (Passwordless Login)
 The orchestrator SSHs into your Proxmox nodes to run primitives and gather state.
+
+> **GUI alternative:** if the dashboard is running (e.g. via `install.sh`), the
+> **Inventory & enrollment** page does all of this from the browser — generate an
+> ed25519 key, push it to each host (the host's password is asked once and never
+> stored), and test the passwordless login. Skip to step 4 if you use it.
+
 1. **Generate your SSH Key:**
    ```bash
    ssh-keygen -t ed25519 -C "fleet-manager"
@@ -245,22 +301,44 @@ flags, and a built-in `--help`. Run it from the project root.
 ./fleet-update.py --force-window
 ```
 
-### All Flags
-```
---dry-run / --check      Simulate everything — no changes, no reboots, no snapshots
---force-notify / --notify  Send a notification even if nothing changed
---verbose                Enable verbose LXC output
---force-window           Bypass per-host maintenance-window checks
--e KEY=VALUE             Pass a raw extra var (repeatable; e.g. -e custom_allow_reboot=false)
---inventory PATH         Inventory file (default: hosts.ini)
---vars-file PATH         Settings YAML (default: vars.yml)
+### Targeted Runs
+```bash
+./fleet-update.py --dry-run --phases lxc --limit 105   # re-check one container, no changes
+./fleet-update.py --phases vm --limit media-vm         # only the VM phase, one VM
 ```
 
-### Automated Schedule (Cron)
-Add this to the Manager LXC's `crontab -e` to run at 4:00 AM daily:
+### Pending-Updates Scan & Run History
+```bash
+./fleet-update.py --scan                 # read-only: what *would* update, fleet-wide
+./fleet-update.py --history 5            # table of the last 5 persisted runs
+./fleet-update.py --history-show latest  # replay a stored run's briefing
+```
+
+### All Flags
+```
+--dry-run / --check        Simulate everything — no changes, no reboots, no snapshots
+--force-notify / --notify  Send a notification even if nothing changed
+--verbose                  Enable verbose LXC output
+--force-window             Bypass per-host maintenance-window checks
+--limit HOST,ID,...        Restrict the run to these host names and/or LXC/VM ids
+--phases P1,P2             Run only these phases (remote,custom,lxc,vm,node,manager)
+--scan                     Read-only pending-updates scan → pending-*.json (no fleet run)
+--history [N]              Show the last N persisted runs and exit (default: 10)
+--history-show TS|latest   Print one persisted run's briefing and exit
+-e KEY=VALUE               Pass a raw extra var (repeatable; e.g. -e custom_allow_reboot=false)
+--inventory PATH           Inventory file (default: hosts.ini)
+--vars-file PATH           Settings YAML (default: vars.yml)
+```
+
+### Automated Schedule
+`install.sh` already schedules the read-only scan every 6 hours (`fleet-scan.timer`).
+For unattended *update* runs, add a cron entry on the Manager LXC (`crontab -e`),
+e.g. 4:00 AM daily:
 ```cron
 0 4 * * * cd /root/proxmox-management && /usr/bin/python3 fleet-update.py >> /var/log/fleet-update.log 2>&1
 ```
+The fleet-wide run lock means a cron run, a dashboard-triggered run, and a manual
+shell run can never collide — late starters exit immediately with a clear message.
 
 ## 🧪 Development & Testing
 

@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %}Trigger a run — Fleet Dashboard{% endblock %}
+{% block content %}
+<div class="page-head"><h1>Trigger a run</h1></div>
+
+{% if lock_holder is not none %}
+<div class="banner warn" data-autorefresh>
+  <span class="dot" aria-hidden="true"></span>
+  <span>A fleet run is already in flight (pid {{ lock_holder.get('pid', '?') }},
+    started {{ lock_holder.get('started', '?') }}) — a new trigger will be refused
+    until it finishes.</span>
+</div>
+{% endif %}
+
+<div class="grid cols-2">
+<form class="card" method="post" action="/runs">
+  <label class="option-row">
+    <span class="switch"><input type="checkbox" name="dry_run" value="true"><span class="track"></span></span>
+    <span class="option-text">
+      <span class="option-title">Dry run</span>
+      <span class="option-desc"><code>--check</code> — simulate everything, change nothing</span>
+    </span>
+  </label>
+  <label class="option-row">
+    <span class="switch"><input type="checkbox" name="scan" value="true"><span class="track"></span></span>
+    <span class="option-text">
+      <span class="option-title">Pending-updates scan only</span>
+      <span class="option-desc"><code>--scan</code> — read-only walk, writes a pending snapshot</span>
+    </span>
+  </label>
+  <label class="option-row">
+    <span class="switch"><input type="checkbox" name="force_notify" value="true"><span class="track"></span></span>
+    <span class="option-text">
+      <span class="option-title">Force notification</span>
+      <span class="option-desc">send the briefing even when nothing changed</span>
+    </span>
+  </label>
+  <label class="option-row">
+    <span class="switch"><input type="checkbox" name="force_window" value="true"><span class="track"></span></span>
+    <span class="option-text">
+      <span class="option-title">Bypass maintenance windows</span>
+      <span class="option-desc">update hosts even outside their window</span>
+    </span>
+  </label>
+
+  <div class="field" style="margin-top: var(--sp-4);">
+    <label>Limit to hosts/ids
+      <input type="text" name="limit" placeholder="pve-01,105,media-vm">
+    </label>
+    <p class="hint">comma-separated names and/or LXC/VM ids — optional</p>
+  </div>
+  <div class="field">
+    <label>Phases
+      <input type="text" name="phases" placeholder="lxc,vm">
+    </label>
+    <p class="hint">optional: {{ phase_names | join(", ") }}</p>
+  </div>
+  {% if token_required %}
+  <div class="field">
+    <label>Dashboard token
+      <input type="password" name="token" required autocomplete="current-password">
+    </label>
+  </div>
+  {% endif %}
+  <button class="btn-primary" type="submit">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+    Start run
+  </button>
+</form>
+
+<div>
+  <div class="card">
+    <h3>What happens</h3>
+    <p class="muted" style="font-size: 0.85rem; margin: 0;">
+      The dashboard launches <code>fleet-update</code> as a detached process —
+      closing this page (or restarting the dashboard) never kills a run.
+      Only one fleet run can be in flight at a time; you'll get a live console
+      with streaming output.
+    </p>
+  </div>
+</div>
+</div>
+
+<h2>Dashboard-triggered runs</h2>
+{% if runs %}
+<div class="table-card">
+<table>
+  <thead><tr><th>Started</th><th>Arguments</th><th>Status</th><th></th></tr></thead>
+  <tbody>
+  {% for run in runs %}
+    <tr>
+      <td class="mono" title="{{ run.started }}">{{ run.started | ts_span }}</td>
+      <td><code>{{ run.args | join(" ") if run.args else "(full run)" }}</code></td>
+      <td>
+        {% if run.finished is none %}<span class="pill warn pulse">running</span>
+        {% elif run.rc is none %}<span class="pill muted">finished (rc unknown)</span>
+        {% elif run.rc == 0 %}<span class="pill ok">finished (rc 0)</span>
+        {% else %}<span class="pill fail">finished (rc {{ run.rc }})</span>{% endif %}
+      </td>
+      <td><a href="/runs/{{ run.id }}">output →</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<div class="empty">
+  <span class="glyph" aria-hidden="true">⏻</span>
+  <p>No runs triggered from the dashboard yet.</p>
+</div>
+{% endif %}
+{% endblock %}
