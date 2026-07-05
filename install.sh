@@ -70,6 +70,8 @@ install_python_deps() {
     "$PIP" install --quiet -e "${REPO_DIR}[web]"
     # ansible-runner needs the ansible-playbook binary but does not depend on it.
     "$PIP" install --quiet ansible-core
+    # community.proxmox 2.x hard-fails without proxmoxer >= 2.3 in ansible's interpreter.
+    "$PIP" install --quiet 'proxmoxer>=2.3'
     info "Installing Ansible collections (community.proxmox, community.general)"
     "$VENV/bin/ansible-galaxy" collection install community.proxmox community.general >/dev/null
 }

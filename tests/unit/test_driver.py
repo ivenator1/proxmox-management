@@ -1434,3 +1434,69 @@ def test_soak_no_kuma_url_is_noop():
     err = driver_mod._soak_canaries(GlobalSettings(), {"101": "5"}, ["101"],
                                     _sleep=lambda s: None)
     assert err is None
+
+
+# ---------------------------------------------------------------------------
+# _discover_vm_locations — multi-node fallback
+# ---------------------------------------------------------------------------
+
+_DISC_NODES = [
+    {"name": "pve-01", "ansible_host": "10.0.0.1"},
+    {"name": "pve-02", "ansible_host": "10.0.0.2"},
+]
+_DISC_RESOURCES = [{"vmid": 200, "node": "pve-02"}, {"vmid": 201, "node": "pve-03"}]
+
+
+def _disc_executor(responses: Dict[str, PrimitiveResult], calls: List[str]):
+    """Factory monkeypatched over driver.RunnerExecutor for discovery tests."""
+    class _Exec:
+        def __init__(self, host, **kw):
+            calls.append(host)
+            self._res = responses[host]
+
+        def run_shell(self, cmd, **kw):
+            return self._res
+
+    return _Exec
+
+
+def test_discover_vm_locations_falls_back_to_next_node(monkeypatch, capsys):
+    calls: List[str] = []
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _disc_executor({
+        "pve-01": PrimitiveResult(rc=4, failed=True, stderr="no route to host"),
+        "pve-02": PrimitiveResult(rc=0, stdout=json.dumps(_DISC_RESOURCES)),
+    }, calls))
+
+    got = driver_mod._discover_vm_locations(_DISC_NODES, inventory_path="hosts.ini")
+
+    assert got == {"200": ("pve-02", "10.0.0.2"), "201": ("pve-03", "pve-03")}
+    assert calls == ["pve-01", "pve-02"]
+    assert "via pve-01 failed" in capsys.readouterr().err
+
+
+def test_discover_vm_locations_first_node_ok_asks_no_others(monkeypatch):
+    calls: List[str] = []
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _disc_executor({
+        "pve-01": PrimitiveResult(rc=0, stdout=json.dumps(_DISC_RESOURCES)),
+        "pve-02": PrimitiveResult(rc=0, stdout="[]"),
+    }, calls))
+
+    got = driver_mod._discover_vm_locations(_DISC_NODES, inventory_path="hosts.ini")
+
+    assert got["200"] == ("pve-02", "10.0.0.2")
+    assert calls == ["pve-01"]
+
+
+def test_discover_vm_locations_all_nodes_down_returns_empty(monkeypatch, capsys):
+    calls: List[str] = []
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _disc_executor({
+        "pve-01": PrimitiveResult(rc=4, failed=True, stderr="no route to host"),
+        "pve-02": PrimitiveResult(rc=0, stdout="not json"),
+    }, calls))
+
+    got = driver_mod._discover_vm_locations(_DISC_NODES, inventory_path="hosts.ini")
+
+    assert got == {}
+    assert calls == ["pve-01", "pve-02"]
+    err = capsys.readouterr().err
+    assert "via pve-01 failed" in err and "via pve-02 failed" in err

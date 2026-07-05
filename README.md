@@ -70,6 +70,7 @@ lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
 * **Manager LXC:** A dedicated LXC (e.g., Debian 12+, VMID 121) with a static IP.
 * **SSH Trust:** Passwordless SSH keys distributed from the Manager to all Proxmox Nodes — via `ssh-copy-id` or the dashboard's Inventory & enrollment page (see step 3).
 * **API Token:** A Proxmox API Token for `root@pam` with "Privilege Separation" unchecked.
+* **proxmoxer ≥ 2.3:** required by the `community.proxmox` collection (2.x); installed into the project venv together with `ansible-core` (step 2 / `install.sh`).
 * **Uptime Kuma:** A Public Status Page (e.g., slug: `proxmox-sg1`) containing the monitors to be validated.
 
 ## 📂 Project Structure
@@ -207,6 +208,10 @@ python3 -m venv .venv
 source .venv/bin/activate
 # (run after cloning — see step 4)
 pip install -e .
+
+# Ansible itself + proxmoxer live in the venv too — community.proxmox 2.x
+# needs proxmoxer >= 2.3 importable by the interpreter Ansible runs under.
+pip install ansible-core 'proxmoxer>=2.3'
 
 # Install required Ansible Collections (for the execution primitives)
 ansible-galaxy collection install community.proxmox community.general
