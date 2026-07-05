@@ -10,6 +10,7 @@ tests and type-checking do not require it installed.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -99,6 +100,16 @@ def invoke_primitive(
     project root — the fleet-update CLI and mol_run_flow.py both guarantee this).
     """
     import ansible_runner  # lazy: only needed when actually executing
+
+    # ansible-runner locates ansible-playbook via shutil.which(), i.e. PATH.
+    # The venv bootstrap (fleet-update.py os.execv, systemd ExecStart) swaps the
+    # interpreter without activating the venv, so PATH would still resolve to the
+    # system ansible — whose interpreter can't see venv-installed module deps
+    # like proxmoxer. Prepend our own bindir so a venv ansible-core wins when
+    # present; when it isn't, which() falls through to the system one as before.
+    bindir = str(Path(sys.executable).parent)
+    if bindir not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
 
     evars = dict(extravars or {})
     if host_pattern is not None:
