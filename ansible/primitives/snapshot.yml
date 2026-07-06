@@ -23,6 +23,9 @@
         api_user: "{{ api_user }}"
         api_token_id: "{{ api_token_id }}"
         api_token_secret: "{{ api_token_secret }}"
+        # PVE nodes ship self-signed certs; community.proxmox 2.x flipped the
+        # default to validate them, which breaks every direct-to-node API call.
+        validate_certs: false
         vmid: "{{ vmid }}"
         snapname: "BEFORE_UPDATE_AUTO"
         state: "{{ snap_state }}"

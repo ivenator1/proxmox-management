@@ -27,8 +27,9 @@ pip install -e '.[web]'              # fastapi + uvicorn for the dashboard
 fleet-dashboard                      # web UI on dashboard_host:dashboard_port (default 0.0.0.0:8421);
                                      # run from the project root (the trigger subprocess needs CWD here)
 
-pip install ansible-core 'proxmoxer>=2.3'   # into the venv — community.proxmox 2.x
-                                            # needs proxmoxer >= 2.3 in ansible's interpreter
+pip install ansible-core 'proxmoxer>=2.3' requests   # into the venv — community.proxmox 2.x
+                                            # needs proxmoxer >= 2.3 in ansible's interpreter;
+                                            # requests = proxmoxer's undeclared HTTPS dep
 ansible-galaxy collection install community.proxmox community.general
 # ~/.ansible/collections is per-user and shared by every checkout on the box.
 
