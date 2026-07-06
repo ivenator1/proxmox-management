@@ -133,3 +133,17 @@ def test_harvest_result_has_events_list():
     runner = _FakeRunner(events=[_ok_event()])
     result = _harvest(runner)
     assert len(result.events) == 1
+
+
+def test_harvest_unreachable_flag():
+    runner = _FakeRunner(events=[_unreachable_event()], rc=4, status="failed")
+    result = _harvest(runner)
+    assert result.failed is True
+    assert result.unreachable is True
+
+
+def test_harvest_plain_failure_is_not_unreachable():
+    runner = _FakeRunner(events=[_failed_event(stderr="boom")], rc=2, status="failed")
+    result = _harvest(runner)
+    assert result.failed is True
+    assert result.unreachable is False

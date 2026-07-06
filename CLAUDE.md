@@ -318,6 +318,13 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
   (header only) — Ansible raises "no hosts matched" otherwise.
 - **`custom_config` is required per-host** for `[custom_hosts]` — fails loud (include_vars) if missing.
 - **Node reboot is skipped** when `manager_lxc_id` runs on that node (would kill the manager mid-run).
+- **Unreachable nodes are tolerated while the cluster is quorate**: LXC discovery
+  (`UnreachableHostError`, from `PrimitiveResult.unreachable` / `runner_on_unreachable`) and
+  the Phase-2 node loop (`_error_is_unreachable()` text match) convert an SSH-unreachable node
+  into a warning + `SKIPPED (unreachable)` record instead of failing the run — gated on
+  `driver._cluster_quorate()` (`pvesh get /cluster/status` on a surviving node; standalone
+  node counts as quorate). Without quorum it stays a hard error (pmxcfs goes read-only →
+  snapshots fail fleet-wide). VM guests stay hard errors — HA should have migrated them.
 - **`lxc_backup_strategy`** is a 4-value enum: `snapshot | vzdump | both | none` — not booleans.
 - **`/tmp/.nc/clear` trick**: overrides `clear` with a no-op so update-script output isn't wiped from capture.
 - **Snapshot name is fixed** at `BEFORE_UPDATE_AUTO` — the `finally` cleanup hardcodes it; changing

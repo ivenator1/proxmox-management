@@ -16,6 +16,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+class UnreachableHostError(RuntimeError):
+    """The target host never answered (SSH down / no route) — as opposed to a
+    command that ran and failed. Lets callers treat a powered-off host
+    differently from a genuine error."""
+
+
 @dataclass
 class PrimitiveResult:
     """The structured outcome of one primitive invocation."""
@@ -23,6 +29,9 @@ class PrimitiveResult:
     rc: int
     changed: bool = False
     failed: bool = False
+    # True when ansible reported the host unreachable (SSH/no-route), i.e. the
+    # command never ran — distinct from failed (the command ran and errored).
+    unreachable: bool = False
     stdout: str = ""
     stderr: str = ""
     # Facts the primitive set via ``set_stats`` (data=..., aggregate=no) — harvested
@@ -41,6 +50,7 @@ def _harvest(runner: Any) -> PrimitiveResult:
     stderr_chunks: List[str] = []
     changed = False
     failed = False
+    unreachable = False
     events: List[Dict[str, Any]] = []
 
     for event in runner.events:
@@ -57,6 +67,7 @@ def _harvest(runner: Any) -> PrimitiveResult:
                 stdout_chunks.append(res["stdout"])
         if event.get("event") in ("runner_on_failed", "runner_on_unreachable"):
             failed = True
+            unreachable = unreachable or event.get("event") == "runner_on_unreachable"
             if isinstance(res.get("stdout"), str):
                 stdout_chunks.append(res["stdout"])
             if isinstance(res.get("stderr"), str):
@@ -71,6 +82,7 @@ def _harvest(runner: Any) -> PrimitiveResult:
         rc=rc,
         changed=changed,
         failed=failed,
+        unreachable=unreachable,
         stdout="\n".join(stdout_chunks),
         stderr="\n".join(stderr_chunks),
         facts=facts,

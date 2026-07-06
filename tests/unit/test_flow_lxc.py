@@ -718,3 +718,24 @@ def test_discover_lxcs_exclude_list_wins_over_os_only_list():
     settings = _settings(os_only_lxc_list=["105"], exclude_list=["105"])
     ids = _discover_lxcs(ex, settings)
     assert ids == ["101"]
+
+
+def test_discover_lxcs_unreachable_raises_typed_error():
+    import pytest
+    from proxmox_fleet.runner import PrimitiveResult, UnreachableHostError
+
+    ex = ScriptedLxcExecutor(default=PrimitiveResult(
+        rc=4, failed=True, unreachable=True, stderr="ssh: No route to host"))
+    with pytest.raises(UnreachableHostError, match="No route to host"):
+        _discover_lxcs(ex, _settings())
+
+
+def test_discover_lxcs_plain_failure_raises_runtime_error():
+    import pytest
+    from proxmox_fleet.runner import PrimitiveResult, UnreachableHostError
+
+    ex = ScriptedLxcExecutor(default=PrimitiveResult(
+        rc=1, failed=True, stderr="pct: command not found"))
+    with pytest.raises(RuntimeError) as exc_info:
+        _discover_lxcs(ex, _settings())
+    assert not isinstance(exc_info.value, UnreachableHostError)

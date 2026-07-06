@@ -39,10 +39,13 @@ from proxmox_fleet.models.state import (
     ErrorEntry,
     FleetState,
     LxcRecord,
+    NodeRecord,
     RemoteRecord,
     VmRecord,
+    WarningEntry,
 )
 from proxmox_fleet.orchestration import run_concurrent
+from proxmox_fleet.runner import UnreachableHostError
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -263,6 +266,57 @@ def _fold_outcome(state: FleetState, outcome: Any, bucket: List[Any]) -> None:
     state.warnings.extend(getattr(outcome, "warnings", []))
 
 
+# Ansible's unreachable-host message (stable across core versions) plus the
+# usual SSH connect errors — used to spot "the host never answered" in error
+# text that already passed through a flow's exception formatting.
+_UNREACHABLE_MARKERS = (
+    "Data could not be sent to remote host",
+    "No route to host",
+    "Connection timed out",
+    "Connection refused",
+)
+
+
+def _error_is_unreachable(text: str) -> bool:
+    return any(marker in text for marker in _UNREACHABLE_MARKERS)
+
+
+def _cluster_quorate(
+    nodes: List[Dict[str, str]],
+    *,
+    inventory_path: str,
+    skip: Set[str],
+) -> Optional[bool]:
+    """Ask the first answering node (not in *skip*) whether the cluster is quorate.
+
+    Returns True/False from ``pvesh get /cluster/status``, True for a standalone
+    node (no cluster entry — quorum doesn't apply), or None when no node answered.
+    Used to decide whether an unreachable node can be safely skipped: with quorum
+    intact the rest of the fleet (including snapshots) still works.
+    """
+    for node_info in nodes:
+        node_name = node_info["name"]
+        if node_name in skip:
+            continue
+        ex = RunnerExecutor(node_name, inventory=inventory_path, check=False)
+        try:
+            res = ex.run_shell(
+                "pvesh get /cluster/status --output-format json 2>/dev/null",
+                changed_when=False,
+                ignore_errors=True,
+            )
+            if res.failed or not res.stdout.strip():
+                continue
+            items = json.loads(res.stdout)
+            for item in (items if isinstance(items, list) else []):
+                if item.get("type") == "cluster":
+                    return bool(item.get("quorate"))
+            return True  # standalone node — no quorum concept
+        except Exception:  # noqa: BLE001 — try the next node
+            continue
+    return None
+
+
 def run_lxc_phase(
     *,
     settings: GlobalSettings,
@@ -303,6 +357,7 @@ def run_lxc_phase(
     # the canary wave can span nodes. A discovery failure on one node is
     # recorded and skips that node only — it never gates the canary waves.
     discovered: List[Tuple[str, str, List[str]]] = []
+    unreachable_nodes: List[str] = []
     for node_info in nodes:
         node_name = node_info["name"]
         api_host = node_info["ansible_host"]
@@ -319,6 +374,11 @@ def run_lxc_phase(
         print(f"[{node_name}] discovering LXCs (first run loads Ansible — may take a moment)...")
         try:
             lxc_ids = _discover_lxcs(discovery_executor, settings)
+        except UnreachableHostError:
+            # The node never answered — decided after the loop (quorum gate).
+            unreachable_nodes.append(node_name)
+            print(f"[{node_name}] WARNING: node unreachable — skipping its containers")
+            continue
         except Exception as exc:  # noqa: BLE001
             state.failed = True
             state.errors.append(ErrorEntry(
@@ -331,6 +391,27 @@ def run_lxc_phase(
 
         print(f"[{node_name}] found {len(lxc_ids)} managed LXC(s): {', '.join(lxc_ids) or 'none'}")
         discovered.append((node_name, api_host, lxc_ids))
+
+    # A down node is tolerable while the cluster is still quorate: the other
+    # nodes (and their snapshots) keep working, so record a warning instead of
+    # failing the run. Without quorum /etc/pve goes read-only fleet-wide —
+    # that IS a run-level failure.
+    if unreachable_nodes:
+        quorate = _cluster_quorate(
+            nodes, inventory_path=inventory_path, skip=set(unreachable_nodes))
+        for name in unreachable_nodes:
+            if quorate:
+                state.warnings.append(WarningEntry(
+                    host=name, task="node reachability",
+                    warning="node down/unreachable — containers skipped this run "
+                            "(cluster still quorate)"))
+            else:
+                reason = ("cluster NOT quorate" if quorate is False
+                          else "no node answered the quorum check")
+                state.failed = True
+                state.errors.append(ErrorEntry(
+                    host=name, task="discover_lxcs",
+                    error=f"node unreachable and {reason}"))
 
     def _run_node_ids(node_name: str, api_host: str, ids: List[str]) -> bool:
         """Run one node's containers concurrently; returns True if any failed."""
@@ -707,11 +788,28 @@ def run_node_phase(
     state = FleetState()
 
     # Phase 2: serial node loop — abort on first failure (any_errors_fatal equivalent).
+    # Exception: a node that never answered (powered off / no route) is skipped
+    # with a warning instead, as long as the cluster is still quorate — a down
+    # node must not block updates for the healthy ones.
     if include_nodes:
         for node_info in nodes:
             node_name = node_info["name"]
             executor = RunnerExecutor(node_name, inventory=inventory_path, check=check)
             outcome = run_node_update(node_name, executor, settings, dry_run=dry_run)
+            if (
+                outcome.failed
+                and outcome.error is not None
+                and _error_is_unreachable(outcome.error.error)
+                and _cluster_quorate(nodes, inventory_path=inventory_path,
+                                     skip={node_name})
+            ):
+                state.node.append(NodeRecord(node=node_name, status="SKIPPED (unreachable)"))
+                state.warnings.append(WarningEntry(
+                    host=node_name, task=outcome.error.task,
+                    warning="node down/unreachable — OS update skipped this run "
+                            "(cluster still quorate)"))
+                print(f"  [{node_name}] SKIPPED (unreachable)")
+                continue
             _fold_outcome(state, outcome, state.node)
             status = outcome.record.status if outcome.record else "?"
             print(f"  [{node_name}] {status}")
