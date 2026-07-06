@@ -22,6 +22,7 @@ from proxmox_fleet.executor import Executor, snapshot_with_retry
 from proxmox_fleet.flows._pkg import kuma_healthy
 from proxmox_fleet.lxc_parse import parse_ct_script, parse_pct_config, parse_pct_status, script_name_from_update
 from proxmox_fleet.models.settings import GlobalSettings
+from proxmox_fleet.runner import UnreachableHostError
 from proxmox_fleet.models.state import ErrorEntry, LxcRecord, WarningEntry
 from proxmox_fleet.status import (
     lxc_app_did_update,
@@ -130,6 +131,8 @@ def _discover_lxcs(executor: Executor, settings: GlobalSettings) -> List[str]:
         f"then echo \"$vmid\"; fi; done"
     )
     res = executor.run_shell(cmd, changed_when=False)
+    if getattr(res, "unreachable", False):
+        raise UnreachableHostError(f"node unreachable: {res.stderr or '(no stderr)'}")
     if res.failed:
         raise RuntimeError(f"discover_lxcs shell failed (rc={res.rc}): {res.stderr or '(no stderr)'}")
     raw_ids = [line.strip() for line in res.stdout.splitlines() if line.strip()]

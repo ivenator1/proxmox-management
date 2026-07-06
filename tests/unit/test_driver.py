@@ -1500,3 +1500,210 @@ def test_discover_vm_locations_all_nodes_down_returns_empty(monkeypatch, capsys)
     assert calls == ["pve-01", "pve-02"]
     err = capsys.readouterr().err
     assert "via pve-01 failed" in err and "via pve-02 failed" in err
+
+
+# ---------------------------------------------------------------------------
+# Unreachable-node tolerance (quorum-gated skip instead of run failure)
+# ---------------------------------------------------------------------------
+
+def _two_node_inventory(tmp_path) -> str:
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\n"
+        "pve-01 ansible_host=10.0.0.1\n"
+        "pve-02 ansible_host=10.0.0.2\n"
+    )
+    return str(p)
+
+
+def test_cluster_quorate_asks_first_answering_node(monkeypatch):
+    class _Exec:
+        def __init__(self, host, **kw):
+            self.host = host
+
+        def run_shell(self, cmd, **kw):
+            if self.host == "pve-01":
+                return PrimitiveResult(rc=4, failed=True, unreachable=True)
+            return PrimitiveResult(
+                rc=0,
+                stdout=json.dumps([{"type": "cluster", "quorate": 1},
+                                   {"type": "node", "name": "pve-02"}]),
+            )
+
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _Exec)
+    nodes = [{"name": "pve-01", "ansible_host": "10.0.0.1"},
+             {"name": "pve-02", "ansible_host": "10.0.0.2"}]
+    assert driver_mod._cluster_quorate(nodes, inventory_path="hosts.ini",
+                                       skip={"pve-01"}) is True
+    # Not-quorate cluster reports 0
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", lambda *a, **kw: type(
+        "E", (), {"run_shell": lambda self, cmd, **kw2: PrimitiveResult(
+            rc=0, stdout=json.dumps([{"type": "cluster", "quorate": 0}]))})())
+    assert driver_mod._cluster_quorate(nodes, inventory_path="hosts.ini",
+                                       skip=set()) is False
+
+
+def test_cluster_quorate_standalone_and_silent(monkeypatch):
+    # Standalone node: no cluster entry → quorum doesn't apply → True.
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", lambda *a, **kw: type(
+        "E", (), {"run_shell": lambda self, cmd, **kw2: PrimitiveResult(
+            rc=0, stdout=json.dumps([{"type": "node", "name": "pve-01"}]))})())
+    nodes = [{"name": "pve-01", "ansible_host": "10.0.0.1"}]
+    assert driver_mod._cluster_quorate(nodes, inventory_path="hosts.ini",
+                                       skip=set()) is True
+    # Nobody answers → None.
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", lambda *a, **kw: type(
+        "E", (), {"run_shell": lambda self, cmd, **kw2: PrimitiveResult(
+            rc=4, failed=True, unreachable=True)})())
+    assert driver_mod._cluster_quorate(nodes, inventory_path="hosts.ini",
+                                       skip=set()) is None
+
+
+def test_lxc_phase_unreachable_node_warns_when_quorate(tmp_path, monkeypatch):
+    from proxmox_fleet.flows.lxc import LxcFlowOutcome
+    from proxmox_fleet.runner import UnreachableHostError
+
+    inv = _two_node_inventory(tmp_path)
+    ran: List[str] = []
+
+    def _fake_discover(ex, settings):
+        if ex.host == "pve-01":
+            raise UnreachableHostError("node unreachable: No route to host")
+        return ["201"]
+
+    def _fake_executor(host, **kw):
+        ex = ScriptedExecutor()
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", _fake_discover)
+    monkeypatch.setattr(driver_mod, "_cluster_quorate", lambda *a, **kw: True)
+    monkeypatch.setattr(driver_mod, "run_lxc_update",
+                        lambda node, lxc_id, ex, settings, **kw:
+                        ran.append(f"{node}/{lxc_id}") or LxcFlowOutcome())
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+
+    state = driver_mod.run_lxc_phase(settings=GlobalSettings(), inventory_path=inv,
+                                     state_output_path=None)
+
+    assert not state.failed
+    assert state.errors == []
+    assert len(state.warnings) == 1
+    assert state.warnings[0].host == "pve-01"
+    assert "unreachable" in state.warnings[0].warning
+    assert ran == ["pve-02/201"]
+
+
+def test_lxc_phase_unreachable_node_fails_without_quorum(tmp_path, monkeypatch):
+    from proxmox_fleet.runner import UnreachableHostError
+
+    inv = _two_node_inventory(tmp_path)
+
+    def _fake_discover(ex, settings):
+        if ex.host == "pve-01":
+            raise UnreachableHostError("node unreachable: No route to host")
+        return []
+
+    def _fake_executor(host, **kw):
+        ex = ScriptedExecutor()
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", _fake_discover)
+    monkeypatch.setattr(driver_mod, "_cluster_quorate", lambda *a, **kw: False)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+
+    state = driver_mod.run_lxc_phase(settings=GlobalSettings(), inventory_path=inv,
+                                     state_output_path=None)
+
+    assert state.failed
+    assert state.warnings == []
+    assert len(state.errors) == 1
+    assert "NOT quorate" in state.errors[0].error
+
+
+def test_node_phase_skips_unreachable_node_and_continues(tmp_path, monkeypatch):
+    from proxmox_fleet.flows.node import NodeFlowOutcome
+    from proxmox_fleet.models.state import ErrorEntry, NodeRecord as NR
+
+    inv = _two_node_inventory(tmp_path)
+
+    def _fake_node_update(node_name, executor, settings, **kw):
+        if node_name == "pve-01":
+            return NodeFlowOutcome(
+                record=NR(node=node_name, status="FAILED"), failed=True,
+                error=ErrorEntry(host=node_name, task="apt dist-upgrade",
+                                 error='Data could not be sent to remote host '
+                                       '"10.0.0.1": No route to host'))
+        return NodeFlowOutcome(record=NR(node=node_name, status="UPDATED"),
+                               changed=True)
+
+    monkeypatch.setattr(driver_mod, "run_node_update", _fake_node_update)
+    monkeypatch.setattr(driver_mod, "_cluster_quorate", lambda *a, **kw: True)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    state = driver_mod.run_node_phase(settings=GlobalSettings(), inventory_path=inv,
+                                      state_output_path=None, include_manager=False)
+
+    assert not state.failed
+    assert [(r.node, r.status) for r in state.node] == [
+        ("pve-01", "SKIPPED (unreachable)"), ("pve-02", "UPDATED")]
+    assert len(state.warnings) == 1
+    assert state.warnings[0].host == "pve-01"
+    assert state.errors == []
+
+
+def test_node_phase_unreachable_without_quorum_still_aborts(tmp_path, monkeypatch):
+    from proxmox_fleet.flows.node import NodeFlowOutcome
+    from proxmox_fleet.models.state import ErrorEntry, NodeRecord as NR
+
+    inv = _two_node_inventory(tmp_path)
+    ran: List[str] = []
+
+    def _fake_node_update(node_name, executor, settings, **kw):
+        ran.append(node_name)
+        return NodeFlowOutcome(
+            record=NR(node=node_name, status="FAILED"), failed=True,
+            error=ErrorEntry(host=node_name, task="apt dist-upgrade",
+                             error="No route to host"))
+
+    monkeypatch.setattr(driver_mod, "run_node_update", _fake_node_update)
+    monkeypatch.setattr(driver_mod, "_cluster_quorate", lambda *a, **kw: False)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    state = driver_mod.run_node_phase(settings=GlobalSettings(), inventory_path=inv,
+                                      state_output_path=None, include_manager=False)
+
+    assert state.failed
+    assert ran == ["pve-01"]  # aborted on first failure as before
+
+
+def test_node_phase_real_failure_still_aborts(tmp_path, monkeypatch):
+    from proxmox_fleet.flows.node import NodeFlowOutcome
+    from proxmox_fleet.models.state import ErrorEntry, NodeRecord as NR
+
+    inv = _two_node_inventory(tmp_path)
+    ran: List[str] = []
+
+    def _fake_node_update(node_name, executor, settings, **kw):
+        ran.append(node_name)
+        return NodeFlowOutcome(
+            record=NR(node=node_name, status="FAILED"), failed=True,
+            error=ErrorEntry(host=node_name, task="apt dist-upgrade",
+                             error="dpkg was interrupted"))
+
+    quorum_calls: List[str] = []
+    monkeypatch.setattr(driver_mod, "run_node_update", _fake_node_update)
+    monkeypatch.setattr(driver_mod, "_cluster_quorate",
+                        lambda *a, **kw: quorum_calls.append("x") or True)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    state = driver_mod.run_node_phase(settings=GlobalSettings(), inventory_path=inv,
+                                      state_output_path=None, include_manager=False)
+
+    assert state.failed
+    assert ran == ["pve-01"]
+    assert quorum_calls == []  # non-unreachable failures never probe quorum
