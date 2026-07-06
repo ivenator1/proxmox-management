@@ -210,8 +210,9 @@ source .venv/bin/activate
 pip install -e .
 
 # Ansible itself + proxmoxer live in the venv too — community.proxmox 2.x
-# needs proxmoxer >= 2.3 importable by the interpreter Ansible runs under.
-pip install ansible-core 'proxmoxer>=2.3'
+# needs proxmoxer >= 2.3 importable by the interpreter Ansible runs under
+# (requests is proxmoxer's undeclared HTTPS-backend dependency).
+pip install ansible-core 'proxmoxer>=2.3' requests
 
 # Install required Ansible Collections (for the execution primitives)
 ansible-galaxy collection install community.proxmox community.general
