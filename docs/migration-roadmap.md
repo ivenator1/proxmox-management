@@ -627,3 +627,154 @@ precision. Lexicographic sort order preserved; pruning unaffected. New test:
 - Manager-host node must never be rebooted mid-run.
 - No heavy runtime deps beyond `pydantic` + `ansible-runner`.
 - Keep each legacy path behind a flag until parity is proven on a real `--check` run.
+
+---
+
+# Multi-Cluster Support Roadmap (2026-07)
+
+Stage 1 (per-cluster VM discovery, collision-free `--scan`, `cluster=` inventory
+var, `proxmox_fleet/cluster.py`) is complete on the
+`claude/multi-cluster-integration` branch. The tasks below cover the remaining
+work, split so independent agents can implement them in separate worktrees.
+
+**Background**: the fleet spans two or more Proxmox clusters, so LXC/VM ids are
+NOT fleet-unique (each cluster can hold its own 101). Qualified id tokens use
+`<cluster>/<vmid>` (e.g. `alpha/101`); a bare `101` keeps the historical
+"matches in every cluster" behaviour. `proxmox_fleet/cluster.py` is the single
+source of truth for this logic — never copy matching code into flows.
+
+## Workflow (applies to every task)
+
+- Work in your own git worktree on a branch named `claude/mc-task<N>-<slug>`,
+  based on `claude/multi-cluster-integration`, and open your PR **against
+  `claude/multi-cluster-integration`** (NOT main, NOT testing).
+- The orchestrator reviews every PR and may request changes; address feedback
+  on the same branch.
+- Run from your worktree root (the repo venv lives in the main checkout and has
+  proxmox_fleet installed editable — `PYTHONPATH` makes your worktree win):
+  ```bash
+  VENV=/home/will/Documents/Projects/proxmox-management/.venv
+  PYTHONPATH=$PWD $VENV/bin/python -m pytest tests/unit/ -q
+  PYTHONPATH=$PWD $VENV/bin/python -m mypy proxmox_fleet/
+  $VENV/bin/ruff check proxmox_fleet/ tests/
+  ```
+  All three must be clean before opening the PR.
+- Back-compat is non-negotiable: an inventory with no `cluster=` vars and
+  settings with only bare ids must behave byte-identically to today (including
+  the briefing golden test — except Task 5, which regenerates it deliberately).
+- Do not modify `ansible/primitives/*.yml`, the `roles/` molecule harnesses, or
+  `executor.snapshot()`'s signature. All new flow parameters must be kw-only
+  with defaults so `mol_run_flow.py` and existing tests keep working.
+
+## Task dependencies
+
+```
+Task 1 (matching helpers + settings/--limit/canary)  ── must merge first
+  ├─ Task 2 (manager_lxc_id)          ── after Task 1, parallel with 3/4
+  ├─ Task 3 (per-cluster API creds)   ── after Task 1, parallel with 2/4
+  └─ Task 4 (quorum per cluster)      ── after Task 1, parallel with 2/3
+Task 5 (cosmetics, golden regen)      ── last, after 2–4 merged
+```
+
+## Task 1 — Qualified-id matching: settings, --limit, canary
+
+Extend `proxmox_fleet/cluster.py` with (unit-test each in
+`tests/unit/test_cluster.py`):
+
+```python
+def token_is_id(token: str) -> bool          # digits, or qualified with digit id-part
+def id_matches(token, cluster, vmid) -> bool # bare → vmid match anywhere; qualified → both
+def matches_any(tokens, cluster, vmid)       # str-coerces; replaces `lxc_id in {str(x)...}`
+def map_lookup(mapping, cluster, vmid, default="")  # exact "cluster/vmid" beats bare "vmid"
+def limit_selects_id(limit, cluster, vmid) -> bool
+```
+
+Wire them in:
+- `models/settings.py`: add a `_stringify_id_list` before-validator (mirror
+  `_stringify_canary_hosts`) over `exclude_list`, `os_update_exclude_list`,
+  `app_update_exclude_list`, `snapshot_exclude_list`, `os_only_lxc_list` so
+  YAML ints keep working. Field types stay `List[str]`/`Dict[str, Any]`.
+- `flows/lxc.py`: `run_lxc_update()` and `_discover_lxcs()` gain kw-only
+  `cluster: str = DEFAULT_CLUSTER`. Replace the five membership checks
+  (app exclude, snapshot exclude, os exclude ×2, os_only) with
+  `matches_any(...)` and the `lxc_kuma_map` lookup with `map_lookup(...)`.
+  In `_discover_lxcs`, cluster-filter `os_only_lxc_list`/`exclude_list` tokens
+  BEFORE building the shell grep regex — a `/` must never land in the pattern.
+- `driver.py`: lxc phase `discovered` tuples carry the node's cluster; the
+  `--limit` id filter uses `limit_selects_id`; `limit_has_ids` uses
+  `token_is_id`. Canary partition + skip records use
+  `matches_any(settings.canary_hosts, cluster, id)`. Rework `_soak_canaries()`
+  to take a pre-resolved `{display_token: monitor_id}` dict built by callers
+  (lxc via `map_lookup`, display token `f"{cluster}/{id}"`; vm/remote pass
+  `{name: monitor}` — their kuma maps are keyed by inventory name and stay
+  unqualified). VM limit also accepts `limit_selects_id`.
+- `scan.py`: same `token_is_id` / `limit_selects_id` swaps; pass
+  `cluster=node_info["cluster"]` into `_discover_lxcs`.
+- `cli.py`: update `--limit` help text to mention `cluster/ID`.
+- `web/app.py`: do NOT loosen `inventory_edit._NAME_RE` (`_TOKEN_RE` also
+  validates enrollment names and kuma ids). Add a dedicated
+  `_LIMIT_TOKEN_RE = ^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$` used only for the
+  trigger form's limit field.
+- `vars.yml.example`: document the `cluster/id` syntax next to each list/map.
+
+Tests: qualified-token settings validation; `alpha/101` excludes only alpha
+while bare `101` excludes both; exact-qualified kuma key beats bare;
+`--limit alpha/101` runs only that cluster's container; qualified canary tokens
+stage only that cluster; web trigger accepts `alpha/101`, rejects `a/b/c` and
+shell metacharacters.
+
+## Task 2 — `manager_lxc_id` qualification
+
+`flows/node.py` (`run_node_update()`): gains kw-only
+`cluster: str = DEFAULT_CLUSTER` (driver's `run_node_phase()` passes the node's
+cluster). Split `settings.manager_lxc_id` with `split_qualified()`: run the
+`pct list | grep -q '^{id} '` manager probe only when the token's cluster is
+None (bare id — today's behaviour) or equals the node's cluster. A qualified id
+must never suppress the OTHER cluster's node reboot when a same-id non-manager
+container lives there. `vars.yml.example`: recommend
+`manager_lxc_id: "alpha/121"` for multi-cluster. Tests in `test_flow_node.py`:
+assert on ScriptedExecutor `.commands` that the probe is skipped/run per
+cluster; bare-id behaviour unchanged.
+
+## Task 3 — Optional per-cluster PVE API credentials
+
+- `models/settings.py`: `class PveClusterCreds(BaseModel)` with
+  `pve_api_user` / `pve_api_token_id` / `pve_api_token_secret` (all `""`
+  default); new field `pve_clusters: Dict[str, PveClusterCreds] = {}`.
+- `cluster.py`: `api_creds(settings, cluster) -> Dict[str, str]` returning
+  `{"api_user", "api_token_id", "api_token_secret"}` with per-field fallback to
+  the global `pve_api_*` values.
+- Build `api_params` from `api_creds()` at the snapshot sites: `flows/lxc.py`,
+  `flows/vm.py` (both already receive `cluster`), and
+  `driver.run_custom_phase()` (its nodes_map must carry the node's cluster).
+  `executor.snapshot()` signature is UNCHANGED (it takes `**api_params`).
+- `vars.yml.example`: document `pve_clusters:` with a commented example.
+
+Tests: settings parsing + per-field fallback; scripted `snapshot()` receives
+beta creds for a beta-cluster host and the globals otherwise (lxc, vm, custom).
+
+## Task 4 — Quorum checks must stay inside the cluster
+
+`driver._cluster_quorate(nodes, ...)` currently asks "the first answering node"
+across the WHOLE inventory — with two clusters, an unreachable node in cluster
+alpha can be judged by cluster beta's quorum, which is meaningless. Change it
+to accept the relevant cluster (or pre-filtered nodes) and make both call sites
+(lxc-phase discovery skip, node-phase serial loop) pass only nodes from the
+unreachable node's own cluster. Single-cluster behaviour must be identical.
+Tests: two-cluster inventory where alpha is fully down and beta answers
+quorate → alpha's unreachable node must NOT be tolerated-as-skipped based on
+beta's answer.
+
+## Task 5 — Cosmetics (breaking format changes, do last)
+
+- LXC error/warning `host` fields (`flows/lxc.py` warning + error entries,
+  `driver.py` lxc run-error) change from bare `lxc_id` to `f"{node}/{lxc_id}"`
+  matching the VM convention (`vm.py` uses `f"{node}/vm-{vmid}"`). This breaks
+  the briefing golden byte-parity test — regenerate
+  `tests/unit/data/briefing_golden.json` deliberately and say so in the PR.
+- Dashboard: change `/hosts/{name}` to `/hosts/{name:path}`; when the segment
+  contains `/`, filter records by the `(node, id)` composite; bare names/ids
+  keep today's any-match. Pending-page links point at `node/id` when the entry
+  carries both.
+
+Tests: updated golden fixture; web route with slash; composite filtering.
