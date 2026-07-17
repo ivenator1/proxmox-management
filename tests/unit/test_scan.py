@@ -284,7 +284,7 @@ def test_run_fleet_scan_end_to_end(tmp_path, monkeypatch):
         })
 
     _patch_executors(monkeypatch, _factory)
-    monkeypatch.setattr(scan_mod, "_discover_lxcs", lambda ex, s: ["101"])
+    monkeypatch.setattr(scan_mod, "_discover_lxcs", lambda ex, s, **kw: ["101"])
 
     settings = GlobalSettings(fleet_history_dir=str(tmp_path / "hist"))
     rc = scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv))
@@ -321,7 +321,7 @@ def test_run_fleet_scan_same_id_on_two_clusters_keeps_both(tmp_path, monkeypatch
         )
 
     _patch_executors(monkeypatch, _factory)
-    monkeypatch.setattr(scan_mod, "_discover_lxcs", lambda ex, s: ["101"])
+    monkeypatch.setattr(scan_mod, "_discover_lxcs", lambda ex, s, **kw: ["101"])
 
     settings = GlobalSettings(fleet_history_dir=str(tmp_path / "hist"))
     rc = scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv))

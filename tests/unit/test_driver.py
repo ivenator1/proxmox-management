@@ -986,7 +986,7 @@ def test_lxc_phase_limit_node_name_keeps_all_ids(tmp_path, monkeypatch):
     discovered: List[str] = []
     ran: List[str] = []
 
-    def _fake_discover(ex, settings):
+    def _fake_discover(ex, settings, **kw):
         discovered.append(ex.host)
         return ["101", "102"]
 
@@ -1023,7 +1023,7 @@ def test_lxc_phase_limit_by_container_id(tmp_path, monkeypatch):
     per_node_ids = {"pve-01": ["101", "102"], "pve-02": ["201"]}
     ran: List[str] = []
 
-    def _fake_discover(ex, settings):
+    def _fake_discover(ex, settings, **kw):
         return per_node_ids[ex.host]
 
     def _fake_lxc_update(node_name, lxc_id, ex, settings, **kw):
@@ -1307,7 +1307,7 @@ def test_lxc_canary_id_failure_skips_rest_across_nodes(tmp_path, monkeypatch):
     per_node_ids = {"pve-01": ["101", "102"], "pve-02": ["201"]}
     ran: List[str] = []
 
-    def _fake_discover(ex, settings):
+    def _fake_discover(ex, settings, **kw):
         return per_node_ids[ex.host]
 
     def _fake_lxc_update(node_name, lxc_id, ex, settings, **kw):
@@ -1348,7 +1348,7 @@ def test_lxc_canary_success_runs_rest(tmp_path, monkeypatch):
         from proxmox_fleet.flows.lxc import LxcFlowOutcome
         return LxcFlowOutcome()
 
-    monkeypatch.setattr(driver_mod, "_discover_lxcs", lambda ex, s: ["101", "102", "103"])
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", lambda ex, s, **kw: ["101", "102", "103"])
     monkeypatch.setattr(driver_mod, "run_lxc_update", _fake_lxc_update)
     monkeypatch.setattr(driver_mod, "_soak_canaries", lambda *a, **kw: None)
     monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
@@ -1372,7 +1372,7 @@ def test_lxc_discovery_failure_does_not_trip_canary_gate(tmp_path, monkeypatch):
     )
     ran: List[str] = []
 
-    def _fake_discover(ex, settings):
+    def _fake_discover(ex, settings, **kw):
         if ex.host == "pve-bad":
             raise RuntimeError("ssh down")
         return ["101", "102"]
@@ -1399,6 +1399,146 @@ def test_lxc_discovery_failure_does_not_trip_canary_gate(tmp_path, monkeypatch):
     assert state.failed is True             # discovery error recorded
     assert sorted(ran) == ["101", "102"]    # both waves still ran
     assert not any("SKIPPED" in r.app for r in state.lxc)
+
+
+# ---------------------------------------------------------------------------
+# Multi-cluster qualified ids (Task 1) — --limit and canary staging
+# ---------------------------------------------------------------------------
+
+
+def _two_cluster_inventory(tmp_path) -> str:
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\n"
+        "alpha-01 ansible_host=10.0.0.1 cluster=alpha\n"
+        "beta-01 ansible_host=10.1.0.1 cluster=beta\n"
+    )
+    return str(p)
+
+
+def test_lxc_phase_qualified_limit_runs_only_that_cluster(tmp_path, monkeypatch):
+    p = _two_cluster_inventory(tmp_path)
+    ran: List[str] = []
+
+    def _fake_discover(ex, settings, **kw):
+        return ["101"]  # both clusters happen to have a container 101
+
+    def _fake_lxc_update(node_name, lxc_id, ex, settings, **kw):
+        ran.append(f"{node_name}/{lxc_id}")
+        from proxmox_fleet.flows.lxc import LxcFlowOutcome
+        return LxcFlowOutcome()
+
+    def _fake_executor(host, **kw):
+        ex = ScriptedExecutor()
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", _fake_discover)
+    monkeypatch.setattr(driver_mod, "run_lxc_update", _fake_lxc_update)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+
+    driver_mod.run_lxc_phase(settings=GlobalSettings(), inventory_path=p,
+                             state_output_path=None, limit={"alpha/101"})
+
+    assert ran == ["alpha-01/101"]          # beta's container 101 never ran
+
+
+def test_lxc_phase_bare_limit_runs_id_in_every_cluster(tmp_path, monkeypatch):
+    p = _two_cluster_inventory(tmp_path)
+    ran: List[str] = []
+
+    def _fake_discover(ex, settings, **kw):
+        return ["101"]
+
+    def _fake_lxc_update(node_name, lxc_id, ex, settings, **kw):
+        ran.append(f"{node_name}/{lxc_id}")
+        from proxmox_fleet.flows.lxc import LxcFlowOutcome
+        return LxcFlowOutcome()
+
+    def _fake_executor(host, **kw):
+        ex = ScriptedExecutor()
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", _fake_discover)
+    monkeypatch.setattr(driver_mod, "run_lxc_update", _fake_lxc_update)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+
+    driver_mod.run_lxc_phase(settings=GlobalSettings(), inventory_path=p,
+                             state_output_path=None, limit={"101"})
+
+    assert sorted(ran) == ["alpha-01/101", "beta-01/101"]  # bare id → both clusters
+
+
+def test_lxc_phase_qualified_canary_stages_only_its_cluster(tmp_path, monkeypatch):
+    p = _two_cluster_inventory(tmp_path)
+    ran: List[str] = []
+
+    def _fake_discover(ex, settings, **kw):
+        return ["101"]  # both clusters have a container 101
+
+    def _fake_lxc_update(node_name, lxc_id, ex, settings, **kw):
+        ran.append(f"{node_name}/{lxc_id}")
+        from proxmox_fleet.flows.lxc import LxcFlowOutcome
+        return LxcFlowOutcome()
+
+    def _fake_executor(host, **kw):
+        ex = ScriptedExecutor()
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", _fake_discover)
+    monkeypatch.setattr(driver_mod, "run_lxc_update", _fake_lxc_update)
+    monkeypatch.setattr(driver_mod, "_soak_canaries", lambda *a, **kw: None)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+
+    state = driver_mod.run_lxc_phase(
+        settings=GlobalSettings(canary_hosts=["alpha/101"]), inventory_path=p,
+        state_output_path=None)
+
+    # Only alpha's 101 is a canary — it runs first; beta's 101 runs in the
+    # (single) rest wave, never marked SKIPPED.
+    assert ran[0] == "alpha-01/101"
+    assert sorted(ran) == ["alpha-01/101", "beta-01/101"]
+    assert not any("SKIPPED" in r.app for r in state.lxc)
+
+
+def test_lxc_phase_qualified_canary_failure_skips_only_its_cluster(tmp_path, monkeypatch):
+    p = _two_cluster_inventory(tmp_path)
+    ran: List[str] = []
+
+    def _fake_discover(ex, settings, **kw):
+        return ["101"]
+
+    def _fake_lxc_update(node_name, lxc_id, ex, settings, **kw):
+        ran.append(f"{node_name}/{lxc_id}")
+        from proxmox_fleet.flows.lxc import LxcFlowOutcome
+        from proxmox_fleet.models.state import ErrorEntry, LxcRecord
+        if node_name == "alpha-01":
+            return LxcFlowOutcome(
+                record=LxcRecord(node=node_name, name="ct101", id=lxc_id, app="FAILED"),
+                failed=True,
+                error=ErrorEntry(host=lxc_id, task="update", error="boom"))
+        return LxcFlowOutcome()
+
+    def _fake_executor(host, **kw):
+        ex = ScriptedExecutor()
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", _fake_discover)
+    monkeypatch.setattr(driver_mod, "run_lxc_update", _fake_lxc_update)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+
+    state = driver_mod.run_lxc_phase(
+        settings=GlobalSettings(canary_hosts=["alpha/101"]), inventory_path=p,
+        state_output_path=None)
+
+    # alpha's canary failed; beta was never staged as a canary at all, so its
+    # container is skipped along with the rest of the (single) canary wave.
+    assert ran == ["alpha-01/101"]
+    skipped = [r for r in state.lxc if r.app == "SKIPPED (canary failed)"]
+    assert [(r.node, r.id) for r in skipped] == [("beta-01", "101")]
 
 
 # --- _soak_canaries --------------------------------------------------------------
@@ -1569,7 +1709,7 @@ def test_lxc_phase_unreachable_node_warns_when_quorate(tmp_path, monkeypatch):
     inv = _two_node_inventory(tmp_path)
     ran: List[str] = []
 
-    def _fake_discover(ex, settings):
+    def _fake_discover(ex, settings, **kw):
         if ex.host == "pve-01":
             raise UnreachableHostError("node unreachable: No route to host")
         return ["201"]
@@ -1602,7 +1742,7 @@ def test_lxc_phase_unreachable_node_fails_without_quorum(tmp_path, monkeypatch):
 
     inv = _two_node_inventory(tmp_path)
 
-    def _fake_discover(ex, settings):
+    def _fake_discover(ex, settings, **kw):
         if ex.host == "pve-01":
             raise UnreachableHostError("node unreachable: No route to host")
         return []

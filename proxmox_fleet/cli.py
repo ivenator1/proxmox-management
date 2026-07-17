@@ -166,7 +166,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="print one persisted run's briefing (timestamp or 'latest') and exit.")
     parser.add_argument("--limit", default=None, metavar="HOST,ID,...",
                         help="restrict the run to these host names and/or LXC/VM ids "
-                             "(everything else is silently skipped).")
+                             "(use cluster/ID, e.g. alpha/101, to target one cluster's "
+                             "container/VM in a multi-cluster fleet; everything else is "
+                             "silently skipped).")
     parser.add_argument("--phases", default=None, metavar="P1,P2",
                         help="run only these phases: remote,custom,lxc,vm,node,manager "
                              "(pre-flight and notify always run).")

@@ -65,10 +65,16 @@ class RevalidatingStaticFiles(StaticFiles):
 # which is not imported here — the driver needs ansible-runner installed).
 PHASE_NAMES = ("remote", "custom", "lxc", "vm", "node", "manager")
 
-# --limit / --phases tokens are passed to a subprocess: allow only inventory
-# name / vmid shaped tokens, nothing shell-meaningful. Shared with the
-# inventory editor so the two layers can never drift apart.
+# --phases tokens are passed to a subprocess: allow only inventory name /
+# vmid shaped tokens, nothing shell-meaningful. Shared with the inventory
+# editor so the two layers can never drift apart.
 _TOKEN_RE = inventory_edit._NAME_RE
+
+# --limit tokens additionally accept one qualifying "cluster/id" segment
+# (e.g. "alpha/101") for multi-cluster fleets. Deliberately NOT reused for
+# _TOKEN_RE — that regex also validates enrollment names and kuma ids, which
+# must never contain a slash.
+_LIMIT_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$")
 
 # Per-bucket table columns for the run-detail and host drill-down pages.
 BUCKET_COLUMNS: Dict[str, Tuple[str, ...]] = {
@@ -337,11 +343,11 @@ def _truthy(value: Any) -> bool:
     return str(value or "").lower() in ("true", "1", "yes", "on")
 
 
-def _csv_tokens(value: str) -> List[str]:
+def _csv_tokens(value: str, pattern: "re.Pattern[str]" = _TOKEN_RE) -> List[str]:
     """Split a comma-separated form field into validated argv-safe tokens."""
     tokens = [t.strip() for t in value.split(",") if t.strip()]
     for token in tokens:
-        if not _TOKEN_RE.match(token):
+        if not pattern.match(token):
             raise ValueError(f"invalid token {token!r} (letters/digits/._- only)")
     return tokens
 
@@ -370,7 +376,7 @@ def build_run_args(form: Mapping[str, Any]) -> List[str]:
             raise ValueError(f"unknown phase(s): {', '.join(unknown)}")
         if phases:
             args += ["--phases", ",".join(phases)]
-    limit = _csv_tokens(str(form.get("limit") or ""))
+    limit = _csv_tokens(str(form.get("limit") or ""), _LIMIT_TOKEN_RE)
     if limit:
         args += ["--limit", ",".join(limit)]
     return args

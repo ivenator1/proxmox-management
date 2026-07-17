@@ -125,3 +125,46 @@ def test_canary_defaults():
     s = GlobalSettings()
     assert s.canary_hosts == []
     assert s.canary_soak_minutes == 0.0
+
+
+# --- Task 1: qualified-id (cluster/vmid) settings validation ----------------------
+
+
+def test_exclude_list_entries_coerced_to_str():
+    s = GlobalSettings.model_validate({"exclude_list": [103, "110"]})
+    assert s.exclude_list == ["103", "110"]
+
+
+def test_id_lists_accept_qualified_cluster_tokens():
+    s = GlobalSettings.model_validate({
+        "exclude_list": [103, "alpha/110"],
+        "os_update_exclude_list": ["alpha/120"],
+        "app_update_exclude_list": ["beta/130"],
+        "snapshot_exclude_list": ["alpha/117"],
+        "os_only_lxc_list": ["beta/140"],
+    })
+    assert s.exclude_list == ["103", "alpha/110"]
+    assert s.os_update_exclude_list == ["alpha/120"]
+    assert s.app_update_exclude_list == ["beta/130"]
+    assert s.snapshot_exclude_list == ["alpha/117"]
+    assert s.os_only_lxc_list == ["beta/140"]
+
+
+def test_id_lists_default_empty():
+    s = GlobalSettings()
+    assert s.exclude_list == []
+    assert s.os_update_exclude_list == []
+    assert s.app_update_exclude_list == []
+    assert s.snapshot_exclude_list == []
+    assert s.os_only_lxc_list == []
+
+
+def test_id_lists_load_mixed_int_and_qualified_from_yaml(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text(
+        "exclude_list:\n  - 103\n  - \"alpha/110\"\n"
+        "os_only_lxc_list:\n  - \"beta/140\"\n"
+    )
+    s = GlobalSettings.load(f)
+    assert s.exclude_list == ["103", "alpha/110"]
+    assert s.os_only_lxc_list == ["beta/140"]

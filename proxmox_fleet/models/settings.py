@@ -117,6 +117,26 @@ class GlobalSettings(BaseModel):
             return [str(v) for v in value]
         return value
 
+    @field_validator(
+        "exclude_list",
+        "os_update_exclude_list",
+        "app_update_exclude_list",
+        "snapshot_exclude_list",
+        "os_only_lxc_list",
+        mode="before",
+    )
+    @classmethod
+    def _stringify_id_list(cls, value: Any) -> Any:
+        """Coerce entries to str so integer/qualified ids in vars.yml are accepted.
+
+        YAML writes ``exclude_list: [103, "alpha/110"]`` with a mixed
+        int/str list, which would otherwise fail validation (the fields are
+        ``List[str]``). Mirrors ``_stringify_canary_hosts``.
+        """
+        if isinstance(value, list):
+            return [str(v) for v in value]
+        return value
+
     @field_validator("lxc_kuma_map", "vm_kuma_map", "remote_kuma_map", mode="before")
     @classmethod
     def _stringify_kuma_keys(cls, value: Any) -> Any:
