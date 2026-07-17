@@ -377,9 +377,20 @@ def build_run_args(form: Mapping[str, Any]) -> List[str]:
 
 
 
+def _lxc_entry_id(key: str, entry: Dict[str, Any]) -> str:
+    """A pending-scan lxc entry's container id.
+
+    New snapshots carry an explicit ``id`` field and are keyed ``node/id``;
+    older persisted snapshots are keyed by the bare id — fall back to the
+    text after the last ``/`` so both shapes keep rendering.
+    """
+    return str(entry.get("id") or key.rsplit("/", 1)[-1])
+
+
 def _lxc_sort_key(item: Tuple[str, Dict[str, Any]]) -> Tuple[str, int, str]:
     key, entry = item
-    return (str(entry.get("node", "")), int(key) if key.isdigit() else 0, key)
+    lxc_id = _lxc_entry_id(key, entry)
+    return (str(entry.get("node", "")), int(lxc_id) if lxc_id.isdigit() else 0, key)
 
 
 def _history_rows_with_deltas(history_dir: str) -> List[Dict[str, Any]]:
@@ -507,8 +518,8 @@ def create_app(
         if pending_snapshot:
             for name in pending_snapshot.get("hosts") or {}:
                 _add_host(str(name))
-            for lxc_id, entry in (pending_snapshot.get("lxc") or {}).items():
-                _add_host(str(entry.get("name") or lxc_id))
+            for lxc_key, entry in (pending_snapshot.get("lxc") or {}).items():
+                _add_host(str(entry.get("name") or _lxc_entry_id(lxc_key, entry)))
         for row in history_mod.history_summary(history_dir, limit=8):
             ts = str(row.get("timestamp", ""))
             items.append({"kind": "run", "label": f"Run {ts_human(ts)}",
@@ -585,7 +596,11 @@ def create_app(
         if snapshot is None and ref != "latest":
             raise HTTPException(404, f"no pending snapshot {ref!r}")
         hosts = sorted((snapshot.get("hosts") or {}).items()) if snapshot else []
-        lxc = sorted((snapshot.get("lxc") or {}).items(), key=_lxc_sort_key) if snapshot else []
+        # The template renders (display_id, entry) pairs — derive the id here so
+        # both node/id-keyed (new) and bare-id-keyed (legacy) snapshots work.
+        lxc = ([(_lxc_entry_id(k, e), e) for k, e in
+                sorted((snapshot.get("lxc") or {}).items(), key=_lxc_sort_key)]
+               if snapshot else [])
         return templates.TemplateResponse(request, "pending.html", {
             "ref": ref,
             "snapshot": snapshot,

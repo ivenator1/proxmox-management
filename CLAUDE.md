@@ -85,6 +85,7 @@ proxmox_fleet/
     vm.py                  # run_vm_update(): two-executor (VM SSH + node SSH for qm rollback/status)
     remote.py              # run_remote_update(): pre_update_cmd→detect→upgrade→reboot→health (no snapshot)
     node.py                # run_node_update() + run_manager_update(): Phase 2+3
+  cluster.py               # multi-cluster helpers: DEFAULT_CLUSTER, split_qualified("alpha/101")
   deps.py                  # validate_depends_order() + dependency_failed()
   driver.py                # run_fleet() orchestrator + per-phase run_*_phase() helpers
   executor.py              # Executor protocol + RunnerExecutor; snapshot()/snapshot_with_retry(); 8 primitive methods
@@ -313,6 +314,11 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
 - **GitHub HTTPS runs on the manager** (`http.request`/`get_json`, `urllib`) — never the PVE node.
 - **`pve_node` is a fallback hint only**: `run_vm_phase()` discovers the live VM→node map via
   `pvesh get /cluster/resources` (HA-aware); `pve_node` is used only when discovery fails.
+- **Multi-cluster**: vmids are NOT fleet-unique — nodes carry a `cluster=` inventory var
+  (default `default`), VM discovery queries one reachable node **per cluster** and keys by
+  `(cluster, vmid)`, and `--scan` keys LXC entries by `node/id`. A VM whose vmid exists in
+  several clusters must set `cluster=` or `pve_node=` (ambiguity fails loud, never guesses).
+  Node names must be unique across all clusters (pre-flight `validate_node_uniqueness()`).
 - **PBS is transparent**: `lxc_backup_storage` set to a PBS storage name routes `vzdump` to PBS automatically.
 - **`[proxmox_vms]`/`[remote_hosts]`/`[custom_hosts]` must exist** in `hosts.ini` even if empty
   (header only) — Ansible raises "no hosts matched" otherwise.

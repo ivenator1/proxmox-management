@@ -166,6 +166,7 @@ def test_scan_lxc_running_with_app(monkeypatch):
     )
     result = scan_mod.scan_lxc(ex, "101", "pve-01")
     assert result["name"] == "sonarr"
+    assert result["id"] == "101"
     assert result["os_pending_count"] == 2
     assert result["app"] == {"script": "sonarr", "current": "4.0.17",
                              "latest": "v4.1.0", "outdated": True}
@@ -293,8 +294,43 @@ def test_run_fleet_scan_end_to_end(tmp_path, monkeypatch):
     assert latest["hosts"]["web-01"]["pending_count"] == 2
     assert latest["hosts"]["web-01"]["kind"] == "remote"
     assert latest["hosts"]["pve-01"]["kind"] == "node"
-    assert latest["lxc"]["101"]["name"] == "sonarr"
-    assert latest["lxc"]["101"]["app"]["outdated"] is True
+    assert latest["lxc"]["pve-01/101"]["name"] == "sonarr"
+    assert latest["lxc"]["pve-01/101"]["id"] == "101"
+    assert latest["lxc"]["pve-01/101"]["app"]["outdated"] is True
+
+
+def test_run_fleet_scan_same_id_on_two_clusters_keeps_both(tmp_path, monkeypatch):
+    """Two clusters' LXC 101 must not overwrite each other in the snapshot."""
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[proxmox_nodes]\n"
+        "alpha-01 ansible_host=10.0.0.1 cluster=alpha\n"
+        "beta-01 ansible_host=10.1.0.1 cluster=beta\n"
+        "[remote_hosts]\n[proxmox_vms]\n[custom_hosts]\n"
+    )
+    _patch_github(monkeypatch)
+
+    def _factory(host, **kw):
+        return ScriptedExecutor(
+            script={
+                "which apt-get": [_ok("apt")],
+                "dist-upgrade": [_ok(APT_SIM), _ok(APT_SIM)],
+                "cat ~/.sonarr": [_ok("4.0.17")],
+            },
+            introspect_facts=_INTROSPECT_RUNNING,
+        )
+
+    _patch_executors(monkeypatch, _factory)
+    monkeypatch.setattr(scan_mod, "_discover_lxcs", lambda ex, s: ["101"])
+
+    settings = GlobalSettings(fleet_history_dir=str(tmp_path / "hist"))
+    rc = scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv))
+
+    assert rc == 0
+    latest = json.loads((tmp_path / "hist" / "pending-latest.json").read_text())
+    assert set(latest["lxc"]) == {"alpha-01/101", "beta-01/101"}
+    assert latest["lxc"]["alpha-01/101"]["node"] == "alpha-01"
+    assert latest["lxc"]["beta-01/101"]["node"] == "beta-01"
 
 
 def test_run_fleet_scan_limit(tmp_path, monkeypatch):

@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 import yaml
 
 from proxmox_fleet import briefing, deps, history, http, inventory, notifiers, window
+from proxmox_fleet.cluster import DEFAULT_CLUSTER
 from proxmox_fleet.executor import RunnerExecutor
 from proxmox_fleet.flows._pkg import kuma_healthy
 from proxmox_fleet.flows.custom import run_custom_update
@@ -500,48 +501,83 @@ def _discover_vm_locations(
     nodes: List[Dict[str, str]],
     *,
     inventory_path: str,
-) -> Dict[str, Tuple[str, str]]:
-    """Query the Proxmox cluster for current VM locations via pvesh over SSH.
+) -> Dict[Tuple[str, str], Tuple[str, str]]:
+    """Query each Proxmox cluster for current VM locations via pvesh over SSH.
 
-    Runs ``pvesh get /cluster/resources --type vm`` on each node in inventory
-    order until one answers — a powered-off first node must not blind the whole
-    phase (cluster resources are visible from any member).
-    Returns {vmid_str: (node_name, ansible_host_ip)}.
-    Returns an empty dict when every node fails (caller falls back to pve_node hint).
+    ``pvesh get /cluster/resources`` only sees the cluster the queried node
+    belongs to, so nodes are grouped by their ``cluster`` inventory var and
+    each cluster is queried separately — its nodes tried in inventory order
+    until one answers (a powered-off first node must not blind that cluster;
+    resources are visible from any member).
+    Returns {(cluster, vmid_str): (node_name, ansible_host_ip)} — vmids are
+    NOT unique across clusters, so the key must carry the cluster.
+    A cluster where every node fails is absent from the result (callers fall
+    back to the pve_node hint for its VMs).
 
     Rationale: pvesh reuses the existing SSH executor pattern, adds no new
     SSL/auth surface, and runs as root so no API token is needed.
     """
     nodes_map = {n["name"]: n["ansible_host"] for n in nodes}
+    clusters: Dict[str, List[Dict[str, str]]] = {}
+    for n in nodes:
+        clusters.setdefault(n.get("cluster", DEFAULT_CLUSTER), []).append(n)
 
-    for candidate in nodes:
-        disc_node = candidate["name"]
-        # check=False: discovery is read-only and must run even in dry-run mode.
-        disc_executor = RunnerExecutor(disc_node, inventory=inventory_path, check=False)
-        try:
-            res = disc_executor.run_shell(
-                "pvesh get /cluster/resources --type vm --output-format json 2>/dev/null",
-                changed_when=False,
-                ignore_errors=True,
-            )
-            if res.failed or not res.stdout.strip():
-                raise RuntimeError(res.stderr.strip() or "pvesh returned no output")
-            resources = json.loads(res.stdout)
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"[vm phase] WARNING: cluster VM discovery via {disc_node} failed "
-                f"({exc!s}), trying next node",
-                file=sys.stderr,
-            )
-            continue
-        result: Dict[str, Tuple[str, str]] = {}
-        for item in (resources if isinstance(resources, list) else []):
-            vmid = str(item.get("vmid", ""))
-            node_name = str(item.get("node", ""))
-            if vmid and node_name:
-                result[vmid] = (node_name, nodes_map.get(node_name, node_name))
-        return result
-    return {}
+    result: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    for cluster, members in clusters.items():
+        for candidate in members:
+            disc_node = candidate["name"]
+            # check=False: discovery is read-only and must run even in dry-run mode.
+            disc_executor = RunnerExecutor(disc_node, inventory=inventory_path, check=False)
+            try:
+                res = disc_executor.run_shell(
+                    "pvesh get /cluster/resources --type vm --output-format json 2>/dev/null",
+                    changed_when=False,
+                    ignore_errors=True,
+                )
+                if res.failed or not res.stdout.strip():
+                    raise RuntimeError(res.stderr.strip() or "pvesh returned no output")
+                resources = json.loads(res.stdout)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[vm phase] WARNING: VM discovery for cluster '{cluster}' via "
+                    f"{disc_node} failed ({exc!s}), trying next node",
+                    file=sys.stderr,
+                )
+                continue
+            for item in (resources if isinstance(resources, list) else []):
+                vmid = str(item.get("vmid", ""))
+                node_name = str(item.get("node", ""))
+                if vmid and node_name:
+                    result[(cluster, vmid)] = (node_name, nodes_map.get(node_name, node_name))
+            break
+    return result
+
+
+def _resolve_vm_cluster(
+    spec: VmSpec,
+    node_clusters: Dict[str, str],
+    vm_locations: Dict[Tuple[str, str], Tuple[str, str]],
+) -> str:
+    """Resolve which cluster a VmSpec belongs to. Never guesses.
+
+    Order: explicit ``cluster=`` inventory var → the cluster of its
+    ``pve_node`` hint → the single cluster discovery found the vmid in.
+    Raises RuntimeError when the vmid was discovered in several clusters and
+    no hint disambiguates (guessing would snapshot/rollback the wrong VM).
+    """
+    if spec.cluster:
+        return spec.cluster
+    if spec.pve_node and spec.pve_node in node_clusters:
+        return node_clusters[spec.pve_node]
+    found = sorted({c for (c, vmid) in vm_locations if vmid == spec.vmid})
+    if len(found) == 1:
+        return found[0]
+    if len(found) > 1:
+        raise RuntimeError(
+            f"vmid {spec.vmid} ({spec.name}) exists in clusters "
+            f"{', '.join(found)} — set cluster= or pve_node= in inventory"
+        )
+    return DEFAULT_CLUSTER
 
 
 def run_vm_phase(
@@ -567,6 +603,7 @@ def run_vm_phase(
     vms = inventory.load_proxmox_vms(inventory_path, host_vars_dir=settings.host_vars_dir)
     nodes = inventory.load_proxmox_nodes(inventory_path, host_vars_dir=settings.host_vars_dir)
     nodes_map = {n["name"]: n["ansible_host"] for n in nodes}
+    node_clusters = {n["name"]: n.get("cluster", DEFAULT_CLUSTER) for n in nodes}
 
     if limit is not None:
         vms = [v for v in vms if v.name in limit or v.vmid in limit]
@@ -592,9 +629,12 @@ def run_vm_phase(
             if not window.in_window(vm_spec.maintenance_window, force=settings.force_window):
                 return VmFlowOutcome()  # silently skipped
 
-        # Prefer live cluster location; fall back to inventory hint.
-        if vm_spec.vmid in vm_locations:
-            node_name, api_host = vm_locations[vm_spec.vmid]
+        # Prefer live cluster location; fall back to inventory hint. The vmid
+        # alone is ambiguous across clusters, so resolve the cluster first
+        # (raises into a FAILED record when it can't be determined safely).
+        vm_cluster = _resolve_vm_cluster(vm_spec, node_clusters, vm_locations)
+        if (vm_cluster, vm_spec.vmid) in vm_locations:
+            node_name, api_host = vm_locations[(vm_cluster, vm_spec.vmid)]
         elif vm_spec.pve_node:
             node_name = vm_spec.pve_node
             api_host = nodes_map.get(node_name, node_name)
@@ -608,7 +648,7 @@ def run_vm_phase(
         node_ex = RunnerExecutor(node_name, inventory=inventory_path, check=check)
         return run_vm_update(
             node_name, vm_spec.vmid, vm_spec.name, vm_ex, node_ex, settings,
-            dry_run=dry_run, api_host=api_host,
+            dry_run=dry_run, api_host=api_host, cluster=vm_cluster,
         )
 
     def _run_wave(wave: List[VmSpec]) -> None:
@@ -654,7 +694,13 @@ def run_vm_phase(
             print(f"[vm phase] canary gate failed ({abort}) — skipping {len(rest)} VM(s)")
             for v in rest:
                 # Live cluster location wins over the pve_node hint, like _run_one.
-                node_name = vm_locations.get(v.vmid, (v.pve_node or "?", ""))[0]
+                # An unresolvable cluster must not raise here — this is only a
+                # display field on a SKIPPED record.
+                try:
+                    v_cluster = _resolve_vm_cluster(v, node_clusters, vm_locations)
+                except RuntimeError:
+                    v_cluster = DEFAULT_CLUSTER
+                node_name = vm_locations.get((v_cluster, v.vmid), (v.pve_node or "?", ""))[0]
                 state.vm.append(VmRecord(node=node_name, vmid=v.vmid, name=v.name,
                                          status=CANARY_SKIP_STATUS))
         else:
@@ -934,6 +980,11 @@ def run_fleet(
 
     def _phase_on(name: str) -> bool:
         return phases is None or name in phases
+
+    # Pre-flight: node names must be unique across clusters — they are the join
+    # key in records, briefing grouping, and the dashboard host pages.
+    inventory.validate_node_uniqueness(
+        inventory.load_proxmox_nodes(inventory_path, host_vars_dir=settings.host_vars_dir))
 
     # Pre-flight: the apt-cacher-ng proxy must be reachable or the whole run aborts
     # (port of the "Verify Apt-Cacher-NG is Online" / "Halt if Proxy is Offline" play).

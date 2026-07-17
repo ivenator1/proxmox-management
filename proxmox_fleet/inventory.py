@@ -10,12 +10,14 @@ would mis-parse (splitting on the first ``=`` makes the key ``hostname key``).
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import yaml
 
+from proxmox_fleet.cluster import DEFAULT_CLUSTER
 from proxmox_fleet.models.config import MaintenanceWindow
 
 # Matches: hostname  key=value key=value …
@@ -96,10 +98,12 @@ def load_proxmox_nodes(
 ) -> List[Dict[str, str]]:
     """Parse ``[proxmox_nodes]`` from *inventory_path* and merge per-host vars.
 
-    Returns a list of ``{name, ansible_host}`` dicts in inventory order.
+    Returns a list of ``{name, ansible_host, cluster}`` dicts in inventory order.
     ansible_host resolution order: inline var → host_vars/<node>.yml → node name.
     Merging host_vars matters because ``ansible_host`` becomes the snapshot API
-    ``api_host`` (which must be an IP, not the inventory name).
+    ``api_host`` (which must be an IP, not the inventory name). ``cluster``
+    resolves the same way, falling back to DEFAULT_CLUSTER — single-cluster
+    inventories need no ``cluster=`` vars at all.
     """
     hvdir = Path(host_vars_dir)
     nodes: List[Dict[str, str]] = []
@@ -108,8 +112,40 @@ def load_proxmox_nodes(
         nodes.append({
             "name": name,
             "ansible_host": str(inline.get("ansible_host", host_vars.get("ansible_host", name))),
+            "cluster": str(inline.get("cluster", host_vars.get("cluster", DEFAULT_CLUSTER))),
         })
     return nodes
+
+
+def validate_node_uniqueness(nodes: List[Dict[str, str]]) -> None:
+    """Fail loud on duplicate node names; warn on cross-cluster IP reuse.
+
+    Node names are the join key everywhere (records, briefing grouping, the
+    dashboard host pages, node→cluster maps) — two [proxmox_nodes] entries
+    sharing a name would silently merge two machines, so that's SystemExit(1).
+    The same ansible_host appearing under two clusters is legal but suspicious
+    (likely a copy-paste error), so it only warns.
+    """
+    seen_names: Dict[str, str] = {}
+    seen_hosts: Dict[str, str] = {}
+    for n in nodes:
+        name, cluster = n["name"], n.get("cluster", DEFAULT_CLUSTER)
+        if name in seen_names:
+            raise SystemExit(
+                f"duplicate [proxmox_nodes] entry '{name}' (clusters "
+                f"'{seen_names[name]}' and '{cluster}') — node names must be "
+                "unique across all clusters"
+            )
+        seen_names[name] = cluster
+        host = n.get("ansible_host", "")
+        if host and host in seen_hosts and seen_hosts[host] != cluster:
+            print(
+                f"WARNING: ansible_host {host} appears in clusters "
+                f"'{seen_hosts[host]}' and '{cluster}' — check for a "
+                "copy-paste error in hosts.ini",
+                file=sys.stderr,
+            )
+        seen_hosts.setdefault(host, cluster)
 
 
 @dataclass
@@ -118,10 +154,11 @@ class VmSpec:
 
     name: str           # inventory hostname
     ansible_host: str   # SSH reachable IP
-    vmid: str           # PVE VM ID (e.g. "200")
+    vmid: str           # PVE VM ID (e.g. "200") — NOT unique across clusters
     pve_node: str       # inventory hostname of the Proxmox node that owns this VM
     maintenance_window: Optional[MaintenanceWindow] = None
     canary: bool = False  # updated in the canary wave before the rest of the fleet
+    cluster: str = ""   # owning cluster; "" = infer (from pve_node, else discovery)
 
 
 @dataclass
@@ -158,6 +195,7 @@ def load_proxmox_vms(
             pve_node=str(inline.get("pve_node", host_vars.get("pve_node", ""))),
             maintenance_window=MaintenanceWindow(**raw_mw) if isinstance(raw_mw, dict) else None,
             canary=_as_bool(inline.get("canary", host_vars.get("canary", False))),
+            cluster=str(inline.get("cluster", host_vars.get("cluster", ""))),
         ))
     return specs
 

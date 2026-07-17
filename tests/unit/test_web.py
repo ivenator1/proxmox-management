@@ -269,6 +269,34 @@ def test_pending_page(history_dir):
     assert "outdated" in resp.text
 
 
+def test_pending_page_legacy_bare_id_key_shows_id(history_dir):
+    """Old persisted snapshots (bare-id lxc keys, no `id` field) still render."""
+    resp = _client(history_dir).get("/pending")
+    assert "<td class=\"num\">101</td>" in resp.text
+
+
+def test_pending_page_node_qualified_keys(tmp_path):
+    """New snapshots key lxc entries by node/id — two clusters' 101 both render."""
+    d = tmp_path / "history"
+    _seed_history(d)
+    scan_mod.write_pending({
+        "timestamp": "20260104T000000000000Z",
+        "hosts": {},
+        "lxc": {"alpha-01/101": {"node": "alpha-01", "id": "101", "name": "sonarr",
+                                 "skipped": None, "os_pending_count": 1,
+                                 "os_pending": ["libssl3"], "app": None, "error": None},
+                "beta-01/101": {"node": "beta-01", "id": "101", "name": "radarr",
+                                "skipped": None, "os_pending_count": 0,
+                                "os_pending": [], "app": None, "error": None}},
+    }, history_dir=d, keep=0)
+    resp = _client(d).get("/pending")
+    assert resp.status_code == 200
+    assert "sonarr" in resp.text and "radarr" in resp.text
+    assert "alpha-01" in resp.text and "beta-01" in resp.text
+    # The ID column shows the bare container id, not the node/id key.
+    assert "alpha-01/101" not in resp.text
+
+
 def test_pending_unknown_ref_404(history_dir):
     assert _client(history_dir).get("/pending", params={"ref": "nope"}).status_code == 404
 

@@ -21,6 +21,8 @@ from proxmox_fleet.driver import (
     run_node_phase,
     run_notify_phase,
 )
+from proxmox_fleet.flows.vm import VmFlowOutcome
+from proxmox_fleet.inventory import VmSpec
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import FleetState
 from proxmox_fleet.runner import PrimitiveResult
@@ -1469,7 +1471,8 @@ def test_discover_vm_locations_falls_back_to_next_node(monkeypatch, capsys):
 
     got = driver_mod._discover_vm_locations(_DISC_NODES, inventory_path="hosts.ini")
 
-    assert got == {"200": ("pve-02", "10.0.0.2"), "201": ("pve-03", "pve-03")}
+    assert got == {("default", "200"): ("pve-02", "10.0.0.2"),
+                   ("default", "201"): ("pve-03", "pve-03")}
     assert calls == ["pve-01", "pve-02"]
     assert "via pve-01 failed" in capsys.readouterr().err
 
@@ -1483,7 +1486,7 @@ def test_discover_vm_locations_first_node_ok_asks_no_others(monkeypatch):
 
     got = driver_mod._discover_vm_locations(_DISC_NODES, inventory_path="hosts.ini")
 
-    assert got["200"] == ("pve-02", "10.0.0.2")
+    assert got[("default", "200")] == ("pve-02", "10.0.0.2")
     assert calls == ["pve-01"]
 
 
@@ -1707,3 +1710,168 @@ def test_node_phase_real_failure_still_aborts(tmp_path, monkeypatch):
     assert state.failed
     assert ran == ["pve-01"]
     assert quorum_calls == []  # non-unreachable failures never probe quorum
+
+
+# ---------------------------------------------------------------------------
+# _discover_vm_locations — multi-cluster
+# ---------------------------------------------------------------------------
+
+_MC_NODES = [
+    {"name": "alpha-01", "ansible_host": "10.0.0.1", "cluster": "alpha"},
+    {"name": "alpha-02", "ansible_host": "10.0.0.2", "cluster": "alpha"},
+    {"name": "beta-01", "ansible_host": "10.1.0.1", "cluster": "beta"},
+]
+
+
+def test_discover_vm_locations_queries_each_cluster(monkeypatch):
+    """One pvesh walk per cluster; a shared vmid keeps both entries."""
+    calls: List[str] = []
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _disc_executor({
+        "alpha-01": PrimitiveResult(rc=0, stdout=json.dumps(
+            [{"vmid": 101, "node": "alpha-01"}])),
+        "beta-01": PrimitiveResult(rc=0, stdout=json.dumps(
+            [{"vmid": 101, "node": "beta-01"}, {"vmid": 300, "node": "beta-01"}])),
+    }, calls))
+
+    got = driver_mod._discover_vm_locations(_MC_NODES, inventory_path="hosts.ini")
+
+    assert calls == ["alpha-01", "beta-01"]     # one query per cluster
+    assert got == {
+        ("alpha", "101"): ("alpha-01", "10.0.0.1"),
+        ("beta", "101"): ("beta-01", "10.1.0.1"),
+        ("beta", "300"): ("beta-01", "10.1.0.1"),
+    }
+
+
+def test_discover_vm_locations_per_cluster_fallthrough(monkeypatch, capsys):
+    """A dead first node blinds only its own cluster's first attempt."""
+    calls: List[str] = []
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _disc_executor({
+        "alpha-01": PrimitiveResult(rc=4, failed=True, stderr="no route to host"),
+        "alpha-02": PrimitiveResult(rc=0, stdout=json.dumps(
+            [{"vmid": 200, "node": "alpha-02"}])),
+        "beta-01": PrimitiveResult(rc=0, stdout=json.dumps(
+            [{"vmid": 200, "node": "beta-01"}])),
+    }, calls))
+
+    got = driver_mod._discover_vm_locations(_MC_NODES, inventory_path="hosts.ini")
+
+    assert calls == ["alpha-01", "alpha-02", "beta-01"]
+    assert got[("alpha", "200")] == ("alpha-02", "10.0.0.2")
+    assert got[("beta", "200")] == ("beta-01", "10.1.0.1")
+    assert "cluster 'alpha' via alpha-01 failed" in capsys.readouterr().err
+
+
+def test_discover_vm_locations_one_cluster_down_other_survives(monkeypatch):
+    calls: List[str] = []
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _disc_executor({
+        "alpha-01": PrimitiveResult(rc=4, failed=True, stderr="down"),
+        "alpha-02": PrimitiveResult(rc=4, failed=True, stderr="down"),
+        "beta-01": PrimitiveResult(rc=0, stdout=json.dumps(
+            [{"vmid": 300, "node": "beta-01"}])),
+    }, calls))
+
+    got = driver_mod._discover_vm_locations(_MC_NODES, inventory_path="hosts.ini")
+
+    assert got == {("beta", "300"): ("beta-01", "10.1.0.1")}
+
+
+# ---------------------------------------------------------------------------
+# _resolve_vm_cluster
+# ---------------------------------------------------------------------------
+
+_MC_NODE_CLUSTERS = {"alpha-01": "alpha", "alpha-02": "alpha", "beta-01": "beta"}
+
+
+def _vm_spec(**kw):
+    defaults = dict(name="vm-x", ansible_host="10.0.1.1", vmid="101", pve_node="")
+    defaults.update(kw)
+    return VmSpec(**defaults)
+
+
+def test_resolve_vm_cluster_explicit_var_wins():
+    locations = {("alpha", "101"): ("alpha-01", "10.0.0.1")}
+    spec = _vm_spec(cluster="beta", pve_node="alpha-01")
+    assert driver_mod._resolve_vm_cluster(spec, _MC_NODE_CLUSTERS, locations) == "beta"
+
+
+def test_resolve_vm_cluster_from_pve_node():
+    spec = _vm_spec(pve_node="beta-01")
+    assert driver_mod._resolve_vm_cluster(spec, _MC_NODE_CLUSTERS, {}) == "beta"
+
+
+def test_resolve_vm_cluster_single_discovery_hit():
+    locations = {("alpha", "101"): ("alpha-01", "10.0.0.1"),
+                 ("beta", "300"): ("beta-01", "10.1.0.1")}
+    assert driver_mod._resolve_vm_cluster(_vm_spec(), _MC_NODE_CLUSTERS, locations) == "alpha"
+
+
+def test_resolve_vm_cluster_ambiguous_raises():
+    locations = {("alpha", "101"): ("alpha-01", "10.0.0.1"),
+                 ("beta", "101"): ("beta-01", "10.1.0.1")}
+    with pytest.raises(RuntimeError, match="alpha, beta"):
+        driver_mod._resolve_vm_cluster(_vm_spec(), _MC_NODE_CLUSTERS, locations)
+
+
+def test_resolve_vm_cluster_undiscovered_defaults():
+    assert driver_mod._resolve_vm_cluster(_vm_spec(), _MC_NODE_CLUSTERS, {}) == "default"
+
+
+def test_vm_phase_ambiguous_vmid_becomes_failed_record(tmp_path, monkeypatch):
+    """An ambiguous shared vmid fails that VM loudly instead of guessing a node."""
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\n"
+        "alpha-01 ansible_host=10.0.0.1 cluster=alpha\n"
+        "beta-01 ansible_host=10.1.0.1 cluster=beta\n"
+        "[proxmox_vms]\n"
+        "mystery-vm ansible_host=10.0.1.1 vmid=101\n"
+    )
+    monkeypatch.setattr(driver_mod, "_discover_vm_locations", lambda *a, **kw: {
+        ("alpha", "101"): ("alpha-01", "10.0.0.1"),
+        ("beta", "101"): ("beta-01", "10.1.0.1"),
+    })
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    state = driver_mod.run_vm_phase(settings=GlobalSettings(), inventory_path=str(p),
+                                    state_output_path=None)
+
+    assert state.failed is True
+    assert any("set cluster= or pve_node=" in e.error for e in state.errors)
+
+
+def test_vm_phase_shared_vmid_targets_own_cluster_node(tmp_path, monkeypatch):
+    """Two clusters' vmid 101 must each be driven against their own node."""
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\n"
+        "alpha-01 ansible_host=10.0.0.1 cluster=alpha\n"
+        "beta-01 ansible_host=10.1.0.1 cluster=beta\n"
+        "[proxmox_vms]\n"
+        "vm-a ansible_host=10.0.1.1 vmid=101 cluster=alpha\n"
+        "vm-b ansible_host=10.1.1.1 vmid=101 cluster=beta\n"
+    )
+    monkeypatch.setattr(driver_mod, "_discover_vm_locations", lambda *a, **kw: {
+        ("alpha", "101"): ("alpha-01", "10.0.0.1"),
+        ("beta", "101"): ("beta-01", "10.1.0.1"),
+    })
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    targeted: List[tuple] = []
+
+    def _fake_vm_update(node_name, vmid, name, vm_ex, node_ex, settings, **kw):
+        targeted.append((name, node_name, kw.get("api_host"), kw.get("cluster")))
+        return VmFlowOutcome()
+
+    monkeypatch.setattr(driver_mod, "run_vm_update", _fake_vm_update)
+
+    state = driver_mod.run_vm_phase(settings=GlobalSettings(), inventory_path=str(p),
+                                    state_output_path=None)
+
+    assert state.failed is False
+    assert sorted(targeted) == [
+        ("vm-a", "alpha-01", "10.0.0.1", "alpha"),
+        ("vm-b", "beta-01", "10.1.0.1", "beta"),
+    ]
