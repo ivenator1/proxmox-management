@@ -355,6 +355,66 @@ def test_run_fleet_scan_limit(tmp_path, monkeypatch):
     assert scanned == ["web-02"]            # node skipped (not in limit, no ids)
 
 
+def test_run_fleet_scan_qualified_vm_limit_selects_only_that_cluster(tmp_path, monkeypatch):
+    """--scan --limit alpha/200 scans only alpha's vmid-200 VM, not beta's."""
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[proxmox_nodes]\n"
+        "alpha-01 ansible_host=10.0.0.1 cluster=alpha\n"
+        "beta-01 ansible_host=10.1.0.1 cluster=beta\n"
+        "[proxmox_vms]\n"
+        "alpha-vm ansible_host=10.0.1.1 vmid=200 pve_node=alpha-01\n"
+        "beta-vm ansible_host=10.1.1.1 vmid=200 pve_node=beta-01\n"
+        "[remote_hosts]\n[custom_hosts]\n"
+    )
+    scanned: List[str] = []
+
+    def _factory(host, **kw):
+        scanned.append(host)
+        return ScriptedExecutor(script={"which apt-get": [_ok("apt")],
+                                        "dist-upgrade": [_ok("")]})
+
+    _patch_executors(monkeypatch, _factory)
+    monkeypatch.setattr(scan_mod, "_discover_lxcs", lambda ex, s, **kw: [])
+
+    settings = GlobalSettings(fleet_history_enabled=False)
+    rc = scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv),
+                                 limit={"alpha/200"})
+    assert rc == 0
+    assert "alpha-vm" in scanned            # qualified token selects alpha's VM
+    assert "beta-vm" not in scanned         # beta's same-vmid VM stays out
+
+
+def test_run_fleet_scan_bare_vm_limit_selects_vmid_in_every_cluster(tmp_path, monkeypatch):
+    """A bare vmid limit token keeps today's behaviour: both clusters' VMs scan."""
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[proxmox_nodes]\n"
+        "alpha-01 ansible_host=10.0.0.1 cluster=alpha\n"
+        "beta-01 ansible_host=10.1.0.1 cluster=beta\n"
+        "[proxmox_vms]\n"
+        "alpha-vm ansible_host=10.0.1.1 vmid=200 pve_node=alpha-01\n"
+        "beta-vm ansible_host=10.1.1.1 vmid=200 pve_node=beta-01\n"
+        "[remote_hosts]\n[custom_hosts]\n"
+    )
+    scanned: List[str] = []
+
+    def _factory(host, **kw):
+        scanned.append(host)
+        return ScriptedExecutor(script={"which apt-get": [_ok("apt")],
+                                        "dist-upgrade": [_ok("")]})
+
+    _patch_executors(monkeypatch, _factory)
+    monkeypatch.setattr(scan_mod, "_discover_lxcs", lambda ex, s, **kw: [])
+
+    settings = GlobalSettings(fleet_history_enabled=False)
+    rc = scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv),
+                                 limit={"200"})
+    assert rc == 0
+    assert "alpha-vm" in scanned
+    assert "beta-vm" in scanned
+
+
 def test_run_fleet_scan_error_sets_exit_code(tmp_path, monkeypatch):
     inv = tmp_path / "hosts.ini"
     inv.write_text("[remote_hosts]\nweb-01\n[proxmox_nodes]\n[proxmox_vms]\n[custom_hosts]\n")

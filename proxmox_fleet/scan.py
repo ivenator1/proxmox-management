@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Set, Union
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet import inventory
-from proxmox_fleet.cluster import limit_selects_id, token_is_id
+from proxmox_fleet.cluster import DEFAULT_CLUSTER, limit_selects_id, token_is_id
 from proxmox_fleet.executor import Executor
 from proxmox_fleet.flows._pkg import detect_pkg_mgr
 from proxmox_fleet.flows.lxc import _build_shell, _discover_lxcs, _read_version
@@ -290,11 +290,22 @@ def run_fleet_scan(
     vms = inventory.load_proxmox_vms(inventory_path, host_vars_dir=settings.host_vars_dir)
     nodes = inventory.load_proxmox_nodes(inventory_path, host_vars_dir=settings.host_vars_dir)
     inventory.validate_node_uniqueness(nodes)
+    node_clusters = {n["name"]: n["cluster"] for n in nodes}
+
+    def _vm_cluster_hint(v: inventory.VmSpec) -> str:
+        # Same cheap pre-execution guess as the driver's VM --limit filter:
+        # explicit cluster= var, else the pve_node hint's cluster, else default.
+        if v.cluster:
+            return v.cluster
+        if v.pve_node:
+            return node_clusters.get(v.pve_node, DEFAULT_CLUSTER)
+        return DEFAULT_CLUSTER
 
     limit_has_ids = limit is not None and any(token_is_id(t) for t in limit)
     if limit is not None:
         remote = [h for h in remote if h.name in limit]
-        vms = [v for v in vms if v.name in limit or v.vmid in limit]
+        vms = [v for v in vms
+               if v.name in limit or limit_selects_id(limit, _vm_cluster_hint(v), v.vmid)]
 
     scan: Dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"),

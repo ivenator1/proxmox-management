@@ -1297,6 +1297,75 @@ def test_vm_canary_failure_skips_rest_with_records(tmp_path, monkeypatch):
     assert skipped[0].node == "pve-01"      # pve_node hint used for the record
 
 
+def test_vm_qualified_canary_token_stages_only_its_cluster(tmp_path, monkeypatch):
+    """canary_hosts=["alpha/200"] stages only alpha's vmid-200 VM as a canary;
+    beta's same-vmid VM runs in the rest wave (never staged, never skipped)."""
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\n"
+        "alpha-01 ansible_host=10.0.0.1 cluster=alpha\n"
+        "beta-01 ansible_host=10.1.0.1 cluster=beta\n"
+        "[proxmox_vms]\n"
+        "alpha-vm ansible_host=10.0.1.1 vmid=200 pve_node=alpha-01\n"
+        "beta-vm ansible_host=10.1.1.1 vmid=200 pve_node=beta-01\n"
+    )
+    ran: List[str] = []
+
+    def _fake_vm_update(node_name, vmid, name, vm_ex, node_ex, settings, **kw):
+        ran.append(name)
+        from proxmox_fleet.flows.vm import VmFlowOutcome
+        return VmFlowOutcome()
+
+    monkeypatch.setattr(driver_mod, "run_vm_update", _fake_vm_update)
+    monkeypatch.setattr(driver_mod, "_discover_vm_locations", lambda *a, **kw: {})
+    monkeypatch.setattr(driver_mod, "_soak_canaries", lambda *a, **kw: None)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    state = driver_mod.run_vm_phase(
+        settings=GlobalSettings(canary_hosts=["alpha/200"]), inventory_path=str(p),
+        state_output_path=None)
+
+    # alpha-vm is the (only) canary and runs first; beta-vm is the rest wave.
+    assert ran == ["alpha-vm", "beta-vm"]
+    assert not any("SKIPPED" in r.status for r in state.vm)
+    assert state.failed is False
+
+
+def test_vm_bare_canary_token_stages_vmid_in_every_cluster(tmp_path, monkeypatch):
+    """A bare canary vmid keeps the historical behaviour: it stages that vmid
+    in every cluster (back-compat)."""
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\n"
+        "alpha-01 ansible_host=10.0.0.1 cluster=alpha\n"
+        "beta-01 ansible_host=10.1.0.1 cluster=beta\n"
+        "[proxmox_vms]\n"
+        "alpha-vm ansible_host=10.0.1.1 vmid=200 pve_node=alpha-01\n"
+        "beta-vm ansible_host=10.1.1.1 vmid=200 pve_node=beta-01\n"
+        "other-vm ansible_host=10.1.1.2 vmid=201 pve_node=beta-01\n"
+    )
+    ran: List[str] = []
+
+    def _fake_vm_update(node_name, vmid, name, vm_ex, node_ex, settings, **kw):
+        ran.append(name)
+        from proxmox_fleet.flows.vm import VmFlowOutcome
+        return VmFlowOutcome()
+
+    monkeypatch.setattr(driver_mod, "run_vm_update", _fake_vm_update)
+    monkeypatch.setattr(driver_mod, "_discover_vm_locations", lambda *a, **kw: {})
+    monkeypatch.setattr(driver_mod, "_soak_canaries", lambda *a, **kw: None)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    driver_mod.run_vm_phase(
+        settings=GlobalSettings(canary_hosts=["200"], vm_forks=1),
+        inventory_path=str(p), state_output_path=None)
+
+    # Both vmid-200 VMs form the canary wave; other-vm is the rest wave.
+    assert ran == ["alpha-vm", "beta-vm", "other-vm"]
+
+
 def test_lxc_canary_id_failure_skips_rest_across_nodes(tmp_path, monkeypatch):
     p = tmp_path / "hosts.ini"
     p.write_text(

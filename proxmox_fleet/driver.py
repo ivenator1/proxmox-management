@@ -620,17 +620,18 @@ def run_vm_phase(
     nodes_map = {n["name"]: n["ansible_host"] for n in nodes}
     node_clusters = {n["name"]: n.get("cluster", DEFAULT_CLUSTER) for n in nodes}
 
-    if limit is not None:
-        def _vm_cluster_hint(v: VmSpec) -> str:
-            # A cheap pre-execution guess for --limit filtering only — the
-            # authoritative resolution (raising on ambiguity) happens per-VM
-            # in _run_one() via _resolve_vm_cluster() once vm_locations is set.
-            if v.cluster:
-                return v.cluster
-            if v.pve_node:
-                return node_clusters.get(v.pve_node, DEFAULT_CLUSTER)
-            return DEFAULT_CLUSTER
+    def _vm_cluster_hint(v: VmSpec) -> str:
+        # A cheap pre-execution guess for --limit filtering and canary
+        # partitioning only — the authoritative resolution (raising on
+        # ambiguity) happens per-VM in _run_one() via _resolve_vm_cluster()
+        # once vm_locations is set.
+        if v.cluster:
+            return v.cluster
+        if v.pve_node:
+            return node_clusters.get(v.pve_node, DEFAULT_CLUSTER)
+        return DEFAULT_CLUSTER
 
+    if limit is not None:
         vms = [v for v in vms
                if v.name in limit or limit_selects_id(limit, _vm_cluster_hint(v), v.vmid)]
 
@@ -698,7 +699,7 @@ def run_vm_phase(
 
     canary = [v for v in vms
               if v.canary or v.name in settings.canary_hosts
-              or v.vmid in settings.canary_hosts]
+              or matches_any(settings.canary_hosts, _vm_cluster_hint(v), v.vmid)]
     rest = [v for v in vms if v not in canary]
 
     if not canary or not rest:
