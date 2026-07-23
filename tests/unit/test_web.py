@@ -269,6 +269,34 @@ def test_pending_page(history_dir):
     assert "outdated" in resp.text
 
 
+def test_pending_page_legacy_bare_id_key_shows_id(history_dir):
+    """Old persisted snapshots (bare-id lxc keys, no `id` field) still render."""
+    resp = _client(history_dir).get("/pending")
+    assert "<td class=\"num\">101</td>" in resp.text
+
+
+def test_pending_page_node_qualified_keys(tmp_path):
+    """New snapshots key lxc entries by node/id — two clusters' 101 both render."""
+    d = tmp_path / "history"
+    _seed_history(d)
+    scan_mod.write_pending({
+        "timestamp": "20260104T000000000000Z",
+        "hosts": {},
+        "lxc": {"alpha-01/101": {"node": "alpha-01", "id": "101", "name": "sonarr",
+                                 "skipped": None, "os_pending_count": 1,
+                                 "os_pending": ["libssl3"], "app": None, "error": None},
+                "beta-01/101": {"node": "beta-01", "id": "101", "name": "radarr",
+                                "skipped": None, "os_pending_count": 0,
+                                "os_pending": [], "app": None, "error": None}},
+    }, history_dir=d, keep=0)
+    resp = _client(d).get("/pending")
+    assert resp.status_code == 200
+    assert "sonarr" in resp.text and "radarr" in resp.text
+    assert "alpha-01" in resp.text and "beta-01" in resp.text
+    # The ID column shows the bare container id, not the node/id key.
+    assert "alpha-01/101" not in resp.text
+
+
 def test_pending_unknown_ref_404(history_dir):
     assert _client(history_dir).get("/pending", params={"ref": "nope"}).status_code == 404
 
@@ -843,3 +871,37 @@ def test_pending_page_tolerates_scans_without_health_keys(history_dir):
     resp = _client(history_dir).get("/pending")
     assert resp.status_code == 200
     assert "sonarr" in resp.text
+
+
+def test_pending_page_renders_health_signals_on_node_keyed_snapshots(history_dir):
+    """The intersection of #38 and #41: node/id keys AND the health columns.
+
+    Neither branch covered this on its own — #38's snapshots are keyed
+    "node/id" while #41's Disk/OS columns render from the same entries.
+    """
+    scan_mod.write_pending({
+        "timestamp": "20260105T000000000000Z",
+        "hosts": {},
+        "lxc": {
+            "Hammond/130": {"node": "Hammond", "id": "130", "name": "grafana",
+                            "skipped": None, "os_pending_count": 4,
+                            "os_pending": ["grafana"], "app": None,
+                            "disk_percent": 90, "os": "debian 13",
+                            "os_mismatch": None, "error": None},
+            "Hammond/123": {"node": "Hammond", "id": "123",
+                            "name": "nginxproxymanager", "skipped": None,
+                            "os_pending_count": 0, "os_pending": [], "app": None,
+                            "disk_percent": 63, "os": "debian 12",
+                            "os_mismatch": "container runs debian 12 but "
+                                           "ct/nginxproxymanager.sh targets debian 13",
+                            "error": None},
+        },
+    }, history_dir=history_dir, keep=0)
+
+    resp = _client(history_dir).get("/pending", params={"ref": "20260105T000000000000Z"})
+    assert resp.status_code == 200
+    assert "90%" in resp.text and "63%" in resp.text
+    assert "debian 12 — outdated" in resp.text
+    # the display id, not the raw "Hammond/130" key
+    assert ">130<" in resp.text and ">123<" in resp.text
+    assert "Hammond/130" not in resp.text

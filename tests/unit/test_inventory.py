@@ -1,10 +1,13 @@
 """Tests for proxmox_fleet.inventory loaders (custom/nodes/vms/remote)."""
 
+import pytest
+
 from proxmox_fleet.inventory import (
     load_custom_hosts,
     load_proxmox_nodes,
     load_proxmox_vms,
     load_remote_hosts,
+    validate_node_uniqueness,
 )
 
 
@@ -192,6 +195,61 @@ def test_proxmox_nodes_inline_wins_over_host_vars(tmp_path):
     assert nodes[0]["ansible_host"] == "10.0.0.10"
 
 
+# --- cluster var (multi-cluster) ---
+
+def test_proxmox_nodes_cluster_defaults(tmp_path):
+    path = _write_ini(tmp_path, "[proxmox_nodes]\npve-01 ansible_host=10.0.0.10\n")
+    nodes = load_proxmox_nodes(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert nodes[0]["cluster"] == "default"
+
+
+def test_proxmox_nodes_cluster_inline_var(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[proxmox_nodes]\n"
+        "alpha-01 ansible_host=10.0.0.10 cluster=alpha\n"
+        "beta-01 ansible_host=10.1.0.10 cluster=beta\n",
+    )
+    nodes = load_proxmox_nodes(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert [n["cluster"] for n in nodes] == ["alpha", "beta"]
+
+
+def test_proxmox_nodes_cluster_from_host_vars_inline_wins(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[proxmox_nodes]\npve-01\npve-02 cluster=beta\n",
+    )
+    _write_host_vars(tmp_path, "pve-01", "cluster: alpha\n")
+    _write_host_vars(tmp_path, "pve-02", "cluster: gamma\n")
+    nodes = load_proxmox_nodes(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert nodes[0]["cluster"] == "alpha"   # host_vars fallback
+    assert nodes[1]["cluster"] == "beta"    # inline wins
+
+
+def test_validate_node_uniqueness_ok():
+    validate_node_uniqueness([
+        {"name": "pve-01", "ansible_host": "10.0.0.1", "cluster": "alpha"},
+        {"name": "pve-02", "ansible_host": "10.0.0.2", "cluster": "beta"},
+    ])
+
+
+def test_validate_node_uniqueness_duplicate_name_fails_loud():
+    with pytest.raises(SystemExit) as exc:
+        validate_node_uniqueness([
+            {"name": "pve-01", "ansible_host": "10.0.0.1", "cluster": "alpha"},
+            {"name": "pve-01", "ansible_host": "10.1.0.1", "cluster": "beta"},
+        ])
+    assert "pve-01" in str(exc.value)
+
+
+def test_validate_node_uniqueness_shared_ip_warns(capsys):
+    validate_node_uniqueness([
+        {"name": "pve-01", "ansible_host": "10.0.0.1", "cluster": "alpha"},
+        {"name": "pve-02", "ansible_host": "10.0.0.1", "cluster": "beta"},
+    ])
+    assert "10.0.0.1" in capsys.readouterr().err
+
+
 # --- load_proxmox_vms ---
 
 def test_proxmox_vms_inline_vars(tmp_path):
@@ -223,6 +281,25 @@ def test_proxmox_vms_from_host_vars(tmp_path):
 def test_proxmox_vms_missing_section_returns_empty(tmp_path):
     path = _write_ini(tmp_path, "[remote_hosts]\n")
     assert load_proxmox_vms(path) == []
+
+
+def test_proxmox_vms_cluster_var(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[proxmox_vms]\n"
+        "vm-a ansible_host=10.0.0.30 vmid=200 cluster=beta\n"
+        "vm-b ansible_host=10.0.0.31 vmid=200\n",
+    )
+    _write_host_vars(tmp_path, "vm-b", "cluster: alpha\n")
+    vms = load_proxmox_vms(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert vms[0].cluster == "beta"
+    assert vms[1].cluster == "alpha"
+
+
+def test_proxmox_vms_cluster_defaults_empty(tmp_path):
+    """Empty means "infer" (from pve_node or discovery) — not DEFAULT_CLUSTER."""
+    path = _write_ini(tmp_path, "[proxmox_vms]\nvm-a vmid=200 pve_node=pve-01\n")
+    assert load_proxmox_vms(path, host_vars_dir=str(tmp_path / "host_vars"))[0].cluster == ""
 
 
 # --- load_remote_hosts ---

@@ -166,9 +166,10 @@ def scan_lxc(executor: Executor, lxc_id: str, node: str) -> Dict[str, Any]:
     Stopped containers and templates are skipped (a scan never starts a CT).
     Never raises — errors land in the returned dict's ``error`` key.
     """
-    out: Dict[str, Any] = {"node": node, "name": lxc_id, "skipped": None,
-                           "os_pending_count": 0, "os_pending": [],
-                           "app": None, "disk_percent": None, "os": "",
+    out: Dict[str, Any] = {"node": node, "id": lxc_id, "name": lxc_id,
+                           "skipped": None, "os_pending_count": 0,
+                           "os_pending": [], "app": None,
+                           "disk_percent": None, "os": "",
                            "os_mismatch": None, "error": None}
     try:
         intro = executor.introspect(lxc_id)
@@ -323,6 +324,7 @@ def run_fleet_scan(
     remote = inventory.load_remote_hosts(inventory_path, host_vars_dir=settings.host_vars_dir)
     vms = inventory.load_proxmox_vms(inventory_path, host_vars_dir=settings.host_vars_dir)
     nodes = inventory.load_proxmox_nodes(inventory_path, host_vars_dir=settings.host_vars_dir)
+    inventory.validate_node_uniqueness(nodes)
 
     limit_has_ids = limit is not None and any(t.isdigit() for t in limit)
     if limit is not None:
@@ -384,10 +386,12 @@ def run_fleet_scan(
         for lxc_id, result, run_err in run_concurrent(
                 lxc_ids, _scan_one, max_workers=settings.lxc_forks):
             if result is None:
-                result = {"node": node_name, "name": str(lxc_id), "skipped": None,
-                          "os_pending_count": 0, "os_pending": [], "app": None,
-                          "error": str(run_err)[:300]}
-            scan["lxc"][str(lxc_id)] = result
+                result = {"node": node_name, "id": str(lxc_id), "name": str(lxc_id),
+                          "skipped": None, "os_pending_count": 0, "os_pending": [],
+                          "app": None, "error": str(run_err)[:300]}
+            # Keyed by node/id — a bare vmid is not unique across clusters, and
+            # two same-id containers must not overwrite each other in the JSON.
+            scan["lxc"][f"{node_name}/{lxc_id}"] = result
             failed = failed or bool(result.get("error"))
             app = result.get("app")
             app_str = ""
