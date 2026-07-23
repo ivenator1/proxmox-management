@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import pkg_changed as _pkg_changed
+from proxmox_fleet.cluster import DEFAULT_CLUSTER
 from proxmox_fleet.changes import vm_pkg_count as _vm_pkg_count
 from proxmox_fleet.executor import Executor, snapshot_with_retry
 from proxmox_fleet.flows._pkg import detect_pkg_mgr, kuma_healthy, upgrade_cmd
@@ -48,13 +49,14 @@ def run_vm_update(
     *,
     dry_run: bool = False,
     api_host: str = "",
+    cluster: str = DEFAULT_CLUSTER,
 ) -> VmFlowOutcome:
     """Run the full vm_update flow for one VM. Never raises — failures are
     captured into the outcome (FAILED record + error entry), mirroring rescue.
 
     Args:
         node:               Proxmox node inventory hostname (used in VmRecord.node).
-        vmid:               VM ID string (e.g. "200").
+        vmid:               VM ID string (e.g. "200") — only unique within *cluster*.
         inventory_hostname: VM's inventory hostname for Kuma map lookups.
         executor:           Bound to the VM (SSH); used for package upgrades only.
         node_executor:      Bound to the Proxmox node (SSH); used for qm commands
@@ -64,7 +66,11 @@ def run_vm_update(
         settings:           GlobalSettings from vars.yml.
         dry_run:            When True, simulate upgrade but apply no changes.
         api_host:           The node's ansible_host IP for Proxmox API (snapshot).
+        cluster:            The owning cluster (driver-resolved). Unused today;
+                            reserved for cluster-qualified settings matching and
+                            per-cluster API credentials.
     """
+    del cluster  # reserved — see docstring
 
     snap_taken = False
     snapshot_failed = False

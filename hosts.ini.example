@@ -1,6 +1,14 @@
+# Multi-cluster: with two or more Proxmox clusters, LXC/VM ids are NOT unique
+# fleet-wide (each cluster can have its own 101). Tag each node with
+# cluster=<name> (inline or in host_vars/<node>.yml) so discovery queries every
+# cluster and same-id guests never cross-target. Nodes without a cluster= var
+# all fall into one implicit "default" cluster — single-cluster setups need no
+# changes. Node NAMES must stay unique across all clusters.
 [proxmox_nodes]
 pve-01 ansible_host=10.10.10.10
 pve-02 ansible_host=10.10.10.20
+# alpha-01 ansible_host=10.10.10.10 cluster=alpha
+# beta-01  ansible_host=10.20.10.10 cluster=beta
 
 [proxmox_nodes:vars]
 ansible_user=root
@@ -13,9 +21,13 @@ ansible_python_interpreter=/usr/bin/python3
 # the Python driver runs, it queries the Proxmox cluster via pvesh to find
 # each VM's current node — HA migrations are handled automatically. pve_node
 # is only used when cluster discovery is unavailable (e.g. standalone node).
+# With multiple clusters, set cluster=<name> (or a pve_node in the right
+# cluster) when the same vmid exists in more than one cluster — an ambiguous
+# vmid fails loud rather than guessing.
 # Leave the group empty (just the header) if you have no VMs.
 [proxmox_vms]
 # my-vm  ansible_host=10.10.10.50  vmid=200  pve_node=pve-01
+# other  ansible_host=10.20.10.50  vmid=200  cluster=beta
 
 [proxmox_vms:vars]
 ansible_user=root
