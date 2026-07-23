@@ -905,3 +905,25 @@ def test_pending_page_renders_health_signals_on_node_keyed_snapshots(history_dir
     # the display id, not the raw "Hammond/130" key
     assert ">130<" in resp.text and ">123<" in resp.text
     assert "Hammond/130" not in resp.text
+
+
+def test_pending_page_shows_unreachable_as_skipped_not_an_error(history_dir):
+    """An unreachable host reads as "could not look", not a red failure."""
+    scan_mod.write_pending({
+        "timestamp": "20260106T000000000000Z",
+        "hosts": {"ONeill": {"kind": "node", "pkg_mgr": "", "pending_count": 0,
+                             "pending": [], "unreachable": True,
+                             "error": "No route to host"}},
+        "lxc": {"ONeill": {"node": "ONeill", "id": "ONeill", "name": "ONeill",
+                           "skipped": "unreachable", "os_pending_count": 0,
+                           "os_pending": [], "app": None, "disk_percent": None,
+                           "os": "", "os_mismatch": None, "unreachable": True,
+                           "error": "discovery failed: node unreachable"}},
+    }, history_dir=history_dir, keep=0)
+
+    resp = _client(history_dir).get("/pending", params={"ref": "20260106T000000000000Z"})
+    assert resp.status_code == 200
+    assert "unreachable — skipped" in resp.text
+    assert "skipped (unreachable)" in resp.text
+    # the raw error is a tooltip, not a red cell
+    assert '<span class="fail">No route to host</span>' not in resp.text

@@ -46,7 +46,11 @@ from proxmox_fleet.models.state import (
     WarningEntry,
 )
 from proxmox_fleet.orchestration import run_concurrent
-from proxmox_fleet.runner import UnreachableHostError
+from proxmox_fleet.runner import (
+    UNREACHABLE_MARKERS,
+    UnreachableHostError,
+    is_unreachable_error,
+)
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -269,19 +273,14 @@ def _fold_outcome(state: FleetState, outcome: Any, bucket: List[Any]) -> None:
     state.warnings.extend(getattr(outcome, "warnings", []))
 
 
-# Ansible's unreachable-host message (stable across core versions) plus the
-# usual SSH connect errors — used to spot "the host never answered" in error
-# text that already passed through a flow's exception formatting.
-_UNREACHABLE_MARKERS = (
-    "Data could not be sent to remote host",
-    "No route to host",
-    "Connection timed out",
-    "Connection refused",
-)
+# Kept as module-local names for the existing call sites and tests; the markers
+# and the predicate itself now live in runner.py, next to UnreachableHostError,
+# so scan.py can apply exactly the same rule.
+_UNREACHABLE_MARKERS = UNREACHABLE_MARKERS
 
 
 def _error_is_unreachable(text: str) -> bool:
-    return any(marker in text for marker in _UNREACHABLE_MARKERS)
+    return is_unreachable_error(text)
 
 
 def _cluster_quorate(
