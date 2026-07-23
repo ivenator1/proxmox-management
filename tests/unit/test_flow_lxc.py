@@ -739,3 +739,80 @@ def test_discover_lxcs_plain_failure_raises_runtime_error():
     with pytest.raises(RuntimeError) as exc_info:
         _discover_lxcs(ex, _settings())
     assert not isinstance(exc_info.value, UnreachableHostError)
+
+
+# ---------------------------------------------------------------------------
+# Non-raising update failures — captured output + failed run
+# ---------------------------------------------------------------------------
+
+
+def test_app_update_failure_records_error_and_fails_run(monkeypatch):
+    """A non-zero /usr/bin/update must carry its output out, not just a boolean."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal()
+    ex._lxc_app_result = _fail(rc=1, stderr="npm: migration failed, aborting")
+    out = run_lxc_update("pve-01", "123", ex, _settings(), api_host="192.168.1.10")
+
+    assert out.failed is True
+    assert out.record is not None and out.record.app == "FAILED"
+    assert len(out.errors) == 1
+    assert out.errors[0].host == "123"
+    assert out.errors[0].task == "app update"
+    assert "migration failed" in out.errors[0].error
+
+
+def test_os_update_failure_records_error_and_fails_run(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal()
+    ex._lxc_os_result = _fail(rc=100, stderr="E: You don't have enough free space in /var/cache/apt")
+    out = run_lxc_update("pve-01", "130", ex, _settings(), api_host="192.168.1.10")
+
+    assert out.failed is True
+    assert out.record is not None and out.record.os == "FAILED"
+    assert [e.task for e in out.errors] == ["OS update"]
+    assert "enough free space" in out.errors[0].error
+
+
+def test_both_updates_failing_record_one_error_each(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal()
+    ex._lxc_os_result = _fail(rc=100, stderr="E: no space left on device")
+    ex._lxc_app_result = _fail(rc=1, stderr="build step exited 1")
+    out = run_lxc_update("pve-01", "130", ex, _settings(), api_host="192.168.1.10")
+
+    assert out.failed is True
+    assert [e.task for e in out.errors] == ["OS update", "app update"]
+
+
+def test_failure_detail_falls_back_to_stdout_then_rc(monkeypatch):
+    from proxmox_fleet.flows.lxc import _failure_detail
+
+    assert _failure_detail(PrimitiveResult(rc=1, failed=True, stderr="  boom  ")) == "boom"
+    # stdout is used when stderr is empty, and newlines are collapsed for the
+    # briefing's inline-code rendering
+    assert _failure_detail(
+        PrimitiveResult(rc=1, failed=True, stdout="line one\nline two")
+    ) == "line one line two"
+    assert "rc=7" in _failure_detail(PrimitiveResult(rc=7, failed=True))
+
+
+def test_failure_detail_keeps_the_tail_of_long_output():
+    from proxmox_fleet.flows.lxc import _FAILURE_DETAIL_MAX, _failure_detail
+
+    long = "x" * 500 + " E: the actual complaint"
+    detail = _failure_detail(PrimitiveResult(rc=1, failed=True, stderr=long))
+    assert detail.startswith("...")
+    assert detail.endswith("E: the actual complaint")
+    assert len(detail) == _FAILURE_DETAIL_MAX + 3
+
+
+def test_successful_run_records_no_errors(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal(ver_before="1.0", ver_after="1.1")
+    out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
+    assert out.failed is False
+    assert out.errors == []

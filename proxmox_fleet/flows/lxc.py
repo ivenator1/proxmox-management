@@ -44,17 +44,43 @@ class HealthCheckError(RuntimeError):
 
 @dataclass
 class LxcFlowOutcome:
-    """Everything the driver needs to fold this container into the FleetState."""
+    """Everything the driver needs to fold this container into the FleetState.
+
+    ``error`` carries the single rescue-path exception; ``errors`` carries the
+    non-raising update failures (OS and/or app), which are reported without
+    aborting the flow and so can be more than one per container.
+    """
 
     record: Optional[LxcRecord] = None
     changed: bool = False
     failed: bool = False
     error: Optional[ErrorEntry] = None
+    errors: List[ErrorEntry] = field(default_factory=list)
     warnings: List[WarningEntry] = field(default_factory=list)
 
     @property
     def should_report(self) -> bool:
         return self.record is not None
+
+
+_FAILURE_DETAIL_MAX = 300
+
+
+def _failure_detail(res: Any) -> str:
+    """One-line tail of a failed primitive's output, for the Error Log.
+
+    stderr first (where apt and the community update scripts put the actual
+    complaint), stdout as the fallback. Newlines are collapsed because the
+    briefing renders the entry inside backticks, and the *tail* is kept because
+    the operative line (``E: You don't have enough free space...``) comes last.
+    """
+    text = (getattr(res, "stderr", "") or "").strip() or (getattr(res, "stdout", "") or "").strip()
+    if not text:
+        return f"command failed (rc={getattr(res, 'rc', '?')}) with no output"
+    flat = " ".join(text.split())
+    if len(flat) > _FAILURE_DETAIL_MAX:
+        flat = "..." + flat[-_FAILURE_DETAIL_MAX:]
+    return flat
 
 
 def _build_shell(lxc_os: str) -> str:
@@ -312,6 +338,10 @@ def run_lxc_update(
             os_res = executor.lxc_os_update(lxc_id, os_update_cmd=os_cmd)
             os_res_stdout = os_res.stdout
             os_failed = os_res.failed
+            if os_failed:
+                outcome.errors.append(ErrorEntry(
+                    host=lxc_id, task="OS update", error=_failure_detail(os_res),
+                ))
             if settings.lxc_verbose:
                 summary = (os_res.stdout or "").strip().replace("\n", " ")[:120]
                 _vprint(node, lxc_id, name, f"os_update: {'FAILED' if os_failed else 'ok'}  {summary}")
@@ -348,6 +378,10 @@ def run_lxc_update(
             )
             app_failed = app_res.failed
             app_changed = not app_res.failed  # tentative; overridden below by version/hash
+            if app_failed:
+                outcome.errors.append(ErrorEntry(
+                    host=lxc_id, task="app update", error=_failure_detail(app_res),
+                ))
             if settings.lxc_verbose:
                 summary = (app_res.stdout or "").strip().replace("\n", " ")[:120]
                 _vprint(node, lxc_id, name, f"app_update: {'FAILED' if app_failed else 'ok'}  {summary}")
@@ -445,6 +479,11 @@ def run_lxc_update(
         )
 
         outcome.changed = something_changed
+        # A non-zero OS or app update does not raise (the flow carries on so the
+        # other line still gets reported), but it is still a failed run: without
+        # this the record says FAILED while state.failed stays false, so the exit
+        # code, the history entry and the dashboard all report success.
+        outcome.failed = bool(outcome.errors)
         script_expected = lxc_id not in {str(x) for x in settings.os_only_lxc_list}
         if lxc_should_report(app_status_str, os_status_str, dry_run=False,
                              script_expected=script_expected):

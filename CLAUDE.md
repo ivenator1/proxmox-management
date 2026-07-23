@@ -334,6 +334,16 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
   a `FAILED` record without aborting the others.
 - **Rollback only fires when `snap_taken`** — `strategy: none` or a failed snapshot just records
   `FAILED` (the latter `FAILED (NO SNAPSHOT)`); **vzdump alone never auto-restores**.
+- **A non-zero OS/app update does not raise** (the flow carries on so the other line still gets
+  reported) but it *is* a failed run: each one appends an `ErrorEntry` (task `OS update` /
+  `app update`) to `LxcFlowOutcome.errors` carrying `_failure_detail()` — the failing command's
+  stderr, else stdout, collapsed to one line and tail-capped at 300 chars — and sets
+  `outcome.failed`. Without that the record reads `FAILED` while `state.failed` stays false, so
+  the exit code, history and dashboard all claim success with no reason recorded anywhere.
+  `outcome.errors` (plural, lxc-only, both lines can fail) is separate from `outcome.error` (the
+  single rescue-path exception); `driver._fold_outcome()` reads it defensively via `getattr`.
+  These failures do **not** enter rescue, so **they do not roll back** — the container is left
+  half-updated by design.
 - **Custom-config commands are opaque strings**: `CustomConfig` validates as literals, never
   renders. `steps.run_steps()` resolves only `{{ steps.NAME }}` in Python at run time; everything
   else is left for the shell. `register` stashes a step's stdout for a later `when:`.
