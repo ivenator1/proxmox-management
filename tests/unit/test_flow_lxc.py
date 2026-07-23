@@ -816,3 +816,39 @@ def test_successful_run_records_no_errors(monkeypatch):
     out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
     assert out.failed is False
     assert out.errors == []
+
+
+def test_failure_detail_strips_ansi_and_keeps_the_real_cause():
+    """Verbatim stderr from a live exit-203 run of ct/nginxproxymanager.sh.
+
+    The last line is the misleading fallthrough into build_container; the actual
+    cause is two lines above it, so both must survive stripping + truncation.
+    """
+    from proxmox_fleet.flows.lxc import _failure_detail
+
+    stderr = (
+        "\x1b[K  ✖️  \x1b[01;31mContainer OS debian 12 does not match the "
+        "recommended debian 13 — skipping update.\x1b[m\n"
+        "\x1b[K  ✖️  \x1b[01;31mUpgrade the container OS to debian 13 first, then "
+        "run this update again — or bypass this check (may break, no support) with: "
+        'echo "debian 13" > /usr/local/community-scripts/ignore-os-mismatch\x1b[m\n'
+        "\x1b[K  ✖️  \x1b[01;31mYou need to set 'CTID' variable.\x1b[m\n"
+    )
+    detail = _failure_detail(PrimitiveResult(rc=203, failed=True, stderr=stderr))
+
+    assert "\x1b" not in detail
+    assert "[K" not in detail
+    assert "Container OS debian 12 does not match the recommended debian 13" in detail
+    assert "You need to set 'CTID' variable." in detail
+
+
+def test_failure_detail_prefers_stderr_over_banner_stdout():
+    """The community scripts put their banner on stdout and the error on stderr."""
+    from proxmox_fleet.flows.lxc import _failure_detail
+
+    detail = _failure_detail(PrimitiveResult(
+        rc=203, failed=True,
+        stdout="   ____  _   _ ___ \n  |  _ \\| \\ | |  _ \\ \n",
+        stderr="\x1b[01;31mContainer OS debian 12 does not match\x1b[m",
+    ))
+    assert detail == "Container OS debian 12 does not match"

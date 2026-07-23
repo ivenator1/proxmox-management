@@ -337,7 +337,9 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
 - **A non-zero OS/app update does not raise** (the flow carries on so the other line still gets
   reported) but it *is* a failed run: each one appends an `ErrorEntry` (task `OS update` /
   `app update`) to `LxcFlowOutcome.errors` carrying `_failure_detail()` — the failing command's
-  stderr, else stdout, collapsed to one line and tail-capped at 300 chars — and sets
+  stderr, else stdout, ANSI-stripped, collapsed to one line and tail-capped at 400 chars (the
+  community scripts colourise even under `TERM=dumb`/`PHS_SILENT`, and their *last* line can be a
+  misleading fallthrough with the real cause two lines above) — and sets
   `outcome.failed`. Without that the record reads `FAILED` while `state.failed` stays false, so
   the exit code, history and dashboard all claim success with no reason recorded anywhere.
   `outcome.errors` (plural, lxc-only, both lines can fail) is separate from `outcome.error` (the

@@ -12,6 +12,7 @@ Status strings come from proxmox_fleet.status (byte-parity with the old Jinja).
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -63,18 +64,30 @@ class LxcFlowOutcome:
         return self.record is not None
 
 
-_FAILURE_DETAIL_MAX = 300
+_FAILURE_DETAIL_MAX = 400
+
+# Community-script msg_error output is colourised even under TERM=dumb/PHS_SILENT
+# (verified against a live exit-203 run), and every line is prefixed with a bare
+# ESC[K. Left in, the escapes eat the character budget and render as noise in the
+# briefing, so they are stripped before truncation.
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def _failure_detail(res: Any) -> str:
     """One-line tail of a failed primitive's output, for the Error Log.
 
-    stderr first (where apt and the community update scripts put the actual
-    complaint), stdout as the fallback. Newlines are collapsed because the
-    briefing renders the entry inside backticks, and the *tail* is kept because
-    the operative line (``E: You don't have enough free space...``) comes last.
+    stderr first, stdout as the fallback: apt writes its ``E: ...`` lines to
+    stderr, and the community update scripts send msg_error there too while
+    stdout carries only their ASCII-art banner.
+
+    The *tail* is kept because the operative line comes last, and the budget is
+    generous enough for several lines — the community scripts' final line can be
+    a misleading fallthrough ("You need to set 'CTID' variable"), with the real
+    cause ("Container OS debian 12 does not match the recommended debian 13")
+    two lines above it.
     """
     text = (getattr(res, "stderr", "") or "").strip() or (getattr(res, "stdout", "") or "").strip()
+    text = _ANSI_RE.sub("", text).strip()
     if not text:
         return f"command failed (rc={getattr(res, 'rc', '?')}) with no output"
     flat = " ".join(text.split())
