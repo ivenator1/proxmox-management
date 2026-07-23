@@ -85,6 +85,15 @@ lxc_continue_on_error: false
 # Reported in the briefing's Warnings section, on --dry-run, and in --scan.
 lxc_disk_warn_percent: 75
 
+# --- RESOURCE SCALING (opt-in) ---
+# Temporarily raise a container's cores/memory to its ct script's var_cpu/var_ram
+# for the duration of the app update, then restore the live pre-scale values.
+# Only ever fires on containers provisioned BELOW their script's spec (one the
+# script created already matches). Off by default: the community scripts dropped
+# build-time scaling, so enabling this adds `pct set` calls they no longer make.
+# The plan is computed either way and shown under --verbose.
+lxc_resource_scaling: false
+
 # --- BACKUP STRATEGY ---
 # snapshot | vzdump | both | none
 lxc_backup_strategy: "snapshot"

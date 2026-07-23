@@ -11,13 +11,23 @@ from typing import Optional
 
 
 def parse_pct_config(stdout: str) -> dict:
-    """Extract {name, os_type, is_template} from `pct config <id>` stdout."""
+    """Extract {name, os_type, is_template, cores, memory} from `pct config <id>`.
+
+    ``cores``/``memory`` are the container's live allocation, as strings ("" when
+    the key is absent and PVE's default applies). They are anchored to the start
+    of a line because the ``description:`` field holds a blob of URL-encoded HTML
+    that an unanchored pattern can match inside.
+    """
     name_m = re.search(r"hostname: (\S+)", stdout)
     os_m = re.search(r"ostype: (\w+)", stdout)
+    cores_m = re.search(r"^cores: (\d+)", stdout, re.MULTILINE)
+    memory_m = re.search(r"^memory: (\d+)", stdout, re.MULTILINE)
     return {
         "name": name_m.group(1) if name_m else "Unknown",
         "os_type": os_m.group(1) if os_m else "debian",
         "is_template": "template: 1" in stdout,
+        "cores": cores_m.group(1) if cores_m else "",
+        "memory": memory_m.group(1) if memory_m else "",
     }
 
 
@@ -74,9 +84,15 @@ def os_version_matches(cur_os: str, cur_ver: str, rec_os: str, rec_ver: str) -> 
 def parse_ct_script(content: str) -> dict:
     """Extract resource requirements and GH repo from a community-scripts ct/*.sh file.
 
-    Returns {build_cpu, build_ram, run_cpu, run_ram, gh_repo, needs_resource_scale}.
-    Any missing field is "". needs_resource_scale is True only when both build_cpu
-    and run_cpu are non-empty integers and build_cpu > run_cpu.
+    Returns {build_cpu, build_ram, gh_repo, var_os, var_version}; any missing
+    field is "".
+
+    ``build_cpu``/``build_ram`` are the script's declared spec. There is no
+    run-side counterpart here any more: the old ``pct set $CTID -cores N`` lines
+    are gone from every current ct script (and from build.func/install.func), so
+    upstream no longer does temporary build-time scaling. The container's live
+    allocation — the only sane run-side source — comes from ``parse_pct_config``,
+    and :func:`resource_scale_plan` combines the two.
     """
 
     def _first(pattern: str) -> str:
@@ -96,30 +112,57 @@ def parse_ct_script(content: str) -> dict:
         m = re.search(rf'{name}="([^"$]*)"', content)
         return m.group(1).strip() if m else ""
 
-    build_cpu = _first(r'var_cpu="(\d+)"')
-    build_ram = _first(r'var_ram="(\d+)"')
-    run_cpu = _first(r"pct set \$CTID -cores (\d+)")
-    run_ram = _first(r"pct set \$CTID -memory (\d+)")
     gh_repo = _first(r'check_for_gh_release\s+"[^"]+"\s+"([^"]+)"')
-    var_os = _var("var_os").lower()
-    var_version = _var("var_version")
-
-    needs_scale = False
-    if build_cpu and run_cpu:
-        try:
-            needs_scale = int(build_cpu) > int(run_cpu)
-        except ValueError:
-            pass
 
     return {
-        "build_cpu": build_cpu,
-        "build_ram": build_ram,
-        "run_cpu": run_cpu,
-        "run_ram": run_ram,
+        "build_cpu": _var("var_cpu"),
+        "build_ram": _var("var_ram"),
         "gh_repo": gh_repo,
-        "needs_resource_scale": needs_scale,
-        "var_os": var_os,
-        "var_version": var_version,
+        "var_os": _var("var_os").lower(),
+        "var_version": _var("var_version"),
+    }
+
+
+def _as_int(value: object) -> int:
+    """Best-effort int for a parsed field; 0 when absent or unparseable."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def resource_scale_plan(ct_info: dict, pct_info: dict) -> dict:
+    """Decide whether a container is under-provisioned for its update script.
+
+    Build requirements come from the ct script's ``var_cpu``/``var_ram``; the
+    current allocation comes from ``pct config``. Returns
+    {needs_scale, build_cpu, build_ram, run_cpu, run_ram} as strings, where the
+    build_* values are the temporary target and the run_* values are the live
+    pre-scale allocation to restore afterwards.
+
+    Targets are ``max(script, current)`` so a container provisioned *above* its
+    script's spec is never shrunk, and needs_scale is False whenever the current
+    allocation is unreadable — a container created by the script itself already
+    matches, so this only fires on hand-provisioned ones.
+
+    Whether the plan is acted on is a separate decision (``lxc_resource_scaling``):
+    upstream dropped build-time scaling, so executing it re-introduces an
+    optimization the scripts no longer perform rather than restoring parity.
+    """
+    cur_cpu = _as_int(pct_info.get("cores"))
+    cur_ram = _as_int(pct_info.get("memory"))
+    if not cur_cpu or not cur_ram:
+        return {"needs_scale": False, "build_cpu": "", "build_ram": "",
+                "run_cpu": "", "run_ram": ""}
+
+    target_cpu = max(_as_int(ct_info.get("build_cpu")), cur_cpu)
+    target_ram = max(_as_int(ct_info.get("build_ram")), cur_ram)
+    return {
+        "needs_scale": target_cpu > cur_cpu or target_ram > cur_ram,
+        "build_cpu": str(target_cpu),
+        "build_ram": str(target_ram),
+        "run_cpu": str(cur_cpu),
+        "run_ram": str(cur_ram),
     }
 
 

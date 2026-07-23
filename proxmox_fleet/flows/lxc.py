@@ -28,6 +28,7 @@ from proxmox_fleet.lxc_parse import (
     parse_os_release,
     parse_pct_config,
     parse_pct_status,
+    resource_scale_plan,
     script_name_from_update,
 )
 from proxmox_fleet.models.settings import GlobalSettings
@@ -423,12 +424,17 @@ def run_lxc_update(
                 dpkg_res = executor.run_shell(hash_cmd, changed_when=False)
                 dpkg_before = dpkg_res.stdout.strip()
 
-        # 4-5. App update with resource scaling (primitive handles scale up/down)
-        needs_scale = ct_info.get("needs_resource_scale", False)
-        build_cpu = ct_info.get("build_cpu", "")
-        build_ram = ct_info.get("build_ram", "")
-        run_cpu = ct_info.get("run_cpu", "")
-        run_ram = ct_info.get("run_ram", "")
+        # 4-5. App update with resource scaling (primitive handles scale up/down).
+        # The plan is always computed — it is cheap and shows up under --verbose —
+        # but acting on it is opt-in: upstream no longer scales at build time, so
+        # executing it adds `pct set` calls the ct scripts themselves do not make.
+        scale = resource_scale_plan(ct_info, pct_info)
+        needs_scale = scale["needs_scale"] and settings.lxc_resource_scaling
+        if settings.lxc_verbose and scale["needs_scale"]:
+            _vprint(node, lxc_id, name,
+                    f"resources: {scale['run_cpu']}c/{scale['run_ram']}M → "
+                    f"{scale['build_cpu']}c/{scale['build_ram']}M"
+                    f"{'' if needs_scale else ' (lxc_resource_scaling off — not applied)'}")
 
         app_failed = False
         app_changed = False
@@ -440,10 +446,10 @@ def run_lxc_update(
                 lxc_shell=shell,
                 lxc_unattended=settings.lxc_unattended,
                 lxc_needs_scale=bool(needs_scale),
-                lxc_build_cpu=str(build_cpu),
-                lxc_build_ram=str(build_ram),
-                lxc_run_cpu=str(run_cpu),
-                lxc_run_ram=str(run_ram),
+                lxc_build_cpu=scale["build_cpu"],
+                lxc_build_ram=scale["build_ram"],
+                lxc_run_cpu=scale["run_cpu"],
+                lxc_run_ram=scale["run_ram"],
             )
             app_failed = app_res.failed
             app_changed = not app_res.failed  # tentative; overridden below by version/hash

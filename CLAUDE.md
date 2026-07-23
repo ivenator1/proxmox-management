@@ -366,10 +366,19 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
   dot boundary (alpine `3.22.1` satisfies a script targeting `3.22`), and missing data on either
   side counts as a match, so an unparseable read never invents a warning.
 - **`parse_ct_script` must handle `var_x="${var_x:-N}"`**: current community scripts write that
-  form so the environment can override. The older `build_cpu`/`build_ram`/`run_cpu` patterns
-  match only the bare `var_cpu="2"` form and therefore **no longer match live scripts** —
-  resource scaling is silently inert (`needs_resource_scale` always False). `var_os`/`var_version`
-  use the `_var()` helper, which accepts both forms.
+  form so the environment can override, and the bare `var_cpu="2"` patterns silently stopped
+  matching. Every field now goes through the `_var()` helper, which accepts both forms.
+- **Resource scaling is opt-in and re-sourced** (`lxc_parse.resource_scale_plan`): `pct set $CTID
+  -cores N` is gone from every current ct script *and* from `build.func`/`install.func` — upstream
+  dropped build-time scaling, so `parse_ct_script` no longer returns `run_cpu`/`run_ram`/
+  `needs_resource_scale`. The run side is now the container's live allocation from `pct config`
+  (`cores:`/`memory:`, **anchored with `^…` + MULTILINE** — the `description:` field is a blob of
+  URL-encoded HTML that an unanchored pattern matches inside). Targets are `max(script, current)`
+  so an over-provisioned container is never shrunk, and the restore target is the live pre-scale
+  value. The plan is always computed (visible under `--verbose`) but only executed when
+  `lxc_resource_scaling: true` — default **false**, because turning it on adds `pct set` calls the
+  scripts themselves no longer make. It can only fire on hand-provisioned containers; one created
+  by its own script already matches its spec.
 - **Custom-config commands are opaque strings**: `CustomConfig` validates as literals, never
   renders. `steps.run_steps()` resolves only `{{ steps.NAME }}` in Python at run time; everything
   else is left for the shell. `register` stashes a step's stdout for a later `when:`.

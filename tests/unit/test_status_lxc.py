@@ -23,6 +23,7 @@ from proxmox_fleet.lxc_parse import (
     parse_os_release,
     parse_pct_config,
     parse_pct_status,
+    resource_scale_plan,
 )
 from proxmox_fleet.status import (
     lxc_app_did_update,
@@ -368,22 +369,6 @@ def test_var_ram_no_resource_script():
     assert parse_ct_script(NO_RESOURCE_SCRIPT)["build_ram"] == ""
 
 
-def test_run_cpu_full_script():
-    assert parse_ct_script(FULL_SCRIPT)["run_cpu"] == "2"
-
-
-def test_run_cpu_partial_script():
-    assert parse_ct_script(PARTIAL_RESOURCE_SCRIPT)["run_cpu"] == ""
-
-
-def test_run_ram_full_script():
-    assert parse_ct_script(FULL_SCRIPT)["run_ram"] == "1024"
-
-
-def test_run_ram_no_resource_script():
-    assert parse_ct_script(NO_RESOURCE_SCRIPT)["run_ram"] == ""
-
-
 def test_gh_repo_extraction():
     assert parse_ct_script(FULL_SCRIPT)["gh_repo"] == "Sonarr/Sonarr"
 
@@ -392,31 +377,75 @@ def test_gh_repo_absent():
     assert parse_ct_script(NO_GH_RELEASE_SCRIPT)["gh_repo"] == ""
 
 
-# needs_resource_scale — mirrors NEEDS_SCALE in test_detect_regex.py
+def test_parse_ct_script_no_longer_reports_run_resources():
+    """`pct set $CTID -cores N` is gone from every current ct script.
+
+    The run side now comes from the container's live `pct config`, so these keys
+    were removed rather than left returning a value nothing produces.
+    """
+    info = parse_ct_script(FULL_SCRIPT)
+    assert "run_cpu" not in info
+    assert "run_ram" not in info
+    assert "needs_resource_scale" not in info
 
 
-def test_needs_scale_build_greater_than_run():
-    assert parse_ct_script("var_cpu=\"4\"\npct set $CTID -cores 2\n")["needs_resource_scale"] is True
+def test_parse_ct_script_reads_the_current_var_cpu_form():
+    """The regression: var_cpu="${var_cpu:-4}" used to parse as "" ."""
+    info = parse_ct_script('var_cpu="${var_cpu:-4}"\nvar_ram="${var_ram:-6144}"\n')
+    assert info["build_cpu"] == "4"
+    assert info["build_ram"] == "6144"
 
 
-def test_needs_scale_build_equal_to_run():
-    assert parse_ct_script("var_cpu=\"2\"\npct set $CTID -cores 2\n")["needs_resource_scale"] is False
+# resource_scale_plan — build spec (ct script) vs live allocation (pct config)
 
 
-def test_needs_scale_build_less_than_run():
-    assert parse_ct_script("var_cpu=\"2\"\npct set $CTID -cores 4\n")["needs_resource_scale"] is False
+def test_scale_plan_needed_when_container_is_under_provisioned():
+    plan = resource_scale_plan(
+        {"build_cpu": "4", "build_ram": "6144"},
+        {"cores": "2", "memory": "2048"},
+    )
+    assert plan["needs_scale"] is True
+    assert (plan["build_cpu"], plan["build_ram"]) == ("4", "6144")
+    # restore target is the live pre-scale allocation, not the script's spec
+    assert (plan["run_cpu"], plan["run_ram"]) == ("2", "2048")
 
 
-def test_needs_scale_empty_build_cpu():
-    assert parse_ct_script("pct set $CTID -cores 2\n")["needs_resource_scale"] is False
+def test_scale_plan_not_needed_when_allocation_matches():
+    """A container created by the script itself already matches its spec."""
+    plan = resource_scale_plan(
+        {"build_cpu": "2", "build_ram": "2048"},
+        {"cores": "2", "memory": "2048"},
+    )
+    assert plan["needs_scale"] is False
 
 
-def test_needs_scale_empty_run_cpu():
-    assert parse_ct_script("var_cpu=\"4\"\n")["needs_resource_scale"] is False
+def test_scale_plan_never_shrinks_an_over_provisioned_container():
+    plan = resource_scale_plan(
+        {"build_cpu": "2", "build_ram": "1024"},
+        {"cores": "8", "memory": "8192"},
+    )
+    assert plan["needs_scale"] is False
+    assert (plan["build_cpu"], plan["build_ram"]) == ("8", "8192")
 
 
-def test_needs_scale_both_empty():
-    assert parse_ct_script("")["needs_resource_scale"] is False
+def test_scale_plan_fires_on_ram_alone():
+    plan = resource_scale_plan(
+        {"build_cpu": "2", "build_ram": "6144"},
+        {"cores": "2", "memory": "2048"},
+    )
+    assert plan["needs_scale"] is True
+    assert (plan["build_cpu"], plan["build_ram"]) == ("2", "6144")
+
+
+def test_scale_plan_inert_without_a_readable_allocation():
+    for pct_info in ({}, {"cores": "", "memory": ""}, {"cores": "2"}):
+        plan = resource_scale_plan({"build_cpu": "4", "build_ram": "6144"}, pct_info)
+        assert plan["needs_scale"] is False
+
+
+def test_scale_plan_inert_without_a_script_spec():
+    plan = resource_scale_plan({}, {"cores": "2", "memory": "2048"})
+    assert plan["needs_scale"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -671,3 +700,30 @@ def test_os_version_matches_is_permissive_when_data_is_missing():
     """Mirrors the guard's early return — never warn on an unparseable read."""
     assert os_version_matches("", "", "debian", "13")
     assert os_version_matches("debian", "12", "", "")
+
+
+def test_parse_pct_config_reads_cores_and_memory():
+    stdout = ("arch: amd64\ncores: 2\nhostname: nginxproxymanager\n"
+              "memory: 2048\nostype: debian\nswap: 512\n")
+    info = parse_pct_config(stdout)
+    assert info["cores"] == "2"
+    assert info["memory"] == "2048"
+
+
+def test_parse_pct_config_ignores_decoys_in_the_description_blob():
+    """`description:` is one long line of URL-encoded HTML — anchor or be fooled."""
+    stdout = (
+        "arch: amd64\n"
+        "cores: 2\n"
+        "description: <div>%0A cores: 99 memory: 99999 %0A</div>\n"
+        "memory: 2048\n"
+    )
+    info = parse_pct_config(stdout)
+    assert info["cores"] == "2"
+    assert info["memory"] == "2048"
+
+
+def test_parse_pct_config_missing_resources_are_empty():
+    info = parse_pct_config("hostname: sonarr\nostype: debian\n")
+    assert info["cores"] == ""
+    assert info["memory"] == ""

@@ -74,6 +74,7 @@ class ScriptedLxcExecutor:
         self.snapshots_created: list = []
         self.snapshots_deleted: list = []
         self.rollback_called = False
+        self.app_update_kwargs: dict = {}
 
         self._introspect_facts = introspect_facts if introspect_facts is not None else dict(_INTROSPECT_NO_SCRIPT)
         self._lxc_os_result = lxc_os_result
@@ -129,6 +130,11 @@ class ScriptedLxcExecutor:
         lxc_run_cpu="", lxc_run_ram="",
     ):
         self.commands.append(f"lxc_app_update:{lxc_id}")
+        self.app_update_kwargs = {
+            "lxc_needs_scale": lxc_needs_scale,
+            "lxc_build_cpu": lxc_build_cpu, "lxc_build_ram": lxc_build_ram,
+            "lxc_run_cpu": lxc_run_cpu, "lxc_run_ram": lxc_run_ram,
+        }
         return self._lxc_app_result
 
     def post_update(self, lxc_id, *, lxc_shell="bash", dpkg_hash_cmd="", lxc_script_name=""):
@@ -991,3 +997,53 @@ def test_no_warnings_when_container_was_not_running_at_introspect(monkeypatch):
     ex = _exec_with_health(df="", os_release="")
     out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
     assert out.warnings == []
+
+
+# ---------------------------------------------------------------------------
+# Resource scaling — plan always computed, execution opt-in
+# ---------------------------------------------------------------------------
+
+PCT_CONFIG_SMALL = "hostname: sonarr\nostype: debian\ncores: 2\nmemory: 2048\n"
+CT_SCRIPT_HUNGRY = 'var_cpu="${var_cpu:-4}"\nvar_ram="${var_ram:-6144}"\n'
+
+
+def _exec_under_provisioned():
+    ex = _exec_normal()
+    ex._introspect_facts = dict(_INTROSPECT_WITH_SCRIPT, config_stdout=PCT_CONFIG_SMALL)
+    return ex
+
+
+def test_scaling_not_applied_by_default(monkeypatch):
+    """lxc_resource_scaling defaults off — upstream no longer scales at build time."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_HUNGRY))
+    ex = _exec_under_provisioned()
+    run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
+    assert ex.app_update_kwargs["lxc_needs_scale"] is False
+
+
+def test_scaling_applied_when_enabled(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_HUNGRY))
+    ex = _exec_under_provisioned()
+    run_lxc_update("pve-01", "101", ex, _settings(lxc_resource_scaling=True),
+                   api_host="192.168.1.10")
+
+    kw = ex.app_update_kwargs
+    assert kw["lxc_needs_scale"] is True
+    assert (kw["lxc_build_cpu"], kw["lxc_build_ram"]) == ("4", "6144")
+    # restores the container's own live values, not the script's spec
+    assert (kw["lxc_run_cpu"], kw["lxc_run_ram"]) == ("2", "2048")
+
+
+def test_scaling_inert_when_allocation_already_matches(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(
+                            200, 'var_cpu="${var_cpu:-2}"\nvar_ram="${var_ram:-2048}"\n'))
+    ex = _exec_under_provisioned()
+    run_lxc_update("pve-01", "101", ex, _settings(lxc_resource_scaling=True),
+                   api_host="192.168.1.10")
+    assert ex.app_update_kwargs["lxc_needs_scale"] is False
