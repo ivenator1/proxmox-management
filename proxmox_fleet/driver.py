@@ -253,7 +253,8 @@ def _fold_outcome(state: FleetState, outcome: Any, bucket: List[Any]) -> None:
 
     Appends ``outcome.record`` to ``bucket`` (the matching record list), OR-joins
     the changed/failed flags, and accumulates errors/warnings. Node outcomes carry
-    no warnings, so that field is read defensively.
+    no warnings, and only the lxc flow carries the plural ``errors`` list (its
+    non-raising OS/app update failures), so both fields are read defensively.
     """
     if outcome.record is not None:
         bucket.append(outcome.record)
@@ -263,6 +264,7 @@ def _fold_outcome(state: FleetState, outcome: Any, bucket: List[Any]) -> None:
         state.failed = True
     if outcome.error is not None:
         state.errors.append(outcome.error)
+    state.errors.extend(getattr(outcome, "errors", []))
     state.warnings.extend(getattr(outcome, "warnings", []))
 
 
@@ -437,8 +439,10 @@ def run_lxc_phase(
                 wave_failed = wave_failed or outcome.failed
                 rec = outcome.record
                 if rec is not None:
-                    status = "FAILED" if outcome.failed else f"app={rec.app}  os={rec.os}"
-                    print(f"  [{node_name}/{lxc_id}] {rec.name}: {status}")
+                    # Always print both lines: the record encodes the failure in
+                    # app/os already ("FAILED + ROLLED BACK", "FAILED"), and a bare
+                    # "FAILED" hides which of the two actually broke.
+                    print(f"  [{node_name}/{lxc_id}] {rec.name}: app={rec.app}  os={rec.os}")
                 else:
                     print(f"  [{node_name}/{lxc_id}] idle (no changes)")
             elif run_err is not None:

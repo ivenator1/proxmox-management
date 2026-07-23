@@ -810,3 +810,36 @@ def test_history_renders_activity_heatmap(history_dir):
     assert resp.status_code == 200
     assert "Activity" in resp.text
     assert "heatmap" in resp.text
+
+
+def test_pending_page_renders_health_signals(history_dir):
+    """Low disk and an out-of-date container OS must be visible on the page."""
+    scan_mod.write_pending({
+        "timestamp": "20260104T000000000000Z",
+        "hosts": {},
+        "lxc": {
+            "130": {"node": "Hammond", "name": "grafana", "skipped": None,
+                    "os_pending_count": 4, "os_pending": ["grafana"], "app": None,
+                    "disk_percent": 90, "os": "debian 13",
+                    "os_mismatch": None, "error": None},
+            "123": {"node": "Hammond", "name": "nginxproxymanager", "skipped": None,
+                    "os_pending_count": 0, "os_pending": [], "app": None,
+                    "disk_percent": 63, "os": "debian 12",
+                    "os_mismatch": "container runs debian 12 but ct/nginxproxymanager.sh "
+                                   "targets debian 13", "error": None},
+        },
+    }, history_dir=history_dir, keep=0)
+
+    resp = _client(history_dir).get("/pending", params={"ref": "20260104T000000000000Z"})
+    assert resp.status_code == 200
+    assert "90%" in resp.text                      # over the 75% default → flagged
+    assert "63%" in resp.text
+    assert "debian 12 — outdated" in resp.text     # the mismatch pill
+    assert "targets debian 13" in resp.text        # full reason in the tooltip
+
+
+def test_pending_page_tolerates_scans_without_health_keys(history_dir):
+    """The seeded fixture predates the health fields — must still render."""
+    resp = _client(history_dir).get("/pending")
+    assert resp.status_code == 200
+    assert "sonarr" in resp.text

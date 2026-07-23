@@ -12,6 +12,7 @@ Status strings come from proxmox_fleet.status (byte-parity with the old Jinja).
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -20,7 +21,16 @@ from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import lxc_os_changed, lxc_os_pkg_count
 from proxmox_fleet.executor import Executor, snapshot_with_retry
 from proxmox_fleet.flows._pkg import kuma_healthy
-from proxmox_fleet.lxc_parse import parse_ct_script, parse_pct_config, parse_pct_status, script_name_from_update
+from proxmox_fleet.lxc_parse import (
+    os_version_matches,
+    parse_ct_script,
+    parse_df_percent,
+    parse_os_release,
+    parse_pct_config,
+    parse_pct_status,
+    resource_scale_plan,
+    script_name_from_update,
+)
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.runner import UnreachableHostError
 from proxmox_fleet.models.state import ErrorEntry, LxcRecord, WarningEntry
@@ -44,17 +54,87 @@ class HealthCheckError(RuntimeError):
 
 @dataclass
 class LxcFlowOutcome:
-    """Everything the driver needs to fold this container into the FleetState."""
+    """Everything the driver needs to fold this container into the FleetState.
+
+    ``error`` carries the single rescue-path exception; ``errors`` carries the
+    non-raising update failures (OS and/or app), which are reported without
+    aborting the flow and so can be more than one per container.
+    """
 
     record: Optional[LxcRecord] = None
     changed: bool = False
     failed: bool = False
     error: Optional[ErrorEntry] = None
+    errors: List[ErrorEntry] = field(default_factory=list)
     warnings: List[WarningEntry] = field(default_factory=list)
 
     @property
     def should_report(self) -> bool:
         return self.record is not None
+
+
+_FAILURE_DETAIL_MAX = 400
+
+# Community-script msg_error output is colourised even under TERM=dumb/PHS_SILENT
+# (verified against a live exit-203 run), and every line is prefixed with a bare
+# ESC[K. Left in, the escapes eat the character budget and render as noise in the
+# briefing, so they are stripped before truncation.
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _failure_detail(res: Any) -> str:
+    """One-line tail of a failed primitive's output, for the Error Log.
+
+    stderr first, stdout as the fallback: apt writes its ``E: ...`` lines to
+    stderr, and the community update scripts send msg_error there too while
+    stdout carries only their ASCII-art banner.
+
+    The *tail* is kept because the operative line comes last, and the budget is
+    generous enough for several lines — the community scripts' final line can be
+    a misleading fallthrough ("You need to set 'CTID' variable"), with the real
+    cause ("Container OS debian 12 does not match the recommended debian 13")
+    two lines above it.
+    """
+    text = (getattr(res, "stderr", "") or "").strip() or (getattr(res, "stdout", "") or "").strip()
+    text = _ANSI_RE.sub("", text).strip()
+    if not text:
+        return f"command failed (rc={getattr(res, 'rc', '?')}) with no output"
+    flat = " ".join(text.split())
+    if len(flat) > _FAILURE_DETAIL_MAX:
+        flat = "..." + flat[-_FAILURE_DETAIL_MAX:]
+    return flat
+
+
+def disk_warning(introspect_facts: Dict[str, Any], threshold: int) -> Optional[str]:
+    """Warning text when the container's rootfs is at/over *threshold* percent.
+
+    Returns None when there is nothing to say, including when df produced no
+    parseable output (a container that was not running when introspect ran).
+    Applies to every container, with or without an update script: apt itself runs
+    out of space, which is how CT 130's OS update failed.
+    """
+    used = parse_df_percent(str(introspect_facts.get("df_stdout", "")))
+    if used is None or used < threshold:
+        return None
+    return (f"rootfs {used}% full — apt can fail to unpack, and the community-scripts "
+            f"storage guard aborts app updates above 80%")
+
+
+def os_mismatch_warning(introspect_facts: Dict[str, Any], ct_info: Dict[str, Any],
+                        script_name: str) -> Optional[str]:
+    """Warning text when the container OS is older than the ct script's target.
+
+    This is the CT 123 failure mode: check_container_os_guard() refuses to update,
+    start() returns, and the ct script falls through to build_container, which
+    exits 203 with the misleading "You need to set 'CTID' variable".
+    """
+    cur = parse_os_release(str(introspect_facts.get("os_release_stdout", "")))
+    rec_os = str(ct_info.get("var_os", ""))
+    rec_ver = str(ct_info.get("var_version", ""))
+    if os_version_matches(cur["id"], cur["version_id"], rec_os, rec_ver):
+        return None
+    return (f"container runs {cur['id']} {cur['version_id']} but ct/{script_name}.sh targets "
+            f"{rec_os} {rec_ver} — app updates will fail (exit 203) until the OS is upgraded")
 
 
 def _build_shell(lxc_os: str) -> str:
@@ -196,6 +276,14 @@ def run_lxc_update(
     rollback_done = False
     outcome = LxcFlowOutcome()
 
+    # Health warnings are raised before any update runs — and outside the try, so
+    # they survive a later failure and are emitted on the dry-run path too, which
+    # is the point: they are meant to arrive before the maintenance window, not
+    # in the same briefing as the failure they predict.
+    disk_msg = disk_warning(introspect_res.facts, settings.lxc_disk_warn_percent)
+    if disk_msg:
+        outcome.warnings.append(WarningEntry(host=lxc_id, task="disk space", warning=disk_msg))
+
     api_params: Dict[str, Any] = {
         "api_host": api_host,
         "api_user": settings.pve_api_user,
@@ -238,6 +326,14 @@ def run_lxc_update(
                     ct_info = parse_ct_script("")
             else:
                 lxc_no_update_script = True
+
+        # Placed after detect (it needs the ct script's var_os/var_version) but
+        # before the dry-run return, so --dry-run reports it too.
+        if ct_script_name and not app_excluded:
+            os_msg = os_mismatch_warning(introspect_res.facts, ct_info, ct_script_name)
+            if os_msg:
+                outcome.warnings.append(
+                    WarningEntry(host=lxc_id, task="container OS", warning=os_msg))
 
         # ------------------------------------------------------------------
         # Dry-check — version compare only, no mutations
@@ -312,6 +408,10 @@ def run_lxc_update(
             os_res = executor.lxc_os_update(lxc_id, os_update_cmd=os_cmd)
             os_res_stdout = os_res.stdout
             os_failed = os_res.failed
+            if os_failed:
+                outcome.errors.append(ErrorEntry(
+                    host=lxc_id, task="OS update", error=_failure_detail(os_res),
+                ))
             if settings.lxc_verbose:
                 summary = (os_res.stdout or "").strip().replace("\n", " ")[:120]
                 _vprint(node, lxc_id, name, f"os_update: {'FAILED' if os_failed else 'ok'}  {summary}")
@@ -324,12 +424,17 @@ def run_lxc_update(
                 dpkg_res = executor.run_shell(hash_cmd, changed_when=False)
                 dpkg_before = dpkg_res.stdout.strip()
 
-        # 4-5. App update with resource scaling (primitive handles scale up/down)
-        needs_scale = ct_info.get("needs_resource_scale", False)
-        build_cpu = ct_info.get("build_cpu", "")
-        build_ram = ct_info.get("build_ram", "")
-        run_cpu = ct_info.get("run_cpu", "")
-        run_ram = ct_info.get("run_ram", "")
+        # 4-5. App update with resource scaling (primitive handles scale up/down).
+        # The plan is always computed — it is cheap and shows up under --verbose —
+        # but acting on it is opt-in: upstream no longer scales at build time, so
+        # executing it adds `pct set` calls the ct scripts themselves do not make.
+        scale = resource_scale_plan(ct_info, pct_info)
+        needs_scale = scale["needs_scale"] and settings.lxc_resource_scaling
+        if settings.lxc_verbose and scale["needs_scale"]:
+            _vprint(node, lxc_id, name,
+                    f"resources: {scale['run_cpu']}c/{scale['run_ram']}M → "
+                    f"{scale['build_cpu']}c/{scale['build_ram']}M"
+                    f"{'' if needs_scale else ' (lxc_resource_scaling off — not applied)'}")
 
         app_failed = False
         app_changed = False
@@ -341,13 +446,17 @@ def run_lxc_update(
                 lxc_shell=shell,
                 lxc_unattended=settings.lxc_unattended,
                 lxc_needs_scale=bool(needs_scale),
-                lxc_build_cpu=str(build_cpu),
-                lxc_build_ram=str(build_ram),
-                lxc_run_cpu=str(run_cpu),
-                lxc_run_ram=str(run_ram),
+                lxc_build_cpu=scale["build_cpu"],
+                lxc_build_ram=scale["build_ram"],
+                lxc_run_cpu=scale["run_cpu"],
+                lxc_run_ram=scale["run_ram"],
             )
             app_failed = app_res.failed
             app_changed = not app_res.failed  # tentative; overridden below by version/hash
+            if app_failed:
+                outcome.errors.append(ErrorEntry(
+                    host=lxc_id, task="app update", error=_failure_detail(app_res),
+                ))
             if settings.lxc_verbose:
                 summary = (app_res.stdout or "").strip().replace("\n", " ")[:120]
                 _vprint(node, lxc_id, name, f"app_update: {'FAILED' if app_failed else 'ok'}  {summary}")
@@ -445,6 +554,11 @@ def run_lxc_update(
         )
 
         outcome.changed = something_changed
+        # A non-zero OS or app update does not raise (the flow carries on so the
+        # other line still gets reported), but it is still a failed run: without
+        # this the record says FAILED while state.failed stays false, so the exit
+        # code, the history entry and the dashboard all report success.
+        outcome.failed = bool(outcome.errors)
         script_expected = lxc_id not in {str(x) for x in settings.os_only_lxc_list}
         if lxc_should_report(app_status_str, os_status_str, dry_run=False,
                              script_expected=script_expected):

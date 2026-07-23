@@ -16,7 +16,15 @@ Each test section mirrors its Jinja counterpart case-for-case:
 
 
 from proxmox_fleet.changes import dpkg_hash_differs, lxc_os_changed, lxc_os_pkg_count
-from proxmox_fleet.lxc_parse import parse_ct_script, parse_pct_config, parse_pct_status
+from proxmox_fleet.lxc_parse import (
+    os_version_matches,
+    parse_ct_script,
+    parse_df_percent,
+    parse_os_release,
+    parse_pct_config,
+    parse_pct_status,
+    resource_scale_plan,
+)
 from proxmox_fleet.status import (
     lxc_app_did_update,
     lxc_app_status,
@@ -361,22 +369,6 @@ def test_var_ram_no_resource_script():
     assert parse_ct_script(NO_RESOURCE_SCRIPT)["build_ram"] == ""
 
 
-def test_run_cpu_full_script():
-    assert parse_ct_script(FULL_SCRIPT)["run_cpu"] == "2"
-
-
-def test_run_cpu_partial_script():
-    assert parse_ct_script(PARTIAL_RESOURCE_SCRIPT)["run_cpu"] == ""
-
-
-def test_run_ram_full_script():
-    assert parse_ct_script(FULL_SCRIPT)["run_ram"] == "1024"
-
-
-def test_run_ram_no_resource_script():
-    assert parse_ct_script(NO_RESOURCE_SCRIPT)["run_ram"] == ""
-
-
 def test_gh_repo_extraction():
     assert parse_ct_script(FULL_SCRIPT)["gh_repo"] == "Sonarr/Sonarr"
 
@@ -385,31 +377,75 @@ def test_gh_repo_absent():
     assert parse_ct_script(NO_GH_RELEASE_SCRIPT)["gh_repo"] == ""
 
 
-# needs_resource_scale — mirrors NEEDS_SCALE in test_detect_regex.py
+def test_parse_ct_script_no_longer_reports_run_resources():
+    """`pct set $CTID -cores N` is gone from every current ct script.
+
+    The run side now comes from the container's live `pct config`, so these keys
+    were removed rather than left returning a value nothing produces.
+    """
+    info = parse_ct_script(FULL_SCRIPT)
+    assert "run_cpu" not in info
+    assert "run_ram" not in info
+    assert "needs_resource_scale" not in info
 
 
-def test_needs_scale_build_greater_than_run():
-    assert parse_ct_script("var_cpu=\"4\"\npct set $CTID -cores 2\n")["needs_resource_scale"] is True
+def test_parse_ct_script_reads_the_current_var_cpu_form():
+    """The regression: var_cpu="${var_cpu:-4}" used to parse as "" ."""
+    info = parse_ct_script('var_cpu="${var_cpu:-4}"\nvar_ram="${var_ram:-6144}"\n')
+    assert info["build_cpu"] == "4"
+    assert info["build_ram"] == "6144"
 
 
-def test_needs_scale_build_equal_to_run():
-    assert parse_ct_script("var_cpu=\"2\"\npct set $CTID -cores 2\n")["needs_resource_scale"] is False
+# resource_scale_plan — build spec (ct script) vs live allocation (pct config)
 
 
-def test_needs_scale_build_less_than_run():
-    assert parse_ct_script("var_cpu=\"2\"\npct set $CTID -cores 4\n")["needs_resource_scale"] is False
+def test_scale_plan_needed_when_container_is_under_provisioned():
+    plan = resource_scale_plan(
+        {"build_cpu": "4", "build_ram": "6144"},
+        {"cores": "2", "memory": "2048"},
+    )
+    assert plan["needs_scale"] is True
+    assert (plan["build_cpu"], plan["build_ram"]) == ("4", "6144")
+    # restore target is the live pre-scale allocation, not the script's spec
+    assert (plan["run_cpu"], plan["run_ram"]) == ("2", "2048")
 
 
-def test_needs_scale_empty_build_cpu():
-    assert parse_ct_script("pct set $CTID -cores 2\n")["needs_resource_scale"] is False
+def test_scale_plan_not_needed_when_allocation_matches():
+    """A container created by the script itself already matches its spec."""
+    plan = resource_scale_plan(
+        {"build_cpu": "2", "build_ram": "2048"},
+        {"cores": "2", "memory": "2048"},
+    )
+    assert plan["needs_scale"] is False
 
 
-def test_needs_scale_empty_run_cpu():
-    assert parse_ct_script("var_cpu=\"4\"\n")["needs_resource_scale"] is False
+def test_scale_plan_never_shrinks_an_over_provisioned_container():
+    plan = resource_scale_plan(
+        {"build_cpu": "2", "build_ram": "1024"},
+        {"cores": "8", "memory": "8192"},
+    )
+    assert plan["needs_scale"] is False
+    assert (plan["build_cpu"], plan["build_ram"]) == ("8", "8192")
 
 
-def test_needs_scale_both_empty():
-    assert parse_ct_script("")["needs_resource_scale"] is False
+def test_scale_plan_fires_on_ram_alone():
+    plan = resource_scale_plan(
+        {"build_cpu": "2", "build_ram": "6144"},
+        {"cores": "2", "memory": "2048"},
+    )
+    assert plan["needs_scale"] is True
+    assert (plan["build_cpu"], plan["build_ram"]) == ("2", "6144")
+
+
+def test_scale_plan_inert_without_a_readable_allocation():
+    for pct_info in ({}, {"cores": "", "memory": ""}, {"cores": "2"}):
+        plan = resource_scale_plan({"build_cpu": "4", "build_ram": "6144"}, pct_info)
+        assert plan["needs_scale"] is False
+
+
+def test_scale_plan_inert_without_a_script_spec():
+    plan = resource_scale_plan({}, {"cores": "2", "memory": "2048"})
+    assert plan["needs_scale"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -592,3 +628,102 @@ def test_did_update_agrees_with_status_string():
         status = lxc_app_status(app_changed=True, **kwargs)
         did = lxc_app_did_update(app_changed=True, **kwargs)
         assert ("updated" in status.lower()) == did, (kwargs, status, did)
+
+
+# ---------------------------------------------------------------------------
+# Health-signal parsers — fixtures are verbatim output captured off live CTs
+# ---------------------------------------------------------------------------
+
+
+def test_parse_df_percent_reads_the_capacity_column():
+    stdout = (
+        "Filesystem     1024-blocks    Used Available Capacity Mounted on\n"
+        "/dev/rbd17         4046560 3416796    403668      90% /\n"
+    )
+    assert parse_df_percent(stdout) == 90
+
+
+def test_parse_df_percent_none_when_empty():
+    """A container that was not running when introspect ran yields no output."""
+    assert parse_df_percent("") is None
+    assert parse_df_percent("df: /: No such file or directory") is None
+
+
+def test_parse_os_release_handles_quoted_and_bare_values():
+    stdout = (
+        'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\n'
+        'VERSION_ID="12"\n'
+        "VERSION_CODENAME=bookworm\n"
+        "ID=debian\n"
+    )
+    assert parse_os_release(stdout) == {"id": "debian", "version_id": "12"}
+
+
+def test_parse_os_release_empty_input():
+    assert parse_os_release("") == {"id": "", "version_id": ""}
+
+
+def test_parse_ct_script_reads_var_os_in_the_current_default_form():
+    """Current scripts write var_os="${var_os:-debian}" so env can override it."""
+    script = (
+        'var_os="${var_os:-debian}"\n'
+        'var_version="${var_version:-13}"\n'
+    )
+    info = parse_ct_script(script)
+    assert info["var_os"] == "debian"
+    assert info["var_version"] == "13"
+
+
+def test_parse_ct_script_reads_var_os_in_the_legacy_bare_form():
+    info = parse_ct_script('var_os="debian"\nvar_version="12"\n')
+    assert info["var_os"] == "debian"
+    assert info["var_version"] == "12"
+
+
+def test_parse_ct_script_missing_os_fields_are_empty():
+    info = parse_ct_script("echo hello\n")
+    assert info["var_os"] == ""
+    assert info["var_version"] == ""
+
+
+def test_os_version_matches_exact_and_dot_boundary():
+    assert os_version_matches("debian", "13", "debian", "13")
+    assert not os_version_matches("debian", "12", "debian", "13")
+    # alpine 3.22.1 satisfies a script targeting 3.22
+    assert os_version_matches("alpine", "3.22.1", "alpine", "3.22")
+    # ...but 3.221 must not be read as a 3.22 prefix
+    assert not os_version_matches("alpine", "3.221", "alpine", "3.22")
+    assert not os_version_matches("ubuntu", "24.04", "debian", "13")
+
+
+def test_os_version_matches_is_permissive_when_data_is_missing():
+    """Mirrors the guard's early return — never warn on an unparseable read."""
+    assert os_version_matches("", "", "debian", "13")
+    assert os_version_matches("debian", "12", "", "")
+
+
+def test_parse_pct_config_reads_cores_and_memory():
+    stdout = ("arch: amd64\ncores: 2\nhostname: nginxproxymanager\n"
+              "memory: 2048\nostype: debian\nswap: 512\n")
+    info = parse_pct_config(stdout)
+    assert info["cores"] == "2"
+    assert info["memory"] == "2048"
+
+
+def test_parse_pct_config_ignores_decoys_in_the_description_blob():
+    """`description:` is one long line of URL-encoded HTML — anchor or be fooled."""
+    stdout = (
+        "arch: amd64\n"
+        "cores: 2\n"
+        "description: <div>%0A cores: 99 memory: 99999 %0A</div>\n"
+        "memory: 2048\n"
+    )
+    info = parse_pct_config(stdout)
+    assert info["cores"] == "2"
+    assert info["memory"] == "2048"
+
+
+def test_parse_pct_config_missing_resources_are_empty():
+    info = parse_pct_config("hostname: sonarr\nostype: debian\n")
+    assert info["cores"] == ""
+    assert info["memory"] == ""

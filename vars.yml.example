@@ -78,6 +78,22 @@ lxc_dry_run: false         # compare versions only; no actual updates
 lxc_auto_reboot: true      # reboot container when reboot-required is present
 lxc_continue_on_error: false
 
+# --- HEALTH WARNINGS (pre-emptive; never skip or fail a container) ---
+# Warn when a container's rootfs is at/above this percentage. Kept below the
+# community scripts' own >80% abort (check_container_storage) so a container is
+# flagged a run or two before its app updates start failing with exit 114.
+# Reported in the briefing's Warnings section, on --dry-run, and in --scan.
+lxc_disk_warn_percent: 75
+
+# --- RESOURCE SCALING (opt-in) ---
+# Temporarily raise a container's cores/memory to its ct script's var_cpu/var_ram
+# for the duration of the app update, then restore the live pre-scale values.
+# Only ever fires on containers provisioned BELOW their script's spec (one the
+# script created already matches). Off by default: the community scripts dropped
+# build-time scaling, so enabling this adds `pct set` calls they no longer make.
+# The plan is computed either way and shown under --verbose.
+lxc_resource_scaling: false
+
 # --- BACKUP STRATEGY ---
 # snapshot | vzdump | both | none
 lxc_backup_strategy: "snapshot"
