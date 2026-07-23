@@ -541,7 +541,10 @@ def create_app(
     def index(request: Request) -> Any:
         latest_run = _read_run_or_none("latest")
         latest_pending = _read_pending_or_none("latest")
-        pending_rows = scan_mod.pending_summary(history_dir, limit=1)
+        # Same threshold as /pending, so a customised lxc_disk_warn_percent can
+        # never make the overview's counts disagree with the pending page's.
+        pending_rows = scan_mod.pending_summary(
+            history_dir, limit=1, disk_threshold=settings.lxc_disk_warn_percent)
         pending_row = pending_rows[0] if pending_rows else None
         # newest first from history_summary; reversed → oldest first for the
         # pulse strip / sparkline (time flows left → right)
