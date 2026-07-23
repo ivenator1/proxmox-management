@@ -43,6 +43,7 @@ from proxmox_fleet.lxc_parse import (
 )
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.orchestration import run_concurrent
+from proxmox_fleet.runner import UnreachableHostError, is_unreachable_error
 
 # OS type (pct config ostype) → package manager, for containers.
 _OSTYPE_PKG_MGR = {
@@ -106,9 +107,11 @@ def scan_host(executor: Executor) -> Dict[str, Any]:
             raise RuntimeError(f"scan command failed (rc={res.rc}): {res.stderr or res.stdout}"[:300])
         pending = parse_pending(res.stdout, pkg_mgr)
         return {"pkg_mgr": pkg_mgr, "pending_count": len(pending),
-                "pending": pending, "error": None}
+                "pending": pending, "unreachable": False, "error": None}
     except Exception as exc:  # noqa: BLE001 - a scan must never abort the walk
         return {"pkg_mgr": "", "pending_count": 0, "pending": [],
+                "unreachable": (isinstance(exc, UnreachableHostError)
+                                or is_unreachable_error(str(exc))),
                 "error": str(exc)[:300]}
 
 
@@ -160,17 +163,26 @@ def _lxc_app_pending(
              "outdated": outdated}, ct_info, script_name)
 
 
+def _empty_lxc_entry(node: str, lxc_id: str) -> Dict[str, Any]:
+    """The full shape of a pending-scan lxc entry, with nothing filled in.
+
+    Both scan_lxc() and run_fleet_scan()'s failure fallbacks start from this, so
+    a key added here can never reach only one of them (which is exactly how
+    disk_percent/os/os_mismatch previously went missing from the error path).
+    """
+    return {"node": node, "id": str(lxc_id), "name": str(lxc_id), "skipped": None,
+            "os_pending_count": 0, "os_pending": [], "app": None,
+            "disk_percent": None, "os": "", "os_mismatch": None,
+            "unreachable": False, "error": None}
+
+
 def scan_lxc(executor: Executor, lxc_id: str, node: str) -> Dict[str, Any]:
     """Scan one container on its node: pending OS packages + app version.
 
     Stopped containers and templates are skipped (a scan never starts a CT).
     Never raises — errors land in the returned dict's ``error`` key.
     """
-    out: Dict[str, Any] = {"node": node, "id": lxc_id, "name": lxc_id,
-                           "skipped": None, "os_pending_count": 0,
-                           "os_pending": [], "app": None,
-                           "disk_percent": None, "os": "",
-                           "os_mismatch": None, "error": None}
+    out: Dict[str, Any] = _empty_lxc_entry(node, lxc_id)
     try:
         intro = executor.introspect(lxc_id)
         info = parse_pct_config(str(intro.facts.get("config_stdout", "")))
@@ -204,6 +216,7 @@ def scan_lxc(executor: Executor, lxc_id: str, node: str) -> Dict[str, Any]:
         return out
     except Exception as exc:  # noqa: BLE001
         out["error"] = str(exc)[:300]
+        out["unreachable"] = isinstance(exc, UnreachableHostError) or is_unreachable_error(str(exc))
         return out
 
 
@@ -277,8 +290,12 @@ def pending_summary(
             "low_disk": sum(1 for c in lxc.values()
                             if (c.get("disk_percent") or 0) >= disk_threshold),
             "os_mismatch": sum(1 for c in lxc.values() if c.get("os_mismatch")),
+            # Unreachable hosts are reported separately: they are "could not
+            # look", not a broken scan, and they do not fail the run either.
+            "unreachable": sum(1 for entry in (*hosts.values(), *lxc.values())
+                               if entry.get("unreachable")),
             "errors": sum(1 for entry in (*hosts.values(), *lxc.values())
-                          if entry.get("error")),
+                          if entry.get("error") and not entry.get("unreachable")),
         })
     return out
 
@@ -354,11 +371,19 @@ def run_fleet_scan(
     for (kind, name), result, run_err in results:
         if result is None:
             result = {"kind": kind, "pkg_mgr": "", "pending_count": 0,
-                      "pending": [], "error": str(run_err)[:300]}
+                      "pending": [],
+                      "unreachable": is_unreachable_error(str(run_err)),
+                      "error": str(run_err)[:300]}
         scan["hosts"][name] = result
-        failed = failed or bool(result.get("error"))
-        err = f"  ERROR: {result['error']}" if result.get("error") else ""
-        print(f"  [{name}] {result['pending_count']} OS package(s) pending{err}")
+        # An unreachable host is "could not look", not "the scan is broken" —
+        # a powered-off or down node must not make a read-only scan exit 1.
+        if result.get("error") and not result.get("unreachable"):
+            failed = True
+        if result.get("unreachable"):
+            print(f"  [{name}] unreachable — skipped")
+        else:
+            err = f"  ERROR: {result['error']}" if result.get("error") else ""
+            print(f"  [{name}] {result['pending_count']} OS package(s) pending{err}")
 
     # Per-node container scans (same node-targeting rules as the lxc phase).
     for node_info in nodes:
@@ -370,11 +395,19 @@ def run_fleet_scan(
         try:
             lxc_ids = _discover_lxcs(ex, settings)
         except Exception as exc:  # noqa: BLE001
-            scan["lxc"][node_name] = {"node": node_name, "name": node_name,
-                                      "skipped": None, "os_pending_count": 0,
-                                      "os_pending": [], "app": None,
-                                      "error": f"discovery failed: {exc}"[:300]}
-            failed = True
+            entry = _empty_lxc_entry(node_name, node_name)
+            entry["error"] = f"discovery failed: {exc}"[:300]
+            entry["unreachable"] = (isinstance(exc, UnreachableHostError)
+                                    or is_unreachable_error(str(exc)))
+            if entry["unreachable"]:
+                # Same rule as the update path: a node that never answered is
+                # skipped, not failed. No quorum check — a read-only scan takes
+                # no snapshots, so pmxcfs going read-only cannot affect it.
+                entry["skipped"] = "unreachable"
+                print(f"[{node_name}] unreachable — containers skipped")
+            else:
+                failed = True
+            scan["lxc"][node_name] = entry
             continue
         if limit is not None and node_name not in limit:
             lxc_ids = [i for i in lxc_ids if i in limit]
@@ -386,13 +419,14 @@ def run_fleet_scan(
         for lxc_id, result, run_err in run_concurrent(
                 lxc_ids, _scan_one, max_workers=settings.lxc_forks):
             if result is None:
-                result = {"node": node_name, "id": str(lxc_id), "name": str(lxc_id),
-                          "skipped": None, "os_pending_count": 0, "os_pending": [],
-                          "app": None, "error": str(run_err)[:300]}
+                result = _empty_lxc_entry(node_name, lxc_id)
+                result["error"] = str(run_err)[:300]
+                result["unreachable"] = is_unreachable_error(str(run_err))
             # Keyed by node/id — a bare vmid is not unique across clusters, and
             # two same-id containers must not overwrite each other in the JSON.
             scan["lxc"][f"{node_name}/{lxc_id}"] = result
-            failed = failed or bool(result.get("error"))
+            if result.get("error") and not result.get("unreachable"):
+                failed = True
             app = result.get("app")
             app_str = ""
             if app:

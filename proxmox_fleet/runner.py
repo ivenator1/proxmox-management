@@ -22,6 +22,26 @@ class UnreachableHostError(RuntimeError):
     differently from a genuine error."""
 
 
+# Ansible's unreachable-host message (stable across core versions) plus the usual
+# SSH connect errors. Used to spot "the host never answered" in error text that
+# has already passed through a flow's exception formatting and so lost its type.
+UNREACHABLE_MARKERS = (
+    "Data could not be sent to remote host",
+    "No route to host",
+    "Connection timed out",
+    "Connection refused",
+)
+
+
+def is_unreachable_error(text: str) -> bool:
+    """True when *text* looks like a host that never answered.
+
+    Prefer catching :class:`UnreachableHostError` where the type survives; this
+    is the fallback for error strings that have already been stringified.
+    """
+    return any(marker in text for marker in UNREACHABLE_MARKERS)
+
+
 @dataclass
 class PrimitiveResult:
     """The structured outcome of one primitive invocation."""
