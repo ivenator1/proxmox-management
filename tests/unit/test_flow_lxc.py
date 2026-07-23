@@ -852,3 +852,142 @@ def test_failure_detail_prefers_stderr_over_banner_stdout():
         stderr="\x1b[01;31mContainer OS debian 12 does not match\x1b[m",
     ))
     assert detail == "Container OS debian 12 does not match"
+
+
+# ---------------------------------------------------------------------------
+# Pre-emptive health warnings (low disk / OS behind the ct script's target)
+# ---------------------------------------------------------------------------
+
+# Verbatim `df -P /` from CT 130 (grafana) the morning its update failed.
+DF_90_PERCENT = (
+    "Filesystem     1024-blocks    Used Available Capacity Mounted on\n"
+    "/dev/rbd17         4046560 3416796    403668      90% /\n"
+)
+DF_52_PERCENT = (
+    "Filesystem     1024-blocks    Used Available Capacity Mounted on\n"
+    "/dev/rbd7         17369872 8440172   8022028      52% /\n"
+)
+# Verbatim /etc/os-release from CT 123 (nginxproxymanager).
+OS_RELEASE_BOOKWORM = (
+    'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\n'
+    'NAME="Debian GNU/Linux"\n'
+    'VERSION_ID="12"\n'
+    'VERSION="12 (bookworm)"\n'
+    "VERSION_CODENAME=bookworm\n"
+    "ID=debian\n"
+)
+OS_RELEASE_TRIXIE = (
+    'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"\n'
+    'VERSION_ID="13"\n'
+    "ID=debian\n"
+)
+# Verbatim var_* block from the current ct/nginxproxymanager.sh.
+CT_SCRIPT_TRIXIE = (
+    'var_cpu="${var_cpu:-2}"\n'
+    'var_ram="${var_ram:-2048}"\n'
+    'var_disk="${var_disk:-12}"\n'
+    'var_os="${var_os:-debian}"\n'
+    'var_version="${var_version:-13}"\n'
+)
+
+
+def _exec_with_health(df="", os_release=""):
+    """Happy-path executor whose introspect also returns the two health facts.
+
+    The ct script body itself comes from the monkeypatched http_mod.request.
+    """
+    ex = _exec_normal()
+    ex._introspect_facts = dict(
+        _INTROSPECT_WITH_SCRIPT, df_stdout=df, os_release_stdout=os_release)
+    return ex
+
+
+def test_disk_warning_fires_at_threshold(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DF_90_PERCENT, os_release=OS_RELEASE_TRIXIE)
+    out = run_lxc_update("pve-01", "130", ex, _settings(), api_host="192.168.1.10")
+
+    disk = [w for w in out.warnings if w.task == "disk space"]
+    assert len(disk) == 1
+    assert disk[0].host == "130"
+    assert "90% full" in disk[0].warning
+
+
+def test_disk_warning_silent_below_threshold(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DF_52_PERCENT, os_release=OS_RELEASE_TRIXIE)
+    out = run_lxc_update("pve-01", "105", ex, _settings(), api_host="192.168.1.10")
+    assert [w for w in out.warnings if w.task == "disk space"] == []
+
+
+def test_disk_threshold_is_configurable(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DF_52_PERCENT, os_release=OS_RELEASE_TRIXIE)
+    settings = _settings(lxc_disk_warn_percent=50)
+    out = run_lxc_update("pve-01", "105", ex, settings, api_host="192.168.1.10")
+    assert [w.task for w in out.warnings if w.task == "disk space"] == ["disk space"]
+
+
+def test_os_mismatch_warning_fires_for_bookworm_on_a_trixie_script(monkeypatch):
+    """CT 123's exact situation: debian 12 container, ct script targeting 13."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DF_52_PERCENT, os_release=OS_RELEASE_BOOKWORM)
+    out = run_lxc_update("pve-01", "123", ex, _settings(), api_host="192.168.1.10")
+
+    osw = [w for w in out.warnings if w.task == "container OS"]
+    assert len(osw) == 1
+    assert "debian 12" in osw[0].warning and "debian 13" in osw[0].warning
+    assert "203" in osw[0].warning
+
+
+def test_os_mismatch_silent_when_versions_agree(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DF_52_PERCENT, os_release=OS_RELEASE_TRIXIE)
+    out = run_lxc_update("pve-01", "125", ex, _settings(), api_host="192.168.1.10")
+    assert [w for w in out.warnings if w.task == "container OS"] == []
+
+
+def test_health_warnings_are_emitted_on_the_dry_run_path(monkeypatch):
+    """The point of the warnings: arrive before the window, not with the failure."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    monkeypatch.setattr(http_mod, "get_json", lambda url, **kw: {"tag_name": "1.1"})
+    ex = _exec_with_health(df=DF_90_PERCENT, os_release=OS_RELEASE_BOOKWORM)
+    out = run_lxc_update("pve-01", "123", ex, _settings(), dry_run=True,
+                         api_host="192.168.1.10")
+
+    assert sorted(w.task for w in out.warnings) == ["container OS", "disk space"]
+    assert ex.snapshots_created == []  # still a dry run
+
+
+def test_health_warnings_survive_a_failing_update(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DF_90_PERCENT, os_release=OS_RELEASE_TRIXIE)
+    ex._lxc_app_result = _fail(rc=114, stderr="Storage too low")
+    out = run_lxc_update("pve-01", "130", ex, _settings(), api_host="192.168.1.10")
+
+    assert out.failed is True
+    assert [w.task for w in out.warnings] == ["disk space"]
+
+
+def test_no_warnings_when_container_was_not_running_at_introspect(monkeypatch):
+    """df/os-release come back empty for a stopped CT — must not false-positive."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df="", os_release="")
+    out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
+    assert out.warnings == []

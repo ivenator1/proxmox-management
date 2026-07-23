@@ -21,7 +21,15 @@ from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import lxc_os_changed, lxc_os_pkg_count
 from proxmox_fleet.executor import Executor, snapshot_with_retry
 from proxmox_fleet.flows._pkg import kuma_healthy
-from proxmox_fleet.lxc_parse import parse_ct_script, parse_pct_config, parse_pct_status, script_name_from_update
+from proxmox_fleet.lxc_parse import (
+    os_version_matches,
+    parse_ct_script,
+    parse_df_percent,
+    parse_os_release,
+    parse_pct_config,
+    parse_pct_status,
+    script_name_from_update,
+)
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.runner import UnreachableHostError
 from proxmox_fleet.models.state import ErrorEntry, LxcRecord, WarningEntry
@@ -94,6 +102,38 @@ def _failure_detail(res: Any) -> str:
     if len(flat) > _FAILURE_DETAIL_MAX:
         flat = "..." + flat[-_FAILURE_DETAIL_MAX:]
     return flat
+
+
+def disk_warning(introspect_facts: Dict[str, Any], threshold: int) -> Optional[str]:
+    """Warning text when the container's rootfs is at/over *threshold* percent.
+
+    Returns None when there is nothing to say, including when df produced no
+    parseable output (a container that was not running when introspect ran).
+    Applies to every container, with or without an update script: apt itself runs
+    out of space, which is how CT 130's OS update failed.
+    """
+    used = parse_df_percent(str(introspect_facts.get("df_stdout", "")))
+    if used is None or used < threshold:
+        return None
+    return (f"rootfs {used}% full — apt can fail to unpack, and the community-scripts "
+            f"storage guard aborts app updates above 80%")
+
+
+def os_mismatch_warning(introspect_facts: Dict[str, Any], ct_info: Dict[str, Any],
+                        script_name: str) -> Optional[str]:
+    """Warning text when the container OS is older than the ct script's target.
+
+    This is the CT 123 failure mode: check_container_os_guard() refuses to update,
+    start() returns, and the ct script falls through to build_container, which
+    exits 203 with the misleading "You need to set 'CTID' variable".
+    """
+    cur = parse_os_release(str(introspect_facts.get("os_release_stdout", "")))
+    rec_os = str(ct_info.get("var_os", ""))
+    rec_ver = str(ct_info.get("var_version", ""))
+    if os_version_matches(cur["id"], cur["version_id"], rec_os, rec_ver):
+        return None
+    return (f"container runs {cur['id']} {cur['version_id']} but ct/{script_name}.sh targets "
+            f"{rec_os} {rec_ver} — app updates will fail (exit 203) until the OS is upgraded")
 
 
 def _build_shell(lxc_os: str) -> str:
@@ -235,6 +275,14 @@ def run_lxc_update(
     rollback_done = False
     outcome = LxcFlowOutcome()
 
+    # Health warnings are raised before any update runs — and outside the try, so
+    # they survive a later failure and are emitted on the dry-run path too, which
+    # is the point: they are meant to arrive before the maintenance window, not
+    # in the same briefing as the failure they predict.
+    disk_msg = disk_warning(introspect_res.facts, settings.lxc_disk_warn_percent)
+    if disk_msg:
+        outcome.warnings.append(WarningEntry(host=lxc_id, task="disk space", warning=disk_msg))
+
     api_params: Dict[str, Any] = {
         "api_host": api_host,
         "api_user": settings.pve_api_user,
@@ -277,6 +325,14 @@ def run_lxc_update(
                     ct_info = parse_ct_script("")
             else:
                 lxc_no_update_script = True
+
+        # Placed after detect (it needs the ct script's var_os/var_version) but
+        # before the dry-run return, so --dry-run reports it too.
+        if ct_script_name and not app_excluded:
+            os_msg = os_mismatch_warning(introspect_res.facts, ct_info, ct_script_name)
+            if os_msg:
+                outcome.warnings.append(
+                    WarningEntry(host=lxc_id, task="container OS", warning=os_msg))
 
         # ------------------------------------------------------------------
         # Dry-check — version compare only, no mutations

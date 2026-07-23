@@ -398,3 +398,91 @@ def test_read_pending_missing_raises(tmp_path):
     import pytest
     with pytest.raises(FileNotFoundError):
         scan_mod.read_pending(tmp_path, "latest")
+
+
+# --- scan health signals (disk / OS target) -------------------------------------
+
+_DF_90 = ("Filesystem     1024-blocks    Used Available Capacity Mounted on\n"
+          "/dev/rbd17         4046560 3416796    403668      90% /\n")
+_OSREL_BOOKWORM = 'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\nVERSION_ID="12"\nID=debian\n'
+_OSREL_TRIXIE = 'VERSION_ID="13"\nID=debian\n'
+
+
+def _patch_github_trixie(monkeypatch, *, latest="v4.1.0"):
+    """ct script that both names a GH repo and targets debian 13."""
+    ct_script = ('var_os="${var_os:-debian}"\n'
+                 'var_version="${var_version:-13}"\n'
+                 'check_for_gh_release "sonarr" "Sonarr/Sonarr"\n')
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: type("R", (), {"body": ct_script})())
+    monkeypatch.setattr(http_mod, "get_json", lambda url, **kw: {"tag_name": latest})
+
+
+def test_scan_lxc_reports_disk_and_os(monkeypatch):
+    _patch_github_trixie(monkeypatch)
+    ex = ScriptedExecutor(
+        script={"dist-upgrade": [_ok(APT_SIM)], "cat ~/.sonarr": [_ok("4.0.17")]},
+        introspect_facts=dict(_INTROSPECT_RUNNING,
+                              df_stdout=_DF_90, os_release_stdout=_OSREL_TRIXIE),
+    )
+    result = scan_mod.scan_lxc(ex, "130", "pve-01")
+    assert result["disk_percent"] == 90
+    assert result["os"] == "debian 13"
+    assert result["os_mismatch"] is None
+
+
+def test_scan_lxc_flags_os_mismatch(monkeypatch):
+    _patch_github_trixie(monkeypatch)
+    ex = ScriptedExecutor(
+        script={"dist-upgrade": [_ok("")], "cat ~/.sonarr": [_ok("4.0.17")]},
+        introspect_facts=dict(_INTROSPECT_RUNNING,
+                              df_stdout=_DF_90, os_release_stdout=_OSREL_BOOKWORM),
+    )
+    result = scan_mod.scan_lxc(ex, "123", "pve-01")
+    assert result["os"] == "debian 12"
+    assert "debian 12" in result["os_mismatch"]
+    assert "debian 13" in result["os_mismatch"]
+
+
+def test_scan_lxc_health_absent_without_introspect_facts(monkeypatch):
+    """Older primitive output (no df/os-release facts) must not break the scan."""
+    _patch_github(monkeypatch)
+    ex = ScriptedExecutor(
+        script={"dist-upgrade": [_ok("")], "cat ~/.sonarr": [_ok("4.0.17")]},
+        introspect_facts=_INTROSPECT_RUNNING,
+    )
+    result = scan_mod.scan_lxc(ex, "101", "pve-01")
+    assert result["disk_percent"] is None
+    assert result["os"] == ""
+    assert result["os_mismatch"] is None
+
+
+def test_pending_summary_counts_health_signals(tmp_path):
+    scan = {
+        "timestamp": "2026-07-23T04-00-00Z",
+        "hosts": {},
+        "lxc": {
+            "123": {"os_pending_count": 0, "app": None, "disk_percent": 63,
+                    "os_mismatch": "container runs debian 12 but ...", "error": None},
+            "130": {"os_pending_count": 4, "app": None, "disk_percent": 90,
+                    "os_mismatch": None, "error": None},
+            "105": {"os_pending_count": 0, "app": None, "disk_percent": 52,
+                    "os_mismatch": None, "error": None},
+        },
+    }
+    (tmp_path / "pending-2026-07-23T04-00-00Z.json").write_text(json.dumps(scan))
+    rows = scan_mod.pending_summary(tmp_path, disk_threshold=75)
+    assert rows[0]["low_disk"] == 1        # only 130 at 90%
+    assert rows[0]["os_mismatch"] == 1     # only 123
+
+
+def test_pending_summary_tolerates_scans_without_health_keys(tmp_path):
+    scan = {
+        "timestamp": "2026-07-01T04-00-00Z",
+        "hosts": {},
+        "lxc": {"101": {"os_pending_count": 2, "app": None, "error": None}},
+    }
+    (tmp_path / "pending-2026-07-01T04-00-00Z.json").write_text(json.dumps(scan))
+    rows = scan_mod.pending_summary(tmp_path)
+    assert rows[0]["low_disk"] == 0
+    assert rows[0]["os_mismatch"] == 0

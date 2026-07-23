@@ -16,7 +16,14 @@ Each test section mirrors its Jinja counterpart case-for-case:
 
 
 from proxmox_fleet.changes import dpkg_hash_differs, lxc_os_changed, lxc_os_pkg_count
-from proxmox_fleet.lxc_parse import parse_ct_script, parse_pct_config, parse_pct_status
+from proxmox_fleet.lxc_parse import (
+    os_version_matches,
+    parse_ct_script,
+    parse_df_percent,
+    parse_os_release,
+    parse_pct_config,
+    parse_pct_status,
+)
 from proxmox_fleet.status import (
     lxc_app_did_update,
     lxc_app_status,
@@ -592,3 +599,75 @@ def test_did_update_agrees_with_status_string():
         status = lxc_app_status(app_changed=True, **kwargs)
         did = lxc_app_did_update(app_changed=True, **kwargs)
         assert ("updated" in status.lower()) == did, (kwargs, status, did)
+
+
+# ---------------------------------------------------------------------------
+# Health-signal parsers — fixtures are verbatim output captured off live CTs
+# ---------------------------------------------------------------------------
+
+
+def test_parse_df_percent_reads_the_capacity_column():
+    stdout = (
+        "Filesystem     1024-blocks    Used Available Capacity Mounted on\n"
+        "/dev/rbd17         4046560 3416796    403668      90% /\n"
+    )
+    assert parse_df_percent(stdout) == 90
+
+
+def test_parse_df_percent_none_when_empty():
+    """A container that was not running when introspect ran yields no output."""
+    assert parse_df_percent("") is None
+    assert parse_df_percent("df: /: No such file or directory") is None
+
+
+def test_parse_os_release_handles_quoted_and_bare_values():
+    stdout = (
+        'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\n'
+        'VERSION_ID="12"\n'
+        "VERSION_CODENAME=bookworm\n"
+        "ID=debian\n"
+    )
+    assert parse_os_release(stdout) == {"id": "debian", "version_id": "12"}
+
+
+def test_parse_os_release_empty_input():
+    assert parse_os_release("") == {"id": "", "version_id": ""}
+
+
+def test_parse_ct_script_reads_var_os_in_the_current_default_form():
+    """Current scripts write var_os="${var_os:-debian}" so env can override it."""
+    script = (
+        'var_os="${var_os:-debian}"\n'
+        'var_version="${var_version:-13}"\n'
+    )
+    info = parse_ct_script(script)
+    assert info["var_os"] == "debian"
+    assert info["var_version"] == "13"
+
+
+def test_parse_ct_script_reads_var_os_in_the_legacy_bare_form():
+    info = parse_ct_script('var_os="debian"\nvar_version="12"\n')
+    assert info["var_os"] == "debian"
+    assert info["var_version"] == "12"
+
+
+def test_parse_ct_script_missing_os_fields_are_empty():
+    info = parse_ct_script("echo hello\n")
+    assert info["var_os"] == ""
+    assert info["var_version"] == ""
+
+
+def test_os_version_matches_exact_and_dot_boundary():
+    assert os_version_matches("debian", "13", "debian", "13")
+    assert not os_version_matches("debian", "12", "debian", "13")
+    # alpine 3.22.1 satisfies a script targeting 3.22
+    assert os_version_matches("alpine", "3.22.1", "alpine", "3.22")
+    # ...but 3.221 must not be read as a 3.22 prefix
+    assert not os_version_matches("alpine", "3.221", "alpine", "3.22")
+    assert not os_version_matches("ubuntu", "24.04", "debian", "13")
+
+
+def test_os_version_matches_is_permissive_when_data_is_missing():
+    """Mirrors the guard's early return — never warn on an unparseable read."""
+    assert os_version_matches("", "", "debian", "13")
+    assert os_version_matches("debian", "12", "", "")

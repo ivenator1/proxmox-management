@@ -346,6 +346,28 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
   single rescue-path exception); `driver._fold_outcome()` reads it defensively via `getattr`.
   These failures do **not** enter rescue, so **they do not roll back** — the container is left
   half-updated by design.
+- **Pre-emptive health warnings** (`flows/lxc.py`: `disk_warning()` / `os_mismatch_warning()`):
+  the `lxc_introspect` primitive also returns `df_stdout` + `os_release_stdout` (batched — no
+  extra subprocess), and the flow emits a `WarningEntry` when the rootfs is at/over
+  `lxc_disk_warn_percent` (default 75, below the community scripts' own >80% `exit 114`) or the
+  container OS is behind the ct script's `var_os`/`var_version` (the `exit 203` trap). Disk is
+  checked for **every** container (plain apt runs out of space too); OS only when a ct script
+  exists. Both fire **outside** `try` / before the dry-run return, so `--dry-run` reports them
+  ahead of a window — that is the point. `scan.py` surfaces the same two signals as
+  `disk_percent`/`os`/`os_mismatch` per container, counted by `pending_summary()` as
+  `low_disk`/`os_mismatch`. Warnings only: nothing is skipped or failed.
+- **Introspect precedes `pct_start`**, so `df_stdout`/`os_release_stdout` are empty for a
+  container that was stopped (a failed `pct exec` gives rc≠0 + empty stdout, absorbed by
+  `failed_when: false`). The parsers return `None`/`""` there and no warning fires — an accepted
+  gap, not a false negative to "fix" by moving the reads after the start.
+- **`os_version_matches()` mirrors `check_container_os_guard`**: exact match or a prefix on a
+  dot boundary (alpine `3.22.1` satisfies a script targeting `3.22`), and missing data on either
+  side counts as a match, so an unparseable read never invents a warning.
+- **`parse_ct_script` must handle `var_x="${var_x:-N}"`**: current community scripts write that
+  form so the environment can override. The older `build_cpu`/`build_ram`/`run_cpu` patterns
+  match only the bare `var_cpu="2"` form and therefore **no longer match live scripts** —
+  resource scaling is silently inert (`needs_resource_scale` always False). `var_os`/`var_version`
+  use the `_var()` helper, which accepts both forms.
 - **Custom-config commands are opaque strings**: `CustomConfig` validates as literals, never
   renders. `steps.run_steps()` resolves only `{{ steps.NAME }}` in Python at run time; everything
   else is left for the shell. `register` stashes a step's stdout for a later `when:`.

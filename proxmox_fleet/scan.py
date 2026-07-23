@@ -21,14 +21,26 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet import inventory
 from proxmox_fleet.executor import Executor
 from proxmox_fleet.flows._pkg import detect_pkg_mgr
-from proxmox_fleet.flows.lxc import _build_shell, _discover_lxcs, _read_version
-from proxmox_fleet.lxc_parse import parse_ct_script, parse_pct_config, parse_pct_status, script_name_from_update
+from proxmox_fleet.flows.lxc import (
+    _build_shell,
+    _discover_lxcs,
+    _read_version,
+    os_mismatch_warning,
+)
+from proxmox_fleet.lxc_parse import (
+    parse_ct_script,
+    parse_df_percent,
+    parse_os_release,
+    parse_pct_config,
+    parse_pct_status,
+    script_name_from_update,
+)
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.orchestration import run_concurrent
 
@@ -105,24 +117,28 @@ def _lxc_app_pending(
     lxc_id: str,
     os_type: str,
     introspect_facts: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any], str]:
     """App version current → latest for a community-script container.
 
-    Returns None when the container has no update script (os_only containers).
+    Returns ``(app, ct_info, script_name)``. *app* is None when the container has
+    no update script (os_only containers). *ct_info* and *script_name* are handed
+    back so the caller can run the OS-target check without re-fetching the script.
     Mirrors the lxc flow's dry-check: script name from the pulled
     ``/usr/bin/update``, latest tag from the ct script's GitHub repo.
     """
     if int(introspect_facts.get("pull_rc", 1)) != 0:
-        return None
+        return None, {}, ""
     script_name = script_name_from_update(str(introspect_facts.get("script_stdout", ""))) or ""
     if not script_name:
-        return None
+        return None, {}, ""
 
+    ct_info: Dict[str, Any] = {}
     gh_repo = ""
     try:
         ct_url = (f"https://raw.githubusercontent.com/community-scripts/ProxmoxVE"
                   f"/main/ct/{script_name}.sh")
-        gh_repo = parse_ct_script(http_mod.request(ct_url).body).get("gh_repo", "")
+        ct_info = parse_ct_script(http_mod.request(ct_url).body)
+        gh_repo = ct_info.get("gh_repo", "")
     except Exception:  # noqa: BLE001 - fail-open like the flow's detect
         pass
 
@@ -140,8 +156,8 @@ def _lxc_app_pending(
 
     outdated = bool(current and latest
                     and current.lstrip("v") != latest.lstrip("v"))
-    return {"script": script_name, "current": current, "latest": latest,
-            "outdated": outdated}
+    return ({"script": script_name, "current": current, "latest": latest,
+             "outdated": outdated}, ct_info, script_name)
 
 
 def scan_lxc(executor: Executor, lxc_id: str, node: str) -> Dict[str, Any]:
@@ -152,7 +168,8 @@ def scan_lxc(executor: Executor, lxc_id: str, node: str) -> Dict[str, Any]:
     """
     out: Dict[str, Any] = {"node": node, "name": lxc_id, "skipped": None,
                            "os_pending_count": 0, "os_pending": [],
-                           "app": None, "error": None}
+                           "app": None, "disk_percent": None, "os": "",
+                           "os_mismatch": None, "error": None}
     try:
         intro = executor.introspect(lxc_id)
         info = parse_pct_config(str(intro.facts.get("config_stdout", "")))
@@ -174,7 +191,15 @@ def scan_lxc(executor: Executor, lxc_id: str, node: str) -> Dict[str, Any]:
         pending = parse_pending(res.stdout, pkg_mgr)
         out["os_pending_count"] = len(pending)
         out["os_pending"] = pending
-        out["app"] = _lxc_app_pending(executor, lxc_id, os_type, intro.facts)
+        app, ct_info, script_name = _lxc_app_pending(executor, lxc_id, os_type, intro.facts)
+        out["app"] = app
+
+        # Health signals — read from the same introspect pass, no extra commands.
+        out["disk_percent"] = parse_df_percent(str(intro.facts.get("df_stdout", "")))
+        cur_os = parse_os_release(str(intro.facts.get("os_release_stdout", "")))
+        out["os"] = f"{cur_os['id']} {cur_os['version_id']}".strip()
+        if script_name:
+            out["os_mismatch"] = os_mismatch_warning(intro.facts, ct_info, script_name)
         return out
     except Exception as exc:  # noqa: BLE001
         out["error"] = str(exc)[:300]
@@ -210,6 +235,7 @@ def pending_summary(
     history_dir: Union[str, Path],
     *,
     limit: int = 10,
+    disk_threshold: int = 75,
 ) -> List[Dict[str, Any]]:
     """Read back the newest *limit* pending-scan summaries, newest first.
 
@@ -217,6 +243,10 @@ def pending_summary(
     with the table-level aggregates, unreadable/corrupt files skipped,
     ``limit <= 0`` meaning "all scans". ``pending-latest.json`` is excluded
     (it duplicates the newest timestamped file).
+
+    *disk_threshold* counts containers at or above that rootfs percentage; pass
+    ``settings.lxc_disk_warn_percent`` to keep the scan page and the briefing
+    warnings agreeing on what "low" means.
     """
     directory = Path(history_dir)
     scans = sorted(
@@ -241,6 +271,11 @@ def pending_summary(
             "lxc_os_pending": sum(int(c.get("os_pending_count", 0)) for c in lxc.values()),
             "outdated_apps": sum(1 for c in lxc.values()
                                  if (c.get("app") or {}).get("outdated")),
+            # Health signals — containers that need attention before they fail.
+            # Read defensively: scans written before these keys existed lack them.
+            "low_disk": sum(1 for c in lxc.values()
+                            if (c.get("disk_percent") or 0) >= disk_threshold),
+            "os_mismatch": sum(1 for c in lxc.values() if c.get("os_mismatch")),
             "errors": sum(1 for entry in (*hosts.values(), *lxc.values())
                           if entry.get("error")),
         })
