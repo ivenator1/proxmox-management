@@ -541,7 +541,10 @@ def create_app(
     def index(request: Request) -> Any:
         latest_run = _read_run_or_none("latest")
         latest_pending = _read_pending_or_none("latest")
-        pending_rows = scan_mod.pending_summary(history_dir, limit=1)
+        # Same threshold as /pending, so a customised lxc_disk_warn_percent can
+        # never make the overview's counts disagree with the pending page's.
+        pending_rows = scan_mod.pending_summary(
+            history_dir, limit=1, disk_threshold=settings.lxc_disk_warn_percent)
         pending_row = pending_rows[0] if pending_rows else None
         # newest first from history_summary; reversed → oldest first for the
         # pulse strip / sparkline (time flows left → right)
@@ -586,12 +589,17 @@ def create_app(
             raise HTTPException(404, f"no pending snapshot {ref!r}")
         hosts = sorted((snapshot.get("hosts") or {}).items()) if snapshot else []
         lxc = sorted((snapshot.get("lxc") or {}).items(), key=_lxc_sort_key) if snapshot else []
+        # Pass the configured threshold through so the page and the briefing
+        # warnings agree on what counts as "low disk".
+        disk_threshold = settings.lxc_disk_warn_percent
         return templates.TemplateResponse(request, "pending.html", {
             "ref": ref,
             "snapshot": snapshot,
             "hosts": hosts,
             "lxc": lxc,
-            "scans": scan_mod.pending_summary(history_dir, limit=0),
+            "disk_threshold": disk_threshold,
+            "scans": scan_mod.pending_summary(
+                history_dir, limit=0, disk_threshold=disk_threshold),
         })
 
     @protected.get("/history")

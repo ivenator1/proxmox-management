@@ -56,7 +56,9 @@ class Executor(Protocol):
     def introspect(self, lxc_id: str) -> PrimitiveResult:
         """Read pct config, pct status, and update-script content in one subprocess.
 
-        Returns facts: config_stdout, config_rc, status_stdout, pull_rc, script_stdout.
+        Returns facts: config_stdout, config_rc, status_stdout, pull_rc,
+        script_stdout, df_stdout, os_release_stdout. The last two are empty for a
+        container that was not running (introspect precedes the flow's pct_start).
         """
         ...
 

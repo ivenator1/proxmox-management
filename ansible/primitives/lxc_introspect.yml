@@ -14,6 +14,8 @@
 #   status_stdout  stdout of pct status
 #   pull_rc        rc of pct pull (non-zero → no /usr/bin/update script)
 #   script_stdout  content of /usr/bin/update (empty when pull_rc != 0)
+#   df_stdout      `df -P /` inside the container (empty when it is not running)
+#   os_release_stdout  /etc/os-release inside the container (ditto)
 - name: "lxc_introspect primitive"
   hosts: "{{ target_hosts | default('all') }}"
   gather_facts: false
@@ -51,6 +53,23 @@
       check_mode: false
       when: _pull.rc == 0
 
+    # Health signals, read here so they cost no extra subprocess. Both need the
+    # container running: introspect runs *before* the flow starts a stopped one,
+    # so these come back empty for was_stopped containers (accepted gap).
+    - name: "Read container disk usage"
+      ansible.builtin.command: "pct exec {{ lxc_id }} -- df -P /"
+      register: _df
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Read container os-release"
+      ansible.builtin.command: "pct exec {{ lxc_id }} -- cat /etc/os-release"
+      register: _osrel
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
     - name: "Return results"
       ansible.builtin.set_stats:
         data:
@@ -59,4 +78,6 @@
           status_stdout: "{{ _status.stdout | default('') }}"
           pull_rc: "{{ _pull.rc | default(1) }}"
           script_stdout: "{{ _script.stdout | default('') }}"
+          df_stdout: "{{ _df.stdout | default('') }}"
+          os_release_stdout: "{{ _osrel.stdout | default('') }}"
         aggregate: false

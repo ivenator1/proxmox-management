@@ -326,7 +326,9 @@ flags, and a built-in `--help`. Run it from the project root.
 --scan                     Read-only pending-updates scan → pending-*.json (no fleet run)
 --history [N]              Show the last N persisted runs and exit (default: 10)
 --history-show TS|latest   Print one persisted run's briefing and exit
--e KEY=VALUE               Pass a raw extra var (repeatable; e.g. -e custom_allow_reboot=false)
+-e KEY=VALUE               Raw extra var (repeatable). Only fleet_dry_run, lxc_verbose,
+                           force_notify, force_window, custom_dry_run are honoured; any
+                           other key is accepted and silently ignored.
 --inventory PATH           Inventory file (default: hosts.ini)
 --vars-file PATH           Settings YAML (default: vars.yml)
 ```

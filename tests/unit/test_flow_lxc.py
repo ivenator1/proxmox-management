@@ -74,6 +74,7 @@ class ScriptedLxcExecutor:
         self.snapshots_created: list = []
         self.snapshots_deleted: list = []
         self.rollback_called = False
+        self.app_update_kwargs: dict = {}
 
         self._introspect_facts = introspect_facts if introspect_facts is not None else dict(_INTROSPECT_NO_SCRIPT)
         self._lxc_os_result = lxc_os_result
@@ -129,6 +130,11 @@ class ScriptedLxcExecutor:
         lxc_run_cpu="", lxc_run_ram="",
     ):
         self.commands.append(f"lxc_app_update:{lxc_id}")
+        self.app_update_kwargs = {
+            "lxc_needs_scale": lxc_needs_scale,
+            "lxc_build_cpu": lxc_build_cpu, "lxc_build_ram": lxc_build_ram,
+            "lxc_run_cpu": lxc_run_cpu, "lxc_run_ram": lxc_run_ram,
+        }
         return self._lxc_app_result
 
     def post_update(self, lxc_id, *, lxc_shell="bash", dpkg_hash_cmd="", lxc_script_name=""):
@@ -739,3 +745,305 @@ def test_discover_lxcs_plain_failure_raises_runtime_error():
     with pytest.raises(RuntimeError) as exc_info:
         _discover_lxcs(ex, _settings())
     assert not isinstance(exc_info.value, UnreachableHostError)
+
+
+# ---------------------------------------------------------------------------
+# Non-raising update failures — captured output + failed run
+# ---------------------------------------------------------------------------
+
+
+def test_app_update_failure_records_error_and_fails_run(monkeypatch):
+    """A non-zero /usr/bin/update must carry its output out, not just a boolean."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal()
+    ex._lxc_app_result = _fail(rc=1, stderr="npm: migration failed, aborting")
+    out = run_lxc_update("pve-01", "123", ex, _settings(), api_host="192.168.1.10")
+
+    assert out.failed is True
+    assert out.record is not None and out.record.app == "FAILED"
+    assert len(out.errors) == 1
+    assert out.errors[0].host == "123"
+    assert out.errors[0].task == "app update"
+    assert "migration failed" in out.errors[0].error
+
+
+def test_os_update_failure_records_error_and_fails_run(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal()
+    ex._lxc_os_result = _fail(rc=100, stderr="E: You don't have enough free space in /var/cache/apt")
+    out = run_lxc_update("pve-01", "130", ex, _settings(), api_host="192.168.1.10")
+
+    assert out.failed is True
+    assert out.record is not None and out.record.os == "FAILED"
+    assert [e.task for e in out.errors] == ["OS update"]
+    assert "enough free space" in out.errors[0].error
+
+
+def test_both_updates_failing_record_one_error_each(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal()
+    ex._lxc_os_result = _fail(rc=100, stderr="E: no space left on device")
+    ex._lxc_app_result = _fail(rc=1, stderr="build step exited 1")
+    out = run_lxc_update("pve-01", "130", ex, _settings(), api_host="192.168.1.10")
+
+    assert out.failed is True
+    assert [e.task for e in out.errors] == ["OS update", "app update"]
+
+
+def test_failure_detail_falls_back_to_stdout_then_rc(monkeypatch):
+    from proxmox_fleet.flows.lxc import _failure_detail
+
+    assert _failure_detail(PrimitiveResult(rc=1, failed=True, stderr="  boom  ")) == "boom"
+    # stdout is used when stderr is empty, and newlines are collapsed for the
+    # briefing's inline-code rendering
+    assert _failure_detail(
+        PrimitiveResult(rc=1, failed=True, stdout="line one\nline two")
+    ) == "line one line two"
+    assert "rc=7" in _failure_detail(PrimitiveResult(rc=7, failed=True))
+
+
+def test_failure_detail_keeps_the_tail_of_long_output():
+    from proxmox_fleet.flows.lxc import _FAILURE_DETAIL_MAX, _failure_detail
+
+    long = "x" * 500 + " E: the actual complaint"
+    detail = _failure_detail(PrimitiveResult(rc=1, failed=True, stderr=long))
+    assert detail.startswith("...")
+    assert detail.endswith("E: the actual complaint")
+    assert len(detail) == _FAILURE_DETAIL_MAX + 3
+
+
+def test_successful_run_records_no_errors(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal(ver_before="1.0", ver_after="1.1")
+    out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
+    assert out.failed is False
+    assert out.errors == []
+
+
+def test_failure_detail_strips_ansi_and_keeps_the_real_cause():
+    """Verbatim stderr from a live exit-203 run of ct/nginxproxymanager.sh.
+
+    The last line is the misleading fallthrough into build_container; the actual
+    cause is two lines above it, so both must survive stripping + truncation.
+    """
+    from proxmox_fleet.flows.lxc import _failure_detail
+
+    stderr = (
+        "\x1b[K  ✖️  \x1b[01;31mContainer OS debian 12 does not match the "
+        "recommended debian 13 — skipping update.\x1b[m\n"
+        "\x1b[K  ✖️  \x1b[01;31mUpgrade the container OS to debian 13 first, then "
+        "run this update again — or bypass this check (may break, no support) with: "
+        'echo "debian 13" > /usr/local/community-scripts/ignore-os-mismatch\x1b[m\n'
+        "\x1b[K  ✖️  \x1b[01;31mYou need to set 'CTID' variable.\x1b[m\n"
+    )
+    detail = _failure_detail(PrimitiveResult(rc=203, failed=True, stderr=stderr))
+
+    assert "\x1b" not in detail
+    assert "[K" not in detail
+    assert "Container OS debian 12 does not match the recommended debian 13" in detail
+    assert "You need to set 'CTID' variable." in detail
+
+
+def test_failure_detail_prefers_stderr_over_banner_stdout():
+    """The community scripts put their banner on stdout and the error on stderr."""
+    from proxmox_fleet.flows.lxc import _failure_detail
+
+    detail = _failure_detail(PrimitiveResult(
+        rc=203, failed=True,
+        stdout="   ____  _   _ ___ \n  |  _ \\| \\ | |  _ \\ \n",
+        stderr="\x1b[01;31mContainer OS debian 12 does not match\x1b[m",
+    ))
+    assert detail == "Container OS debian 12 does not match"
+
+
+# ---------------------------------------------------------------------------
+# Pre-emptive health warnings (low disk / OS behind the ct script's target)
+# ---------------------------------------------------------------------------
+
+# Verbatim `df -P /` from CT 130 (grafana) the morning its update failed.
+DF_90_PERCENT = (
+    "Filesystem     1024-blocks    Used Available Capacity Mounted on\n"
+    "/dev/rbd17         4046560 3416796    403668      90% /\n"
+)
+DF_52_PERCENT = (
+    "Filesystem     1024-blocks    Used Available Capacity Mounted on\n"
+    "/dev/rbd7         17369872 8440172   8022028      52% /\n"
+)
+# Verbatim /etc/os-release from CT 123 (nginxproxymanager).
+OS_RELEASE_BOOKWORM = (
+    'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\n'
+    'NAME="Debian GNU/Linux"\n'
+    'VERSION_ID="12"\n'
+    'VERSION="12 (bookworm)"\n'
+    "VERSION_CODENAME=bookworm\n"
+    "ID=debian\n"
+)
+OS_RELEASE_TRIXIE = (
+    'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"\n'
+    'VERSION_ID="13"\n'
+    "ID=debian\n"
+)
+# Verbatim var_* block from the current ct/nginxproxymanager.sh.
+CT_SCRIPT_TRIXIE = (
+    'var_cpu="${var_cpu:-2}"\n'
+    'var_ram="${var_ram:-2048}"\n'
+    'var_disk="${var_disk:-12}"\n'
+    'var_os="${var_os:-debian}"\n'
+    'var_version="${var_version:-13}"\n'
+)
+
+
+def _exec_with_health(df="", os_release=""):
+    """Happy-path executor whose introspect also returns the two health facts.
+
+    The ct script body itself comes from the monkeypatched http_mod.request.
+    """
+    ex = _exec_normal()
+    ex._introspect_facts = dict(
+        _INTROSPECT_WITH_SCRIPT, df_stdout=df, os_release_stdout=os_release)
+    return ex
+
+
+def test_disk_warning_fires_at_threshold(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DF_90_PERCENT, os_release=OS_RELEASE_TRIXIE)
+    out = run_lxc_update("pve-01", "130", ex, _settings(), api_host="192.168.1.10")
+
+    disk = [w for w in out.warnings if w.task == "disk space"]
+    assert len(disk) == 1
+    assert disk[0].host == "130"
+    assert "90% full" in disk[0].warning
+
+
+def test_disk_warning_silent_below_threshold(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DF_52_PERCENT, os_release=OS_RELEASE_TRIXIE)
+    out = run_lxc_update("pve-01", "105", ex, _settings(), api_host="192.168.1.10")
+    assert [w for w in out.warnings if w.task == "disk space"] == []
+
+
+def test_disk_threshold_is_configurable(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DF_52_PERCENT, os_release=OS_RELEASE_TRIXIE)
+    settings = _settings(lxc_disk_warn_percent=50)
+    out = run_lxc_update("pve-01", "105", ex, settings, api_host="192.168.1.10")
+    assert [w.task for w in out.warnings if w.task == "disk space"] == ["disk space"]
+
+
+def test_os_mismatch_warning_fires_for_bookworm_on_a_trixie_script(monkeypatch):
+    """CT 123's exact situation: debian 12 container, ct script targeting 13."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DF_52_PERCENT, os_release=OS_RELEASE_BOOKWORM)
+    out = run_lxc_update("pve-01", "123", ex, _settings(), api_host="192.168.1.10")
+
+    osw = [w for w in out.warnings if w.task == "container OS"]
+    assert len(osw) == 1
+    assert "debian 12" in osw[0].warning and "debian 13" in osw[0].warning
+    assert "203" in osw[0].warning
+
+
+def test_os_mismatch_silent_when_versions_agree(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DF_52_PERCENT, os_release=OS_RELEASE_TRIXIE)
+    out = run_lxc_update("pve-01", "125", ex, _settings(), api_host="192.168.1.10")
+    assert [w for w in out.warnings if w.task == "container OS"] == []
+
+
+def test_health_warnings_are_emitted_on_the_dry_run_path(monkeypatch):
+    """The point of the warnings: arrive before the window, not with the failure."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    monkeypatch.setattr(http_mod, "get_json", lambda url, **kw: {"tag_name": "1.1"})
+    ex = _exec_with_health(df=DF_90_PERCENT, os_release=OS_RELEASE_BOOKWORM)
+    out = run_lxc_update("pve-01", "123", ex, _settings(), dry_run=True,
+                         api_host="192.168.1.10")
+
+    assert sorted(w.task for w in out.warnings) == ["container OS", "disk space"]
+    assert ex.snapshots_created == []  # still a dry run
+
+
+def test_health_warnings_survive_a_failing_update(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DF_90_PERCENT, os_release=OS_RELEASE_TRIXIE)
+    ex._lxc_app_result = _fail(rc=114, stderr="Storage too low")
+    out = run_lxc_update("pve-01", "130", ex, _settings(), api_host="192.168.1.10")
+
+    assert out.failed is True
+    assert [w.task for w in out.warnings] == ["disk space"]
+
+
+def test_no_warnings_when_container_was_not_running_at_introspect(monkeypatch):
+    """df/os-release come back empty for a stopped CT — must not false-positive."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df="", os_release="")
+    out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
+    assert out.warnings == []
+
+
+# ---------------------------------------------------------------------------
+# Resource scaling — plan always computed, execution opt-in
+# ---------------------------------------------------------------------------
+
+PCT_CONFIG_SMALL = "hostname: sonarr\nostype: debian\ncores: 2\nmemory: 2048\n"
+CT_SCRIPT_HUNGRY = 'var_cpu="${var_cpu:-4}"\nvar_ram="${var_ram:-6144}"\n'
+
+
+def _exec_under_provisioned():
+    ex = _exec_normal()
+    ex._introspect_facts = dict(_INTROSPECT_WITH_SCRIPT, config_stdout=PCT_CONFIG_SMALL)
+    return ex
+
+
+def test_scaling_not_applied_by_default(monkeypatch):
+    """lxc_resource_scaling defaults off — upstream no longer scales at build time."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_HUNGRY))
+    ex = _exec_under_provisioned()
+    run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
+    assert ex.app_update_kwargs["lxc_needs_scale"] is False
+
+
+def test_scaling_applied_when_enabled(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_HUNGRY))
+    ex = _exec_under_provisioned()
+    run_lxc_update("pve-01", "101", ex, _settings(lxc_resource_scaling=True),
+                   api_host="192.168.1.10")
+
+    kw = ex.app_update_kwargs
+    assert kw["lxc_needs_scale"] is True
+    assert (kw["lxc_build_cpu"], kw["lxc_build_ram"]) == ("4", "6144")
+    # restores the container's own live values, not the script's spec
+    assert (kw["lxc_run_cpu"], kw["lxc_run_ram"]) == ("2", "2048")
+
+
+def test_scaling_inert_when_allocation_already_matches(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(
+                            200, 'var_cpu="${var_cpu:-2}"\nvar_ram="${var_ram:-2048}"\n'))
+    ex = _exec_under_provisioned()
+    run_lxc_update("pve-01", "101", ex, _settings(lxc_resource_scaling=True),
+                   api_host="192.168.1.10")
+    assert ex.app_update_kwargs["lxc_needs_scale"] is False
