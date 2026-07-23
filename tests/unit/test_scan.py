@@ -11,7 +11,7 @@ from typing import Any, Dict, List
 from proxmox_fleet import http as http_mod
 from proxmox_fleet import scan as scan_mod
 from proxmox_fleet.models.settings import GlobalSettings
-from proxmox_fleet.runner import PrimitiveResult
+from proxmox_fleet.runner import PrimitiveResult, UnreachableHostError
 
 
 def _ok(stdout="", rc=0):
@@ -538,3 +538,150 @@ def test_scan_lxc_returns_both_the_cluster_id_and_the_health_signals(monkeypatch
     assert result["disk_percent"] == 90
     assert result["os"] == "debian 12"
     assert result["os_mismatch"] is not None
+
+
+# --- unreachable hosts must not fail a read-only scan ---------------------------
+
+_UNREACHABLE_ERR = ("Data could not be sent to remote host 10.10.10.40. "
+                    "Make sure this host can be reached over ssh: "
+                    "ssh: connect to host 10.10.10.40 port 22: No route to host")
+
+
+def test_scan_host_flags_unreachable_rather_than_a_plain_error():
+    from proxmox_fleet.runner import PrimitiveResult
+
+    class Dead:
+        host = "ONeill"
+
+        def run_shell(self, command, **opts):
+            return PrimitiveResult(rc=4, failed=True, unreachable=True,
+                                   stderr=_UNREACHABLE_ERR)
+
+    result = scan_mod.scan_host(Dead())
+    assert result["unreachable"] is True
+    assert result["error"]
+
+
+def test_scan_host_genuine_failure_is_not_flagged_unreachable():
+    ex = ScriptedExecutor(default=_ok("bash: apt-get: command not found", rc=127))
+    ex.default = PrimitiveResult(rc=127, failed=True, stderr="boom: disk I/O error")
+    result = scan_mod.scan_host(ex)
+    assert result.get("unreachable") is False
+    assert result["error"]
+
+
+def test_scan_lxc_typed_unreachable_is_flagged():
+    from proxmox_fleet.runner import UnreachableHostError
+
+    class Dead:
+        host = "ONeill"
+
+        def introspect(self, lxc_id):
+            raise UnreachableHostError("node unreachable: No route to host")
+
+    result = scan_mod.scan_lxc(Dead(), "101", "ONeill")
+    assert result["unreachable"] is True
+    assert result["error"]
+
+
+def test_empty_lxc_entry_has_the_same_shape_as_a_real_scan(monkeypatch):
+    """The drift guard: the fallback dict must not miss keys scan_lxc returns."""
+    _patch_github_trixie(monkeypatch)
+    ex = ScriptedExecutor(
+        script={"dist-upgrade": [_ok(APT_SIM)], "cat ~/.sonarr": [_ok("4.0.17")]},
+        introspect_facts=dict(_INTROSPECT_RUNNING,
+                              df_stdout=_DF_90, os_release_stdout=_OSREL_TRIXIE),
+    )
+    real = scan_mod.scan_lxc(ex, "101", "pve-01")
+    stub = scan_mod._empty_lxc_entry("pve-01", "101")
+    assert set(stub) == set(real)
+
+
+def test_pending_summary_separates_unreachable_from_errors(tmp_path):
+    scan = {
+        "timestamp": "2026-07-23T10-00-00Z",
+        "hosts": {"ONeill": {"pending_count": 0, "unreachable": True,
+                             "error": _UNREACHABLE_ERR},
+                  "web-01": {"pending_count": 0, "unreachable": False,
+                             "error": "scan command failed"}},
+        "lxc": {},
+    }
+    (tmp_path / "pending-2026-07-23T10-00-00Z.json").write_text(json.dumps(scan))
+    row = scan_mod.pending_summary(tmp_path)[0]
+    assert row["unreachable"] == 1   # ONeill
+    assert row["errors"] == 1        # web-01 only
+
+
+def test_pending_summary_tolerates_scans_without_the_unreachable_key(tmp_path):
+    scan = {"timestamp": "2026-07-01T04-00-00Z",
+            "hosts": {"web-01": {"pending_count": 0, "error": "boom"}}, "lxc": {}}
+    (tmp_path / "pending-2026-07-01T04-00-00Z.json").write_text(json.dumps(scan))
+    row = scan_mod.pending_summary(tmp_path)[0]
+    assert row["unreachable"] == 0
+    assert row["errors"] == 1
+
+
+def test_run_fleet_scan_unreachable_node_does_not_set_exit_code(tmp_path, monkeypatch):
+    """The fleet-scan.service failure: ONeill down made a read-only scan exit 1.
+
+    A reachable node is still scanned, and the run reports success.
+    """
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[proxmox_nodes]\nONeill ansible_host=10.10.10.40\npve-01 ansible_host=10.0.0.1\n"
+        "[remote_hosts]\n[proxmox_vms]\n[custom_hosts]\n"
+    )
+    _patch_github(monkeypatch)
+
+    def _factory(host, **kw):
+        if host == "ONeill":
+            ex = ScriptedExecutor(default=PrimitiveResult(
+                rc=4, failed=True, unreachable=True, stderr=_UNREACHABLE_ERR))
+        else:
+            ex = ScriptedExecutor(
+                script={"which apt-get": [_ok("apt")],
+                        "dist-upgrade": [_ok(APT_SIM), _ok(APT_SIM)],
+                        "cat ~/.sonarr": [_ok("4.0.17")]},
+                introspect_facts=_INTROSPECT_RUNNING,
+            )
+        ex.host = host   # class default is "web-01"; the stub below keys off it
+        return ex
+
+    _patch_executors(monkeypatch, _factory)
+
+    def _discover(ex, s):
+        if getattr(ex, "host", "") == "ONeill":
+            raise UnreachableHostError("node unreachable: No route to host")
+        return ["101"]
+
+    monkeypatch.setattr(scan_mod, "_discover_lxcs", _discover)
+
+    settings = GlobalSettings(fleet_history_dir=str(tmp_path / "hist"))
+    rc = scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv))
+
+    assert rc == 0, "an unreachable node must not fail a read-only scan"
+    latest = json.loads((tmp_path / "hist" / "pending-latest.json").read_text())
+    assert latest["hosts"]["ONeill"]["unreachable"] is True
+    assert latest["lxc"]["ONeill"]["skipped"] == "unreachable"
+    # the surviving node was still scanned
+    assert latest["lxc"]["pve-01/101"]["name"] == "sonarr"
+
+
+def test_run_fleet_scan_genuine_error_still_sets_exit_code(tmp_path, monkeypatch):
+    """Tolerating unreachable must not swallow a real failure on a live node."""
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[proxmox_nodes]\npve-01 ansible_host=10.0.0.1\n"
+        "[remote_hosts]\n[proxmox_vms]\n[custom_hosts]\n"
+    )
+
+    def _factory(host, **kw):
+        return ScriptedExecutor(script={"which apt-get": [_ok("apt")],
+                                        "dist-upgrade": [_fail(stderr="disk I/O error")]})
+
+    _patch_executors(monkeypatch, _factory)
+    monkeypatch.setattr(scan_mod, "_discover_lxcs", lambda ex, s: [])
+
+    settings = GlobalSettings(fleet_history_enabled=False)
+    rc = scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv))
+    assert rc == 1

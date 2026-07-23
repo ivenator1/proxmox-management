@@ -23,7 +23,8 @@
         <td><code>{{ entry.get("pkg_mgr", "") }}</code></td>
         <td class="num {% if not count %}zero{% endif %}">{{ count }}</td>
         <td>
-          {% if entry.get("error") %}<span class="fail">{{ entry.error }}</span>
+          {% if entry.get("unreachable") %}<span class="pill muted" title="{{ entry.error }}">unreachable — skipped</span>
+          {% elif entry.get("error") %}<span class="fail">{{ entry.error }}</span>
           {% elif entry.get("pending") %}
             <details class="pkg-list">
               <summary>{{ entry.pending | length }} package(s)</summary>
@@ -80,7 +81,7 @@
         </td>
         <td>
           {% if entry.get("skipped") %}<span class="pill muted">skipped ({{ entry.skipped }})</span>{% endif %}
-          {% if entry.get("error") %}<span class="fail">{{ entry.error }}</span>{% endif %}
+          {% if entry.get("error") and not entry.get("unreachable") %}<span class="fail">{{ entry.error }}</span>{% endif %}
         </td>
       </tr>
     {% endfor %}
@@ -100,7 +101,7 @@
 {% if scans %}
 <div class="table-card">
 <table>
-  <thead><tr><th>Timestamp</th><th class="num">Host pkgs</th><th class="num">LXC OS pkgs</th><th class="num">Outdated apps</th><th class="num" title="Containers at or above {{ disk_threshold }}% rootfs">Low disk</th><th class="num" title="Containers whose OS is behind their ct script's target">OS outdated</th><th class="num">Errors</th></tr></thead>
+  <thead><tr><th>Timestamp</th><th class="num">Host pkgs</th><th class="num">LXC OS pkgs</th><th class="num">Outdated apps</th><th class="num" title="Containers at or above {{ disk_threshold }}% rootfs">Low disk</th><th class="num" title="Containers whose OS is behind their ct script's target">OS outdated</th><th class="num" title="Hosts that never answered — skipped, not failed">Unreachable</th><th class="num">Errors</th></tr></thead>
   <tbody>
   {% for row in scans %}
     <tr>
@@ -110,6 +111,7 @@
       <td class="num {% if not row.outdated_apps %}zero{% endif %}">{{ row.outdated_apps }}</td>
       <td class="num {% if not row.get('low_disk') %}zero{% endif %}">{% if row.get('low_disk') %}<span class="fail">{{ row.low_disk }}</span>{% else %}0{% endif %}</td>
       <td class="num {% if not row.get('os_mismatch') %}zero{% endif %}">{% if row.get('os_mismatch') %}<span class="fail">{{ row.os_mismatch }}</span>{% else %}0{% endif %}</td>
+      <td class="num {% if not row.get('unreachable') %}zero{% endif %}">{{ row.get('unreachable', 0) }}</td>
       <td class="num {% if not row.errors %}zero{% endif %}">{% if row.errors %}<span class="fail">{{ row.errors }}</span>{% else %}0{% endif %}</td>
     </tr>
   {% endfor %}
