@@ -354,8 +354,10 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
   checked for **every** container (plain apt runs out of space too); OS only when a ct script
   exists. Both fire **outside** `try` / before the dry-run return, so `--dry-run` reports them
   ahead of a window — that is the point. `scan.py` surfaces the same two signals as
-  `disk_percent`/`os`/`os_mismatch` per container, counted by `pending_summary()` as
-  `low_disk`/`os_mismatch`. Warnings only: nothing is skipped or failed.
+  `disk_percent`/`os`/`os_mismatch` per container, counted by `pending_summary(disk_threshold=)`
+  as `low_disk`/`os_mismatch`, and the dashboard's `/pending` page renders both (Disk + OS
+  columns, plus per-scan counters) — `web/app.py` passes `settings.lxc_disk_warn_percent` so the
+  page and the briefing agree on "low". Warnings only: nothing is skipped or failed.
 - **Introspect precedes `pct_start`**, so `df_stdout`/`os_release_stdout` are empty for a
   container that was stopped (a failed `pct exec` gives rc≠0 + empty stdout, absorbed by
   `failed_when: false`). The parsers return `None`/`""` there and no warning fires — an accepted

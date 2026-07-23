@@ -586,12 +586,17 @@ def create_app(
             raise HTTPException(404, f"no pending snapshot {ref!r}")
         hosts = sorted((snapshot.get("hosts") or {}).items()) if snapshot else []
         lxc = sorted((snapshot.get("lxc") or {}).items(), key=_lxc_sort_key) if snapshot else []
+        # Pass the configured threshold through so the page and the briefing
+        # warnings agree on what counts as "low disk".
+        disk_threshold = settings.lxc_disk_warn_percent
         return templates.TemplateResponse(request, "pending.html", {
             "ref": ref,
             "snapshot": snapshot,
             "hosts": hosts,
             "lxc": lxc,
-            "scans": scan_mod.pending_summary(history_dir, limit=0),
+            "disk_threshold": disk_threshold,
+            "scans": scan_mod.pending_summary(
+                history_dir, limit=0, disk_threshold=disk_threshold),
         })
 
     @protected.get("/history")
