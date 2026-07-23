@@ -45,6 +45,17 @@ def _parse_csv_set(value: Optional[str]) -> Optional[Set[str]]:
 
 
 # Boolean -e extravars that map 1:1 onto GlobalSettings fields.
+#
+# This allowlist is the whole of what `-e` can change on settings. Together with
+# the driver's own reads (`force_window`, `fleet_dry_run`, `custom_dry_run` in
+# run_custom_phase), the complete set of honoured keys is:
+#
+#     fleet_dry_run  lxc_verbose  force_notify  force_window  custom_dry_run
+#
+# Every other key is parsed, carried in the extravars dict, and never read — so
+# `-e discord_webhook=` or `-e fleet_history_dir=/tmp/x` looks accepted and does
+# nothing. Change those in vars.yml (or point --vars-file at another file)
+# instead. Values are booleans only, via _is_true(): true/1/yes.
 _SETTINGS_EXTRAVARS = ("fleet_dry_run", "lxc_verbose", "force_notify", "force_window")
 
 # Per-type record counts shown as table columns, in briefing/phase order.
@@ -156,7 +167,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument("--check", action="store_true", help="dry run (no changes).")
     parser.add_argument("-e", "--extra-vars", action="append", default=[], metavar="KEY=VALUE",
-                        help="extra vars (e.g. fleet_dry_run=true, force_notify=true).")
+                        help="extra vars. Only fleet_dry_run, lxc_verbose, force_notify, force_window "
+                             "and custom_dry_run are honoured; other keys are silently ignored.")
     parser.add_argument("--inventory", default="hosts.ini", help="inventory path.")
     parser.add_argument("--vars-file", default="vars.yml",
                         help="path to vars.yml used to load GlobalSettings.")

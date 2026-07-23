@@ -412,3 +412,38 @@ def test_scan_exit_code_forwarded():
         patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
     ):
         assert cli.main(["--scan"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# -e scope — the honoured set is documented in README/--help/CLAUDE.md
+# ---------------------------------------------------------------------------
+
+
+def test_settings_extravars_allowlist_is_exactly_the_documented_four():
+    """Guards the docs: widening this silently makes README and --help wrong."""
+    assert set(cli._SETTINGS_EXTRAVARS) == {
+        "fleet_dry_run", "lxc_verbose", "force_notify", "force_window"}
+
+
+def test_unknown_extra_vars_are_parsed_but_never_reach_settings():
+    """The trap: `-e discord_webhook=` looks accepted and does nothing."""
+    from proxmox_fleet.models.settings import GlobalSettings
+
+    settings = GlobalSettings(discord_webhook="https://example.invalid/hook",
+                              fleet_history_dir="/var/log/fleet-update")
+    extravars = cli._parse_extra_vars(
+        ["discord_webhook=", "fleet_history_dir=/tmp/elsewhere"])
+    # parsed into the dict...
+    assert extravars == {"discord_webhook": "", "fleet_history_dir": "/tmp/elsewhere"}
+    # ...but the settings are untouched
+    out = cli.apply_extravar_overrides(settings, extravars)
+    assert out.discord_webhook == "https://example.invalid/hook"
+    assert out.fleet_history_dir == "/var/log/fleet-update"
+
+
+def test_known_boolean_extra_var_does_reach_settings():
+    from proxmox_fleet.models.settings import GlobalSettings
+
+    out = cli.apply_extravar_overrides(
+        GlobalSettings(), cli._parse_extra_vars(["fleet_dry_run=true"]))
+    assert out.fleet_dry_run is True

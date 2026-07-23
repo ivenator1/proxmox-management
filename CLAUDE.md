@@ -15,7 +15,7 @@ flags. `fleet-update` (pip console command) is the programmatic/cron interface.
 ./fleet-update.py --dry-run --force-notify     # fleet-wide dry-run, forces Discord/ntfy notify
 ./fleet-update.py --force-notify               # full run, forced notification
 ./fleet-update.py --force-window               # bypass maintenance windows
-./fleet-update.py -e custom_allow_reboot=false # raw extra vars (old -e interface)
+./fleet-update.py -e custom_dry_run=true       # raw extra vars — only 5 keys are honoured
 ./fleet-update.py --history 5                  # table of the last 5 persisted runs (no fleet run)
 ./fleet-update.py --history-show latest        # replay a stored run's briefing (TS or 'latest')
 ./fleet-update.py --limit pve-01,105           # target host names and/or LXC/VM ids only
@@ -401,6 +401,15 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
   (unchanged when `len <= 4005`).
 - **`settings.notifiers` defaults to `None`** (not `[]`): preserves the `notifiers is defined`
   distinction — explicit `[]` means "none" and must not trigger the `discord_webhook` back-compat shim.
+- **`-e KEY=VALUE` honours only five keys** — `fleet_dry_run`, `lxc_verbose`, `force_notify`,
+  `force_window` (folded onto settings by `cli.apply_extravar_overrides` via the
+  `_SETTINGS_EXTRAVARS` allowlist) and `custom_dry_run` (read straight from the dict in
+  `run_custom_phase`). Every other key is parsed by `_parse_extra_vars`, carried in the
+  extravars dict, and **never read**: `-e discord_webhook=` or `-e fleet_history_dir=/tmp/x`
+  looks accepted and silently does nothing. Values are booleans only (`_is_true`: true/1/yes),
+  so `-e` cannot set a string setting at all — use `vars.yml` or `--vars-file`. The example
+  previously advertised in the README and `--help` (`-e custom_allow_reboot=false`) was itself
+  a no-op: `custom_allow_reboot` is only ever read from settings.
 - **`run_shell.yml`/`reboot_host.yml` have `check_mode: false`** — commands always execute; Python
   controls dry-run by choosing a simulate vs. real command. The node flow additionally guards
   reboot with `not dry_run` in Python.
