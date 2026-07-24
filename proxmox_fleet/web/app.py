@@ -417,6 +417,28 @@ def _history_rows_with_deltas(history_dir: str) -> List[Dict[str, Any]]:
     return rows
 
 
+def _record_matches_host(record: Dict[str, Any], name: str) -> bool:
+    """True when *record* belongs to the host identified by *name*.
+
+    Bare names/ids (no ``/``) keep the historical any-``_HOST_KEYS``-equals-
+    ``name`` match, byte-identically. A composite ``node/id`` token (the
+    LXC error/warning ``host`` convention as of Task 5, matching VM's
+    ``node/vm-id``) additionally matches records whose own ``host`` field
+    equals the full token, or whose ``node`` field matches the node part
+    and whose ``id``/``vmid`` field matches the id part — so the page also
+    finds the LxcRecord/VmRecord entries a scan/run persisted separately
+    from the error/warning entries.
+    """
+    if "/" not in name:
+        return any(str(record.get(k, "")) == name for k in _HOST_KEYS)
+    node_part, id_part = name.split("/", 1)
+    if str(record.get("host", "")) == name:
+        return True
+    if str(record.get("node", "")) != node_part:
+        return False
+    return str(record.get("id", "")) == id_part or str(record.get("vmid", "")) == id_part
+
+
 def _host_records(history_dir: str, name: str) -> List[Dict[str, Any]]:
     """A host's records across all persisted runs, newest run first."""
     out: List[Dict[str, Any]] = []
@@ -427,7 +449,7 @@ def _host_records(history_dir: str, name: str) -> List[Dict[str, Any]]:
             continue
         for bucket, columns in BUCKET_COLUMNS.items():
             for record in run.get(bucket, []) or []:
-                if any(str(record.get(k, "")) == name for k in _HOST_KEYS):
+                if _record_matches_host(record, name):
                     out.append({
                         "timestamp": row["timestamp"],
                         "bucket": bucket,
@@ -647,7 +669,7 @@ def create_app(
             "buckets": buckets,
         })
 
-    @protected.get("/hosts/{name}")
+    @protected.get("/hosts/{name:path}")
     def host_detail(request: Request, name: str) -> Any:
         return templates.TemplateResponse(request, "host.html", {
             "name": name,

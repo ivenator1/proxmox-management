@@ -303,7 +303,7 @@ def run_lxc_update(
     # in the same briefing as the failure they predict.
     disk_msg = disk_warning(introspect_res.facts, settings.lxc_disk_warn_percent)
     if disk_msg:
-        outcome.warnings.append(WarningEntry(host=lxc_id, task="disk space", warning=disk_msg))
+        outcome.warnings.append(WarningEntry(host=f"{node}/{lxc_id}", task="disk space", warning=disk_msg))
 
     api_params: Dict[str, Any] = {
         "api_host": api_host,
@@ -352,7 +352,7 @@ def run_lxc_update(
             os_msg = os_mismatch_warning(introspect_res.facts, ct_info, ct_script_name)
             if os_msg:
                 outcome.warnings.append(
-                    WarningEntry(host=lxc_id, task="container OS", warning=os_msg))
+                    WarningEntry(host=f"{node}/{lxc_id}", task="container OS", warning=os_msg))
 
         # ------------------------------------------------------------------
         # Dry-check — version compare only, no mutations
@@ -408,7 +408,7 @@ def run_lxc_update(
                 _vprint(node, lxc_id, name, f"snapshot={'taken' if snap_taken else 'FAILED'}")
             if not snap_taken:
                 outcome.warnings.append(WarningEntry(
-                    host=lxc_id, task="Create snapshot",
+                    host=f"{node}/{lxc_id}", task="Create snapshot",
                     warning="snapshot failed — automatic rollback unavailable for this update",
                 ))
                 snapshot_failed = True
@@ -431,7 +431,7 @@ def run_lxc_update(
             os_failed = os_res.failed
             if os_failed:
                 outcome.errors.append(ErrorEntry(
-                    host=lxc_id, task="OS update", error=_failure_detail(os_res),
+                    host=f"{node}/{lxc_id}", task="OS update", error=_failure_detail(os_res),
                 ))
             if settings.lxc_verbose:
                 summary = (os_res.stdout or "").strip().replace("\n", " ")[:120]
@@ -476,7 +476,7 @@ def run_lxc_update(
             app_changed = not app_res.failed  # tentative; overridden below by version/hash
             if app_failed:
                 outcome.errors.append(ErrorEntry(
-                    host=lxc_id, task="app update", error=_failure_detail(app_res),
+                    host=f"{node}/{lxc_id}", task="app update", error=_failure_detail(app_res),
                 ))
             if settings.lxc_verbose:
                 summary = (app_res.stdout or "").strip().replace("\n", " ")[:120]
@@ -617,7 +617,7 @@ def run_lxc_update(
             app=rescue_app, os="FAILED", snap=False,
         )
         outcome.error = ErrorEntry(
-            host=lxc_id, task=str(failed_task), error=str(exc)[:300]
+            host=f"{node}/{lxc_id}", task=str(failed_task), error=str(exc)[:300]
         )
         outcome.warnings = list(outcome.warnings)
         return outcome
