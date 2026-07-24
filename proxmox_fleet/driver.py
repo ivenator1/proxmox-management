@@ -25,7 +25,14 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 import yaml
 
 from proxmox_fleet import briefing, deps, history, http, inventory, notifiers, window
-from proxmox_fleet.cluster import DEFAULT_CLUSTER, limit_selects_id, map_lookup, matches_any, token_is_id
+from proxmox_fleet.cluster import (
+    DEFAULT_CLUSTER,
+    api_creds,
+    limit_selects_id,
+    map_lookup,
+    matches_any,
+    token_is_id,
+)
 from proxmox_fleet.executor import RunnerExecutor
 from proxmox_fleet.flows._pkg import kuma_healthy
 from proxmox_fleet.flows.custom import run_custom_update
@@ -181,9 +188,11 @@ def run_custom_phase(
     # Phase 0b: serial execution loop.
     state = FleetState()
     failed_hosts: Set[str] = set()
-    # Node name → ansible_host IP map, loaded lazily on the first config that
-    # opts into PVE snapshots (pve_vmid).
-    nodes_map: Optional[Dict[str, str]] = None
+    # Node name → {ansible_host, cluster} map, loaded lazily on the first
+    # config that opts into PVE snapshots (pve_vmid). cluster is threaded
+    # through so the snapshot picks up that cluster's API credential
+    # override, if any (proxmox_fleet.cluster.api_creds).
+    nodes_map: Optional[Dict[str, Dict[str, str]]] = None
 
     for spec in specs:
         # Maintenance window gate (silently skip, mirroring role behaviour).
@@ -214,19 +223,20 @@ def run_custom_phase(
         api_params: Optional[Dict[str, Any]] = None
         if config.pve_vmid.strip():
             if nodes_map is None:
-                nodes_map = {n["name"]: n["ansible_host"] for n in inventory.load_proxmox_nodes(
-                    inventory_path, host_vars_dir=settings.host_vars_dir)}
-            api_host = nodes_map.get(config.pve_node)
-            if api_host is None:
+                nodes_map = {
+                    n["name"]: {"ansible_host": n["ansible_host"], "cluster": n["cluster"]}
+                    for n in inventory.load_proxmox_nodes(
+                        inventory_path, host_vars_dir=settings.host_vars_dir)
+                }
+            node_info = nodes_map.get(config.pve_node)
+            if node_info is None:
                 print(f"FATAL: config {spec.custom_config!r}: pve_node {config.pve_node!r} "
                       "is not in [proxmox_nodes]", file=sys.stderr)
                 raise SystemExit(1)
             node_executor = RunnerExecutor(config.pve_node, inventory=inventory_path, check=check)
             api_params = {
-                "api_host": api_host,
-                "api_user": settings.pve_api_user,
-                "api_token_id": settings.pve_api_token_id,
-                "api_token_secret": settings.pve_api_token_secret,
+                "api_host": node_info["ansible_host"],
+                **api_creds(settings, node_info["cluster"]),
             }
 
         outcome = run_custom_update(

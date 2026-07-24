@@ -1,6 +1,6 @@
 """Tests for proxmox_fleet.models.settings.GlobalSettings."""
 
-from proxmox_fleet.models.settings import GlobalSettings
+from proxmox_fleet.models.settings import GlobalSettings, PveClusterCreds
 
 
 def test_all_defaults():
@@ -168,3 +168,56 @@ def test_id_lists_load_mixed_int_and_qualified_from_yaml(tmp_path):
     s = GlobalSettings.load(f)
     assert s.exclude_list == ["103", "alpha/110"]
     assert s.os_only_lxc_list == ["beta/140"]
+
+
+# --- Task 3: per-cluster PVE API credentials ----------------------------------------
+
+
+def test_pve_cluster_creds_defaults_empty():
+    c = PveClusterCreds()
+    assert c.pve_api_user == ""
+    assert c.pve_api_token_id == ""
+    assert c.pve_api_token_secret == ""
+
+
+def test_pve_clusters_defaults_empty_dict():
+    s = GlobalSettings()
+    assert s.pve_clusters == {}
+
+
+def test_pve_clusters_parses_nested_creds():
+    s = GlobalSettings.model_validate({
+        "pve_clusters": {
+            "alpha": {
+                "pve_api_user": "root@pam",
+                "pve_api_token_id": "ansible",
+                "pve_api_token_secret": "alpha-secret",
+            },
+            "beta": {
+                "pve_api_token_secret": "beta-secret",
+            },
+        }
+    })
+    assert s.pve_clusters["alpha"].pve_api_user == "root@pam"
+    assert s.pve_clusters["alpha"].pve_api_token_id == "ansible"
+    assert s.pve_clusters["alpha"].pve_api_token_secret == "alpha-secret"
+    # beta only overrides one field — the rest default to empty (fallback is
+    # api_creds()'s job, not the model's).
+    assert s.pve_clusters["beta"].pve_api_user == ""
+    assert s.pve_clusters["beta"].pve_api_token_secret == "beta-secret"
+
+
+def test_pve_clusters_loads_from_yaml(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text(
+        "pve_api_user: root@pam\n"
+        "pve_api_token_id: ansible\n"
+        "pve_api_token_secret: global-secret\n"
+        "pve_clusters:\n"
+        "  beta:\n"
+        "    pve_api_token_secret: beta-secret\n"
+    )
+    s = GlobalSettings.load(f)
+    assert s.pve_api_token_secret == "global-secret"
+    assert s.pve_clusters["beta"].pve_api_token_secret == "beta-secret"
+    assert s.pve_clusters["beta"].pve_api_user == ""

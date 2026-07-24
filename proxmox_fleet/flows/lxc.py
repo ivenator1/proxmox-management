@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import lxc_os_changed, lxc_os_pkg_count
-from proxmox_fleet.cluster import DEFAULT_CLUSTER, map_lookup, matches_any, split_qualified
+from proxmox_fleet.cluster import DEFAULT_CLUSTER, api_creds, map_lookup, matches_any, split_qualified
 from proxmox_fleet.executor import Executor, snapshot_with_retry
 from proxmox_fleet.flows._pkg import kuma_healthy
 from proxmox_fleet.lxc_parse import (
@@ -307,9 +307,7 @@ def run_lxc_update(
 
     api_params: Dict[str, Any] = {
         "api_host": api_host,
-        "api_user": settings.pve_api_user,
-        "api_token_id": settings.pve_api_token_id,
-        "api_token_secret": settings.pve_api_token_secret,
+        **api_creds(settings, cluster),
     }
 
     try:
