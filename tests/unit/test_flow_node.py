@@ -271,6 +271,65 @@ def test_manager_lxc_id_empty_skips_check():
     assert not any("pct list" in cmd for cmd in ex.commands)
 
 
+def test_qualified_manager_id_skips_probe_on_other_cluster():
+    """manager_lxc_id="alpha/121" + node cluster="beta" — probe NOT issued.
+
+    A qualified manager id only ever refers to a container on its own
+    cluster; running the probe against a different cluster's node risks
+    matching an unrelated container with the same numeric id and wrongly
+    suppressing that node's reboot.
+    """
+    ex = ScriptedNodeExecutor(script={
+        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+        "vmlinuz": [REBOOT_NEEDED],
+    })
+    outcome = run_node_update(
+        "pve-01", ex, _settings(manager_lxc_id="alpha/121"),
+        dry_run=False, cluster="beta", _sleep=_no_sleep,
+    )
+
+    assert not outcome.failed
+    assert not any("pct list" in cmd for cmd in ex.commands)
+    # not treated as manager — reboot proceeds normally
+    assert outcome.record.status == "UPDATED & REBOOTED"
+    assert ex.reboots == 1
+
+
+def test_qualified_manager_id_runs_probe_on_matching_cluster():
+    """manager_lxc_id="alpha/121" + node cluster="alpha" — probe IS issued."""
+    ex = ScriptedNodeExecutor(script={
+        "pct list": [IS_MANAGER],
+        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+        "vmlinuz": [REBOOT_NEEDED],
+    })
+    outcome = run_node_update(
+        "pve-01", ex, _settings(manager_lxc_id="alpha/121"),
+        dry_run=False, cluster="alpha", _sleep=_no_sleep,
+    )
+
+    assert not outcome.failed
+    assert any("pct list" in cmd for cmd in ex.commands)
+    assert outcome.record.status == "UPDATED (MANUAL REBOOT REQ)"
+    assert ex.reboots == 0
+
+
+def test_bare_manager_id_runs_probe_regardless_of_cluster():
+    """manager_lxc_id="121" (bare) — probe IS issued no matter the node's cluster."""
+    ex = ScriptedNodeExecutor(script={
+        "pct list": [NOT_MANAGER],
+        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+        "vmlinuz": [NO_REBOOT],
+    })
+    outcome = run_node_update(
+        "pve-01", ex, _settings(manager_lxc_id="121"),
+        dry_run=False, cluster="beta", _sleep=_no_sleep,
+    )
+
+    assert not outcome.failed
+    assert any("pct list" in cmd for cmd in ex.commands)
+    assert outcome.record.status == "UPDATED"
+
+
 def test_settle_sleep_called_after_reboot(monkeypatch):
     """The 15 s settle sleep is called after wait_for_port on reboot."""
     monkeypatch.setattr(http_mod, "wait_for_port", lambda *a, **kw: None)

@@ -135,7 +135,11 @@ fleet_history_keep: 30          # keep the newest N run-*.json (0 = keep all)
 
 # --- EXCLUSIONS ---
 #LXC of managing node
-manager_lxc_id: "121"
+# Multi-cluster fleets should qualify this as "cluster/ID" (e.g. "alpha/121")
+# so the node-reboot-suppression check only matches the manager container on
+# its own cluster; a bare ID (e.g. "121") matches that id in every cluster,
+# same as before multi-cluster support.
+manager_lxc_id: "alpha/121"
 
 # List IDs you want to skip entirely (VMs or sensitive LXCs)
 # Multi-cluster fleets may qualify an entry as "cluster/ID" (e.g. "alpha/103")
