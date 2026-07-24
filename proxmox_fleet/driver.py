@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 import yaml
 
 from proxmox_fleet import briefing, deps, history, http, inventory, notifiers, window
-from proxmox_fleet.cluster import DEFAULT_CLUSTER
+from proxmox_fleet.cluster import DEFAULT_CLUSTER, limit_selects_id, map_lookup, matches_any, token_is_id
 from proxmox_fleet.executor import RunnerExecutor
 from proxmox_fleet.flows._pkg import kuma_healthy
 from proxmox_fleet.flows.custom import run_custom_update
@@ -98,13 +98,21 @@ CANARY_SKIP_STATUS = "SKIPPED (canary failed)"
 
 def _soak_canaries(
     settings: GlobalSettings,
-    kuma_map: Dict[str, Any],
+    monitor_map: Dict[str, str],
     tokens: Sequence[str],
     *,
     _sleep: Callable[[float], None] = time.sleep,
 ) -> Optional[str]:
     """Soak after a successful canary wave: wait ``canary_soak_minutes``, then
     poll Kuma for every canary token that has a monitor mapping.
+
+    *monitor_map* is a pre-resolved ``{display_token: monitor_id}`` dict built
+    by the caller — the lxc phase resolves it via ``cluster.map_lookup()``
+    (qualified-id aware, display token ``f"{cluster}/{id}"``); the vm/remote
+    phases pass ``{inventory_name: monitor_id}`` since their kuma maps are
+    keyed by inventory name and stay unqualified. *tokens* is the ordered
+    list of canary display tokens (for a stable "no mapping" skip and the
+    error message).
 
     Returns None when all monitored canaries are healthy (or nothing is
     monitored), else an error message — the caller aborts the second wave.
@@ -115,7 +123,7 @@ def _soak_canaries(
         return None
     url = f"{settings.kuma_url}/api/status-page/heartbeat/{settings.kuma_slug}"
     for token in tokens:
-        monitor_id = str(kuma_map.get(token, ""))
+        monitor_id = str(monitor_map.get(token, ""))
         if not monitor_id:
             continue
         try:
@@ -353,16 +361,19 @@ def run_lxc_phase(
     dry_run = check or settings.fleet_dry_run or settings.lxc_dry_run
     state = FleetState()
 
-    limit_has_ids = limit is not None and any(token.isdigit() for token in limit)
+    limit_has_ids = limit is not None and any(token_is_id(token) for token in limit)
 
     # Discovery pass: resolve every node's managed container ids up-front so
     # the canary wave can span nodes. A discovery failure on one node is
     # recorded and skips that node only — it never gates the canary waves.
-    discovered: List[Tuple[str, str, List[str]]] = []
+    # Each tuple carries the node's cluster so every id-matching decision
+    # below (limit, canary, kuma map) resolves qualified tokens correctly.
+    discovered: List[Tuple[str, str, str, List[str]]] = []
     unreachable_nodes: List[str] = []
     for node_info in nodes:
         node_name = node_info["name"]
         api_host = node_info["ansible_host"]
+        node_cluster = node_info["cluster"]
 
         # Node not targeted and no container ids to look for anywhere → skip
         # the discovery SSH round-trip entirely.
@@ -375,7 +386,7 @@ def run_lxc_phase(
         # Discover which LXCs are on this node (filters exclude_list)
         print(f"[{node_name}] discovering LXCs (first run loads Ansible — may take a moment)...")
         try:
-            lxc_ids = _discover_lxcs(discovery_executor, settings)
+            lxc_ids = _discover_lxcs(discovery_executor, settings, cluster=node_cluster)
         except UnreachableHostError:
             # The node never answered — decided after the loop (quorum gate).
             unreachable_nodes.append(node_name)
@@ -389,10 +400,10 @@ def run_lxc_phase(
             continue
 
         if limit is not None and node_name not in limit:
-            lxc_ids = [i for i in lxc_ids if i in limit]
+            lxc_ids = [i for i in lxc_ids if limit_selects_id(limit, node_cluster, i)]
 
         print(f"[{node_name}] found {len(lxc_ids)} managed LXC(s): {', '.join(lxc_ids) or 'none'}")
-        discovered.append((node_name, api_host, lxc_ids))
+        discovered.append((node_name, api_host, node_cluster, lxc_ids))
 
     # A down node is tolerable while the cluster is still quorate: the other
     # nodes (and their snapshots) keep working, so record a warning instead of
@@ -415,7 +426,7 @@ def run_lxc_phase(
                     host=name, task="discover_lxcs",
                     error=f"node unreachable and {reason}"))
 
-    def _run_node_ids(node_name: str, api_host: str, ids: List[str]) -> bool:
+    def _run_node_ids(node_name: str, api_host: str, cluster: str, ids: List[str]) -> bool:
         """Run one node's containers concurrently; returns True if any failed."""
         wave_failed = False
 
@@ -424,7 +435,7 @@ def run_lxc_phase(
             ex = RunnerExecutor(node_name, inventory=inventory_path, check=check)
             return run_lxc_update(
                 node_name, lxc_id, ex, settings,
-                dry_run=dry_run, api_host=api_host,
+                dry_run=dry_run, api_host=api_host, cluster=cluster,
             )
 
         results = run_concurrent(
@@ -456,44 +467,48 @@ def run_lxc_phase(
                 print(f"  [{node_name}/{lxc_id}] ERROR: {run_err}")
         return wave_failed
 
-    canary_set = {str(c) for c in settings.canary_hosts}
-    all_ids = [i for _, _, ids in discovered for i in ids]
-    canary_ids = [i for i in all_ids if i in canary_set]
-    rest_ids = [i for i in all_ids if i not in canary_set]
+    all_pairs = [(cluster, i) for _, _, cluster, ids in discovered for i in ids]
+    canary_pairs = [(c, i) for c, i in all_pairs if matches_any(settings.canary_hosts, c, i)]
+    rest_pairs = [(c, i) for c, i in all_pairs if not matches_any(settings.canary_hosts, c, i)]
 
-    if not canary_ids or not rest_ids:
-        for node_name, api_host, ids in discovered:
-            _run_node_ids(node_name, api_host, ids)
+    if not canary_pairs or not rest_pairs:
+        for node_name, api_host, cluster, ids in discovered:
+            _run_node_ids(node_name, api_host, cluster, ids)
     else:
-        print(f"[lxc phase] canary wave: {', '.join(canary_ids)}")
+        canary_tokens = [f"{c}/{i}" for c, i in canary_pairs]
+        print(f"[lxc phase] canary wave: {', '.join(canary_tokens)}")
         canary_failed = False
-        for node_name, api_host, ids in discovered:
-            wave = [i for i in ids if i in canary_set]
+        for node_name, api_host, cluster, ids in discovered:
+            wave = [i for i in ids if matches_any(settings.canary_hosts, cluster, i)]
             if wave:
-                canary_failed = _run_node_ids(node_name, api_host, wave) or canary_failed
+                canary_failed = _run_node_ids(node_name, api_host, cluster, wave) or canary_failed
         abort: Optional[str] = None
         if canary_failed:
             abort = "a canary container failed"
         elif not dry_run:
-            abort = _soak_canaries(settings, settings.lxc_kuma_map, canary_ids)
+            monitor_map = {
+                f"{c}/{i}": str(map_lookup(settings.lxc_kuma_map, c, i))
+                for c, i in canary_pairs
+            }
+            abort = _soak_canaries(settings, monitor_map, canary_tokens)
             if abort is not None:
                 state.failed = True
                 state.errors.append(ErrorEntry(
                     host="lxc-canary", task="canary soak", error=abort[:300]))
         if abort is not None:
             print(f"[lxc phase] canary gate failed ({abort}) — "
-                  f"skipping {len(rest_ids)} container(s)")
-            for node_name, _, ids in discovered:
+                  f"skipping {len(rest_pairs)} container(s)")
+            for node_name, _, cluster, ids in discovered:
                 for lxc_id in ids:
-                    if lxc_id not in canary_set:
+                    if not matches_any(settings.canary_hosts, cluster, lxc_id):
                         state.lxc.append(LxcRecord(node=node_name, name=lxc_id,
                                                    id=lxc_id, app=CANARY_SKIP_STATUS,
                                                    snap=False))
         else:
-            for node_name, api_host, ids in discovered:
-                wave = [i for i in ids if i not in canary_set]
+            for node_name, api_host, cluster, ids in discovered:
+                wave = [i for i in ids if not matches_any(settings.canary_hosts, cluster, i)]
                 if wave:
-                    _run_node_ids(node_name, api_host, wave)
+                    _run_node_ids(node_name, api_host, cluster, wave)
 
     if state_output_path is not None:
         state.dump_for_ansible(state_output_path)
@@ -608,8 +623,20 @@ def run_vm_phase(
     nodes_map = {n["name"]: n["ansible_host"] for n in nodes}
     node_clusters = {n["name"]: n.get("cluster", DEFAULT_CLUSTER) for n in nodes}
 
+    def _vm_cluster_hint(v: VmSpec) -> str:
+        # A cheap pre-execution guess for --limit filtering and canary
+        # partitioning only — the authoritative resolution (raising on
+        # ambiguity) happens per-VM in _run_one() via _resolve_vm_cluster()
+        # once vm_locations is set.
+        if v.cluster:
+            return v.cluster
+        if v.pve_node:
+            return node_clusters.get(v.pve_node, DEFAULT_CLUSTER)
+        return DEFAULT_CLUSTER
+
     if limit is not None:
-        vms = [v for v in vms if v.name in limit or v.vmid in limit]
+        vms = [v for v in vms
+               if v.name in limit or limit_selects_id(limit, _vm_cluster_hint(v), v.vmid)]
 
     dry_run = check or settings.fleet_dry_run or settings.vm_dry_run
     state = FleetState()
@@ -675,7 +702,7 @@ def run_vm_phase(
 
     canary = [v for v in vms
               if v.canary or v.name in settings.canary_hosts
-              or v.vmid in settings.canary_hosts]
+              or matches_any(settings.canary_hosts, _vm_cluster_hint(v), v.vmid)]
     rest = [v for v in vms if v not in canary]
 
     if not canary or not rest:
@@ -687,8 +714,9 @@ def run_vm_phase(
         if state.failed:
             abort = "a canary VM failed"
         elif not dry_run:
-            abort = _soak_canaries(settings, settings.vm_kuma_map,
-                                   [v.name for v in canary])
+            canary_names = [v.name for v in canary]
+            monitor_map = {name: str(settings.vm_kuma_map.get(name, "")) for name in canary_names}
+            abort = _soak_canaries(settings, monitor_map, canary_names)
             if abort is not None:
                 state.failed = True
                 state.errors.append(ErrorEntry(
@@ -783,8 +811,9 @@ def run_remote_phase(
         if state.failed:
             abort = "a canary host failed"
         elif not dry_run:
-            abort = _soak_canaries(settings, settings.remote_kuma_map,
-                                   [h.name for h in canary])
+            canary_names = [h.name for h in canary]
+            monitor_map = {name: str(settings.remote_kuma_map.get(name, "")) for name in canary_names}
+            abort = _soak_canaries(settings, monitor_map, canary_names)
             if abort is not None:
                 state.failed = True
                 state.errors.append(ErrorEntry(

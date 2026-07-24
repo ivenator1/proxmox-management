@@ -1047,3 +1047,109 @@ def test_scaling_inert_when_allocation_already_matches(monkeypatch):
     run_lxc_update("pve-01", "101", ex, _settings(lxc_resource_scaling=True),
                    api_host="192.168.1.10")
     assert ex.app_update_kwargs["lxc_needs_scale"] is False
+
+
+# ---------------------------------------------------------------------------
+# Multi-cluster qualified ids (Task 1) — cluster.py wiring
+# ---------------------------------------------------------------------------
+
+
+def test_discover_lxcs_qualified_os_only_matches_its_cluster():
+    ex = ScriptedLxcExecutor(default=_ok(stdout="101\n105\n"))
+    settings = _settings(os_only_lxc_list=["alpha/105"])
+    ids = _discover_lxcs(ex, settings, cluster="alpha")
+    # The cluster qualifier must never reach the shell regex — only the bare id.
+    assert "grep -qxE '(105)'" in ex.commands[0]
+    assert ids == ["101", "105"]
+
+
+def test_discover_lxcs_qualified_os_only_other_cluster_dropped_before_regex():
+    ex = ScriptedLxcExecutor(default=_ok(stdout="101\n"))
+    settings = _settings(os_only_lxc_list=["alpha/105"])
+    _discover_lxcs(ex, settings, cluster="beta")
+    # 105 only applies to "alpha" — beta's regex must not reference it at all.
+    assert "grep -qxE" not in ex.commands[0]
+
+
+def test_discover_lxcs_qualified_exclude_scopes_to_its_cluster():
+    ex = ScriptedLxcExecutor(default=_ok(stdout="101\n105\n"))
+    settings = _settings(exclude_list=["alpha/105"])
+    assert _discover_lxcs(ex, settings, cluster="alpha") == ["101"]
+
+    ex2 = ScriptedLxcExecutor(default=_ok(stdout="101\n105\n"))
+    assert _discover_lxcs(ex2, settings, cluster="beta") == ["101", "105"]
+
+
+def test_discover_lxcs_bare_exclude_applies_to_every_cluster():
+    settings = _settings(exclude_list=["105"])
+    ex_a = ScriptedLxcExecutor(default=_ok(stdout="101\n105\n"))
+    ex_b = ScriptedLxcExecutor(default=_ok(stdout="101\n105\n"))
+    assert _discover_lxcs(ex_a, settings, cluster="alpha") == ["101"]
+    assert _discover_lxcs(ex_b, settings, cluster="beta") == ["101"]
+
+
+def test_run_lxc_update_qualified_app_exclude_only_its_cluster(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    settings = _settings(app_update_exclude_list=["alpha/101"])
+
+    ex_alpha = ScriptedLxcExecutor(
+        introspect_facts=_INTROSPECT_WITH_SCRIPT,
+        script={"reboot-required": [_fail(rc=1)]},
+        lxc_os_result=_ok(stdout="2 upgraded, 0 newly installed", changed=True),
+    )
+    out_alpha = run_lxc_update("pve-01", "101", ex_alpha, settings,
+                               api_host="192.168.1.10", cluster="alpha")
+    assert out_alpha.record.app == "SKIPPED"
+    assert not any(c.startswith("lxc_app_update:") for c in ex_alpha.commands)
+
+    ex_beta = ScriptedLxcExecutor(
+        introspect_facts=_INTROSPECT_WITH_SCRIPT,
+        script={"reboot-required": [_fail(rc=1)]},
+        lxc_os_result=_ok(stdout="2 upgraded, 0 newly installed", changed=True),
+    )
+    out_beta = run_lxc_update("pve-01", "101", ex_beta, settings,
+                              api_host="192.168.1.10", cluster="beta")
+    assert out_beta.record.app != "SKIPPED"
+    assert any(c.startswith("lxc_app_update:") for c in ex_beta.commands)
+
+
+def test_run_lxc_update_bare_app_exclude_applies_to_every_cluster(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    settings = _settings(app_update_exclude_list=["101"])
+
+    for cluster in ("alpha", "beta"):
+        ex = ScriptedLxcExecutor(
+            introspect_facts=_INTROSPECT_WITH_SCRIPT,
+            script={"reboot-required": [_fail(rc=1)]},
+            lxc_os_result=_ok(stdout="2 upgraded, 0 newly installed", changed=True),
+        )
+        out = run_lxc_update("pve-01", "101", ex, settings,
+                             api_host="192.168.1.10", cluster=cluster)
+        assert out.record.app == "SKIPPED"
+
+
+def test_run_lxc_update_kuma_map_exact_qualified_key_wins(monkeypatch):
+    """map_lookup: an exact "cluster/id" kuma key beats the bare "id" key."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    monkeypatch.setattr(http_mod, "get_json", lambda url, **kw: {"heartbeatList": {}})
+
+    from proxmox_fleet.flows import lxc as lxc_mod
+
+    captured = {}
+
+    def _fake_kuma_healthy(payload, *, monitor_id):
+        captured["monitor_id"] = monitor_id
+        return True
+
+    monkeypatch.setattr(lxc_mod, "kuma_healthy", _fake_kuma_healthy)
+
+    settings = _settings(
+        lxc_kuma_map={"101": "5", "alpha/101": "9"},
+        kuma_url="http://kuma", kuma_slug="fleet",
+    )
+    ex = _exec_normal(ver_before="1.0", ver_after="1.1")
+    run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10", cluster="alpha")
+    assert captured["monitor_id"] == "9"

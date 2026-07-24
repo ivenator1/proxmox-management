@@ -149,6 +149,27 @@ def test_build_args_rejects_unknown_phase():
         build_run_args({"phases": "lxc,bogus"})
 
 
+def test_build_args_limit_accepts_qualified_cluster_id():
+    args = build_run_args({"limit": "alpha/101"})
+    assert args == ["--limit", "alpha/101"]
+
+
+def test_build_args_limit_rejects_too_many_slashes():
+    with pytest.raises(ValueError, match="invalid token"):
+        build_run_args({"limit": "a/b/c"})
+
+
+def test_build_args_limit_rejects_shell_metacharacters_in_qualified_token():
+    with pytest.raises(ValueError, match="invalid token"):
+        build_run_args({"limit": "alpha/101;rm -rf /"})
+
+
+def test_build_args_phases_rejects_qualified_token():
+    # cluster/id qualification is a --limit-only concept — phases stay bare.
+    with pytest.raises(ValueError, match="invalid token"):
+        build_run_args({"phases": "alpha/lxc"})
+
+
 # --- read-only pages --------------------------------------------------------- #
 
 def test_index_shows_latest_run_and_pending(history_dir):

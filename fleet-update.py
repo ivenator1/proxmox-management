@@ -154,7 +154,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="HOST,ID,...",
         help=(
             "Restrict the run to these host names and/or LXC/VM ids — everything else "
-            "is silently skipped. Use 'manager' to include the manager self-update."
+            "is silently skipped. Use cluster/ID (e.g. alpha/101) to target one "
+            "cluster's container/VM in a multi-cluster fleet. Use 'manager' to include "
+            "the manager self-update."
         ),
     )
     parser.add_argument(
