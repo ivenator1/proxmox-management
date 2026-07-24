@@ -15,7 +15,7 @@ flags. `fleet-update` (pip console command) is the programmatic/cron interface.
 ./fleet-update.py --dry-run --force-notify     # fleet-wide dry-run, forces Discord/ntfy notify
 ./fleet-update.py --force-notify               # full run, forced notification
 ./fleet-update.py --force-window               # bypass maintenance windows
-./fleet-update.py -e custom_allow_reboot=false # raw extra vars (old -e interface)
+./fleet-update.py -e custom_dry_run=true       # raw extra vars — only 5 keys are honoured
 ./fleet-update.py --history 5                  # table of the last 5 persisted runs (no fleet run)
 ./fleet-update.py --history-show latest        # replay a stored run's briefing (TS or 'latest')
 ./fleet-update.py --limit pve-01,105           # target host names and/or LXC/VM ids only
@@ -340,6 +340,51 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
   a `FAILED` record without aborting the others.
 - **Rollback only fires when `snap_taken`** — `strategy: none` or a failed snapshot just records
   `FAILED` (the latter `FAILED (NO SNAPSHOT)`); **vzdump alone never auto-restores**.
+- **A non-zero OS/app update does not raise** (the flow carries on so the other line still gets
+  reported) but it *is* a failed run: each one appends an `ErrorEntry` (task `OS update` /
+  `app update`) to `LxcFlowOutcome.errors` carrying `_failure_detail()` — the failing command's
+  stderr, else stdout, ANSI-stripped, collapsed to one line and tail-capped at 400 chars (the
+  community scripts colourise even under `TERM=dumb`/`PHS_SILENT`, and their *last* line can be a
+  misleading fallthrough with the real cause two lines above) — and sets
+  `outcome.failed`. Without that the record reads `FAILED` while `state.failed` stays false, so
+  the exit code, history and dashboard all claim success with no reason recorded anywhere.
+  `outcome.errors` (plural, lxc-only, both lines can fail) is separate from `outcome.error` (the
+  single rescue-path exception); `driver._fold_outcome()` reads it defensively via `getattr`.
+  These failures do **not** enter rescue, so **they do not roll back** — the container is left
+  half-updated by design.
+- **Pre-emptive health warnings** (`flows/lxc.py`: `disk_warning()` / `os_mismatch_warning()`):
+  the `lxc_introspect` primitive also returns `df_stdout` + `os_release_stdout` (batched — no
+  extra subprocess), and the flow emits a `WarningEntry` when the rootfs is at/over
+  `lxc_disk_warn_percent` (default 75, below the community scripts' own >80% `exit 114`) or the
+  container OS is behind the ct script's `var_os`/`var_version` (the `exit 203` trap). Disk is
+  checked for **every** container (plain apt runs out of space too); OS only when a ct script
+  exists. Both fire **outside** `try` / before the dry-run return, so `--dry-run` reports them
+  ahead of a window — that is the point. `scan.py` surfaces the same two signals as
+  `disk_percent`/`os`/`os_mismatch` per container, counted by `pending_summary(disk_threshold=)`
+  as `low_disk`/`os_mismatch`, and the dashboard's `/pending` page renders both (Disk + OS
+  columns, plus per-scan counters) — `web/app.py` passes `settings.lxc_disk_warn_percent` so the
+  page and the briefing agree on "low". Warnings only: nothing is skipped or failed.
+- **Introspect precedes `pct_start`**, so `df_stdout`/`os_release_stdout` are empty for a
+  container that was stopped (a failed `pct exec` gives rc≠0 + empty stdout, absorbed by
+  `failed_when: false`). The parsers return `None`/`""` there and no warning fires — an accepted
+  gap, not a false negative to "fix" by moving the reads after the start.
+- **`os_version_matches()` mirrors `check_container_os_guard`**: exact match or a prefix on a
+  dot boundary (alpine `3.22.1` satisfies a script targeting `3.22`), and missing data on either
+  side counts as a match, so an unparseable read never invents a warning.
+- **`parse_ct_script` must handle `var_x="${var_x:-N}"`**: current community scripts write that
+  form so the environment can override, and the bare `var_cpu="2"` patterns silently stopped
+  matching. Every field now goes through the `_var()` helper, which accepts both forms.
+- **Resource scaling is opt-in and re-sourced** (`lxc_parse.resource_scale_plan`): `pct set $CTID
+  -cores N` is gone from every current ct script *and* from `build.func`/`install.func` — upstream
+  dropped build-time scaling, so `parse_ct_script` no longer returns `run_cpu`/`run_ram`/
+  `needs_resource_scale`. The run side is now the container's live allocation from `pct config`
+  (`cores:`/`memory:`, **anchored with `^…` + MULTILINE** — the `description:` field is a blob of
+  URL-encoded HTML that an unanchored pattern matches inside). Targets are `max(script, current)`
+  so an over-provisioned container is never shrunk, and the restore target is the live pre-scale
+  value. The plan is always computed (visible under `--verbose`) but only executed when
+  `lxc_resource_scaling: true` — default **false**, because turning it on adds `pct set` calls the
+  scripts themselves no longer make. It can only fire on hand-provisioned containers; one created
+  by its own script already matches its spec.
 - **Custom-config commands are opaque strings**: `CustomConfig` validates as literals, never
   renders. `steps.run_steps()` resolves only `{{ steps.NAME }}` in Python at run time; everything
   else is left for the shell. `register` stashes a step's stdout for a later `when:`.
@@ -362,6 +407,15 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
   (unchanged when `len <= 4005`).
 - **`settings.notifiers` defaults to `None`** (not `[]`): preserves the `notifiers is defined`
   distinction — explicit `[]` means "none" and must not trigger the `discord_webhook` back-compat shim.
+- **`-e KEY=VALUE` honours only five keys** — `fleet_dry_run`, `lxc_verbose`, `force_notify`,
+  `force_window` (folded onto settings by `cli.apply_extravar_overrides` via the
+  `_SETTINGS_EXTRAVARS` allowlist) and `custom_dry_run` (read straight from the dict in
+  `run_custom_phase`). Every other key is parsed by `_parse_extra_vars`, carried in the
+  extravars dict, and **never read**: `-e discord_webhook=` or `-e fleet_history_dir=/tmp/x`
+  looks accepted and silently does nothing. Values are booleans only (`_is_true`: true/1/yes),
+  so `-e` cannot set a string setting at all — use `vars.yml` or `--vars-file`. The example
+  previously advertised in the README and `--help` (`-e custom_allow_reboot=false`) was itself
+  a no-op: `custom_allow_reboot` is only ever read from settings.
 - **`run_shell.yml`/`reboot_host.yml` have `check_mode: false`** — commands always execute; Python
   controls dry-run by choosing a simulate vs. real command. The node flow additionally guards
   reboot with `not dry_run` in Python.

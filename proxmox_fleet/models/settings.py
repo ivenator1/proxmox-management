@@ -49,6 +49,13 @@ class GlobalSettings(BaseModel):
     lxc_tags: List[str] = Field(default_factory=lambda: ["community-script", "proxmox-helper-scripts"])
     lxc_forks: int = 20
     lxc_continue_on_error: bool = False
+    # Warn below the community scripts' own >80% abort (check_container_storage)
+    # so a container is flagged a run or two before its updates start failing.
+    lxc_disk_warn_percent: int = 75
+    # Temporarily raise cores/memory to the ct script's var_cpu/var_ram for the
+    # update, then restore. Defaults off: upstream dropped build-time scaling, so
+    # turning this on adds `pct set` calls the scripts themselves no longer make.
+    lxc_resource_scaling: bool = False
     lxc_kuma_map: Dict[str, Any] = Field(default_factory=dict)
     exclude_list: List[str] = Field(default_factory=list)
     os_update_exclude_list: List[str] = Field(default_factory=list)

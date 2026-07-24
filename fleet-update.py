@@ -67,8 +67,10 @@ EXAMPLES
   # Verbose LXC output with a custom inventory file:
   ./fleet-update.py --verbose --inventory /etc/fleet/hosts.ini
 
-  # Pass a raw extra var (same as old 'fleet-update -e KEY=VALUE'):
-  ./fleet-update.py -e custom_allow_reboot=false
+  # Pass a raw extra var (same as old 'fleet-update -e KEY=VALUE'). Only
+  # fleet_dry_run, lxc_verbose, force_notify, force_window and custom_dry_run
+  # are honoured -- any other key is accepted and silently ignored:
+  ./fleet-update.py -e custom_dry_run=true
 
   # Show the last 5 persisted runs / replay the latest run's briefing:
   ./fleet-update.py --history 5
@@ -115,7 +117,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         action="append",
         default=[],
         metavar="KEY=VALUE",
-        help="Pass a raw extra var. Can be repeated. Example: -e custom_allow_reboot=false",
+        help="Raw extra var, repeatable. Only fleet_dry_run, lxc_verbose, force_notify, "
+             "force_window and custom_dry_run are honoured; any other key is accepted "
+             "and silently ignored (set it in vars.yml instead).",
     )
     parser.add_argument(
         "--inventory",

@@ -838,3 +838,92 @@ def test_history_renders_activity_heatmap(history_dir):
     assert resp.status_code == 200
     assert "Activity" in resp.text
     assert "heatmap" in resp.text
+
+
+def test_pending_page_renders_health_signals(history_dir):
+    """Low disk and an out-of-date container OS must be visible on the page."""
+    scan_mod.write_pending({
+        "timestamp": "20260104T000000000000Z",
+        "hosts": {},
+        "lxc": {
+            "130": {"node": "Hammond", "name": "grafana", "skipped": None,
+                    "os_pending_count": 4, "os_pending": ["grafana"], "app": None,
+                    "disk_percent": 90, "os": "debian 13",
+                    "os_mismatch": None, "error": None},
+            "123": {"node": "Hammond", "name": "nginxproxymanager", "skipped": None,
+                    "os_pending_count": 0, "os_pending": [], "app": None,
+                    "disk_percent": 63, "os": "debian 12",
+                    "os_mismatch": "container runs debian 12 but ct/nginxproxymanager.sh "
+                                   "targets debian 13", "error": None},
+        },
+    }, history_dir=history_dir, keep=0)
+
+    resp = _client(history_dir).get("/pending", params={"ref": "20260104T000000000000Z"})
+    assert resp.status_code == 200
+    assert "90%" in resp.text                      # over the 75% default → flagged
+    assert "63%" in resp.text
+    assert "debian 12 — outdated" in resp.text     # the mismatch pill
+    assert "targets debian 13" in resp.text        # full reason in the tooltip
+
+
+def test_pending_page_tolerates_scans_without_health_keys(history_dir):
+    """The seeded fixture predates the health fields — must still render."""
+    resp = _client(history_dir).get("/pending")
+    assert resp.status_code == 200
+    assert "sonarr" in resp.text
+
+
+def test_pending_page_renders_health_signals_on_node_keyed_snapshots(history_dir):
+    """The intersection of #38 and #41: node/id keys AND the health columns.
+
+    Neither branch covered this on its own — #38's snapshots are keyed
+    "node/id" while #41's Disk/OS columns render from the same entries.
+    """
+    scan_mod.write_pending({
+        "timestamp": "20260105T000000000000Z",
+        "hosts": {},
+        "lxc": {
+            "Hammond/130": {"node": "Hammond", "id": "130", "name": "grafana",
+                            "skipped": None, "os_pending_count": 4,
+                            "os_pending": ["grafana"], "app": None,
+                            "disk_percent": 90, "os": "debian 13",
+                            "os_mismatch": None, "error": None},
+            "Hammond/123": {"node": "Hammond", "id": "123",
+                            "name": "nginxproxymanager", "skipped": None,
+                            "os_pending_count": 0, "os_pending": [], "app": None,
+                            "disk_percent": 63, "os": "debian 12",
+                            "os_mismatch": "container runs debian 12 but "
+                                           "ct/nginxproxymanager.sh targets debian 13",
+                            "error": None},
+        },
+    }, history_dir=history_dir, keep=0)
+
+    resp = _client(history_dir).get("/pending", params={"ref": "20260105T000000000000Z"})
+    assert resp.status_code == 200
+    assert "90%" in resp.text and "63%" in resp.text
+    assert "debian 12 — outdated" in resp.text
+    # the display id, not the raw "Hammond/130" key
+    assert ">130<" in resp.text and ">123<" in resp.text
+    assert "Hammond/130" not in resp.text
+
+
+def test_pending_page_shows_unreachable_as_skipped_not_an_error(history_dir):
+    """An unreachable host reads as "could not look", not a red failure."""
+    scan_mod.write_pending({
+        "timestamp": "20260106T000000000000Z",
+        "hosts": {"ONeill": {"kind": "node", "pkg_mgr": "", "pending_count": 0,
+                             "pending": [], "unreachable": True,
+                             "error": "No route to host"}},
+        "lxc": {"ONeill": {"node": "ONeill", "id": "ONeill", "name": "ONeill",
+                           "skipped": "unreachable", "os_pending_count": 0,
+                           "os_pending": [], "app": None, "disk_percent": None,
+                           "os": "", "os_mismatch": None, "unreachable": True,
+                           "error": "discovery failed: node unreachable"}},
+    }, history_dir=history_dir, keep=0)
+
+    resp = _client(history_dir).get("/pending", params={"ref": "20260106T000000000000Z"})
+    assert resp.status_code == 200
+    assert "unreachable — skipped" in resp.text
+    assert "skipped (unreachable)" in resp.text
+    # the raw error is a tooltip, not a red cell
+    assert '<span class="fail">No route to host</span>' not in resp.text
