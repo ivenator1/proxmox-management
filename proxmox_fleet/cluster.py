@@ -87,3 +87,33 @@ def limit_selects_id(limit: Iterable[Any], cluster: str, vmid: str) -> bool:
     keep call sites self-documenting about which list is being consulted.
     """
     return matches_any(limit, cluster, vmid)
+
+
+def api_creds(settings: Any, cluster: str) -> Dict[str, str]:
+    """Return ``{"api_user", "api_token_id", "api_token_secret"}`` for *cluster*.
+
+    Per-field fallback: an entry in ``settings.pve_clusters[cluster]`` wins
+    only when it is non-empty; an empty/absent override falls back to the
+    matching global ``settings.pve_api_*`` value. With no ``pve_clusters``
+    entry for *cluster* (or no ``pve_clusters`` at all), this returns exactly
+    the global values — back-compat for single-cluster fleets.
+
+    ``settings`` is accepted duck-typed (not imported as
+    ``models.settings.GlobalSettings``) to avoid a settings↔cluster import
+    cycle.
+    """
+    override = getattr(settings, "pve_clusters", {}).get(cluster)
+
+    def _field(name: str) -> str:
+        global_value = getattr(settings, name)
+        if override is not None:
+            override_value = getattr(override, name, "")
+            if override_value:
+                return str(override_value)
+        return str(global_value)
+
+    return {
+        "api_user": _field("pve_api_user"),
+        "api_token_id": _field("pve_api_token_id"),
+        "api_token_secret": _field("pve_api_token_secret"),
+    }

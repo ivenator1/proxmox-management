@@ -67,6 +67,7 @@ class ScriptedVmExecutor:
         self.snap_changed = snap_changed
         self.snapshots_created = []
         self.snapshots_deleted = []
+        self.snapshot_api_params = []
 
     def _resp(self, command):
         for key, queue in self.script.items():
@@ -86,6 +87,7 @@ class ScriptedVmExecutor:
         return _ok()
 
     def snapshot(self, vmid, *, snap_state, **api_params):
+        self.snapshot_api_params.append(dict(api_params))
         if snap_state == "present":
             self.snapshots_created.append(vmid)
         else:
@@ -144,6 +146,60 @@ def test_normal_update_apt():
     assert "200" in vm_ex.snapshots_deleted
     # No qm commands went to the VM executor
     assert not any("qm" in c for c in vm_ex.commands)
+
+
+# ---------------------------------------------------------------------------
+# Task 3: per-cluster API credentials reach the snapshot call
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_uses_global_creds_for_default_cluster():
+    vm_ex = _vm_ex(**{
+        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+        "reboot-required": [_ok(rc=1, changed=False)],
+    })
+    node_ex = _node_ex()
+
+    run_vm_update("pve-01", "200", "my-vm", vm_ex, node_ex, _settings(),
+                  dry_run=False, api_host="1.2.3.4")
+
+    assert vm_ex.snapshot_api_params
+    for params in vm_ex.snapshot_api_params:
+        assert params == {
+            "api_host": "1.2.3.4",
+            "api_user": "root@pam",
+            "api_token_id": "test",
+            "api_token_secret": "secret",
+        }
+
+
+def test_snapshot_uses_beta_cluster_override():
+    vm_ex = _vm_ex(**{
+        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+        "reboot-required": [_ok(rc=1, changed=False)],
+    })
+    node_ex = _node_ex()
+    settings = _settings(pve_clusters={
+        "beta": {
+            "pve_api_user": "beta-user@pve",
+            "pve_api_token_id": "beta-tok",
+            "pve_api_token_secret": "beta-secret",
+        }
+    })
+
+    run_vm_update("pve-01", "200", "my-vm", vm_ex, node_ex, settings,
+                  dry_run=False, api_host="1.2.3.4", cluster="beta")
+
+    assert vm_ex.snapshot_api_params
+    for params in vm_ex.snapshot_api_params:
+        assert params == {
+            "api_host": "1.2.3.4",
+            "api_user": "beta-user@pve",
+            "api_token_id": "beta-tok",
+            "api_token_secret": "beta-secret",
+        }
 
 
 def test_update_with_reboot():

@@ -1,6 +1,23 @@
 pve_api_user: "root@pam"
 pve_api_token_id: "ansible"
 pve_api_token_secret: "pve_api_token_secret" #Change with your api token secret
+
+# Multi-cluster fleets: each cluster's API token normally lives on that
+# cluster only, so the three pve_api_* values above may not work everywhere.
+# pve_clusters overrides them per cluster (keyed by the same name used in
+# each node's cluster= inventory var); any field left unset/empty falls back
+# to the global pve_api_* value above. Single-cluster fleets can leave this
+# unset entirely.
+# pve_clusters:
+#   alpha:
+#     pve_api_user: "root@pam"
+#     pve_api_token_id: "ansible"
+#     pve_api_token_secret: "alpha_api_token_secret"
+#   beta:
+#     pve_api_user: "root@pam"
+#     pve_api_token_id: "ansible"
+#     pve_api_token_secret: "beta_api_token_secret"
+
 discord_webhook: "discord_webhook" #Change with your Discord Webook URL
 
 # --- NOTIFIERS ---

@@ -2,6 +2,7 @@
 
 from proxmox_fleet.cluster import (
     DEFAULT_CLUSTER,
+    api_creds,
     id_matches,
     limit_selects_id,
     map_lookup,
@@ -9,6 +10,7 @@ from proxmox_fleet.cluster import (
     split_qualified,
     token_is_id,
 )
+from proxmox_fleet.models.settings import GlobalSettings
 
 
 def test_default_cluster_constant():
@@ -155,3 +157,84 @@ def test_limit_selects_id_host_name_token_never_matches():
 
 def test_limit_selects_id_empty_limit():
     assert limit_selects_id(set(), "alpha", "101") is False
+
+
+# --- api_creds -----------------------------------------------------------------------
+
+
+def test_api_creds_no_pve_clusters_returns_globals():
+    s = GlobalSettings(
+        pve_api_user="root@pam",
+        pve_api_token_id="ansible",
+        pve_api_token_secret="global-secret",
+    )
+    assert api_creds(s, "alpha") == {
+        "api_user": "root@pam",
+        "api_token_id": "ansible",
+        "api_token_secret": "global-secret",
+    }
+
+
+def test_api_creds_unknown_cluster_falls_back_to_globals():
+    s = GlobalSettings.model_validate({
+        "pve_api_user": "root@pam",
+        "pve_api_token_id": "ansible",
+        "pve_api_token_secret": "global-secret",
+        "pve_clusters": {
+            "beta": {"pve_api_token_secret": "beta-secret"},
+        },
+    })
+    assert api_creds(s, "gamma") == {
+        "api_user": "root@pam",
+        "api_token_id": "ansible",
+        "api_token_secret": "global-secret",
+    }
+
+
+def test_api_creds_full_cluster_override():
+    s = GlobalSettings.model_validate({
+        "pve_api_user": "root@pam",
+        "pve_api_token_id": "ansible",
+        "pve_api_token_secret": "global-secret",
+        "pve_clusters": {
+            "alpha": {
+                "pve_api_user": "alpha-user@pve",
+                "pve_api_token_id": "alpha-token",
+                "pve_api_token_secret": "alpha-secret",
+            },
+        },
+    })
+    assert api_creds(s, "alpha") == {
+        "api_user": "alpha-user@pve",
+        "api_token_id": "alpha-token",
+        "api_token_secret": "alpha-secret",
+    }
+
+
+def test_api_creds_per_field_fallback():
+    # beta only overrides the token secret — user/token_id inherit globals.
+    s = GlobalSettings.model_validate({
+        "pve_api_user": "root@pam",
+        "pve_api_token_id": "ansible",
+        "pve_api_token_secret": "global-secret",
+        "pve_clusters": {
+            "beta": {"pve_api_token_secret": "beta-secret"},
+        },
+    })
+    assert api_creds(s, "beta") == {
+        "api_user": "root@pam",
+        "api_token_id": "ansible",
+        "api_token_secret": "beta-secret",
+    }
+
+
+def test_api_creds_empty_override_string_falls_back_to_global():
+    s = GlobalSettings.model_validate({
+        "pve_api_user": "root@pam",
+        "pve_api_token_id": "ansible",
+        "pve_api_token_secret": "global-secret",
+        "pve_clusters": {
+            "beta": {"pve_api_user": "", "pve_api_token_secret": "beta-secret"},
+        },
+    })
+    assert api_creds(s, "beta")["api_user"] == "root@pam"

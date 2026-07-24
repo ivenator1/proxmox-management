@@ -1100,6 +1100,98 @@ def test_custom_phase_passes_snapshot_wiring(tmp_path, monkeypatch):
     assert captured["snapshot_retry_delay"] == 1.5
 
 
+def _pve_custom_inventory_multi_cluster(tmp_path: Path) -> str:
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\n"
+        "pve-01 ansible_host=10.0.0.9\n"
+        "pve-02 ansible_host=10.0.0.10 cluster=beta\n"
+        "[custom_hosts]\n"
+        "gitea ansible_host=10.0.0.1 custom_config=gitea\n"
+    )
+    return str(p)
+
+
+def test_custom_phase_uses_beta_cluster_creds(tmp_path, monkeypatch):
+    """Task 3: a config pinned to a beta-cluster node picks up that
+    cluster's pve_clusters override instead of the global pve_api_* creds."""
+    inv = _pve_custom_inventory_multi_cluster(tmp_path)
+    _write_config(tmp_path, "gitea", {
+        "name": "Gitea",
+        "update_steps": [{"name": "upgrade", "command": "do-upgrade"}],
+        "health_check": {"type": "none"},
+        "pve_vmid": 105,
+        "pve_node": "pve-02",
+    })
+    settings = _settings(
+        tmp_path, pve_api_user="root@pam",
+        pve_api_token_id="tk", pve_api_token_secret="sec",
+        pve_clusters={
+            "beta": {
+                "pve_api_user": "beta-user@pve",
+                "pve_api_token_id": "beta-tok",
+                "pve_api_token_secret": "beta-sec",
+            }
+        },
+    )
+
+    captured: Dict[str, Any] = {}
+
+    def _fake_update(host, config, executor, **kw):
+        captured.update(kw, host=host, config=config, executor=executor)
+        from proxmox_fleet.flows.custom import CustomFlowOutcome
+        return CustomFlowOutcome()
+
+    monkeypatch.setattr(driver_mod, "run_custom_update", _fake_update)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda host, **kw: ScriptedExecutor())
+
+    run_custom_phase(settings=settings, inventory_path=inv, state_output_path=None)
+
+    assert captured["api_params"] == {
+        "api_host": "10.0.0.10", "api_user": "beta-user@pve",
+        "api_token_id": "beta-tok", "api_token_secret": "beta-sec",
+    }
+
+
+def test_custom_phase_default_cluster_node_uses_globals_with_pve_clusters_set(tmp_path, monkeypatch):
+    """A node with no cluster= (DEFAULT_CLUSTER) is unaffected by an unrelated
+    beta override — back-compat within a mixed-cluster fleet."""
+    inv = _pve_custom_inventory_multi_cluster(tmp_path)
+    _write_config(tmp_path, "gitea", {
+        "name": "Gitea",
+        "update_steps": [{"name": "upgrade", "command": "do-upgrade"}],
+        "health_check": {"type": "none"},
+        "pve_vmid": 105,
+        "pve_node": "pve-01",
+    })
+    settings = _settings(
+        tmp_path, pve_api_user="root@pam",
+        pve_api_token_id="tk", pve_api_token_secret="sec",
+        pve_clusters={
+            "beta": {"pve_api_token_secret": "beta-sec"},
+        },
+    )
+
+    captured: Dict[str, Any] = {}
+
+    def _fake_update(host, config, executor, **kw):
+        captured.update(kw, host=host, config=config, executor=executor)
+        from proxmox_fleet.flows.custom import CustomFlowOutcome
+        return CustomFlowOutcome()
+
+    monkeypatch.setattr(driver_mod, "run_custom_update", _fake_update)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda host, **kw: ScriptedExecutor())
+
+    run_custom_phase(settings=settings, inventory_path=inv, state_output_path=None)
+
+    assert captured["api_params"] == {
+        "api_host": "10.0.0.9", "api_user": "root@pam",
+        "api_token_id": "tk", "api_token_secret": "sec",
+    }
+
+
 def test_custom_phase_no_snapshot_wiring_without_pve_vmid(tmp_path, monkeypatch):
     inv = _pve_custom_inventory(tmp_path)
     _write_config(tmp_path, "gitea", {

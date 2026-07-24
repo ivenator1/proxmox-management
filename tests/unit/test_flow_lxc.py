@@ -75,6 +75,7 @@ class ScriptedLxcExecutor:
         self.snapshots_deleted: list = []
         self.rollback_called = False
         self.app_update_kwargs: dict = {}
+        self.snapshot_api_params: list = []
 
         self._introspect_facts = introspect_facts if introspect_facts is not None else dict(_INTROSPECT_NO_SCRIPT)
         self._lxc_os_result = lxc_os_result
@@ -101,6 +102,7 @@ class ScriptedLxcExecutor:
         return _ok()
 
     def snapshot(self, lxc_id, *, snap_state, **api_params):
+        self.snapshot_api_params.append(dict(api_params))
         if snap_state == "present":
             self.snapshots_created.append(lxc_id)
         else:
@@ -219,6 +221,64 @@ def test_version_unchanged_noop(monkeypatch):
     assert out.record is None  # idle OK is suppressed
     assert out.changed is False
     assert out.failed is False
+
+
+# ---------------------------------------------------------------------------
+# Task 3: per-cluster API credentials reach the snapshot call
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_uses_global_creds_for_default_cluster(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal()
+    run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
+    assert ex.snapshot_api_params  # at least one snapshot call happened
+    for params in ex.snapshot_api_params:
+        assert params == {
+            "api_host": "192.168.1.10",
+            "api_user": "root@pam",
+            "api_token_id": "tok",
+            "api_token_secret": "secret",
+        }
+
+
+def test_snapshot_uses_beta_cluster_override(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal()
+    settings = _settings(pve_clusters={
+        "beta": {
+            "pve_api_user": "beta-user@pve",
+            "pve_api_token_id": "beta-tok",
+            "pve_api_token_secret": "beta-secret",
+        }
+    })
+    run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10", cluster="beta")
+    assert ex.snapshot_api_params
+    for params in ex.snapshot_api_params:
+        assert params == {
+            "api_host": "192.168.1.10",
+            "api_user": "beta-user@pve",
+            "api_token_id": "beta-tok",
+            "api_token_secret": "beta-secret",
+        }
+
+
+def test_snapshot_uses_globals_for_unconfigured_cluster(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal()
+    settings = _settings(pve_clusters={
+        "beta": {"pve_api_token_secret": "beta-secret"},
+    })
+    # cluster="alpha" has no override — falls back to globals, same as default.
+    run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10", cluster="alpha")
+    assert ex.snapshot_api_params
+    for params in ex.snapshot_api_params:
+        assert params["api_user"] == "root@pam"
+        assert params["api_token_id"] == "tok"
+        assert params["api_token_secret"] == "secret"
 
 
 CT_SCRIPT_WITH_REPO = (

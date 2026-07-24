@@ -13,6 +13,18 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+class PveClusterCreds(BaseModel):
+    """Per-cluster override for the global ``pve_api_*`` credentials.
+
+    Any field left empty falls back to the matching global setting —
+    see :func:`proxmox_fleet.cluster.api_creds`.
+    """
+
+    pve_api_user: str = ""
+    pve_api_token_id: str = ""
+    pve_api_token_secret: str = ""
+
+
 class GlobalSettings(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -89,6 +101,9 @@ class GlobalSettings(BaseModel):
     pve_api_user: str = ""
     pve_api_token_id: str = ""
     pve_api_token_secret: str = ""
+    # Optional per-cluster overrides, keyed by cluster name — see
+    # proxmox_fleet.cluster.api_creds() for the per-field fallback rules.
+    pve_clusters: Dict[str, PveClusterCreds] = Field(default_factory=dict)
 
     # Timeouts & retries (formerly hardcoded)
     apt_proxy_check_timeout: float = 30.0
