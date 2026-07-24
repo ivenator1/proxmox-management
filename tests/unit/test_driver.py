@@ -2014,6 +2014,177 @@ def test_node_phase_real_failure_still_aborts(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Quorum checks must stay inside the unreachable node's own cluster (Task 4)
+# ---------------------------------------------------------------------------
+
+def test_cluster_quorate_scopes_to_given_cluster(monkeypatch):
+    """A sibling cluster's quorate answer must not leak into another cluster's verdict."""
+
+    class _Exec:
+        def __init__(self, host, **kw):
+            self.host = host
+
+        def run_shell(self, cmd, **kw):
+            if self.host == "beta-01":
+                return PrimitiveResult(
+                    rc=0, stdout=json.dumps([{"type": "cluster", "quorate": 1}]))
+            # alpha nodes never answer.
+            return PrimitiveResult(rc=4, failed=True, unreachable=True)
+
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _Exec)
+    nodes = [
+        {"name": "beta-01", "ansible_host": "10.1.0.1", "cluster": "beta"},
+        {"name": "alpha-01", "ansible_host": "10.0.0.1", "cluster": "alpha"},
+        {"name": "alpha-02", "ansible_host": "10.0.0.2", "cluster": "alpha"},
+    ]
+    # Back-compat: cluster=None (default) considers every node in inventory
+    # order — beta-01 answers first, so the (meaningless, cross-cluster) True
+    # is what the old code returned.
+    assert driver_mod._cluster_quorate(
+        nodes, inventory_path="hosts.ini", skip=set()) is True
+    # With cluster="alpha", beta-01 must be excluded from consideration — no
+    # alpha node ever answers, so the verdict is None, not beta's True.
+    assert driver_mod._cluster_quorate(
+        nodes, inventory_path="hosts.ini", skip=set(), cluster="alpha") is None
+
+
+def _mc_quorum_inventory(tmp_path: Path) -> str:
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\n"
+        "beta-01 ansible_host=10.1.0.1 cluster=beta\n"
+        "alpha-01 ansible_host=10.0.0.1 cluster=alpha\n"
+        "alpha-02 ansible_host=10.0.0.2 cluster=alpha\n"
+        "alpha-03 ansible_host=10.0.0.3 cluster=alpha\n"
+    )
+    return str(p)
+
+
+def test_lxc_phase_cross_cluster_unreachable_not_tolerated_by_other_cluster_quorum(
+    tmp_path, monkeypatch
+):
+    """alpha-01/alpha-02 unreachable; beta-01 quorate; alpha-03 (still up) reports
+    NOT quorate. Beta's healthy answer must never rescue alpha's nodes — this is
+    the exact bug: with unscoped quorum, beta-01 (first in inventory order)
+    answering quorate=True previously made alpha's unreachable nodes tolerated.
+    """
+    from proxmox_fleet.runner import UnreachableHostError
+
+    inv = _mc_quorum_inventory(tmp_path)
+
+    def _fake_discover(ex, settings, **kw):
+        if ex.host in ("alpha-01", "alpha-02"):
+            raise UnreachableHostError("node unreachable: No route to host")
+        return []
+
+    quorum_responses = {
+        "beta-01": PrimitiveResult(
+            rc=0, stdout=json.dumps([{"type": "cluster", "quorate": 1}])),
+        "alpha-03": PrimitiveResult(
+            rc=0, stdout=json.dumps([{"type": "cluster", "quorate": 0}])),
+    }
+
+    class _McExec:
+        def __init__(self, host, **kw):
+            self.host = host
+
+        def run_shell(self, cmd, **kw):
+            return quorum_responses.get(
+                self.host, PrimitiveResult(rc=4, failed=True, unreachable=True))
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", _fake_discover)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _McExec)
+
+    state = driver_mod.run_lxc_phase(settings=GlobalSettings(), inventory_path=inv,
+                                     state_output_path=None)
+
+    assert state.failed
+    assert state.warnings == []  # never tolerated on the strength of beta's quorum
+    alpha_hosts = {e.host for e in state.errors}
+    assert alpha_hosts == {"alpha-01", "alpha-02"}
+    for e in state.errors:
+        assert "NOT quorate" in e.error
+
+
+def test_lxc_phase_single_cluster_unreachable_still_tolerated_when_quorate(
+    tmp_path, monkeypatch
+):
+    """Regression: an inventory with no cluster= vars (everything DEFAULT_CLUSTER)
+    must behave exactly as before — unreachable node tolerated-as-skipped when
+    the (whole, single) cluster is still quorate. Exercises the real
+    (unmocked) _cluster_quorate to prove the cluster filter is a no-op here.
+    """
+    from proxmox_fleet.runner import UnreachableHostError
+
+    inv = _two_node_inventory(tmp_path)  # pve-01, pve-02 — no cluster= vars
+
+    def _fake_discover(ex, settings, **kw):
+        if ex.host == "pve-01":
+            raise UnreachableHostError("node unreachable: No route to host")
+        return []
+
+    class _Exec:
+        def __init__(self, host, **kw):
+            self.host = host
+
+        def run_shell(self, cmd, **kw):
+            if self.host == "pve-02":
+                return PrimitiveResult(
+                    rc=0, stdout=json.dumps([{"type": "cluster", "quorate": 1}]))
+            return PrimitiveResult(rc=4, failed=True, unreachable=True)
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", _fake_discover)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _Exec)
+
+    state = driver_mod.run_lxc_phase(settings=GlobalSettings(), inventory_path=inv,
+                                     state_output_path=None)
+
+    assert not state.failed
+    assert state.errors == []
+    assert len(state.warnings) == 1
+    assert state.warnings[0].host == "pve-01"
+    assert "unreachable" in state.warnings[0].warning
+
+
+def test_node_phase_quorum_check_scoped_to_failing_node_cluster(tmp_path, monkeypatch):
+    """The node-phase serial-loop _cluster_quorate call must pass the failing
+    node's own cluster, not fall back to the whole inventory."""
+    from proxmox_fleet.flows.node import NodeFlowOutcome
+    from proxmox_fleet.models.state import ErrorEntry, NodeRecord as NR
+
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\n"
+        "alpha-01 ansible_host=10.0.0.1 cluster=alpha\n"
+        "beta-01 ansible_host=10.1.0.1 cluster=beta\n"
+    )
+    inv = str(p)
+
+    def _fake_node_update(node_name, executor, settings, **kw):
+        return NodeFlowOutcome(
+            record=NR(node=node_name, status="FAILED"), failed=True,
+            error=ErrorEntry(host=node_name, task="apt dist-upgrade",
+                             error="No route to host"))
+
+    calls: List[Any] = []
+
+    def _fake_quorate(nodes, *, inventory_path, skip, cluster=None):
+        calls.append((skip, cluster))
+        return True
+
+    monkeypatch.setattr(driver_mod, "run_node_update", _fake_node_update)
+    monkeypatch.setattr(driver_mod, "_cluster_quorate", _fake_quorate)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor",
+                        lambda *a, **kw: ScriptedExecutor())
+
+    state = driver_mod.run_node_phase(settings=GlobalSettings(), inventory_path=inv,
+                                      state_output_path=None, include_manager=False)
+
+    assert not state.failed  # both tolerated as skipped (quorate stubbed True)
+    assert calls == [({"alpha-01"}, "alpha"), ({"beta-01"}, "beta")]
+
+
+# ---------------------------------------------------------------------------
 # _discover_vm_locations — multi-cluster
 # ---------------------------------------------------------------------------
 

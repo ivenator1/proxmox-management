@@ -306,14 +306,23 @@ def _cluster_quorate(
     *,
     inventory_path: str,
     skip: Set[str],
+    cluster: Optional[str] = None,
 ) -> Optional[bool]:
     """Ask the first answering node (not in *skip*) whether the cluster is quorate.
+
+    When *cluster* is given, *nodes* is first filtered to members of that
+    cluster (``node_info.get("cluster", DEFAULT_CLUSTER)``) — quorum must be
+    judged from inside the unreachable node's own cluster, never a sibling
+    cluster's answer. When *cluster* is None (default), all *nodes* are
+    considered, unchanged from historical behaviour.
 
     Returns True/False from ``pvesh get /cluster/status``, True for a standalone
     node (no cluster entry — quorum doesn't apply), or None when no node answered.
     Used to decide whether an unreachable node can be safely skipped: with quorum
     intact the rest of the fleet (including snapshots) still works.
     """
+    if cluster is not None:
+        nodes = [n for n in nodes if n.get("cluster", DEFAULT_CLUSTER) == cluster]
     for node_info in nodes:
         node_name = node_info["name"]
         if node_name in skip:
@@ -379,7 +388,7 @@ def run_lxc_phase(
     # Each tuple carries the node's cluster so every id-matching decision
     # below (limit, canary, kuma map) resolves qualified tokens correctly.
     discovered: List[Tuple[str, str, str, List[str]]] = []
-    unreachable_nodes: List[str] = []
+    unreachable_nodes: List[Tuple[str, str]] = []
     for node_info in nodes:
         node_name = node_info["name"]
         api_host = node_info["ansible_host"]
@@ -399,7 +408,7 @@ def run_lxc_phase(
             lxc_ids = _discover_lxcs(discovery_executor, settings, cluster=node_cluster)
         except UnreachableHostError:
             # The node never answered — decided after the loop (quorum gate).
-            unreachable_nodes.append(node_name)
+            unreachable_nodes.append((node_name, node_cluster))
             print(f"[{node_name}] WARNING: node unreachable — skipping its containers")
             continue
         except Exception as exc:  # noqa: BLE001
@@ -420,9 +429,24 @@ def run_lxc_phase(
     # failing the run. Without quorum /etc/pve goes read-only fleet-wide —
     # that IS a run-level failure.
     if unreachable_nodes:
-        quorate = _cluster_quorate(
-            nodes, inventory_path=inventory_path, skip=set(unreachable_nodes))
-        for name in unreachable_nodes:
+        # Quorum must be judged from inside each unreachable node's own
+        # cluster — a sibling cluster's healthy answer says nothing about
+        # whether THIS node's pmxcfs is still writable. Cache the verdict per
+        # cluster (computed against that cluster's unreachable node names) to
+        # avoid redundant SSH rounds when several nodes in the same cluster
+        # are down together.
+        unreachable_names_by_cluster: Dict[str, Set[str]] = {}
+        for name, node_cluster in unreachable_nodes:
+            unreachable_names_by_cluster.setdefault(node_cluster, set()).add(name)
+        quorate_by_cluster: Dict[str, Optional[bool]] = {}
+        for name, node_cluster in unreachable_nodes:
+            if node_cluster not in quorate_by_cluster:
+                quorate_by_cluster[node_cluster] = _cluster_quorate(
+                    nodes, inventory_path=inventory_path,
+                    skip=unreachable_names_by_cluster[node_cluster],
+                    cluster=node_cluster,
+                )
+            quorate = quorate_by_cluster[node_cluster]
             if quorate:
                 state.warnings.append(WarningEntry(
                     host=name, task="node reachability",
@@ -892,7 +916,7 @@ def run_node_phase(
                 and outcome.error is not None
                 and _error_is_unreachable(outcome.error.error)
                 and _cluster_quorate(nodes, inventory_path=inventory_path,
-                                     skip={node_name})
+                                     skip={node_name}, cluster=node_cluster)
             ):
                 state.node.append(NodeRecord(node=node_name, status="SKIPPED (unreachable)"))
                 state.warnings.append(WarningEntry(
