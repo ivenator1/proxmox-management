@@ -149,6 +149,27 @@ def test_build_args_rejects_unknown_phase():
         build_run_args({"phases": "lxc,bogus"})
 
 
+def test_build_args_limit_accepts_qualified_cluster_id():
+    args = build_run_args({"limit": "alpha/101"})
+    assert args == ["--limit", "alpha/101"]
+
+
+def test_build_args_limit_rejects_too_many_slashes():
+    with pytest.raises(ValueError, match="invalid token"):
+        build_run_args({"limit": "a/b/c"})
+
+
+def test_build_args_limit_rejects_shell_metacharacters_in_qualified_token():
+    with pytest.raises(ValueError, match="invalid token"):
+        build_run_args({"limit": "alpha/101;rm -rf /"})
+
+
+def test_build_args_phases_rejects_qualified_token():
+    # cluster/id qualification is a --limit-only concept — phases stay bare.
+    with pytest.raises(ValueError, match="invalid token"):
+        build_run_args({"phases": "alpha/lxc"})
+
+
 # --- read-only pages --------------------------------------------------------- #
 
 def test_index_shows_latest_run_and_pending(history_dir):
@@ -293,8 +314,13 @@ def test_pending_page_node_qualified_keys(tmp_path):
     assert resp.status_code == 200
     assert "sonarr" in resp.text and "radarr" in resp.text
     assert "alpha-01" in resp.text and "beta-01" in resp.text
-    # The ID column shows the bare container id, not the node/id key.
-    assert "alpha-01/101" not in resp.text
+    # The ID column itself still shows the bare container id, not the node/id
+    # key — it appears twice, once per cluster's "101".
+    assert resp.text.count('<td class="num">101</td>') == 2
+    # But each row's link now points at the composite node/id path (Task 5)
+    # so the two clusters' identical ids don't collide on one host page.
+    assert 'href="/hosts/alpha-01/101"' in resp.text
+    assert 'href="/hosts/beta-01/101"' in resp.text
 
 
 def test_pending_unknown_ref_404(history_dir):
@@ -313,6 +339,42 @@ def test_host_drilldown_unknown_host_is_empty(history_dir):
     resp = _client(history_dir).get("/hosts/ghost")
     assert resp.status_code == 200
     assert "No records" in resp.text
+
+
+def test_host_drilldown_composite_node_id_routes_and_filters(tmp_path):
+    """/hosts/{node}/{id} (Task 5) must route via the :path converter and
+    filter to that (node, id) pair only — a same-id container on a different
+    node (the whole point of multi-cluster qualification) must not bleed in."""
+    d = tmp_path / "history"
+    state = _state(
+        fleet_lxc_data=[
+            dict(node="pve-01", name="sonarr", id="101", app="SONARR_ONLY_v4_1", os="OK"),
+            dict(node="pve-02", name="radarr", id="101", app="RADARR_ONLY_v5_2", os="OK"),
+        ],
+        fleet_error_log=[dict(host="pve-01/101", task="app update", error="pve-01 boom")],
+        fleet_warning_log=[dict(host="pve-02/101", task="disk space", warning="pve-02 warn")],
+        fleet_changed=True, fleet_failed=True,
+    )
+    write_history(state, history_dir=d, keep=0,
+                  timestamp="20260105T000000000000Z",
+                  briefing=briefing.prepare_body(state))
+
+    # Exclusion assertions use record-table-only markers (app value, warning /
+    # error text) — bare host *names* also appear in the page's global search
+    # index nav, so "radarr"/"sonarr" would leak in regardless of filtering.
+    resp = _client(d).get("/hosts/pve-01/101")
+    assert resp.status_code == 200
+    assert "SONARR_ONLY_v4_1" in resp.text          # pve-01/101's own record
+    assert "pve-01 boom" in resp.text               # pve-01/101's own error
+    assert "RADARR_ONLY_v5_2" not in resp.text      # pve-02/101's record excluded
+    assert "pve-02 warn" not in resp.text            # pve-02/101's warning excluded
+
+    resp2 = _client(d).get("/hosts/pve-02/101")
+    assert resp2.status_code == 200
+    assert "RADARR_ONLY_v5_2" in resp2.text
+    assert "pve-02 warn" in resp2.text
+    assert "SONARR_ONLY_v4_1" not in resp2.text
+    assert "pve-01 boom" not in resp2.text
 
 
 def test_trigger_page(history_dir):
@@ -902,9 +964,11 @@ def test_pending_page_renders_health_signals_on_node_keyed_snapshots(history_dir
     assert resp.status_code == 200
     assert "90%" in resp.text and "63%" in resp.text
     assert "debian 12 — outdated" in resp.text
-    # the display id, not the raw "Hammond/130" key
+    # the display id column shows the bare id, not the raw "Hammond/130" key
     assert ">130<" in resp.text and ">123<" in resp.text
-    assert "Hammond/130" not in resp.text
+    # the composite key now appears only inside the drill-down link href (Task 5),
+    # never as a visible id-column value
+    assert 'href="/hosts/Hammond/130"' in resp.text
 
 
 def test_pending_page_shows_unreachable_as_skipped_not_an_error(history_dir):

@@ -65,10 +65,16 @@ class RevalidatingStaticFiles(StaticFiles):
 # which is not imported here — the driver needs ansible-runner installed).
 PHASE_NAMES = ("remote", "custom", "lxc", "vm", "node", "manager")
 
-# --limit / --phases tokens are passed to a subprocess: allow only inventory
-# name / vmid shaped tokens, nothing shell-meaningful. Shared with the
-# inventory editor so the two layers can never drift apart.
+# --phases tokens are passed to a subprocess: allow only inventory name /
+# vmid shaped tokens, nothing shell-meaningful. Shared with the inventory
+# editor so the two layers can never drift apart.
 _TOKEN_RE = inventory_edit._NAME_RE
+
+# --limit tokens additionally accept one qualifying "cluster/id" segment
+# (e.g. "alpha/101") for multi-cluster fleets. Deliberately NOT reused for
+# _TOKEN_RE — that regex also validates enrollment names and kuma ids, which
+# must never contain a slash.
+_LIMIT_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$")
 
 # Per-bucket table columns for the run-detail and host drill-down pages.
 BUCKET_COLUMNS: Dict[str, Tuple[str, ...]] = {
@@ -337,11 +343,11 @@ def _truthy(value: Any) -> bool:
     return str(value or "").lower() in ("true", "1", "yes", "on")
 
 
-def _csv_tokens(value: str) -> List[str]:
+def _csv_tokens(value: str, pattern: "re.Pattern[str]" = _TOKEN_RE) -> List[str]:
     """Split a comma-separated form field into validated argv-safe tokens."""
     tokens = [t.strip() for t in value.split(",") if t.strip()]
     for token in tokens:
-        if not _TOKEN_RE.match(token):
+        if not pattern.match(token):
             raise ValueError(f"invalid token {token!r} (letters/digits/._- only)")
     return tokens
 
@@ -370,7 +376,7 @@ def build_run_args(form: Mapping[str, Any]) -> List[str]:
             raise ValueError(f"unknown phase(s): {', '.join(unknown)}")
         if phases:
             args += ["--phases", ",".join(phases)]
-    limit = _csv_tokens(str(form.get("limit") or ""))
+    limit = _csv_tokens(str(form.get("limit") or ""), _LIMIT_TOKEN_RE)
     if limit:
         args += ["--limit", ",".join(limit)]
     return args
@@ -411,6 +417,28 @@ def _history_rows_with_deltas(history_dir: str) -> List[Dict[str, Any]]:
     return rows
 
 
+def _record_matches_host(record: Dict[str, Any], name: str) -> bool:
+    """True when *record* belongs to the host identified by *name*.
+
+    Bare names/ids (no ``/``) keep the historical any-``_HOST_KEYS``-equals-
+    ``name`` match, byte-identically. A composite ``node/id`` token (the
+    LXC error/warning ``host`` convention as of Task 5, matching VM's
+    ``node/vm-id``) additionally matches records whose own ``host`` field
+    equals the full token, or whose ``node`` field matches the node part
+    and whose ``id``/``vmid`` field matches the id part — so the page also
+    finds the LxcRecord/VmRecord entries a scan/run persisted separately
+    from the error/warning entries.
+    """
+    if "/" not in name:
+        return any(str(record.get(k, "")) == name for k in _HOST_KEYS)
+    node_part, id_part = name.split("/", 1)
+    if str(record.get("host", "")) == name:
+        return True
+    if str(record.get("node", "")) != node_part:
+        return False
+    return str(record.get("id", "")) == id_part or str(record.get("vmid", "")) == id_part
+
+
 def _host_records(history_dir: str, name: str) -> List[Dict[str, Any]]:
     """A host's records across all persisted runs, newest run first."""
     out: List[Dict[str, Any]] = []
@@ -421,7 +449,7 @@ def _host_records(history_dir: str, name: str) -> List[Dict[str, Any]]:
             continue
         for bucket, columns in BUCKET_COLUMNS.items():
             for record in run.get(bucket, []) or []:
-                if any(str(record.get(k, "")) == name for k in _HOST_KEYS):
+                if _record_matches_host(record, name):
                     out.append({
                         "timestamp": row["timestamp"],
                         "bucket": bucket,
@@ -641,7 +669,7 @@ def create_app(
             "buckets": buckets,
         })
 
-    @protected.get("/hosts/{name}")
+    @protected.get("/hosts/{name:path}")
     def host_detail(request: Request, name: str) -> Any:
         return templates.TemplateResponse(request, "host.html", {
             "name": name,

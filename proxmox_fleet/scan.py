@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet import inventory
+from proxmox_fleet.cluster import DEFAULT_CLUSTER, limit_selects_id, token_is_id
 from proxmox_fleet.executor import Executor
 from proxmox_fleet.flows._pkg import detect_pkg_mgr
 from proxmox_fleet.flows.lxc import (
@@ -342,11 +343,22 @@ def run_fleet_scan(
     vms = inventory.load_proxmox_vms(inventory_path, host_vars_dir=settings.host_vars_dir)
     nodes = inventory.load_proxmox_nodes(inventory_path, host_vars_dir=settings.host_vars_dir)
     inventory.validate_node_uniqueness(nodes)
+    node_clusters = {n["name"]: n["cluster"] for n in nodes}
 
-    limit_has_ids = limit is not None and any(t.isdigit() for t in limit)
+    def _vm_cluster_hint(v: inventory.VmSpec) -> str:
+        # Same cheap pre-execution guess as the driver's VM --limit filter:
+        # explicit cluster= var, else the pve_node hint's cluster, else default.
+        if v.cluster:
+            return v.cluster
+        if v.pve_node:
+            return node_clusters.get(v.pve_node, DEFAULT_CLUSTER)
+        return DEFAULT_CLUSTER
+
+    limit_has_ids = limit is not None and any(token_is_id(t) for t in limit)
     if limit is not None:
         remote = [h for h in remote if h.name in limit]
-        vms = [v for v in vms if v.name in limit or v.vmid in limit]
+        vms = [v for v in vms
+               if v.name in limit or limit_selects_id(limit, _vm_cluster_hint(v), v.vmid)]
 
     scan: Dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"),
@@ -390,10 +402,11 @@ def run_fleet_scan(
         node_name = node_info["name"]
         if limit is not None and node_name not in limit and not limit_has_ids:
             continue
+        node_cluster = node_info["cluster"]
         ex = RunnerExecutor(node_name, inventory=inventory_path, check=False)
         print(f"[{node_name}] discovering LXCs...")
         try:
-            lxc_ids = _discover_lxcs(ex, settings)
+            lxc_ids = _discover_lxcs(ex, settings, cluster=node_cluster)
         except Exception as exc:  # noqa: BLE001
             entry = _empty_lxc_entry(node_name, node_name)
             entry["error"] = f"discovery failed: {exc}"[:300]
@@ -410,7 +423,7 @@ def run_fleet_scan(
             scan["lxc"][node_name] = entry
             continue
         if limit is not None and node_name not in limit:
-            lxc_ids = [i for i in lxc_ids if i in limit]
+            lxc_ids = [i for i in lxc_ids if limit_selects_id(limit, node_cluster, i)]
 
         def _scan_one(lxc_id: str, _node: str = node_name) -> Dict[str, Any]:
             cex = RunnerExecutor(_node, inventory=inventory_path, check=False)

@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import lxc_os_changed, lxc_os_pkg_count
+from proxmox_fleet.cluster import DEFAULT_CLUSTER, api_creds, map_lookup, matches_any, split_qualified
 from proxmox_fleet.executor import Executor, snapshot_with_retry
 from proxmox_fleet.flows._pkg import kuma_healthy
 from proxmox_fleet.lxc_parse import (
@@ -191,12 +192,29 @@ def _read_version(executor: Executor, lxc_id: str, script_name: str, os_type: st
     return res.stdout.strip()
 
 
-def _discover_lxcs(executor: Executor, settings: GlobalSettings) -> List[str]:
+def _discover_lxcs(
+    executor: Executor,
+    settings: GlobalSettings,
+    *,
+    cluster: str = DEFAULT_CLUSTER,
+) -> List[str]:
     """List container VMIDs on the node that carry any of the configured fleet tags,
     plus any IDs explicitly listed in os_only_lxc_list (OS updates only — they lack
-    /usr/bin/update, so the flow naturally reports app="NO SCRIPT")."""
+    /usr/bin/update, so the flow naturally reports app="NO SCRIPT").
+
+    *cluster* is the owning node's cluster: os_only_lxc_list/exclude_list tokens
+    are filtered to those that apply to it (bare, or exactly qualified for it)
+    BEFORE building the shell grep regex — a qualified token's ``/`` must never
+    land in the pattern.
+    """
     tag_regex = "|".join(settings.lxc_tags)
-    extra_ids = [str(x) for x in settings.os_only_lxc_list]
+    # Bare vmid part only — the cluster qualifier (if any) never reaches the
+    # shell regex, and tokens for another cluster are dropped entirely.
+    extra_ids = [
+        vmid
+        for tok_cluster, vmid in (split_qualified(x) for x in settings.os_only_lxc_list)
+        if tok_cluster is None or tok_cluster == cluster
+    ]
     extra_clause = ""
     if extra_ids:
         extra_regex = "|".join(extra_ids)
@@ -216,8 +234,7 @@ def _discover_lxcs(executor: Executor, settings: GlobalSettings) -> List[str]:
     if res.failed:
         raise RuntimeError(f"discover_lxcs shell failed (rc={res.rc}): {res.stderr or '(no stderr)'}")
     raw_ids = [line.strip() for line in res.stdout.splitlines() if line.strip()]
-    exclude = {str(x) for x in settings.exclude_list}
-    return [lxc_id for lxc_id in raw_ids if lxc_id not in exclude]
+    return [lxc_id for lxc_id in raw_ids if not matches_any(settings.exclude_list, cluster, lxc_id)]
 
 
 def run_lxc_update(
@@ -228,6 +245,7 @@ def run_lxc_update(
     *,
     dry_run: bool = False,
     api_host: str = "",
+    cluster: str = DEFAULT_CLUSTER,
 ) -> LxcFlowOutcome:
     """Run the whole lxc_update flow for one container. Never raises — failures
     are captured into the outcome (FAILED record + error entry), mirroring rescue.
@@ -240,6 +258,9 @@ def run_lxc_update(
         dry_run:   When True, detect phase runs (version compare) but no updates.
         api_host:  The node's ansible_host IP for the Proxmox API (snapshot calls).
                    Required when lxc_backup_strategy includes 'snapshot'.
+        cluster:   The owning node's cluster — resolves qualified (``cluster/id``)
+                   entries in the exclude lists and lxc_kuma_map against this
+                   container; a bare token still matches in any cluster.
     """
 
     # ------------------------------------------------------------------
@@ -282,13 +303,11 @@ def run_lxc_update(
     # in the same briefing as the failure they predict.
     disk_msg = disk_warning(introspect_res.facts, settings.lxc_disk_warn_percent)
     if disk_msg:
-        outcome.warnings.append(WarningEntry(host=lxc_id, task="disk space", warning=disk_msg))
+        outcome.warnings.append(WarningEntry(host=f"{node}/{lxc_id}", task="disk space", warning=disk_msg))
 
     api_params: Dict[str, Any] = {
         "api_host": api_host,
-        "api_user": settings.pve_api_user,
-        "api_token_id": settings.pve_api_token_id,
-        "api_token_secret": settings.pve_api_token_secret,
+        **api_creds(settings, cluster),
     }
 
     try:
@@ -300,7 +319,7 @@ def run_lxc_update(
 
         pull_rc_val = introspect_res.facts.get("pull_rc", 1)
         lxc_no_update_script = int(pull_rc_val) != 0
-        app_excluded = lxc_id in {str(x) for x in settings.app_update_exclude_list}
+        app_excluded = matches_any(settings.app_update_exclude_list, cluster, lxc_id)
 
         if settings.lxc_verbose:
             _vprint(node, lxc_id, name, f"script={'NONE (pull failed)' if lxc_no_update_script else 'found'}")
@@ -333,7 +352,7 @@ def run_lxc_update(
             os_msg = os_mismatch_warning(introspect_res.facts, ct_info, ct_script_name)
             if os_msg:
                 outcome.warnings.append(
-                    WarningEntry(host=lxc_id, task="container OS", warning=os_msg))
+                    WarningEntry(host=f"{node}/{lxc_id}", task="container OS", warning=os_msg))
 
         # ------------------------------------------------------------------
         # Dry-check — version compare only, no mutations
@@ -377,7 +396,9 @@ def run_lxc_update(
         if strategy in ("vzdump", "both"):
             executor.vzdump(lxc_id, backup_storage=settings.lxc_backup_storage, lxc_name=name)
 
-        if strategy in ("snapshot", "both") and lxc_id not in {str(x) for x in settings.snapshot_exclude_list}:
+        if strategy in ("snapshot", "both") and not matches_any(
+            settings.snapshot_exclude_list, cluster, lxc_id
+        ):
             snap_res = snapshot_with_retry(executor, lxc_id, snap_state="present",
                                            retries=settings.snapshot_retries,
                                            delay=settings.snapshot_retry_delay,
@@ -387,7 +408,7 @@ def run_lxc_update(
                 _vprint(node, lxc_id, name, f"snapshot={'taken' if snap_taken else 'FAILED'}")
             if not snap_taken:
                 outcome.warnings.append(WarningEntry(
-                    host=lxc_id, task="Create snapshot",
+                    host=f"{node}/{lxc_id}", task="Create snapshot",
                     warning="snapshot failed — automatic rollback unavailable for this update",
                 ))
                 snapshot_failed = True
@@ -403,14 +424,14 @@ def run_lxc_update(
         # 2. OS update (skip if excluded)
         os_res_stdout = ""
         os_failed = False
-        if lxc_id not in {str(x) for x in settings.os_update_exclude_list}:
+        if not matches_any(settings.os_update_exclude_list, cluster, lxc_id):
             os_cmd = _os_update_cmd(lxc_id, lxc_os)
             os_res = executor.lxc_os_update(lxc_id, os_update_cmd=os_cmd)
             os_res_stdout = os_res.stdout
             os_failed = os_res.failed
             if os_failed:
                 outcome.errors.append(ErrorEntry(
-                    host=lxc_id, task="OS update", error=_failure_detail(os_res),
+                    host=f"{node}/{lxc_id}", task="OS update", error=_failure_detail(os_res),
                 ))
             if settings.lxc_verbose:
                 summary = (os_res.stdout or "").strip().replace("\n", " ")[:120]
@@ -455,7 +476,7 @@ def run_lxc_update(
             app_changed = not app_res.failed  # tentative; overridden below by version/hash
             if app_failed:
                 outcome.errors.append(ErrorEntry(
-                    host=lxc_id, task="app update", error=_failure_detail(app_res),
+                    host=f"{node}/{lxc_id}", task="app update", error=_failure_detail(app_res),
                 ))
             if settings.lxc_verbose:
                 summary = (app_res.stdout or "").strip().replace("\n", " ")[:120]
@@ -525,7 +546,7 @@ def run_lxc_update(
         )
         something_changed = app_did_update or os_changed
 
-        kuma_id = str(settings.lxc_kuma_map.get(lxc_id, ""))
+        kuma_id = str(map_lookup(settings.lxc_kuma_map, cluster, lxc_id))
         if kuma_id and settings.kuma_url and something_changed:
             kuma_url = f"{settings.kuma_url}/api/status-page/heartbeat/{settings.kuma_slug}"
             try:
@@ -546,7 +567,7 @@ def run_lxc_update(
             is_template=is_template,
             is_running=is_running,
             dry_run=False,
-            excluded=(lxc_id in {str(x) for x in settings.os_update_exclude_list}),
+            excluded=matches_any(settings.os_update_exclude_list, cluster, lxc_id),
             os_failed=os_failed,
             os_changed=os_changed,
             pkg_count=pkg_count,
@@ -559,7 +580,7 @@ def run_lxc_update(
         # this the record says FAILED while state.failed stays false, so the exit
         # code, the history entry and the dashboard all report success.
         outcome.failed = bool(outcome.errors)
-        script_expected = lxc_id not in {str(x) for x in settings.os_only_lxc_list}
+        script_expected = not matches_any(settings.os_only_lxc_list, cluster, lxc_id)
         if lxc_should_report(app_status_str, os_status_str, dry_run=False,
                              script_expected=script_expected):
             outcome.record = LxcRecord(
@@ -596,7 +617,7 @@ def run_lxc_update(
             app=rescue_app, os="FAILED", snap=False,
         )
         outcome.error = ErrorEntry(
-            host=lxc_id, task=str(failed_task), error=str(exc)[:300]
+            host=f"{node}/{lxc_id}", task=str(failed_task), error=str(exc)[:300]
         )
         outcome.warnings = list(outcome.warnings)
         return outcome

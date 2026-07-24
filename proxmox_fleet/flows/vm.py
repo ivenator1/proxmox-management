@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import pkg_changed as _pkg_changed
-from proxmox_fleet.cluster import DEFAULT_CLUSTER
+from proxmox_fleet.cluster import DEFAULT_CLUSTER, api_creds
 from proxmox_fleet.changes import vm_pkg_count as _vm_pkg_count
 from proxmox_fleet.executor import Executor, snapshot_with_retry
 from proxmox_fleet.flows._pkg import detect_pkg_mgr, kuma_healthy, upgrade_cmd
@@ -66,11 +66,10 @@ def run_vm_update(
         settings:           GlobalSettings from vars.yml.
         dry_run:            When True, simulate upgrade but apply no changes.
         api_host:           The node's ansible_host IP for Proxmox API (snapshot).
-        cluster:            The owning cluster (driver-resolved). Unused today;
-                            reserved for cluster-qualified settings matching and
-                            per-cluster API credentials.
+        cluster:            The owning cluster (driver-resolved) — selects the
+                            per-cluster API credential override, if any
+                            (see ``cluster.api_creds``).
     """
-    del cluster  # reserved — see docstring
 
     snap_taken = False
     snapshot_failed = False
@@ -79,9 +78,7 @@ def run_vm_update(
 
     api_params: Dict[str, Any] = {
         "api_host": api_host,
-        "api_user": settings.pve_api_user,
-        "api_token_id": settings.pve_api_token_id,
-        "api_token_secret": settings.pve_api_token_secret,
+        **api_creds(settings, cluster),
     }
 
     try:
