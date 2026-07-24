@@ -51,7 +51,11 @@
       <tr>
         <td>{{ entry.get("node", "") }}</td>
         <td class="num">{{ lxc_id }}</td>
+        {% if entry.get("node") and entry.get("id") %}
+        <td><a href="/hosts/{{ entry.node }}/{{ entry.id }}">{{ entry.get("name", lxc_id) }}</a></td>
+        {% else %}
         <td><a href="/hosts/{{ entry.get('name', lxc_id) }}">{{ entry.get("name", lxc_id) }}</a></td>
+        {% endif %}
         <td class="num">
           {% if disk is none %}<span class="muted">—</span>
           {% elif disk >= disk_threshold %}<span class="fail">{{ disk }}%</span>

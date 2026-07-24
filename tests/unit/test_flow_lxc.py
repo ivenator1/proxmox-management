@@ -823,7 +823,7 @@ def test_app_update_failure_records_error_and_fails_run(monkeypatch):
     assert out.failed is True
     assert out.record is not None and out.record.app == "FAILED"
     assert len(out.errors) == 1
-    assert out.errors[0].host == "123"
+    assert out.errors[0].host == "pve-01/123"
     assert out.errors[0].task == "app update"
     assert "migration failed" in out.errors[0].error
 
@@ -977,7 +977,7 @@ def test_disk_warning_fires_at_threshold(monkeypatch):
 
     disk = [w for w in out.warnings if w.task == "disk space"]
     assert len(disk) == 1
-    assert disk[0].host == "130"
+    assert disk[0].host == "pve-01/130"
     assert "90% full" in disk[0].warning
 
 

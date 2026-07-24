@@ -494,7 +494,7 @@ def run_lxc_phase(
                 state.failed = True
                 wave_failed = True
                 state.errors.append(ErrorEntry(
-                    host=str(lxc_id),
+                    host=f"{node_name}/{lxc_id}",
                     task="run_lxc_update",
                     error=str(run_err)[:300],
                 ))
