@@ -873,7 +873,10 @@ def run_node_phase(
         for node_info in nodes:
             node_name = node_info["name"]
             executor = RunnerExecutor(node_name, inventory=inventory_path, check=check)
-            outcome = run_node_update(node_name, executor, settings, dry_run=dry_run)
+            node_cluster = node_info.get("cluster", DEFAULT_CLUSTER)
+            outcome = run_node_update(
+                node_name, executor, settings, dry_run=dry_run, cluster=node_cluster
+            )
             if (
                 outcome.failed
                 and outcome.error is not None

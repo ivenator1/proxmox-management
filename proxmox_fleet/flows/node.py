@@ -21,6 +21,7 @@ from typing import Callable, Optional
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import pkg_changed as _pkg_changed
+from proxmox_fleet.cluster import DEFAULT_CLUSTER, split_qualified
 from proxmox_fleet.executor import Executor
 from proxmox_fleet.flows._pkg import upgrade_cmd
 from proxmox_fleet.models.settings import GlobalSettings
@@ -56,6 +57,7 @@ def run_node_update(
     settings: GlobalSettings,
     *,
     dry_run: bool = False,
+    cluster: str = DEFAULT_CLUSTER,
     _sleep: Callable[[float], None] = time.sleep,
 ) -> NodeFlowOutcome:
     """Run the Phase 2 node OS update flow for one Proxmox node. Never raises.
@@ -65,6 +67,9 @@ def run_node_update(
         executor: Bound to the Proxmox node via SSH.
         settings: GlobalSettings from vars.yml.
         dry_run:  When True, simulate apt upgrade but apply no changes and skip reboot.
+        cluster:  This node's cluster (inventory `cluster=`, default DEFAULT_CLUSTER).
+                  Gates the manager-detection probe below when manager_lxc_id is
+                  cluster-qualified.
         _sleep:   Injectable sleep for tests (replaces both retry delay and proxy settle).
     """
     outcome = NodeFlowOutcome()
@@ -72,15 +77,24 @@ def run_node_update(
     try:
         # ------------------------------------------------------------------
         # Is this node hosting the manager LXC? (skip reboot if so)
+        #
+        # manager_lxc_id may be a bare id ("121", matches in every cluster —
+        # today's behaviour) or cluster-qualified ("alpha/121"). A qualified
+        # id only ever refers to a container in that one cluster, so the probe
+        # must not run against a different cluster's node — otherwise a
+        # same-numbered, unrelated container there could be mistaken for the
+        # manager and have its node's reboot wrongly suppressed.
         # ------------------------------------------------------------------
         is_manager = False
         if settings.manager_lxc_id:
-            chk = executor.run_shell(
-                f"pct list | grep -q '^{settings.manager_lxc_id} '; echo $?",
-                changed_when=False,
-                ignore_errors=True,
-            )
-            is_manager = chk.stdout.strip() == "0"
+            mgr_cluster, mgr_id = split_qualified(settings.manager_lxc_id)
+            if mgr_cluster is None or mgr_cluster == cluster:
+                chk = executor.run_shell(
+                    f"pct list | grep -q '^{mgr_id} '; echo $?",
+                    changed_when=False,
+                    ignore_errors=True,
+                )
+                is_manager = chk.stdout.strip() == "0"
 
         # ------------------------------------------------------------------
         # Apt upgrade (5 retries, 30 s delay — mirrors Ansible retries/delay)
