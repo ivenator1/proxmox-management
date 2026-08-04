@@ -1,31 +1,39 @@
-{% extends "base.html" %}
-{% block title %}Overview — Fleet Dashboard{% endblock %}
-{% block content %}
-
-{% if lock_holder is not none %}
+{% extends "base.html" %} {% block title %}Overview — Fleet Dashboard{% endblock
+%} {% block content %} {% if lock_holder is not none %}
 <div class="banner warn" data-autorefresh>
   <span class="dot" aria-hidden="true"></span>
-  <span>A fleet run is in flight (pid {{ lock_holder.get('pid', '?') }},
-    started {{ lock_holder.get('started', '?') }}).
-    {% if active_run %}<a href="/runs/{{ active_run }}">Watch live output →</a>{% endif %}</span>
+  <span
+    >A fleet run is in flight (pid {{ lock_holder.get('pid', '?') }}, started {{
+    lock_holder.get('started', '?') }}). {% if active_run %}<a
+      href="/runs/{{ active_run }}"
+      >Watch live output →</a
+    >{% endif %}</span
+  >
 </div>
 {% elif active_run %}
 <div class="banner warn" data-autorefresh>
   <span class="dot" aria-hidden="true"></span>
-  <span>Dashboard run {{ active_run }} is in flight —
-    <a href="/runs/{{ active_run }}">watch live output →</a></span>
+  <span
+    >Dashboard run {{ active_run }} is in flight —
+    <a href="/runs/{{ active_run }}">watch live output →</a></span
+  >
 </div>
 {% endif %}
 
 <div class="page-head">
   <h1>Overview</h1>
   {% if latest_run %}
-  <span class="sub">last run
-    <a class="mono" href="/history/{{ latest_run.timestamp }}">{{ latest_run.timestamp | ts_span }}</a>
-    {% if latest_run.failed %}<span class="pill fail">FAILED</span>
-    {% elif latest_run.changed %}<span class="pill info">Changed</span>
-    {% else %}<span class="pill ok">Clean</span>{% endif %}
-    {% if latest_run.timestamp | ts_iso %}· <span data-ts="{{ latest_run.timestamp | ts_iso }}"></span>{% endif %}
+  <span class="sub"
+    >last run
+    <a class="mono" href="/history/{{ latest_run.timestamp }}"
+      >{{ latest_run.timestamp | ts_span }}</a
+    >
+    {% if latest_run.failed %}<span class="pill fail">FAILED</span> {% elif
+    latest_run.changed %}<span class="pill info">Changed</span> {% else %}<span
+      class="pill ok"
+      >Clean</span
+    >{% endif %} {% if latest_run.timestamp | ts_iso %}·
+    <span data-ts="{{ latest_run.timestamp | ts_iso }}"></span>{% endif %}
   </span>
   {% endif %}
 </div>
@@ -36,9 +44,10 @@
       <h2>Update endpoints</h2>
       <a class="btn btn-sm" href="/inventory">inventory →</a>
     </div>
-    <p class="muted" style="font-size: 0.85rem;">
-      Configured in the <a href="/inventory">inventory</a>; LXCs are
-      {% if latest_pending %}discovered by the <a href="/pending">latest scan</a>{% else %}discovered by scans (none yet){% endif %}.
+    <p class="muted" style="font-size: 0.85rem">
+      Configured in the <a href="/inventory">inventory</a>; LXCs are {% if
+      latest_pending %}discovered by the <a href="/pending">latest scan</a>{%
+      else %}discovered by scans (none yet){% endif %}.
     </p>
     <div class="stat-grid">
       {% for ep in endpoints %}
@@ -54,33 +63,66 @@
   <div class="card">
     <div class="card-head"><h2>Fleet health</h2></div>
     <div class="gauge-wrap">
-      {% set ring = (health / 100 * 264) | round(1) %}
-      {% set tone = "ok" if health >= 80 else ("warn" if health >= 50 else "fail") %}
-      <svg class="gauge" width="110" height="110" viewBox="0 0 100 100" role="img"
-           aria-label="Fleet health {{ health }} out of 100">
-        <circle class="track" cx="50" cy="50" r="42" fill="none" stroke-width="9"/>
-        <circle class="arc" cx="50" cy="50" r="42" fill="none" stroke-width="9"
-                stroke="var(--{{ tone }})" stroke-linecap="round"
-                stroke-dasharray="{{ ring }} 264" stroke-dashoffset="0"
-                transform="rotate(-90 50 50)"/>
-        <text x="50" y="54" text-anchor="middle" font-size="24">{{ health }}<tspan class="unit">/100</tspan></text>
+      {% set ring = (health / 100 * 264) | round(1) %} {% set tone = "ok" if
+      health >= 80 else ("warn" if health >= 50 else "fail") %}
+      <svg
+        class="gauge"
+        width="110"
+        height="110"
+        viewBox="0 0 100 100"
+        role="img"
+        aria-label="Fleet health {{ health }} out of 100"
+      >
+        <circle
+          class="track"
+          cx="50"
+          cy="50"
+          r="42"
+          fill="none"
+          stroke-width="9"
+        />
+        <circle
+          class="arc"
+          cx="50"
+          cy="50"
+          r="42"
+          fill="none"
+          stroke-width="9"
+          stroke="var(--{{ tone }})"
+          stroke-linecap="round"
+          stroke-dasharray="{{ ring }} 264"
+          stroke-dashoffset="0"
+          transform="rotate(-90 50 50)"
+        />
+        <text x="50" y="54" text-anchor="middle" font-size="24">
+          {{ health }}
+          <tspan class="unit">/100</tspan>
+        </text>
       </svg>
       <div>
-        <p class="muted" style="font-size: 0.82rem; margin: 0;">
+        <p class="muted" style="font-size: 0.82rem; margin: 0">
           Scored from the latest run and pending scan: failures, errors,
           warnings and outdated apps all pull it down.
         </p>
         {% if recent %}
-        <div class="pulse-strip" style="margin-top: 0.75rem;" aria-label="Recent runs">
+        <div
+          class="pulse-strip"
+          style="margin-top: 0.75rem"
+          aria-label="Recent runs"
+        >
           {% for row in recent %}
-          <a href="/history/{{ row.timestamp }}"
-             class="{% if row.failed %}fail{% elif row.changed %}info{% else %}ok{% endif %}"
-             data-utc-title="{{ row.timestamp | ts_iso }}"
-             data-title-tail="{% if row.failed %}failed{% elif row.changed %}changed{% else %}clean{% endif %}"
-             title="{{ row.timestamp | ts_human }} — {% if row.failed %}failed{% elif row.changed %}changed{% else %}clean{% endif %}"></a>
+          <a
+            href="/history/{{ row.timestamp }}"
+            class="{% if row.failed %}fail{% elif row.changed %}info{% else %}ok{% endif %}"
+            data-utc-title="{{ row.timestamp | ts_iso }}"
+            data-title-tail="{% if row.failed %}failed{% elif row.changed %}changed{% else %}clean{% endif %}"
+            title="{{ row.timestamp | ts_human }} — {% if row.failed %}failed{% elif row.changed %}changed{% else %}clean{% endif %}"
+          ></a>
           {% endfor %}
         </div>
-        <p class="muted" style="font-size: 0.72rem; margin: 0.3rem 0 0;">last {{ recent | length }} runs, oldest → newest</p>
+        <p class="muted" style="font-size: 0.72rem; margin: 0.3rem 0 0">
+          last {{ recent | length }} runs, oldest → newest
+        </p>
         {% endif %}
       </div>
     </div>
@@ -89,13 +131,16 @@
 </div>
 
 {% if recent %}
-<div class="card" style="margin-top: var(--sp-4);">
+<div class="card" style="margin-top: var(--sp-4)">
   <div class="card-head">
     <h2>Update trends</h2>
-    <span class="muted" style="font-size: 0.78rem;">last {{ recent | length }} run{{ '' if recent | length == 1 else 's' }}, oldest → newest</span>
+    <span class="muted" style="font-size: 0.78rem"
+      >last {{ recent | length }} run{{ '' if recent | length == 1 else 's' }},
+      oldest → newest</span
+    >
   </div>
 
-  <div class="stat-grid" style="margin-bottom: var(--sp-4);">
+  <div class="stat-grid" style="margin-bottom: var(--sp-4)">
     <div class="stat {% if not totals.packages %}zero{% endif %}">
       <span class="label">pkgs upgraded · all time</span>
       <span class="value">{{ totals.packages }}</span>
@@ -110,43 +155,109 @@
     </div>
   </div>
   {% if totals.since %}
-  <p class="muted" style="font-size: 0.7rem; margin: calc(-1 * var(--sp-3)) 0 var(--sp-4);">
-    counting since {{ totals.since | ts_span }}</p>
+  <p
+    class="muted"
+    style="font-size: 0.7rem; margin: calc(-1 * var(--sp-3)) 0 var(--sp-4)"
+  >
+    counting since {{ totals.since | ts_span }}
+  </p>
   {% endif %}
 
-  <div id="trend-chart" class="trend-chart" tabindex="0"
-       aria-label="Per-run trend for the last {{ trend | length }} run{{ '' if trend | length == 1 else 's' }}: OS updates, LXC app updates, errors and warnings. Use arrow keys to step through runs.">
+  <div
+    id="trend-chart"
+    class="trend-chart"
+    tabindex="0"
+    aria-label="Per-run trend for the last {{ trend | length }} run{{ '' if trend | length == 1 else 's' }}: OS updates, LXC app updates, errors and warnings. Use arrow keys to step through runs."
+  >
     <span class="chart-ymax mono" aria-hidden="true">{{ trend_max }}</span>
-    <svg class="chart-svg" viewBox="0 0 1000 100" preserveAspectRatio="none" aria-hidden="true">
+    <svg
+      class="chart-svg"
+      viewBox="0 0 1000 100"
+      preserveAspectRatio="none"
+      aria-hidden="true"
+    >
       <g class="grid">
-        <line x1="0" x2="1000" y1="2" y2="2"/>
-        <line x1="0" x2="1000" y1="50" y2="50"/>
-        <line x1="0" x2="1000" y1="98" y2="98"/>
+        <line x1="0" x2="1000" y1="2" y2="2" />
+        <line x1="0" x2="1000" y1="50" y2="50" />
+        <line x1="0" x2="1000" y1="98" y2="98" />
       </g>
-      <polyline class="s-os" points="{{ trend | map(attribute='os') | list | spark_points(1000, 100, lo=0, hi=trend_max) }}"/>
-      <polyline class="s-app" points="{{ trend | map(attribute='app') | list | spark_points(1000, 100, lo=0, hi=trend_max) }}"/>
-      <polyline class="s-err" points="{{ trend | map(attribute='err') | list | spark_points(1000, 100, lo=0, hi=trend_max) }}"/>
-      <polyline class="s-warn" points="{{ trend | map(attribute='warn') | list | spark_points(1000, 100, lo=0, hi=trend_max) }}"/>
+      <polyline
+        class="s-os"
+        points="{{ trend | map(attribute='os') | list | spark_points(1000, 100, lo=0, hi=trend_max) }}"
+      />
+      <polyline
+        class="s-app"
+        points="{{ trend | map(attribute='app') | list | spark_points(1000, 100, lo=0, hi=trend_max) }}"
+      />
+      <polyline
+        class="s-err"
+        points="{{ trend | map(attribute='err') | list | spark_points(1000, 100, lo=0, hi=trend_max) }}"
+      />
+      <polyline
+        class="s-warn"
+        points="{{ trend | map(attribute='warn') | list | spark_points(1000, 100, lo=0, hi=trend_max) }}"
+      />
     </svg>
   </div>
   <div class="chart-x muted">
-    <span class="ts" data-utc="{{ trend[0].ts | ts_iso }}">{{ trend[0].label }}</span>
-    <span class="ts" data-utc="{{ trend[-1].ts | ts_iso }}">{{ trend[-1].label }}</span>
+    <span class="ts" data-utc="{{ trend[0].ts | ts_iso }}"
+      >{{ trend[0].label }}</span
+    >
+    <span class="ts" data-utc="{{ trend[-1].ts | ts_iso }}"
+      >{{ trend[-1].label }}</span
+    >
   </div>
   <div class="chart-legend">
-    <button type="button" class="key s-os" data-series="os" aria-pressed="true"><svg width="16" height="4" aria-hidden="true"><line x1="1" y1="2" x2="15" y2="2"/></svg>OS updates <small>hosts</small></button>
-    <button type="button" class="key s-app" data-series="app" aria-pressed="true"><svg width="16" height="4" aria-hidden="true"><line x1="1" y1="2" x2="15" y2="2"/></svg>app updates <small>LXCs</small></button>
-    <button type="button" class="key s-err" data-series="err" aria-pressed="true"><svg width="16" height="4" aria-hidden="true"><line x1="1" y1="2" x2="15" y2="2"/></svg>errors</button>
-    <button type="button" class="key s-warn" data-series="warn" aria-pressed="true"><svg width="16" height="4" aria-hidden="true"><line x1="1" y1="2" x2="15" y2="2"/></svg>warnings</button>
-    <span class="chart-hint muted" hidden>click a series to show/hide · y-axis fits visible series</span>
+    <button type="button" class="key s-os" data-series="os" aria-pressed="true">
+      <svg width="16" height="4" aria-hidden="true">
+        <line x1="1" y1="2" x2="15" y2="2" /></svg
+      >OS updates <small>hosts</small>
+    </button>
+    <button
+      type="button"
+      class="key s-app"
+      data-series="app"
+      aria-pressed="true"
+    >
+      <svg width="16" height="4" aria-hidden="true">
+        <line x1="1" y1="2" x2="15" y2="2" /></svg
+      >app updates <small>LXCs</small>
+    </button>
+    <button
+      type="button"
+      class="key s-err"
+      data-series="err"
+      aria-pressed="true"
+    >
+      <svg width="16" height="4" aria-hidden="true">
+        <line x1="1" y1="2" x2="15" y2="2" /></svg
+      >errors
+    </button>
+    <button
+      type="button"
+      class="key s-warn"
+      data-series="warn"
+      aria-pressed="true"
+    >
+      <svg width="16" height="4" aria-hidden="true">
+        <line x1="1" y1="2" x2="15" y2="2" /></svg
+      >warnings
+    </button>
+    <span class="chart-hint muted" hidden
+      >click a series to show/hide · y-axis fits visible series</span
+    >
   </div>
-  <script type="application/json" id="trend-data">{{ {"max": trend_max, "runs": trend} | tojson }}</script>
+  <script type="application/json" id="trend-data">
+    {{ {"max": trend_max, "runs": trend} | tojson }}
+  </script>
 </div>
 {% else %}
 <div class="empty">
   <span class="glyph" aria-hidden="true">⟡</span>
-  <p>No run history yet — run <code>fleet-update</code> or use the
-  <a href="/trigger">trigger</a>.</p>
+  <p>
+    No run history yet — run <code>fleet-update</code> or use the
+    <a href="/trigger">trigger</a>.
+  </p>
 </div>
 {% endif %}
 
@@ -154,8 +265,10 @@
 {% if pending_row %}
 <div class="card">
   <div class="card-head">
-    <span class="muted" style="font-size: 0.85rem;">
-      <a href="/pending?ref={{ pending_row.timestamp }}">{{ pending_row.timestamp | ts_span }}</a>
+    <span class="muted" style="font-size: 0.85rem">
+      <a href="/pending?ref={{ pending_row.timestamp }}"
+        >{{ pending_row.timestamp | ts_span }}</a
+      >
     </span>
     <a class="btn btn-sm" href="/pending">details →</a>
   </div>
@@ -168,11 +281,27 @@
       <span class="label">LXC OS pkgs</span>
       <span class="value">{{ pending_row.lxc_os_pending }}</span>
     </div>
-    <div class="stat {% if not pending_row.outdated_apps %}zero{% endif %} {% if pending_row.outdated_apps %}tint-warn{% endif %}">
+    <div
+      class="stat {% if not pending_row.outdated_apps %}zero{% endif %} {% if pending_row.outdated_apps %}tint-warn{% endif %}"
+    >
       <span class="label">outdated apps</span>
       <span class="value">{{ pending_row.outdated_apps }}</span>
     </div>
-    <div class="stat {% if not pending_row.errors %}zero{% endif %} {% if pending_row.errors %}tint-fail{% endif %}">
+    <div
+      class="stat {% if not pending_row.security_pending %}zero{% endif %} {% if pending_row.security_pending %}tint-warn{% endif %}"
+    >
+      <span class="label">security pkgs</span>
+      <span class="value">{{ pending_row.security_pending }}</span>
+    </div>
+    <div
+      class="stat {% if not pending_row.reboot_hosts %}zero{% endif %} {% if pending_row.reboot_hosts %}tint-warn{% endif %}"
+    >
+      <span class="label">reboot required</span>
+      <span class="value">{{ pending_row.reboot_hosts }}</span>
+    </div>
+    <div
+      class="stat {% if not pending_row.errors %}zero{% endif %} {% if pending_row.errors %}tint-fail{% endif %}"
+    >
       <span class="label">scan errors</span>
       <span class="value">{{ pending_row.errors }}</span>
     </div>
@@ -181,8 +310,44 @@
 {% else %}
 <div class="empty">
   <span class="glyph" aria-hidden="true">⌁</span>
-  <p>No pending scan yet — run <code>fleet-update --scan</code> or
-  <a href="/trigger">trigger one</a>.</p>
+  <p>
+    No pending scan yet — run <code>fleet-update --scan</code> or
+    <a href="/trigger">trigger one</a>.
+  </p>
 </div>
-{% endif %}
-{% endblock %}
+{% endif %} {% if os_upgrades %}
+<div class="card" style="margin-top: var(--sp-4)">
+  <div class="card-head">
+    <h2>Recent OS upgrades</h2>
+    <span class="muted" style="font-size: 0.78rem"
+      >release-level changes seen by the pending scans</span
+    >
+  </div>
+  <div class="table-card">
+    <table>
+      <thead>
+        <tr>
+          <th>Host</th>
+          <th>From</th>
+          <th>To</th>
+          <th>Seen by scan</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for ev in os_upgrades %}
+        <tr>
+          <td><a href="/hosts/{{ ev.host }}">{{ ev.host }}</a></td>
+          <td class="mono">{{ ev.from }}</td>
+          <td class="mono">{{ ev.to }}</td>
+          <td>
+            <span class="ts" data-utc="{{ ev.ts | ts_iso }}"
+              >{{ ev.ts | ts_human }}</span
+            >
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %} {% endblock %}

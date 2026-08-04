@@ -13,15 +13,23 @@
   {% if hosts %}
   <div class="table-card">
   <table>
-    <thead><tr><th>Host</th><th>Kind</th><th>Pkg mgr</th><th class="num">Pending</th><th>Packages / error</th></tr></thead>
+    <thead><tr><th>Host</th><th>Kind</th><th>Pkg mgr</th><th class="num">Pending</th><th class="num" title="Packages from a *-security suite (Debian-Security / Ubuntu security)">Security</th><th>Reboot</th><th>Packages / error</th></tr></thead>
     <tbody>
     {% for name, entry in hosts %}
       {% set count = entry.get("pending_count", 0) %}
+      {% set sec_count = entry.get("security_count", 0) %}
       <tr>
         <td><a href="/hosts/{{ name }}">{{ name }}</a></td>
         <td>{{ entry.get("kind", "") }}</td>
         <td><code>{{ entry.get("pkg_mgr", "") }}</code></td>
         <td class="num {% if not count %}zero{% endif %}">{{ count }}</td>
+        <td class="num {% if not sec_count %}zero{% endif %}">
+          {% if sec_count %}<span class="pill fail" title="{{ entry.get("security") | join(", ") }}">{{ sec_count }}</span>{% else %}0{% endif %}
+        </td>
+        <td>
+          {% if entry.get("reboot_required") %}<span class="pill warn" title="host has /var/run/reboot-required">reboot required</span>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
         <td>
           {% if entry.get("unreachable") %}<span class="pill muted" title="{{ entry.error }}">unreachable — skipped</span>
           {% elif entry.get("error") %}<span class="fail">{{ entry.error }}</span>
@@ -43,10 +51,11 @@
   {% if lxc %}
   <div class="table-card">
   <table>
-    <thead><tr><th>Node</th><th class="num">ID</th><th>Name</th><th class="num">Disk</th><th>OS</th><th class="num">OS pending</th><th>App</th><th>Notes</th></tr></thead>
+    <thead><tr><th>Node</th><th class="num">ID</th><th>Name</th><th class="num">Disk</th><th>OS</th><th class="num">OS pending</th><th class="num" title="Container packages from a *-security suite">Security</th><th>App</th><th>Reboot</th><th>Notes</th></tr></thead>
     <tbody>
     {% for lxc_id, entry in lxc %}
       {% set os_count = entry.get("os_pending_count", 0) %}
+      {% set sec_count = entry.get("os_security_count", 0) %}
       {% set disk = entry.get("disk_percent") %}
       <tr>
         <td>{{ entry.get("node", "") }}</td>
@@ -75,12 +84,19 @@
             </details>
             {% endif %}
         </td>
+        <td class="num {% if not sec_count %}zero{% endif %}">
+          {% if sec_count %}<span class="pill fail" title="{{ entry.get("os_security") | join(", ") }}">{{ sec_count }}</span>{% else %}0{% endif %}
+        </td>
         <td>
           {% set app = entry.get("app") %}
           {% if app %}
             <code>{{ app.get("script", "") }}</code>
             <span class="mono">{{ app.get("current") or "?" }} → {{ app.get("latest") or "?" }}</span>
             {% if app.get("outdated") %}<span class="pill warn">outdated</span>{% endif %}
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td>
+          {% if entry.get("reboot_required") %}<span class="pill warn">reboot required</span>
           {% else %}<span class="muted">—</span>{% endif %}
         </td>
         <td>
@@ -105,7 +121,7 @@
 {% if scans %}
 <div class="table-card">
 <table>
-  <thead><tr><th>Timestamp</th><th class="num">Host pkgs</th><th class="num">LXC OS pkgs</th><th class="num">Outdated apps</th><th class="num" title="Containers at or above {{ disk_threshold }}% rootfs">Low disk</th><th class="num" title="Containers whose OS is behind their ct script's target">OS outdated</th><th class="num" title="Hosts that never answered — skipped, not failed">Unreachable</th><th class="num">Errors</th></tr></thead>
+  <thead><tr><th>Timestamp</th><th class="num">Host pkgs</th><th class="num">LXC OS pkgs</th><th class="num">Outdated apps</th><th class="num" title="Security packages pending across hosts and containers">Security pkgs</th><th class="num" title="Hosts/containers with the reboot-required flag set">Reboot</th><th class="num" title="Containers at or above {{ disk_threshold }}% rootfs">Low disk</th><th class="num" title="Containers whose OS is behind their ct script's target">OS outdated</th><th class="num" title="Hosts that never answered — skipped, not failed">Unreachable</th><th class="num">Errors</th></tr></thead>
   <tbody>
   {% for row in scans %}
     <tr>
@@ -113,6 +129,8 @@
       <td class="num {% if not row.hosts_pending %}zero{% endif %}">{{ row.hosts_pending }}</td>
       <td class="num {% if not row.lxc_os_pending %}zero{% endif %}">{{ row.lxc_os_pending }}</td>
       <td class="num {% if not row.outdated_apps %}zero{% endif %}">{{ row.outdated_apps }}</td>
+      <td class="num {% if not row.get('security_pending') %}zero{% endif %}">{% if row.get('security_pending') %}<span class="fail">{{ row.security_pending }}</span>{% else %}0{% endif %}</td>
+      <td class="num {% if not row.get('reboot_hosts') %}zero{% endif %}">{% if row.get('reboot_hosts') %}<span class="fail">{{ row.reboot_hosts }}</span>{% else %}0{% endif %}</td>
       <td class="num {% if not row.get('low_disk') %}zero{% endif %}">{% if row.get('low_disk') %}<span class="fail">{{ row.low_disk }}</span>{% else %}0{% endif %}</td>
       <td class="num {% if not row.get('os_mismatch') %}zero{% endif %}">{% if row.get('os_mismatch') %}<span class="fail">{{ row.os_mismatch }}</span>{% else %}0{% endif %}</td>
       <td class="num {% if not row.get('unreachable') %}zero{% endif %}">{{ row.get('unreachable', 0) }}</td>

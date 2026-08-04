@@ -33,6 +33,7 @@ from proxmox_fleet.lxc_parse import (
     script_name_from_update,
 )
 from proxmox_fleet.models.settings import GlobalSettings
+from proxmox_fleet.pkg_detail import parse_upgraded, pkg_mgr_for_ostype
 from proxmox_fleet.runner import UnreachableHostError
 from proxmox_fleet.models.state import ErrorEntry, LxcRecord, WarningEntry
 from proxmox_fleet.status import (
@@ -583,9 +584,17 @@ def run_lxc_update(
         script_expected = not matches_any(settings.os_only_lxc_list, cluster, lxc_id)
         if lxc_should_report(app_status_str, os_status_str, dry_run=False,
                              script_expected=script_expected):
+            # Exact OS packages (PR1) — success records only: skip when the OS
+            # step failed (partial output), and store None for an empty parse
+            # (non-apt OS, dnf drift) so idle-style records stay key-free.
+            os_packages = None
+            if not os_failed:
+                os_packages = parse_upgraded(
+                    os_res_stdout, pkg_mgr_for_ostype(lxc_os)) or None
             outcome.record = LxcRecord(
                 node=node, name=name, id=lxc_id,
                 app=app_status_str, os=os_status_str, snap=snap_taken,
+                packages=os_packages,
             )
         return outcome
 

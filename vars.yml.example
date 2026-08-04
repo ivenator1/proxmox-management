@@ -144,6 +144,10 @@ fleet_dry_run: false
 fleet_history_enabled: true
 fleet_history_dir: "/var/log/fleet-update"
 fleet_history_keep: 30          # keep the newest N run-*.json (0 = keep all)
+# Keep exact per-record OS package detail (the `packages` lists) only on the
+# newest N run files; older timestamped runs are stripped in place. 0 = keep
+# it on every run. latest.json and totals.json are never affected.
+fleet_package_detail_keep: 7
 
 # --- DEAD-MAN'S-SWITCH (optional) ---
 # Pinged at the end of every run so its ABSENCE alerts you if the orchestrator

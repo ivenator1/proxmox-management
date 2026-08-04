@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -22,6 +22,10 @@ class LxcRecord(BaseModel):
     app: str
     os: str = ""
     snap: bool = True
+    # Exact OS packages upgraded this run (PR1): [{"name", "from", "to"}].
+    # None keeps idle/dry-run/old records key-free; only real-run success
+    # records carry detail (see flows.lxc).
+    packages: Optional[List[Dict[str, str]]] = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class VmRecord(BaseModel):
@@ -31,12 +35,15 @@ class VmRecord(BaseModel):
     name: str
     status: str
     pkg_count: Optional[int] = None
+    packages: Optional[List[Dict[str, str]]] = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class RemoteRecord(BaseModel):
     model_config = ConfigDict(extra="allow")
     host: str
     status: str
+    pkg_count: Optional[int] = None
+    packages: Optional[List[Dict[str, str]]] = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class NodeRecord(BaseModel):
@@ -45,6 +52,11 @@ class NodeRecord(BaseModel):
     model_config = ConfigDict(extra="allow")
     node: str
     status: str
+    pkg_count: Optional[int] = None
+    packages: Optional[List[Dict[str, str]]] = Field(default=None, exclude_if=lambda value: value is None)
+    # Node/manager status strings intentionally have no dry-run variant;
+    # persist this marker so the ledger never treats simulation as applied.
+    dry_run: Optional[bool] = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class CustomRecord(BaseModel):

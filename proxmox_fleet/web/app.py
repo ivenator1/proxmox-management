@@ -15,6 +15,7 @@ the SSH-enrollment helpers (``/ssh/push``, ``/ssh/test``).
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -31,7 +32,7 @@ from fastapi.templating import Jinja2Templates
 from markupsafe import Markup, escape
 
 from proxmox_fleet import history as history_mod
-from proxmox_fleet import inventory_edit, vars_edit
+from proxmox_fleet import inventory_edit, ledger as ledger_mod, vars_edit
 from proxmox_fleet import scan as scan_mod
 from proxmox_fleet.inventory_edit import InventoryEditError
 from proxmox_fleet.lock import probe_lock
@@ -61,6 +62,7 @@ class RevalidatingStaticFiles(StaticFiles):
         response.headers["Cache-Control"] = "no-cache"
         return response
 
+
 # Phase names accepted by `fleet-update --phases` (mirrors driver.PHASE_NAMES,
 # which is not imported here — the driver needs ansible-runner installed).
 PHASE_NAMES = ("remote", "custom", "lxc", "vm", "node", "manager")
@@ -77,11 +79,13 @@ _TOKEN_RE = inventory_edit._NAME_RE
 _LIMIT_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$")
 
 # Per-bucket table columns for the run-detail and host drill-down pages.
+# ``packages`` (PR1 exact OS package detail) is rendered as a `<details>`
+# disclosure by both templates instead of a plain cell.
 BUCKET_COLUMNS: Dict[str, Tuple[str, ...]] = {
-    "lxc": ("node", "id", "name", "os", "app"),
-    "vm": ("node", "vmid", "name", "status", "pkg_count"),
-    "remote": ("host", "status"),
-    "node": ("node", "status"),
+    "lxc": ("node", "id", "name", "os", "app", "packages"),
+    "vm": ("node", "vmid", "name", "status", "pkg_count", "packages"),
+    "remote": ("host", "status", "pkg_count", "packages"),
+    "node": ("node", "status", "pkg_count", "packages"),
     "custom": ("host", "name", "app"),
     "errors": ("host", "task", "error"),
     "warnings": ("host", "task", "warning"),
@@ -96,9 +100,7 @@ _COUNT_KEYS = ("lxc", "vm", "remote", "node", "custom", "errors", "warnings")
 def _parse_ts(ts: str) -> Optional[datetime]:
     """Parse a history timestamp (``%Y%m%dT%H%M%S%fZ``); None if malformed."""
     try:
-        return datetime.strptime(str(ts).rstrip("Z"), "%Y%m%dT%H%M%S%f").replace(
-            tzinfo=timezone.utc
-        )
+        return datetime.strptime(str(ts).rstrip("Z"), "%Y%m%dT%H%M%S%f").replace(tzinfo=timezone.utc)
     except ValueError:
         return None
 
@@ -132,8 +134,9 @@ def ts_span(ts: str) -> Markup:
     return Markup('<span class="ts" data-utc="{}">{}</span>').format(iso, human)
 
 
-def spark_points(values: Sequence[Any], w: int = 120, h: int = 28,
-                 lo: Optional[float] = None, hi: Optional[float] = None) -> str:
+def spark_points(
+    values: Sequence[Any], w: int = 120, h: int = 28, lo: Optional[float] = None, hi: Optional[float] = None
+) -> str:
     """Jinja filter: numeric series (oldest→newest) → SVG polyline ``points``.
 
     *lo*/*hi* pin the Y scale so several series can share one axis (the
@@ -152,14 +155,10 @@ def spark_points(values: Sequence[Any], w: int = 120, h: int = 28,
     bot = float(lo) if lo is not None else min(vals)
     span = (top - bot) or 1.0
     step = (w - 2 * pad) / (len(vals) - 1)
-    return " ".join(
-        f"{pad + i * step:.1f},{pad + (top - v) / span * (h - 2 * pad):.1f}"
-        for i, v in enumerate(vals)
-    )
+    return " ".join(f"{pad + i * step:.1f},{pad + (top - v) / span * (h - 2 * pad):.1f}" for i, v in enumerate(vals))
 
 
-def _endpoint_counts(inventory_path: str,
-                     latest_pending: Optional[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+def _endpoint_counts(inventory_path: str, latest_pending: Optional[Mapping[str, Any]]) -> List[Dict[str, Any]]:
     """Currently known update endpoints for the overview card.
 
     VM/PVE-host/remote/custom counts come from the inventory groups (what the
@@ -176,10 +175,15 @@ def _endpoint_counts(inventory_path: str,
     ]
 
 
-def _health_score(latest_run: Optional[Mapping[str, Any]],
-                  pending_row: Optional[Mapping[str, Any]]) -> int:
+def _health_score(latest_run: Optional[Mapping[str, Any]], pending_row: Optional[Mapping[str, Any]]) -> int:
     """Fleet health 0–100 for the overview gauge: start at 100; −25 if the
-    latest run failed, −5 per error, −2 per warning, −1 per outdated app."""
+    latest run failed, −5 per error, −2 per warning, −1 per outdated app,
+    −2 per pending security package (capped at −20), −2 per reboot-required
+    host (capped at −10).
+
+    Legacy pending rows (written before the security/reboot keys existed)
+    read as 0 via ``.get()`` — no deduction, no crash.
+    """
     score = 100
     if latest_run:
         counts = latest_run.get("counts") or {}
@@ -189,11 +193,14 @@ def _health_score(latest_run: Optional[Mapping[str, Any]],
         score -= 2 * int(counts.get("warnings", 0) or 0)
     if pending_row:
         score -= int(pending_row.get("outdated_apps", 0) or 0)
+        score -= min(20, 2 * int(pending_row.get("security_pending", 0) or 0))
+        score -= min(10, 2 * int(pending_row.get("reboot_hosts", 0) or 0))
     return max(0, min(100, score))
 
 
-def _activity_weeks(rows: Sequence[Mapping[str, Any]], weeks: int = 17,
-                    today: Optional[date] = None) -> List[List[Dict[str, Any]]]:
+def _activity_weeks(
+    rows: Sequence[Mapping[str, Any]], weeks: int = 17, today: Optional[date] = None
+) -> List[List[Dict[str, Any]]]:
     """GitHub-style activity grid from history rows: *weeks* columns of 7 day
     cells (Monday-first, oldest column first, last column contains today).
     Each cell: date / count / failed / level (0–3) / future / month label."""
@@ -222,14 +229,16 @@ def _activity_weeks(rows: Sequence[Mapping[str, Any]], weeks: int = 17,
             ent = per_day.get(day, {"count": 0, "failed": False})
             count = int(ent["count"])
             level = 0 if count == 0 else 1 if count == 1 else 2 if count <= 3 else 3
-            col.append({
-                "date": day.isoformat(),
-                "count": count,
-                "failed": bool(ent["failed"]),
-                "level": level,
-                "future": day > today,
-                "month": col_label if d == 0 else "",
-            })
+            col.append(
+                {
+                    "date": day.isoformat(),
+                    "count": count,
+                    "failed": bool(ent["failed"]),
+                    "level": level,
+                    "future": day > today,
+                    "month": col_label if d == 0 else "",
+                }
+            )
         grid.append(col)
     return grid
 
@@ -275,16 +284,20 @@ def settings_form_fields(file_data: Mapping[str, Any]) -> List[Dict[str, Any]]:
             text = "true" if value else "false"
         else:
             text = "" if value is None else str(value)
-        rows.append({
-            "name": name, "kind": kind, "value": value,
-            "text": "" if secret else text,
-            "set_in_file": name in file_data, "secret": secret,
-        })
+        rows.append(
+            {
+                "name": name,
+                "kind": kind,
+                "value": value,
+                "text": "" if secret else text,
+                "set_in_file": name in file_data,
+                "secret": secret,
+            }
+        )
     return rows
 
 
-def parse_settings_form(form: Mapping[str, Any],
-                        file_data: Mapping[str, Any]) -> Dict[str, Any]:
+def parse_settings_form(form: Mapping[str, Any], file_data: Mapping[str, Any]) -> Dict[str, Any]:
     """Diff the submitted /settings form against the file: only fields whose
     parsed value differs are returned (so an untouched form writes nothing).
     Blank secret fields mean "keep current". Raises VarsEditError on bad input."""
@@ -327,8 +340,7 @@ def parse_settings_form(form: Mapping[str, Any],
             if [str(v) for v in new] != [str(v) for v in (cur or [])]:
                 changes[name] = new
         elif kind == "map":
-            if {str(k): str(v) for k, v in new.items()} != \
-                    {str(k): str(v) for k, v in (cur or {}).items()}:
+            if {str(k): str(v) for k, v in new.items()} != {str(k): str(v) for k, v in (cur or {}).items()}:
                 changes[name] = new
         elif kind in ("int", "float", "bool"):
             if new != cur:
@@ -380,7 +392,6 @@ def build_run_args(form: Mapping[str, Any]) -> List[str]:
     if limit:
         args += ["--limit", ",".join(limit)]
     return args
-
 
 
 def _lxc_entry_id(key: str, entry: Dict[str, Any]) -> str:
@@ -450,12 +461,197 @@ def _host_records(history_dir: str, name: str) -> List[Dict[str, Any]]:
         for bucket, columns in BUCKET_COLUMNS.items():
             for record in run.get(bucket, []) or []:
                 if _record_matches_host(record, name):
-                    out.append({
-                        "timestamp": row["timestamp"],
-                        "bucket": bucket,
-                        "record": record,
-                        "columns": columns,
-                    })
+                    out.append(
+                        {
+                            "timestamp": row["timestamp"],
+                            "bucket": bucket,
+                            "record": record,
+                            "columns": columns,
+                        }
+                    )
+    return out
+
+
+# Run-record buckets whose ``packages`` field is searched by the package search
+# (the same set history.py strips detail from, minus the search never touching
+# latest.json).
+_PACKAGE_SEARCH_BUCKETS = ("lxc", "vm", "remote", "node")
+
+
+def _pending_entry_matches(name: str, key: str, entry: Mapping[str, Any]) -> bool:
+    """True when a pending-scan lxc entry (snapshot key *key*) belongs to the
+    host identified by *name* — the pending-snapshot mirror of
+    :func:`_record_matches_host`.
+
+    A composite ``node/id`` name matches the entry's own ``node``/``id``
+    fields (or the raw snapshot key); a bare name matches the entry's ``name``
+    field, its explicit ``id`` field, or the bare id a legacy key carries
+    (old snapshots are keyed by the bare id and predate the ``id`` field).
+    """
+    if "/" in name:
+        node_part, id_part = name.split("/", 1)
+        return key == name or (
+            str(entry.get("node", "")) == node_part and str(entry.get("id") or key.rsplit("/", 1)[-1]) == id_part
+        )
+    return str(entry.get("name", "")) == name or str(entry.get("id", "")) == name or key.rsplit("/", 1)[-1] == name
+
+
+def _host_pending_entries(history_dir: str, name: str) -> List[Dict[str, Any]]:
+    """This host's entry from each retained timestamped pending snapshot.
+
+    ``pending-latest.json`` is excluded — it duplicates the newest timestamped
+    file and the /pending page already renders it in full; the host page's
+    timeline shows the *history* of pending updates, newest snapshot first.
+    Host entries (name-keyed, ``kind == "host"``) match by snapshot key;
+    lxc entries (``kind == "lxc"``) match canonically via
+    :func:`_pending_entry_matches` — composite ``node/id`` names, bare
+    container names, and both the new explicit-``id`` and legacy bare-id key
+    shapes. Corrupt/unreadable snapshots are skipped; each hit carries
+    ``timestamp`` + ``bucket == "pending"`` so the merged timeline sort and
+    the template treat it like a run record.
+    """
+    out: List[Dict[str, Any]] = []
+    for scan_file in sorted(Path(history_dir).glob("pending-*.json"), reverse=True):
+        if scan_file.name == "pending-latest.json":
+            continue
+        try:
+            scan = json.loads(scan_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(scan, dict):
+            continue
+        ts = str(scan.get("timestamp", scan_file.stem[8:]))
+        hosts = scan.get("hosts")
+        if isinstance(hosts, dict) and name in hosts:
+            entry = hosts[name]
+            if isinstance(entry, dict):
+                out.append({"timestamp": ts, "bucket": "pending", "kind": "host", "entry": entry})
+        lxc = scan.get("lxc")
+        if isinstance(lxc, dict):
+            for key, entry in sorted(lxc.items()):
+                if isinstance(entry, dict) and _pending_entry_matches(name, key, entry):
+                    out.append({"timestamp": ts, "bucket": "pending", "kind": "lxc", "entry": entry})
+    return out
+
+
+def _host_timeline(history_dir: str, name: str, events: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """The host page's merged timeline: run records + pending-snapshot entries
+    + ledger OS-upgrade events.
+
+    Records come from :func:`_host_records` (newest run first); pending entries
+    from :func:`_host_pending_entries` (newest snapshot first, tagged
+    ``bucket == "pending"``); events are the host's ledger ``os-upgrade``
+    entries (already newest first). All three carry a ``timestamp`` in the
+    same ``%Y%m%dT%H%M%S%fZ`` shape, so one lexical sort interleaves them
+    into a single timeline. Event entries are tagged ``kind == "event"``;
+    pending entries ``kind == "host"/"lxc"`` with ``bucket == "pending"``;
+    record entries stay untagged.
+    """
+    timeline: List[Dict[str, Any]] = _host_records(history_dir, name)
+    timeline.extend(_host_pending_entries(history_dir, name))
+    for event in events:
+        timeline.append(
+            {
+                "timestamp": str(event.get("ts") or ""),
+                "kind": "event",
+                "event": dict(event),
+            }
+        )
+    timeline.sort(key=lambda item: item["timestamp"], reverse=True)
+    return timeline
+
+
+def _record_host_label(bucket: str, record: Mapping[str, Any]) -> str:
+    """The display label for one package-carrying record: lxc → ``name``
+    (falling back to ``node/id``), vm → ``name``, remote → ``host``, node →
+    ``node``. Empty when the record lacks its identifying field (legacy
+    shapes) — the search still returns the hit, the template just has no
+    host link to render."""
+    if bucket == "lxc":
+        name = str(record.get("name") or "")
+        if name:
+            return name
+        node = str(record.get("node") or "")
+        lxc_id = str(record.get("id") or "")
+        return f"{node}/{lxc_id}" if node and lxc_id else node or lxc_id
+    if bucket == "vm":
+        return str(record.get("name") or "")
+    if bucket == "remote":
+        return str(record.get("host") or "")
+    return str(record.get("node") or "")
+
+
+def _record_host_identity(bucket: str, record: Mapping[str, Any]) -> str:
+    """Canonical identity for a package-carrying record."""
+    if bucket == "lxc" and record.get("node") and record.get("id"):
+        return f"{record['node']}/{record['id']}"
+    return _record_host_label(bucket, record)
+
+
+def _record_host_url(bucket: str, record: Mapping[str, Any]) -> str:
+    """The canonical /hosts/… link for a package-carrying record."""
+    identity = _record_host_identity(bucket, record)
+    return f"/hosts/{identity}" if identity else "/hosts/"
+
+
+def _search_packages(history_dir: str, q: str) -> List[Dict[str, Any]]:
+    """Case-insensitive substring search over retained runs' package detail.
+
+    Searches only the timestamped ``run-*.json`` files — never
+    ``latest.json``, which duplicates the newest run. The stripped query
+    matches package NAMES and both the ``from`` and ``to`` versions. Each
+    hit is normalized: ``timestamp`` (+ the ``/history/{ts}`` run link),
+    record ``bucket``, the canonical host identity (``host`` label +
+    ``host_url`` — ``/hosts/{node}/{id}`` for LXCs with both fields), and the
+    package ``name``/``from``/``to``. Identical hits (same run, bucket, host,
+    package triple) are de-duplicated; corrupt run files are skipped. Results
+    come back newest run first, hits in record order.
+    """
+    query = q.strip().lower()
+    if not query:
+        return []
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for run_file in sorted(Path(history_dir).glob("run-*.json"), reverse=True):
+        try:
+            run = json.loads(run_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(run, dict):
+            continue
+        ts = str(run.get("timestamp", run_file.stem[4:]))
+        for bucket in _PACKAGE_SEARCH_BUCKETS:
+            for record in run.get(bucket) or []:
+                if not isinstance(record, dict):
+                    continue
+                host = _record_host_label(bucket, record)
+                identity = _record_host_identity(bucket, record)
+                host_url = _record_host_url(bucket, record)
+                for pkg in record.get("packages") or []:
+                    if not isinstance(pkg, dict):
+                        continue
+                    name = str(pkg.get("name") or "")
+                    frm = str(pkg.get("from") or "")
+                    to = str(pkg.get("to") or "")
+                    if query not in name.lower() and query not in frm.lower() and query not in to.lower():
+                        continue
+                    key = (ts, bucket, identity, name, frm, to)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(
+                        {
+                            "timestamp": ts,
+                            "bucket": bucket,
+                            "host": host,
+                            "identity": identity,
+                            "host_url": host_url,
+                            "run_url": f"/history/{ts}",
+                            "name": name,
+                            "from": frm,
+                            "to": to,
+                        }
+                    )
     return out
 
 
@@ -476,8 +672,7 @@ def create_app(
     # Configure FastAPI-Users authentication
     auth.configure(auth.user_db_path(history_dir))
 
-    app = FastAPI(title="Fleet Dashboard", docs_url=None, redoc_url=None,
-                  on_startup=[auth.create_db_and_tables])
+    app = FastAPI(title="Fleet Dashboard", docs_url=None, redoc_url=None, on_startup=[auth.create_db_and_tables])
 
     # Mount FastAPI-Users routers for authentication
     app.include_router(
@@ -491,8 +686,7 @@ def create_app(
     # thinking about auth is protected, not silently public.
     protected = APIRouter(dependencies=[Depends(current_active_user)])
 
-    app.mount("/static", RevalidatingStaticFiles(directory=str(_PACKAGE_DIR / "static")),
-              name="static")
+    app.mount("/static", RevalidatingStaticFiles(directory=str(_PACKAGE_DIR / "static")), name="static")
     templates = Jinja2Templates(directory=str(_PACKAGE_DIR / "templates"))
     templates.env.filters["ts_human"] = ts_human
     templates.env.filters["ts_iso"] = ts_iso
@@ -525,33 +719,39 @@ def create_app(
             {"kind": "page", "label": "Overview", "url": "/"},
             {"kind": "page", "label": "Pending updates", "url": "/pending"},
             {"kind": "page", "label": "Run history", "url": "/history"},
+            {"kind": "page", "label": "Search packages", "url": "/packages"},
             {"kind": "page", "label": "Trigger a run", "url": "/trigger"},
             {"kind": "page", "label": "Inventory & enrollment", "url": "/inventory"},
             {"kind": "page", "label": "Settings (vars.yml)", "url": "/settings"},
         ]
         seen: set = set()
 
-        def _add_host(name: str) -> None:
-            if name and name not in seen:
-                seen.add(name)
-                items.append({"kind": "host", "label": name, "url": f"/hosts/{name}"})
+        def _add_host(label: str, identity: Optional[str] = None) -> None:
+            host_id = identity or label
+            if host_id and host_id not in seen:
+                seen.add(host_id)
+                items.append({"kind": "host", "label": label, "url": f"/hosts/{host_id}"})
 
         latest = _read_run_or_none("latest")
         if latest:
             for bucket in BUCKET_COLUMNS:
                 for record in latest.get(bucket, []) or []:
-                    for key in ("host", "name"):
-                        _add_host(str(record.get(key) or ""))
+                    if bucket == "lxc" and record.get("node") and record.get("id"):
+                        identity = f"{record['node']}/{record['id']}"
+                        _add_host(str(record.get("name") or identity), identity)
+                    else:
+                        for key in ("host", "name"):
+                            _add_host(str(record.get(key) or ""))
         pending_snapshot = _read_pending_or_none("latest")
         if pending_snapshot:
             for name in pending_snapshot.get("hosts") or {}:
                 _add_host(str(name))
             for lxc_key, entry in (pending_snapshot.get("lxc") or {}).items():
-                _add_host(str(entry.get("name") or _lxc_entry_id(lxc_key, entry)))
+                identity = f"{entry['node']}/{entry['id']}" if entry.get("node") and entry.get("id") else str(lxc_key)
+                _add_host(str(entry.get("name") or _lxc_entry_id(lxc_key, entry)), identity)
         for row in history_mod.history_summary(history_dir, limit=8):
             ts = str(row.get("timestamp", ""))
-            items.append({"kind": "run", "label": f"Run {ts_human(ts)}",
-                          "url": f"/history/{ts}"})
+            items.append({"kind": "run", "label": f"Run {ts_human(ts)}", "url": f"/history/{ts}"})
         return items
 
     # base.html calls palette_items() on every page render; rebuilding it
@@ -582,8 +782,7 @@ def create_app(
         latest_pending = _read_pending_or_none("latest")
         # Same threshold as /pending, so a customised lxc_disk_warn_percent can
         # never make the overview's counts disagree with the pending page's.
-        pending_rows = scan_mod.pending_summary(
-            history_dir, limit=1, disk_threshold=settings.lxc_disk_warn_percent)
+        pending_rows = scan_mod.pending_summary(history_dir, limit=1, disk_threshold=settings.lxc_disk_warn_percent)
         pending_row = pending_rows[0] if pending_rows else None
         # newest first from history_summary; reversed → oldest first for the
         # pulse strip / sparkline (time flows left → right)
@@ -603,23 +802,33 @@ def create_app(
             }
             for row in recent
         ]
-        trend_max = max(
-            (max(p["os"], p["app"], p["err"], p["warn"]) for p in trend),
-            default=0,
-        ) or 1
-        return templates.TemplateResponse(request, "index.html", {
-            "latest_run": latest_run,
-            "latest_pending": latest_pending,
-            "pending_row": pending_row,
-            "lock_holder": probe_lock(history_dir),
-            "active_run": manager.active_run(),
-            "endpoints": _endpoint_counts(inventory_path, latest_pending),
-            "recent": recent,
-            "trend": trend,
-            "trend_max": trend_max,
-            "totals": history_mod.read_totals(history_dir),
-            "health": _health_score(latest_run, pending_row),
-        })
+        trend_max = (
+            max(
+                (max(p["os"], p["app"], p["err"], p["warn"]) for p in trend),
+                default=0,
+            )
+            or 1
+        )
+        # PR3: OS-release upgrades seen by the pending scans (ledger events).
+        os_upgrades = (ledger_mod.read_ledger(history_dir).get("events") or [])[:8]
+        return templates.TemplateResponse(
+            request,
+            "index.html",
+            {
+                "latest_run": latest_run,
+                "latest_pending": latest_pending,
+                "pending_row": pending_row,
+                "lock_holder": probe_lock(history_dir),
+                "active_run": manager.active_run(),
+                "endpoints": _endpoint_counts(inventory_path, latest_pending),
+                "recent": recent,
+                "trend": trend,
+                "trend_max": trend_max,
+                "totals": history_mod.read_totals(history_dir),
+                "health": _health_score(latest_run, pending_row),
+                "os_upgrades": os_upgrades,
+            },
+        )
 
     @protected.get("/pending")
     def pending(request: Request, ref: str = "latest") -> Any:
@@ -629,60 +838,118 @@ def create_app(
         hosts = sorted((snapshot.get("hosts") or {}).items()) if snapshot else []
         # The template renders (display_id, entry) pairs — derive the id here so
         # both node/id-keyed (new) and bare-id-keyed (legacy) snapshots work.
-        lxc = ([(_lxc_entry_id(k, e), e) for k, e in
-                sorted((snapshot.get("lxc") or {}).items(), key=_lxc_sort_key)]
-               if snapshot else [])
+        lxc = (
+            [(_lxc_entry_id(k, e), e) for k, e in sorted((snapshot.get("lxc") or {}).items(), key=_lxc_sort_key)]
+            if snapshot
+            else []
+        )
         # Pass the configured threshold through so the page and the briefing
         # warnings agree on what counts as "low disk".
         disk_threshold = settings.lxc_disk_warn_percent
-        return templates.TemplateResponse(request, "pending.html", {
-            "ref": ref,
-            "snapshot": snapshot,
-            "hosts": hosts,
-            "lxc": lxc,
-            "disk_threshold": disk_threshold,
-            "scans": scan_mod.pending_summary(
-                history_dir, limit=0, disk_threshold=disk_threshold),
-        })
+        return templates.TemplateResponse(
+            request,
+            "pending.html",
+            {
+                "ref": ref,
+                "snapshot": snapshot,
+                "hosts": hosts,
+                "lxc": lxc,
+                "disk_threshold": disk_threshold,
+                "scans": scan_mod.pending_summary(history_dir, limit=0, disk_threshold=disk_threshold),
+            },
+        )
 
     @protected.get("/history")
     def history(request: Request) -> Any:
         rows = _history_rows_with_deltas(history_dir)
-        return templates.TemplateResponse(request, "history.html", {
-            "rows": rows,
-            "count_keys": _COUNT_KEYS,
-            "heatmap": _activity_weeks(rows),
-        })
+        return templates.TemplateResponse(
+            request,
+            "history.html",
+            {
+                "rows": rows,
+                "count_keys": _COUNT_KEYS,
+                "heatmap": _activity_weeks(rows),
+            },
+        )
 
     @protected.get("/history/{ref}")
     def history_show(request: Request, ref: str) -> Any:
         run = _read_run_or_none(ref)
         if run is None:
             raise HTTPException(404, f"no history record {ref!r}")
-        buckets = [
-            (bucket, columns, run.get(bucket, []) or [])
-            for bucket, columns in BUCKET_COLUMNS.items()
-        ]
-        return templates.TemplateResponse(request, "run_detail.html", {
-            "ref": ref,
-            "run": run,
-            "buckets": buckets,
-        })
+        buckets = [(bucket, columns, run.get(bucket, []) or []) for bucket, columns in BUCKET_COLUMNS.items()]
+        return templates.TemplateResponse(
+            request,
+            "run_detail.html",
+            {
+                "ref": ref,
+                "run": run,
+                "buckets": buckets,
+            },
+        )
+
+    @protected.get("/packages")
+    def packages(request: Request, q: str = "") -> Any:
+        """PR4: exact-package search over retained runs.
+
+        The hits come back newest run first from :func:`_search_packages`;
+        this route groups them by run (newest first, hits in record order)
+        so the no-JS template renders one block per run with a run link and
+        per-hit host links. ``fleet_package_detail_keep`` drives the
+        retention note: how many of the newest runs keep their package
+        detail (older timestamped runs are stripped by write_history).
+        """
+        query = q.strip()
+        hits = _search_packages(history_dir, query) if query else []
+        groups: List[Dict[str, Any]] = []
+        index: Dict[str, Dict[str, Any]] = {}
+        for hit in hits:
+            group = index.get(hit["timestamp"])
+            if group is None:
+                group = {"timestamp": hit["timestamp"], "hits": []}
+                index[hit["timestamp"]] = group
+                groups.append(group)
+            group["hits"].append(hit)
+        return templates.TemplateResponse(
+            request,
+            "packages.html",
+            {
+                "q": query,
+                "groups": groups,
+                "total": len(hits),
+                "retention_keep": settings.fleet_package_detail_keep,
+            },
+        )
 
     @protected.get("/hosts/{name:path}")
     def host_detail(request: Request, name: str) -> Any:
-        return templates.TemplateResponse(request, "host.html", {
-            "name": name,
-            "records": _host_records(history_dir, name),
-        })
+        # PR3: the per-host ledger (last-updated metadata + OS-upgrade events)
+        # is matched by the same composite node/id key the run records use, so
+        # /hosts/pve-01/101 resolves both.
+        ledger_data = ledger_mod.read_ledger(history_dir)
+        host_entry = (ledger_data.get("hosts") or {}).get(name)
+        events = [e for e in (ledger_data.get("events") or []) if isinstance(e, dict) and e.get("host") == name]
+        return templates.TemplateResponse(
+            request,
+            "host.html",
+            {
+                "name": name,
+                "timeline": _host_timeline(history_dir, name, events),
+                "ledger": host_entry,
+            },
+        )
 
     @protected.get("/trigger")
     def trigger(request: Request) -> Any:
-        return templates.TemplateResponse(request, "trigger.html", {
-            "phase_names": PHASE_NAMES,
-            "lock_holder": probe_lock(history_dir),
-            "runs": manager.list_runs(),
-        })
+        return templates.TemplateResponse(
+            request,
+            "trigger.html",
+            {
+                "phase_names": PHASE_NAMES,
+                "lock_holder": probe_lock(history_dir),
+                "runs": manager.list_runs(),
+            },
+        )
 
     # ----- inventory enrollment + settings + ssh setup ----------------- #
 
@@ -693,12 +960,11 @@ def create_app(
             url += f"?err={quote(err)}"
         return RedirectResponse(url=url, status_code=303)
 
-    def _inventory_context(request: Request,
-                           ssh_result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _inventory_context(request: Request, ssh_result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Context shared by GET /inventory and the ssh POSTs (which re-render
         the page with the action's output instead of redirecting)."""
         exists = Path(inventory_path).exists()
-        live = GlobalSettings.load(vars_path)   # fresh — edits land on the file
+        live = GlobalSettings.load(vars_path)  # fresh — edits land on the file
         canary_ids = {str(c) for c in live.canary_hosts}
         host_vars_dir = Path(settings.host_vars_dir)
         groups: List[Dict[str, Any]] = []
@@ -711,18 +977,18 @@ def create_app(
                     vmid = hvars.get("vmid", "")
                     kuma = ""
                     if group == "proxmox_vms":
-                        kuma = str(live.vm_kuma_map.get(vmid)
-                                   or live.vm_kuma_map.get(name) or "")
+                        kuma = str(live.vm_kuma_map.get(vmid) or live.vm_kuma_map.get(name) or "")
                     elif group == "remote_hosts":
                         kuma = str(live.remote_kuma_map.get(name) or "")
-                    rows.append({
-                        "name": name,
-                        "vars": hvars,
-                        "canary": (_truthy(hvars.get("canary"))
-                                   or name in canary_ids or vmid in canary_ids),
-                        "kuma": kuma,
-                        "has_host_vars": (host_vars_dir / f"{name}.yml").is_file(),
-                    })
+                    rows.append(
+                        {
+                            "name": name,
+                            "vars": hvars,
+                            "canary": (_truthy(hvars.get("canary")) or name in canary_ids or vmid in canary_ids),
+                            "kuma": kuma,
+                            "has_host_vars": (host_vars_dir / f"{name}.yml").is_file(),
+                        }
+                    )
                 groups.append({"group": group, "hosts": rows})
         return {
             "inventory_exists": exists,
@@ -744,14 +1010,12 @@ def create_app(
 
     @protected.get("/inventory")
     def inventory_page(request: Request) -> Any:
-        return templates.TemplateResponse(
-            request, "inventory.html", _inventory_context(request))
+        return templates.TemplateResponse(request, "inventory.html", _inventory_context(request))
 
     @protected.post("/inventory/create")
     async def inventory_create(request: Request) -> Any:
         created = inventory_edit.ensure_inventory(inventory_path)
-        return _redirect("/inventory",
-                         ok="hosts.ini created" if created else "hosts.ini already exists")
+        return _redirect("/inventory", ok="hosts.ini created" if created else "hosts.ini already exists")
 
     @protected.post("/inventory/add")
     async def inventory_add(request: Request) -> Any:
@@ -765,7 +1029,7 @@ def create_app(
             inline: Dict[str, str] = {}
             if ansible_host:
                 inline["ansible_host"] = ansible_host
-            elif group != "proxmox_nodes":   # nodes fall back to their name
+            elif group != "proxmox_nodes":  # nodes fall back to their name
                 raise InventoryEditError("ansible_host is required")
             if group == "proxmox_vms":
                 vmid = str(form.get("vmid") or "").strip()
@@ -792,19 +1056,16 @@ def create_app(
                 if not _TOKEN_RE.match(kuma_id):
                     raise VarsEditError(f"invalid kuma monitor id {kuma_id!r}")
                 if group == "proxmox_vms":
-                    vars_edit.apply_changes(
-                        vars_path, map_set={"vm_kuma_map": {inline["vmid"]: kuma_id}})
+                    vars_edit.apply_changes(vars_path, map_set={"vm_kuma_map": {inline["vmid"]: kuma_id}})
                 elif group == "remote_hosts":
-                    vars_edit.apply_changes(
-                        vars_path, map_set={"remote_kuma_map": {name: kuma_id}})
+                    vars_edit.apply_changes(vars_path, map_set={"remote_kuma_map": {name: kuma_id}})
 
             # host_vars/<name>.yml: pre_update_cmd + maintenance window
             host_vars: Dict[str, Any] = {}
             pre_cmd = str(form.get("pre_update_cmd") or "").strip()
             if pre_cmd and group == "remote_hosts":
                 host_vars["pre_update_cmd"] = pre_cmd
-            mw_fields = {k: str(form.get(f"mw_{k}") or "").strip()
-                         for k in ("days", "start", "end", "tz")}
+            mw_fields = {k: str(form.get(f"mw_{k}") or "").strip() for k in ("days", "start", "end", "tz")}
             if any(mw_fields.values()) and group != "proxmox_nodes":
                 mw: Dict[str, Any] = {}
                 days = [d.strip() for d in mw_fields["days"].split(",") if d.strip()]
@@ -813,7 +1074,7 @@ def create_app(
                 for k in ("start", "end", "tz"):
                     if mw_fields[k]:
                         mw[k] = mw_fields[k]
-                MaintenanceWindow(**mw)   # fail loud before writing
+                MaintenanceWindow(**mw)  # fail loud before writing
                 host_vars["maintenance_window"] = mw
             if host_vars:
                 vars_edit.host_vars_write(settings.host_vars_dir, name, host_vars)
@@ -838,12 +1099,18 @@ def create_app(
                 ids = [name] + ([vmid] if vmid else [])
                 vars_edit.apply_changes(
                     vars_path,
-                    list_remove={key: ids for key in (
-                        "canary_hosts", "os_only_lxc_list", "exclude_list",
-                        "os_update_exclude_list", "app_update_exclude_list",
-                        "snapshot_exclude_list")},
-                    map_remove={key: ids for key in (
-                        "lxc_kuma_map", "vm_kuma_map", "remote_kuma_map")},
+                    list_remove={
+                        key: ids
+                        for key in (
+                            "canary_hosts",
+                            "os_only_lxc_list",
+                            "exclude_list",
+                            "os_update_exclude_list",
+                            "app_update_exclude_list",
+                            "snapshot_exclude_list",
+                        )
+                    },
+                    map_remove={key: ids for key in ("lxc_kuma_map", "vm_kuma_map", "remote_kuma_map")},
                 )
                 vars_edit.host_vars_delete(settings.host_vars_dir, name)
         except (InventoryEditError, VarsEditError) as exc:
@@ -855,14 +1122,18 @@ def create_app(
     def settings_page(request: Request) -> Any:
         file_data = dict(vars_edit.load_data(vars_path))
         known = set(GlobalSettings.model_fields)
-        return templates.TemplateResponse(request, "settings.html", {
-            "fields": settings_form_fields(file_data),
-            "raw": vars_edit.read_raw(vars_path),
-            "vars_path": vars_path,
-            "extra_keys": sorted(k for k in file_data if k not in known),
-            "ok": request.query_params.get("ok", ""),
-            "err": request.query_params.get("err", ""),
-        })
+        return templates.TemplateResponse(
+            request,
+            "settings.html",
+            {
+                "fields": settings_form_fields(file_data),
+                "raw": vars_edit.read_raw(vars_path),
+                "vars_path": vars_path,
+                "extra_keys": sorted(k for k in file_data if k not in known),
+                "ok": request.query_params.get("ok", ""),
+                "err": request.query_params.get("err", ""),
+            },
+        )
 
     @protected.post("/settings")
     async def settings_save(request: Request) -> Any:
@@ -874,8 +1145,7 @@ def create_app(
                 vars_edit.apply_changes(vars_path, set_keys=changes)
         except VarsEditError as exc:
             raise HTTPException(400, str(exc))
-        msg = (f"updated {len(changes)} setting(s): " + ", ".join(sorted(changes))
-               if changes else "no changes")
+        msg = f"updated {len(changes)} setting(s): " + ", ".join(sorted(changes)) if changes else "no changes"
         return _redirect("/settings", ok=msg)
 
     @protected.post("/settings/raw")
@@ -887,16 +1157,18 @@ def create_app(
             raise HTTPException(400, str(exc))
         return _redirect("/settings", ok=f"{vars_path} replaced (backup written)")
 
-    def _ssh_action(request: Request, action: str,
-                    call: Callable[[], Tuple[bool, str]]) -> Any:
+    def _ssh_action(request: Request, action: str, call: Callable[[], Tuple[bool, str]]) -> Any:
         """Shared tail of the three ssh POSTs: run the action, map bad input
         to 400, re-render the inventory page with the action's output."""
         try:
             ok, output = call()
         except SshSetupError as exc:
             raise HTTPException(400, str(exc))
-        return templates.TemplateResponse(request, "inventory.html", _inventory_context(
-            request, ssh_result={"action": action, "ok": ok, "output": output}))
+        return templates.TemplateResponse(
+            request,
+            "inventory.html",
+            _inventory_context(request, ssh_result={"action": action, "ok": ok, "output": output}),
+        )
 
     @protected.post("/ssh/generate")
     async def ssh_generate(request: Request) -> Any:
@@ -905,19 +1177,30 @@ def create_app(
     @protected.post("/ssh/push")
     async def ssh_push(request: Request) -> Any:
         form = await request.form()
-        return _ssh_action(request, "push", lambda: sshsetup.push_key(
-            str(form.get("host") or ""), str(form.get("user") or "root"),
-            str(form.get("password") or ""), port=form.get("port") or 22,
-            pubkey_path=str(form.get("pubkey") or sshsetup.DEFAULT_KEY + ".pub"),
-        ))
+        return _ssh_action(
+            request,
+            "push",
+            lambda: sshsetup.push_key(
+                str(form.get("host") or ""),
+                str(form.get("user") or "root"),
+                str(form.get("password") or ""),
+                port=form.get("port") or 22,
+                pubkey_path=str(form.get("pubkey") or sshsetup.DEFAULT_KEY + ".pub"),
+            ),
+        )
 
     @protected.post("/ssh/test")
     async def ssh_test(request: Request) -> Any:
         form = await request.form()
-        return _ssh_action(request, "test", lambda: sshsetup.test_key(
-            str(form.get("host") or ""), str(form.get("user") or "root"),
-            port=form.get("port") or 22,
-        ))
+        return _ssh_action(
+            request,
+            "test",
+            lambda: sshsetup.test_key(
+                str(form.get("host") or ""),
+                str(form.get("user") or "root"),
+                port=form.get("port") or 22,
+            ),
+        )
 
     @protected.post("/runs")
     async def start_run(request: Request) -> Any:

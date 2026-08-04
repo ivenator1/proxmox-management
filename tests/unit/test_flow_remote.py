@@ -30,6 +30,11 @@ DNF_UPGRADED = "Upgraded: foo-1.0\nComplete!\n"
 DNF_NOOP = "Nothing to do!\n"
 APK_UPGRADED = "(1 upgraded, 0 installed, 0 removed)\n"
 APK_NOOP = "(0 upgraded, 0 installed, 0 removed)\n"
+# Real apk upgrade stdout with the (i/n) line prefix (PR1 packages detail)
+APK_REAL_DETAIL = (
+    "(1/2) Upgrading musl (1.2.4-r0 -> 1.2.5-r0)\n"
+    "(2/2) Upgrading busybox (1.36.1-r0 -> 1.36.1-r1)\n"
+)
 
 PKG_DETECT_APT = "/usr/bin/apt-get\napt\n"
 PKG_DETECT_DNF = "/usr/bin/dnf\ndnf\n"
@@ -96,6 +101,28 @@ def test_normal_update_apt():
     assert outcome.record.host == "my-server"
 
 
+def test_normal_update_apt_packages_and_count(monkeypatch):
+    """PR1: remote success records carry pkg_count AND the exact package list."""
+    ex = ScriptedRemoteExecutor(script={
+        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+        "dist-upgrade": [_ok(stdout=(
+            "Unpacking libssl3:amd64 (3.0.13-1~deb12u1) over (3.0.11-1~deb12u2) ...\n"
+            "Unpacking curl (8.5.0-2) over (8.5.0-1) ...\n"
+            "2 upgraded, 0 newly installed, 0 to remove.\n"))],
+        "reboot-required": [_ok(rc=1, changed=False)],
+    })
+    outcome = run_remote_update("my-server", ex, _settings(), dry_run=False)
+
+    assert not outcome.failed
+    assert outcome.record is not None
+    assert outcome.record.status == "UPDATED"
+    assert outcome.record.pkg_count == 2
+    assert outcome.record.packages == [
+        {"name": "libssl3", "from": "3.0.11-1~deb12u2", "to": "3.0.13-1~deb12u1"},
+        {"name": "curl", "from": "8.5.0-1", "to": "8.5.0-2"},
+    ]
+
+
 def test_normal_update_dnf():
     """dnf packages upgraded — UPDATED."""
     ex = ScriptedRemoteExecutor(script={
@@ -122,6 +149,24 @@ def test_normal_update_apk():
     assert not outcome.failed
     assert outcome.record is not None
     assert outcome.record.status == "UPDATED"
+
+
+def test_normal_update_apk_packages_with_prefix(monkeypatch):
+    """PR1: the (i/n) prefix must not hide apk packages (bug-#1 regression)."""
+    ex = ScriptedRemoteExecutor(script={
+        "which apt-get": [_ok(stdout=PKG_DETECT_APK)],
+        "apk": [_ok(stdout=APK_REAL_DETAIL)],
+        "reboot-required": [_ok(rc=1, changed=False)],
+    })
+    outcome = run_remote_update("my-server", ex, _settings(), dry_run=False)
+
+    assert not outcome.failed
+    assert outcome.record is not None
+    assert outcome.record.pkg_count == 2
+    assert outcome.record.packages == [
+        {"name": "musl", "from": "1.2.4-r0", "to": "1.2.5-r0"},
+        {"name": "busybox", "from": "1.36.1-r0", "to": "1.36.1-r1"},
+    ]
 
 
 def test_update_with_reboot():
@@ -152,17 +197,33 @@ def test_idle_nothing_to_upgrade():
     assert outcome.record is None
 
 
+APT_SIM_DETAIL = (
+    "Inst libssl3:amd64 [3.0.11-1~deb12u2] (3.0.13-1~deb12u1 Debian:12-security/stable-security [amd64])\n"
+    "Inst curl [8.5.0-1] (8.5.0-2 Debian:12-security/stable-security [amd64])\n"
+    "3 upgraded, 0 newly installed, 0 to remove.\n"
+)
+
+
 def test_dry_run_would_update():
-    """Dry-run with pending upgrades — WOULD UPDATE."""
+    """Dry-run with pending upgrades — WOULD UPDATE.
+
+    PR1 roadmap: simulated (would-update) output IS retained as package detail
+    (here from the ``apt-get -s`` ``Inst`` lines); pkg_count stays None because
+    cumulative totals must count only actual updates."""
     ex = ScriptedRemoteExecutor(script={
         "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-        "apt-get -s": [_ok(stdout=APT_UPGRADED)],  # simulate: -s comes before dist-upgrade
+        "apt-get -s": [_ok(stdout=APT_SIM_DETAIL)],  # simulate: -s comes before dist-upgrade
     })
     outcome = run_remote_update("my-server", ex, _settings(), dry_run=True)
 
     assert not outcome.failed
     assert outcome.record is not None
     assert outcome.record.status == "WOULD UPDATE"
+    assert outcome.record.packages == [
+        {"name": "libssl3", "from": "3.0.11-1~deb12u2", "to": "3.0.13-1~deb12u1"},
+        {"name": "curl", "from": "8.5.0-1", "to": "8.5.0-2"},
+    ]
+    assert outcome.record.pkg_count is None  # totals count real updates only
 
 
 def test_dry_run_ok():

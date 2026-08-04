@@ -21,12 +21,14 @@ from typing import Callable, Optional
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import pkg_changed as _pkg_changed
+from proxmox_fleet.changes import vm_pkg_count as _vm_pkg_count
 from proxmox_fleet.cluster import DEFAULT_CLUSTER, split_qualified
 from proxmox_fleet.executor import Executor
 from proxmox_fleet.flows._pkg import upgrade_cmd
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import ErrorEntry, NodeRecord
 from proxmox_fleet.orchestration import retry
+from proxmox_fleet.pkg_detail import parse_upgraded
 from proxmox_fleet.status import manager_status, node_status
 
 # Nodes are always Debian/apt — no pkg_mgr detection step needed; the apt
@@ -104,13 +106,10 @@ def run_node_update(
         def _apt() -> str:
             res = executor.run_shell(apt_cmd, ignore_errors=True)
             if res.failed and not dry_run:
-                raise RuntimeError(
-                    f"apt dist-upgrade failed (rc={res.rc}): {res.stderr or res.stdout}"
-                )
+                raise RuntimeError(f"apt dist-upgrade failed (rc={res.rc}): {res.stderr or res.stdout}")
             return res.stdout
 
-        apt_stdout = retry(_apt, retries=settings.node_apt_retries,
-                           delay=settings.node_apt_retry_delay, sleep=_sleep)
+        apt_stdout = retry(_apt, retries=settings.node_apt_retries, delay=settings.node_apt_retry_delay, sleep=_sleep)
         apt_changed = _pkg_changed(apt_stdout, "apt")
 
         # ------------------------------------------------------------------
@@ -140,16 +139,24 @@ def run_node_update(
         # ------------------------------------------------------------------
         status = node_status(apt_changed, reboot_needed, rebooted, is_manager)
         outcome.changed = apt_changed or rebooted or (reboot_needed and is_manager)
-        outcome.record = NodeRecord(node=node, status=status)
+        # Nodes are always apt. Counts remain real-run-only for cumulative
+        # totals; simulated output is retained as would-update package detail.
+        pkg_count = _vm_pkg_count(apt_stdout, "apt") if (apt_changed and not dry_run) else None
+        packages = (parse_upgraded(apt_stdout, "apt") or None) if apt_changed else None
+        outcome.record = NodeRecord(
+            node=node,
+            status=status,
+            pkg_count=pkg_count,
+            packages=packages,
+            dry_run=dry_run or None,
+        )
         return outcome
 
     except Exception as exc:  # noqa: BLE001 - mirror Ansible rescue catch-all
         failed_task = getattr(exc, "step_name", type(exc).__name__)
         outcome.failed = True
         outcome.record = NodeRecord(node=node, status="FAILED")
-        outcome.error = ErrorEntry(
-            host=node, task=str(failed_task), error=str(exc)[:300]
-        )
+        outcome.error = ErrorEntry(host=node, task=str(failed_task), error=str(exc)[:300])
         return outcome
 
 
@@ -192,14 +199,20 @@ def run_manager_update(
         # ------------------------------------------------------------------
         status = manager_status(apt_changed, reboot_needed)
         outcome.changed = apt_changed
-        outcome.record = NodeRecord(node="Ansible-Manager", status=status)
+        pkg_count = _vm_pkg_count(res.stdout, "apt") if (apt_changed and not dry_run) else None
+        packages = (parse_upgraded(res.stdout, "apt") or None) if apt_changed else None
+        outcome.record = NodeRecord(
+            node="Ansible-Manager",
+            status=status,
+            pkg_count=pkg_count,
+            packages=packages,
+            dry_run=dry_run or None,
+        )
         return outcome
 
     except Exception as exc:  # noqa: BLE001
         failed_task = getattr(exc, "step_name", type(exc).__name__)
         outcome.failed = True
         outcome.record = NodeRecord(node="Ansible-Manager", status="FAILED")
-        outcome.error = ErrorEntry(
-            host="Ansible-Manager", task=str(failed_task), error=str(exc)[:300]
-        )
+        outcome.error = ErrorEntry(host="Ansible-Manager", task=str(failed_task), error=str(exc)[:300])
         return outcome

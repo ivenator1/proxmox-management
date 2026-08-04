@@ -9,6 +9,8 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+from proxmox_fleet.pkg_detail import parse_upgraded
+
 
 def normalize_version(value: str) -> str:
     """Trim and strip a single leading 'v' (mirrors `| trim | regex_replace('^v', '')`)."""
@@ -74,7 +76,10 @@ def vm_pkg_count(stdout: str, pkg_mgr: str) -> Optional[int]:
         m = re.search(r"Upgrade\s+(\d+)\s+Packages?", stdout, re.IGNORECASE)
         return int(m.group(1)) if m else None
     if pkg_mgr == "apk":
-        count = len(re.findall(r"^Upgrading ", stdout, re.MULTILINE))
+        # Real apk output numbers every line: "(1/2) Upgrading musl (old -> new)".
+        # The old ^Upgrading regex missed the (i/n) prefix and always counted 0 —
+        # delegate to the shared exact-line parser (bug #1 fix).
+        count = len(parse_upgraded(stdout, "apk"))
         return count if count > 0 else None
     return None
 
