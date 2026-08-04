@@ -112,6 +112,42 @@ def test_node_dry_run_serialization():
     assert "dry_run" not in real.model_dump()
 
 
+def test_node_diagnostics_are_optional_and_omitted_for_legacy_records():
+    legacy = NodeRecord(node="pve-01", status="OK")
+    dumped = legacy.model_dump()
+    assert "reboot_reasons" not in dumped
+    assert "checks" not in dumped
+
+    record = NodeRecord(
+        node="pve-01",
+        status="UPDATED (MANUAL REBOOT REQ)",
+        reboot_reasons=["NVIDIA module mismatch: loaded 1, installed 2"],
+        checks={"running_kernel": "6.8.12-8-pve", "nvidia_dkms_ready": True},
+    )
+    assert record.model_dump()["reboot_reasons"] == [
+        "NVIDIA module mismatch: loaded 1, installed 2"
+    ]
+    assert record.model_dump()["checks"]["nvidia_dkms_ready"] is True
+
+
+def test_node_diagnostics_round_trip_through_state(tmp_path):
+    state = FleetState(
+        node=[
+            NodeRecord(
+                node="pve-01",
+                status="UPDATED & REBOOTED",
+                reboot_reasons=["kernel update: old → new"],
+                checks={"pre_reboot": {"nvidia_loaded": "old"}},
+            )
+        ]
+    )
+    path = tmp_path / "state.json"
+    state.dump(path)
+    loaded = FleetState.load(path)
+    assert loaded.node[0].reboot_reasons == ["kernel update: old → new"]
+    assert loaded.node[0].checks == {"pre_reboot": {"nvidia_loaded": "old"}}
+
+
 def test_node_dry_run_round_trips_through_dump_and_load(tmp_path):
     """PR3: a dry_run=true record survives dump → load; a legacy key-free
     file loads with dry_run None, never a crash or an invented flag."""

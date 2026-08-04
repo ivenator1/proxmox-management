@@ -1,0 +1,143 @@
+---
+# Read-only post-upgrade diagnostics for a Proxmox node.
+# Python owns all classification and reboot policy; this primitive only returns facts.
+#
+# Every task is check_mode: false because these are read-only probes that must
+# run even under `--check` — the control plane classifies the returned facts
+# (reboot-required marker, kernel mismatch, NVIDIA installed/loaded module
+# versions, DKMS state for the exact running kernel, nvidia-smi probe).
+#
+# Params (extravars):
+#   target_hosts     host to probe (set by invoke_primitive)
+#   nvidia_host      bool — run the NVIDIA diagnostic tasks (set by Python from
+#                    inventory; the play also honours the inventory var via the
+#                    same `nvidia_host | default(false)` read)
+- name: "node_post_upgrade primitive"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  tasks:
+    - name: "Read running kernel"
+      ansible.builtin.command:
+        argv: [uname, -r]
+      environment:
+        LC_ALL: C
+      register: _running_kernel
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Read latest installed kernel"
+      ansible.builtin.shell: >-
+        set -o pipefail &&
+        ls -1 /boot/vmlinuz-* 2>/dev/null |
+        sort -V |
+        tail -n1 |
+        sed 's|.*vmlinuz-||'
+      args:
+        executable: /bin/bash
+      environment:
+        LC_ALL: C
+      register: _latest_kernel
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Check Debian reboot marker"
+      ansible.builtin.stat:
+        path: /run/reboot-required
+      register: _reboot_required
+      changed_when: false
+      check_mode: false
+
+    - name: "Read Debian reboot package list"
+      ansible.builtin.command:
+        argv: [cat, /run/reboot-required.pkgs]
+      environment:
+        LC_ALL: C
+      register: _reboot_packages
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    # Debian's nvidia-kernel-dkms installs the module as `nvidia-current` while
+    # Ubuntu's nvidia-dkms-* packages install it as `nvidia`; probe both names.
+    - name: "Read installed NVIDIA module version"
+      ansible.builtin.shell: >-
+        (modinfo -F version nvidia 2>/dev/null ||
+         modinfo -F version nvidia-current 2>/dev/null) || exit 1
+      args:
+        executable: /bin/bash
+      environment:
+        LC_ALL: C
+      register: _nvidia_installed
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: nvidia_host | default(false) | bool
+
+    - name: "Read loaded NVIDIA module version"
+      ansible.builtin.shell: >-
+        (cat /sys/module/nvidia/version 2>/dev/null ||
+         cat /sys/module/nvidia-current/version 2>/dev/null) || exit 1
+      args:
+        executable: /bin/bash
+      environment:
+        LC_ALL: C
+      register: _nvidia_loaded
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: nvidia_host | default(false) | bool
+
+    - name: "Read DKMS state for running kernel"
+      ansible.builtin.command:
+        argv:
+          - dkms
+          - status
+          - -k
+          - "{{ _running_kernel.stdout | default('') | trim }}"
+      environment:
+        LC_ALL: C
+      register: _nvidia_dkms
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when:
+        - nvidia_host | default(false) | bool
+        - (_running_kernel.stdout | default('') | trim) != ''
+
+    - name: "Probe NVIDIA device health"
+      ansible.builtin.command:
+        argv:
+          - nvidia-smi
+          - --query-gpu=index
+          - --format=csv,noheader
+      environment:
+        LC_ALL: C
+      register: _nvidia_smi
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: nvidia_host | default(false) | bool
+
+    - name: "Return post-upgrade diagnostics to control plane"
+      ansible.builtin.set_stats:
+        data:
+          diagnostics_version: 1
+          running_kernel_rc: "{{ _running_kernel.rc | default(1) }}"
+          running_kernel: "{{ _running_kernel.stdout | default('') | trim }}"
+          latest_kernel_rc: "{{ _latest_kernel.rc | default(1) }}"
+          latest_kernel: "{{ _latest_kernel.stdout | default('') | trim }}"
+          reboot_required_exists: "{{ _reboot_required.stat.exists | default(false) }}"
+          reboot_required_packages: "{{ _reboot_packages.stdout | default('') }}"
+          nvidia_checked: "{{ nvidia_host | default(false) | bool }}"
+          nvidia_installed_rc: "{{ _nvidia_installed.rc | default(1) }}"
+          nvidia_installed: "{{ _nvidia_installed.stdout | default('') | trim }}"
+          nvidia_loaded_rc: "{{ _nvidia_loaded.rc | default(1) }}"
+          nvidia_loaded: "{{ _nvidia_loaded.stdout | default('') | trim }}"
+          nvidia_dkms_rc: "{{ _nvidia_dkms.rc | default(1) }}"
+          nvidia_dkms_status: "{{ _nvidia_dkms.stdout | default('') }}"
+          nvidia_smi_rc: "{{ _nvidia_smi.rc | default(1) }}"
+        aggregate: false
+      changed_when: false
+      check_mode: false

@@ -36,6 +36,15 @@ class TestNodeStatus:
     def test_reboot_failed_no_apt_change(self):
         assert node_status(False, True, False, False) == "REBOOT FAILED"
 
+    def test_manual_reboot_when_auto_reboot_disabled(self):
+        assert (
+            node_status(False, True, False, False, reboot_disabled=True)
+            == "UPDATED (MANUAL REBOOT REQ)"
+        )
+
+    def test_reboot_failed_reserved_for_enabled_policy(self):
+        assert node_status(True, True, False, False, reboot_disabled=False) == "REBOOT FAILED"
+
     def test_updated_no_reboot(self):
         assert node_status(True, False, False, False) == "UPDATED"
 

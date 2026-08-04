@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -57,6 +57,14 @@ class NodeRecord(BaseModel):
     # Node/manager status strings intentionally have no dry-run variant;
     # persist this marker so the ledger never treats simulation as applied.
     dry_run: Optional[bool] = Field(default=None, exclude_if=lambda value: value is None)
+    # Why this node needs (or needed) a reboot — ordinary marker/kernel reasons
+    # plus NVIDIA installed/loaded mismatch reasons. Omitted entirely when the
+    # node does not need a reboot, preserving the legacy record byte shape.
+    reboot_reasons: Optional[List[str]] = Field(default=None, exclude_if=lambda value: value is None)
+    # Structured post-upgrade check results (NVIDIA diagnostics + classification
+    # for nvidia_host nodes). Omitted entirely when no checks ran, so legacy
+    # records and non-nvidia hosts stay byte-identical.
+    checks: Optional[Dict[str, Any]] = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class CustomRecord(BaseModel):

@@ -10,6 +10,13 @@ pve-02 ansible_host=10.10.10.20
 # alpha-01 ansible_host=10.10.10.10 cluster=alpha
 # beta-01  ansible_host=10.20.10.10 cluster=beta
 
+# Nodes with NVIDIA GPUs: set nvidia_host=true to enable the read-only
+# post-upgrade driver checks for that node (installed vs. loaded module
+# version, DKMS state, nvidia-smi probe) — inline here or in
+# host_vars/<node>.yml. The checks run from the Manager LXC over SSH on the
+# node itself, never inside a workload LXC.
+# gpu-node  ansible_host=10.30.10.10  nvidia_host=true
+
 [proxmox_nodes:vars]
 ansible_user=root
 ansible_ssh_private_key_file=~/.ssh/id_ed25519

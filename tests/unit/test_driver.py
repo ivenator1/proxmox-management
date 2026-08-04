@@ -29,8 +29,8 @@ from proxmox_fleet.models.state import FleetState
 from proxmox_fleet.runner import PrimitiveResult
 
 
-def _ok(stdout: str = "", changed: bool = True) -> PrimitiveResult:
-    return PrimitiveResult(rc=0, changed=changed, stdout=stdout)
+def _ok(stdout: str = "", changed: bool = True, facts: Optional[Dict[str, Any]] = None) -> PrimitiveResult:
+    return PrimitiveResult(rc=0, changed=changed, stdout=stdout, facts=facts or {})
 
 
 def _fail(rc: int = 1) -> PrimitiveResult:
@@ -45,6 +45,7 @@ class ScriptedExecutor:
         script: Optional[Dict[str, List[PrimitiveResult]]] = None,
         default: Optional[PrimitiveResult] = None,
     ) -> None:
+        self.host = "test-host"
         self.script: Dict[str, List[PrimitiveResult]] = {k: list(v) for k, v in (script or {}).items()}
         self.default = default if default is not None else _ok()
         self.commands: List[str] = []
@@ -66,6 +67,10 @@ class ScriptedExecutor:
     def reboot(self, **kw: Any) -> PrimitiveResult:
         self.reboots += 1
         return _ok()
+
+    def node_post_upgrade(self, *, nvidia_host: bool = False) -> PrimitiveResult:
+        self.commands.append(f"node_post_upgrade nvidia_host={nvidia_host}")
+        return self._resp("vmlinuz")
 
 
 @pytest.fixture()
@@ -373,7 +378,19 @@ def test_window_skip_outside_window(tmp_path, monkeypatch):
 APT_UPGRADED = "3 upgraded, 0 newly installed, 0 to remove.\n"
 APT_NOOP = "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
 NOT_MANAGER = _ok(stdout="1\n", changed=False)  # pct list grep → not manager
-NO_REBOOT = _ok(stdout="ok\n", changed=False)
+NO_REBOOT = _ok(
+    changed=False,
+    facts={
+        "diagnostics_version": 1,
+        "running_kernel_rc": 0,
+        "running_kernel": "6.8.12-8-pve",
+        "latest_kernel_rc": 0,
+        "latest_kernel": "6.8.12-8-pve",
+        "reboot_required_exists": False,
+        "reboot_required_packages": "",
+        "nvidia_checked": False,
+    },
+)
 
 
 def _node_inventory(tmp_path: Path, node_lines: str) -> str:
@@ -383,7 +400,7 @@ def _node_inventory(tmp_path: Path, node_lines: str) -> str:
 
 
 def _node_settings(**kw) -> GlobalSettings:
-    return GlobalSettings(manager_lxc_id="121", **kw)
+    return GlobalSettings(manager_lxc_id="121", node_apt_retry_delay=0, **kw)
 
 
 class ScriptedNodeExecutor(ScriptedExecutor):
@@ -460,6 +477,66 @@ def test_node_phase_state_json_has_fleet_keys(tmp_path, monkeypatch):
     raw = json.loads(state_path.read_text())
     for key in ("fleet_node_data", "fleet_changed", "fleet_failed", "fleet_error_log", "fleet_warning_log"):
         assert key in raw, f"missing key: {key}"
+
+
+def test_node_phase_passes_nvidia_host_from_inventory(tmp_path, monkeypatch):
+    from proxmox_fleet.flows.node import NodeFlowOutcome
+    from proxmox_fleet.models.state import NodeRecord
+
+    inv = _node_inventory(
+        tmp_path,
+        "pve-01 ansible_host=10.0.0.1 nvidia_host=true",
+    )
+    captured = {}
+
+    def fake_update(node, executor, settings, **kwargs):
+        captured.update(kwargs)
+        return NodeFlowOutcome(record=NodeRecord(node=node, status="OK"))
+
+    monkeypatch.setattr(driver_mod, "run_node_update", fake_update)
+    state = run_node_phase(
+        settings=_node_settings(),
+        inventory_path=inv,
+        include_manager=False,
+        state_output_path=None,
+    )
+
+    assert captured["nvidia_host"] is True
+    assert [record.node for record in state.node] == ["pve-01"]
+
+
+def test_nvidia_node_failure_keeps_serial_abort_behavior(tmp_path, monkeypatch):
+    from proxmox_fleet.flows.node import NodeFlowOutcome
+    from proxmox_fleet.models.state import ErrorEntry, NodeRecord
+
+    inv = _node_inventory(
+        tmp_path,
+        "pve-01 ansible_host=10.0.0.1 nvidia_host=true\n"
+        "pve-02 ansible_host=10.0.0.2",
+    )
+    visited = []
+
+    def fake_update(node, executor, settings, **kwargs):
+        visited.append(node)
+        if kwargs["nvidia_host"]:
+            return NodeFlowOutcome(
+                record=NodeRecord(node=node, status="FAILED"),
+                failed=True,
+                error=ErrorEntry(host=node, task="NVIDIA post-upgrade check", error="missing DKMS"),
+            )
+        return NodeFlowOutcome(record=NodeRecord(node=node, status="OK"))
+
+    monkeypatch.setattr(driver_mod, "run_node_update", fake_update)
+    state = run_node_phase(
+        settings=_node_settings(),
+        inventory_path=inv,
+        include_manager=False,
+        state_output_path=None,
+    )
+
+    assert state.failed
+    assert visited == ["pve-01"]
+    assert [record.node for record in state.node] == ["pve-01"]
 
 
 def test_node_phase_dry_run_propagated(tmp_path, monkeypatch):

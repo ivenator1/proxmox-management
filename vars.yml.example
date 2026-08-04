@@ -191,3 +191,17 @@ os_only_lxc_list:
 snapshot_exclude_list:
   - "117" #Plex
   - "120" #PBS
+
+# --- NODE POST-UPGRADE CHECKS (NVIDIA) ---
+# Proxmox nodes flagged nvidia_host=true (inline in hosts.ini or in
+# host_vars/<node>.yml) get read-only GPU-driver diagnostics after their node
+# OS update. The checks run from the Manager LXC over Ansible SSH on the node
+# itself — never inside a workload LXC:
+#   * installed vs. loaded NVIDIA module mismatch  → node reboot required
+#   * missing DKMS build for the running kernel    → hard failure (node FAILED)
+#   * nvidia-smi faults (non-zero return code)     → surfaced in the node report
+# node_auto_reboot governs ALL node reboots. Default true = auto-reboot when
+# needed; false = controlled/manual maintenance: nodes needing a reboot report
+# "UPDATED (MANUAL REBOOT REQ)" and are never rebooted automatically. The node
+# hosting the Manager LXC is never rebooted in either case.
+node_auto_reboot: true

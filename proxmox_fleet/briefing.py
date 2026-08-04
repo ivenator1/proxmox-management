@@ -34,6 +34,10 @@ def render_briefing(state: FleetState) -> str:
         if i != 0:
             parts.append("\n\n")
         parts.append(f"**{n.node}: ({n.status})**")
+        # Reboot reasons (ordinary marker/kernel + NVIDIA mismatch) render only
+        # when the record carries them — legacy key-free records stay identical.
+        for reason in (n.reboot_reasons or []):
+            parts.append(f"\n- reboot required: {reason}")
         if n.node != "Ansible-Manager":
             node_lxcs = [lx for lx in state.lxc if lx.node == n.node]
             node_vms = [vm for vm in state.vm if vm.node == n.node]

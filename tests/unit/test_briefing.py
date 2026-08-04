@@ -86,6 +86,25 @@ def test_no_container_changes_shown():
     assert "*No container changes.*" in out
 
 
+def test_node_reboot_reasons_are_rendered():
+    record = dict(
+        node(status="UPDATED (MANUAL REBOOT REQ)"),
+        reboot_reasons=["NVIDIA module mismatch: loaded 550.54.14, installed 550.90.07"],
+    )
+    out = render_briefing(_state(fleet_node_data=[record]))
+    assert (
+        "- reboot required: NVIDIA module mismatch: loaded 550.54.14, installed 550.90.07"
+        in out
+    )
+
+
+def test_node_without_reboot_reasons_keeps_legacy_rendering():
+    assert (
+        render_briefing(_state(fleet_node_data=[node()]))
+        == "**pve-01: (OK)**\n- *No container changes.*"
+    )
+
+
 def test_ansible_manager_no_container_list():
     out = render_briefing(_state(fleet_node_data=[node(node="Ansible-Manager")]))
     assert "Ansible-Manager: (OK)" in out

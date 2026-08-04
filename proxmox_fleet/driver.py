@@ -275,9 +275,10 @@ def _fold_outcome(state: FleetState, outcome: Any, bucket: List[Any]) -> None:
     """Merge one per-host flow outcome into the running FleetState.
 
     Appends ``outcome.record`` to ``bucket`` (the matching record list), OR-joins
-    the changed/failed flags, and accumulates errors/warnings. Node outcomes carry
-    no warnings, and only the lxc flow carries the plural ``errors`` list (its
-    non-raising OS/app update failures), so both fields are read defensively.
+    the changed/failed flags, and accumulates errors/warnings. Only the lxc flow
+    carries the plural ``errors`` list (its non-raising OS/app update failures);
+    node outcomes may carry NVIDIA diagnostic warnings, so both fields are read
+    defensively.
     """
     if outcome.record is not None:
         bucket.append(outcome.record)
@@ -453,7 +454,7 @@ def run_lxc_phase(
                     warning="node down/unreachable — containers skipped this run "
                             "(cluster still quorate)"))
             else:
-                reason = ("cluster NOT quorate" if quorate is False
+                reason = ("cluster NOT quorate" if quorate is not None
                           else "no node answered the quorum check")
                 state.failed = True
                 state.errors.append(ErrorEntry(
@@ -909,7 +910,8 @@ def run_node_phase(
             executor = RunnerExecutor(node_name, inventory=inventory_path, check=check)
             node_cluster = node_info.get("cluster", DEFAULT_CLUSTER)
             outcome = run_node_update(
-                node_name, executor, settings, dry_run=dry_run, cluster=node_cluster
+                node_name, executor, settings, dry_run=dry_run, cluster=node_cluster,
+                nvidia_host=bool(node_info.get("nvidia_host", False)),
             )
             if (
                 outcome.failed

@@ -1,14 +1,15 @@
 """Tests for proxmox_fleet.executor — RunnerExecutor, _merge_facts, snapshot_with_retry."""
 from __future__ import annotations
 
+from typing import Any, Dict, cast
 
 import proxmox_fleet.executor as executor_mod
 from proxmox_fleet.executor import RunnerExecutor, _merge_facts, snapshot_with_retry
 from proxmox_fleet.runner import PrimitiveResult
 
 
-def _pr(**kwargs) -> PrimitiveResult:
-    defaults = dict(rc=0, stdout="", stderr="", changed=False, failed=False, facts={})
+def _pr(**kwargs: Any) -> PrimitiveResult:
+    defaults: Dict[str, Any] = dict(rc=0, stdout="", stderr="", changed=False, failed=False, facts={})
     defaults.update(kwargs)
     return PrimitiveResult(**defaults)
 
@@ -136,6 +137,34 @@ def test_run_local_targets_localhost(monkeypatch):
     assert captured["host_pattern"] == "localhost"
 
 
+def test_node_post_upgrade_invokes_bound_primitive_and_preserves_facts(monkeypatch):
+    captured = {}
+    facts = {"diagnostics_version": 1, "running_kernel": "6.8.12-8-pve"}
+
+    def fake_invoke(primitive, *, inventory, host_pattern, extravars, check, **kw):
+        captured.update(
+            primitive=primitive,
+            inventory=inventory,
+            host_pattern=host_pattern,
+            extravars=extravars,
+            check=check,
+        )
+        return _pr(facts=facts)
+
+    monkeypatch.setattr(executor_mod, "invoke_primitive", fake_invoke)
+    ex = RunnerExecutor("pve-01", inventory="fleet.ini", check=True)
+    result = ex.node_post_upgrade(nvidia_host=True)
+
+    assert captured == {
+        "primitive": "node_post_upgrade",
+        "inventory": "fleet.ini",
+        "host_pattern": "pve-01",
+        "extravars": {"nvidia_host": True},
+        "check": True,
+    }
+    assert result.facts == facts
+
+
 # ---------------------------------------------------------------------------
 # RunnerExecutor.snapshot — fact merge
 # ---------------------------------------------------------------------------
@@ -194,7 +223,7 @@ def test_snapshot_with_retry_present_succeeds_on_second_attempt():
         _pr(changed=False, failed=True),
         _pr(changed=True, failed=False),
     ])
-    result = snapshot_with_retry(ex, "101", snap_state="present",
+    result = snapshot_with_retry(cast(Any, ex), "101", snap_state="present",
                                  retries=3, delay=1.0,
                                  _sleep=sleeps.append,
                                  api_host="1.2.3.4", api_user="u",
@@ -209,7 +238,7 @@ def test_snapshot_with_retry_absent_succeeds_when_not_failed():
         _pr(failed=True),
         _pr(failed=False),
     ])
-    result = snapshot_with_retry(ex, "101", snap_state="absent",
+    result = snapshot_with_retry(cast(Any, ex), "101", snap_state="absent",
                                  retries=3, delay=0.0,
                                  _sleep=lambda _: None,
                                  api_host="1.2.3.4", api_user="u",
@@ -224,7 +253,7 @@ def test_snapshot_with_retry_exhausted_returns_failed_result():
         _pr(changed=False, failed=True),
         _pr(changed=False, failed=True),
     ])
-    result = snapshot_with_retry(ex, "101", snap_state="present",
+    result = snapshot_with_retry(cast(Any, ex), "101", snap_state="present",
                                  retries=3, delay=0.0,
                                  _sleep=lambda _: None,
                                  api_host="1.2.3.4", api_user="u",
@@ -238,7 +267,7 @@ def test_snapshot_with_retry_injectable_sleep_called():
         _pr(changed=False, failed=True),
         _pr(changed=True, failed=False),
     ])
-    snapshot_with_retry(ex, "101", snap_state="present",
+    snapshot_with_retry(cast(Any, ex), "101", snap_state="present",
                         retries=3, delay=7.5,
                         _sleep=sleeps.append,
                         api_host="1.2.3.4", api_user="u",
