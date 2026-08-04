@@ -25,6 +25,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet import inventory
+from proxmox_fleet import ledger
+from proxmox_fleet.cluster import DEFAULT_CLUSTER, limit_selects_id, token_is_id
 from proxmox_fleet.executor import Executor
 from proxmox_fleet.flows._pkg import detect_pkg_mgr
 from proxmox_fleet.flows.lxc import (
@@ -36,20 +38,31 @@ from proxmox_fleet.flows.lxc import (
 from proxmox_fleet.lxc_parse import (
     parse_ct_script,
     parse_df_percent,
-    parse_os_release,
+    # The LXC helper returns {id, version_id}; the scan-local parse_os_release
+    # below extends it with pretty_name. Aliased so the two never shadow each
+    # other — lxc_parse's stays byte-identical for flows/lxc.py and its tests.
+    parse_os_release as _lxc_parse_os_release,
     parse_pct_config,
     parse_pct_status,
     script_name_from_update,
 )
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.orchestration import run_concurrent
+from proxmox_fleet.pkg_detail import pkg_mgr_for_ostype
 from proxmox_fleet.runner import UnreachableHostError, is_unreachable_error
 
-# OS type (pct config ostype) → package manager, for containers.
-_OSTYPE_PKG_MGR = {
-    "debian": "apt", "ubuntu": "apt", "devuan": "apt",
-    "alpine": "apk",
-}
+
+# Sentinel markers delimiting the scan output sections inside one command.
+# They split the pending table from the dnf ``--security`` run, and both from
+# the machine-readable tail (reboot flag + /etc/os-release capture). They are
+# parse_scan_output()'s contract — chosen to be unreachable in real command
+# output, so splitting on them is safe. No single quote may appear anywhere in
+# the commands: scan_lxc wraps the whole thing in ``pct exec <id> -- <shell>
+# -c '<cmd>'``, so an embedded ``'`` breaks the shell line (the old apk
+# ``-l '<'`` form did exactly that — bug #2, fixed by using ``"<"`` instead).
+_SEC_SENTINEL = "__FLEET_SEC__"
+_META_SENTINEL = "__FLEET_META__"
+_REBOOT_MARKER = "reboot_required"
 
 
 def scan_cmd(pkg_mgr: str) -> str:
@@ -58,14 +71,41 @@ def scan_cmd(pkg_mgr: str) -> str:
     apt reuses the dry-run simulate (``-s dist-upgrade``); dnf uses
     ``check-update`` (built for exactly this, exits 100 when updates exist —
     callers must ignore the rc); apk lists upgradable packages.
+
+    Everything rides in one command — scan roundtrips are whole ansible-runner
+    subprocesses, so a second call would double the SSH overhead. After the
+    primary scan output the command emits sentinel-delimited sections:
+    ``__FLEET_SEC__`` (dnf only: the ``--security`` table) and ``__FLEET_META__``
+    (reboot flag + ``/etc/os-release``, parsed by :func:`parse_scan_output`).
+    ``exit $rc`` re-raises the scan section's real exit code so scan_host's
+    failed/rc checks still see it while the metadata tail stays best-effort.
     """
+    # Shared tail: mark the metadata section, report the reboot-required flag
+    # (Debian's /var/run/reboot-required sentinel file — apk hosts skip this:
+    # Alpine has no such concept), capture /etc/os-release, then exit with the
+    # preserved scan rc. ``test -f ... && echo ...`` prints nothing (and exits
+    # 1, discarded by the following ``;``) when no reboot is needed.
+    meta_tail = (
+        f"echo {_META_SENTINEL}; "
+        f"test -f /var/run/reboot-required && echo {_REBOOT_MARKER}; "
+        f"cat /etc/os-release 2>/dev/null; exit $rc"
+    )
     if pkg_mgr == "apt":
         prefix = "LC_ALL=C DEBIAN_FRONTEND=noninteractive"
-        return f"{prefix} apt-get update -qq && {prefix} apt-get -s dist-upgrade"
+        scan = f"{prefix} apt-get update -qq && {prefix} apt-get -s dist-upgrade"
+        return f"{scan}; rc=$?; {meta_tail}"
     if pkg_mgr == "dnf":
-        return "LC_ALL=C dnf -q check-update"
+        sec = "LC_ALL=C dnf -q check-update --security"
+        # rc comes from the *first* check-update (100 when anything is
+        # pending); the --security run also exits 100 when security updates
+        # exist, so its rc is deliberately discarded.
+        return f"LC_ALL=C dnf -q check-update; rc=$?; echo {_SEC_SENTINEL}; {sec}; {meta_tail}"
     if pkg_mgr == "apk":
-        return "LC_ALL=C apk update -q >/dev/null 2>&1; LC_ALL=C apk version -l '<'"
+        scan = 'LC_ALL=C apk update -q >/dev/null 2>&1; LC_ALL=C apk version -l "<"'
+        # No reboot check and no security section: Alpine has neither concept,
+        # so parse_scan_output defaults them (security=[] / reboot False).
+        apk_tail = f"echo {_META_SENTINEL}; cat /etc/os-release 2>/dev/null; exit $rc"
+        return f"{scan}; rc=$?; {apk_tail}"
     raise RuntimeError(f"Unknown package manager: {pkg_mgr!r}")
 
 
@@ -94,25 +134,139 @@ def parse_pending(stdout: str, pkg_mgr: str) -> List[str]:
     return pkgs
 
 
+def parse_os_release(text: str) -> Dict[str, str]:
+    """Extract {id, version_id, pretty_name} from ``/etc/os-release`` contents.
+
+    Extends the LXC helper (aliased ``_lxc_parse_os_release`` at import) with
+    ``pretty_name`` — the human display string (e.g. ``Debian GNU/Linux 12
+    (bookworm)``) that the dashboard surfaces. Values may or may not be
+    quoted; missing fields come back as ``""``.
+    """
+    base = _lxc_parse_os_release(text)
+    m = re.search(r'^PRETTY_NAME="?([^"\n]*)"?$', text, re.MULTILINE)
+    base["pretty_name"] = m.group(1).strip() if m else ""
+    return base
+
+
+_APT_ARCHIVE_RE = re.compile(
+    r"^Inst (\S+?)(?::\S+)?\s+(?:\[[^]]*\]\s+)?\([^)\s]+\s+(\S+)",
+    re.MULTILINE,
+)
+
+
+def _apt_security_names(stdout: str) -> List[str]:
+    """Pending package names whose simulate archive is a ``*-security`` suite.
+
+    apt marks security updates by archive: ``Debian-Security:12/stable-security``
+    or ``Ubuntu:24.04-security`` — the second word inside the Inst line's
+    parens, after the version. Detection needs no extra command: it reads the
+    same simulate output that produced the pending list.
+    """
+    names = [m.group(1) for m in _APT_ARCHIVE_RE.finditer(stdout) if "-security" in m.group(2)]
+    return list(dict.fromkeys(names))
+
+
+def parse_scan_output(stdout: str, pkg_mgr: str) -> Dict[str, Any]:
+    """Split one :func:`scan_cmd` output into its sentinel-delimited sections.
+
+    Returns ``{"pending", "security", "reboot_required", "os_release"}``:
+
+    - ``pending``: package names from the primary scan section (before the
+      first sentinel) — exactly what :func:`parse_pending` would extract.
+    - ``security``: the security subset — for dnf the ``--security`` table
+      between ``__FLEET_SEC__`` and ``__FLEET_META__``; for apt the subset of
+      pending Inst lines whose archive is a ``*-security`` suite; apk always
+      ``[]`` (no such concept).
+    - ``reboot_required``: whether the metadata tail carried the
+      ``reboot_required`` marker (never for apk — no such concept).
+    - ``os_release``: ``{id, version_id, pretty_name}`` parsed from the tail's
+      ``/etc/os-release`` capture (empty strings when absent).
+
+    Section-missing outputs (older commands, partial captures, mocks) degrade
+    to defaults: the whole output becomes the pending section, security is
+    ``[]``, no reboot, empty os_release — never an exception.
+    """
+    lines = stdout.splitlines()
+    sec_idx = next((i for i, line in enumerate(lines) if line.strip() == _SEC_SENTINEL), None)
+    meta_idx = next((i for i, line in enumerate(lines) if line.strip() == _META_SENTINEL), None)
+
+    end = len(lines)
+    pending_end = sec_idx if sec_idx is not None else (meta_idx if meta_idx is not None else end)
+    pending_lines = lines[:pending_end]
+    if sec_idx is not None:
+        security_lines = lines[sec_idx + 1 : meta_idx if meta_idx is not None else end]
+    else:
+        security_lines = []
+    meta_lines = lines[meta_idx + 1 :] if meta_idx is not None else []
+
+    pending = parse_pending("\n".join(pending_lines), pkg_mgr)
+    if pkg_mgr == "dnf":
+        security = parse_pending("\n".join(security_lines), "dnf")
+    elif pkg_mgr == "apt":
+        security = _apt_security_names("\n".join(pending_lines))
+    else:
+        security = []
+    return {
+        "pending": pending,
+        "security": security,
+        "reboot_required": any(line.strip() == _REBOOT_MARKER for line in meta_lines),
+        "os_release": parse_os_release("\n".join(meta_lines)),
+    }
+
+
+def _empty_host_entry() -> Dict[str, Any]:
+    """The full shape of a pending-scan host entry, with nothing filled in.
+
+    Both scan_host()'s error path and run_fleet_scan()'s failure fallback
+    start from this, so a key added here can never reach only one of them
+    (the same drift guard as _empty_lxc_entry for containers).
+    """
+    return {
+        "pkg_mgr": "",
+        "pending_count": 0,
+        "pending": [],
+        "security_count": 0,
+        "security": [],
+        "reboot_required": False,
+        "os_release": {"id": "", "version_id": "", "pretty_name": ""},
+        "unreachable": False,
+        "error": None,
+    }
+
+
 def scan_host(executor: Executor) -> Dict[str, Any]:
     """Scan one SSH-reachable host: detect the package manager, list pending.
 
-    Never raises — errors land in the returned dict's ``error`` key.
+    Also reports the security subset, the reboot-required flag and the host's
+    os-release — all read from the same single command (see
+    :func:`parse_scan_output`). Never raises — errors land in the returned
+    dict's ``error`` key with the entry otherwise shaped by
+    :func:`_empty_host_entry`.
     """
     try:
         pkg_mgr = detect_pkg_mgr(executor)
         # ignore_errors: dnf check-update exits 100 when updates are pending.
         res = executor.run_shell(scan_cmd(pkg_mgr), changed_when=False, ignore_errors=True)
-        if pkg_mgr != "dnf" and res.failed:
+        if res.failed and not (pkg_mgr == "dnf" and res.rc == 100):
             raise RuntimeError(f"scan command failed (rc={res.rc}): {res.stderr or res.stdout}"[:300])
-        pending = parse_pending(res.stdout, pkg_mgr)
-        return {"pkg_mgr": pkg_mgr, "pending_count": len(pending),
-                "pending": pending, "unreachable": False, "error": None}
+        parsed = parse_scan_output(res.stdout, pkg_mgr)
+        pending = parsed["pending"]
+        return {
+            "pkg_mgr": pkg_mgr,
+            "pending_count": len(pending),
+            "pending": pending,
+            "security_count": len(parsed["security"]),
+            "security": parsed["security"],
+            "reboot_required": parsed["reboot_required"],
+            "os_release": parsed["os_release"],
+            "unreachable": False,
+            "error": None,
+        }
     except Exception as exc:  # noqa: BLE001 - a scan must never abort the walk
-        return {"pkg_mgr": "", "pending_count": 0, "pending": [],
-                "unreachable": (isinstance(exc, UnreachableHostError)
-                                or is_unreachable_error(str(exc))),
-                "error": str(exc)[:300]}
+        out = _empty_host_entry()
+        out["unreachable"] = isinstance(exc, UnreachableHostError) or is_unreachable_error(str(exc))
+        out["error"] = str(exc)[:300]
+        return out
 
 
 def _lxc_app_pending(
@@ -138,8 +292,7 @@ def _lxc_app_pending(
     ct_info: Dict[str, Any] = {}
     gh_repo = ""
     try:
-        ct_url = (f"https://raw.githubusercontent.com/community-scripts/ProxmoxVE"
-                  f"/main/ct/{script_name}.sh")
+        ct_url = f"https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/{script_name}.sh"
         ct_info = parse_ct_script(http_mod.request(ct_url).body)
         gh_repo = ct_info.get("gh_repo", "")
     except Exception:  # noqa: BLE001 - fail-open like the flow's detect
@@ -157,10 +310,8 @@ def _lxc_app_pending(
         except Exception:  # noqa: BLE001
             pass
 
-    outdated = bool(current and latest
-                    and current.lstrip("v") != latest.lstrip("v"))
-    return ({"script": script_name, "current": current, "latest": latest,
-             "outdated": outdated}, ct_info, script_name)
+    outdated = bool(current and latest and current.lstrip("v") != latest.lstrip("v"))
+    return ({"script": script_name, "current": current, "latest": latest, "outdated": outdated}, ct_info, script_name)
 
 
 def _empty_lxc_entry(node: str, lxc_id: str) -> Dict[str, Any]:
@@ -170,10 +321,24 @@ def _empty_lxc_entry(node: str, lxc_id: str) -> Dict[str, Any]:
     a key added here can never reach only one of them (which is exactly how
     disk_percent/os/os_mismatch previously went missing from the error path).
     """
-    return {"node": node, "id": str(lxc_id), "name": str(lxc_id), "skipped": None,
-            "os_pending_count": 0, "os_pending": [], "app": None,
-            "disk_percent": None, "os": "", "os_mismatch": None,
-            "unreachable": False, "error": None}
+    return {
+        "node": node,
+        "id": str(lxc_id),
+        "name": str(lxc_id),
+        "skipped": None,
+        "os_pending_count": 0,
+        "os_pending": [],
+        "app": None,
+        "os_security_count": 0,
+        "os_security": [],
+        "reboot_required": False,
+        "os_release": {"id": "", "version_id": "", "pretty_name": ""},
+        "disk_percent": None,
+        "os": "",
+        "os_mismatch": None,
+        "unreachable": False,
+        "error": None,
+    }
 
 
 def scan_lxc(executor: Executor, lxc_id: str, node: str) -> Dict[str, Any]:
@@ -195,22 +360,30 @@ def scan_lxc(executor: Executor, lxc_id: str, node: str) -> Dict[str, Any]:
             return out
 
         os_type = info["os_type"]
-        pkg_mgr = _OSTYPE_PKG_MGR.get(os_type, "dnf")
+        pkg_mgr = pkg_mgr_for_ostype(os_type)
         shell = _build_shell(os_type)
         res = executor.run_shell(
             f"pct exec {lxc_id} -- {shell} -c '{scan_cmd(pkg_mgr)}'",
-            changed_when=False, ignore_errors=True,
+            changed_when=False,
+            ignore_errors=True,
         )
-        pending = parse_pending(res.stdout, pkg_mgr)
+        if res.failed and not (pkg_mgr == "dnf" and res.rc == 100):
+            raise RuntimeError(f"scan command failed (rc={res.rc}): {res.stderr or res.stdout}"[:300])
+        parsed = parse_scan_output(res.stdout, pkg_mgr)
+        pending = parsed["pending"]
         out["os_pending_count"] = len(pending)
         out["os_pending"] = pending
+        out["os_security_count"] = len(parsed["security"])
+        out["os_security"] = parsed["security"]
+        out["reboot_required"] = parsed["reboot_required"]
         app, ct_info, script_name = _lxc_app_pending(executor, lxc_id, os_type, intro.facts)
         out["app"] = app
 
         # Health signals — read from the same introspect pass, no extra commands.
         out["disk_percent"] = parse_df_percent(str(intro.facts.get("df_stdout", "")))
-        cur_os = parse_os_release(str(intro.facts.get("os_release_stdout", "")))
+        cur_os = _lxc_parse_os_release(str(intro.facts.get("os_release_stdout", "")))
         out["os"] = f"{cur_os['id']} {cur_os['version_id']}".strip()
+        out["os_release"] = parsed["os_release"]
         if script_name:
             out["os_mismatch"] = os_mismatch_warning(intro.facts, ct_info, script_name)
         return out
@@ -238,8 +411,12 @@ def write_pending(
     scan_file = directory / f"pending-{ts}.json"
     scan_file.write_text(payload, encoding="utf-8")
     (directory / "pending-latest.json").write_text(payload, encoding="utf-8")
+    # Feed the per-host ledger BEFORE pruning: every scanned host/container
+    # folds into hosts.json regardless of how many pending files are later
+    # retained. Never raises — the ledger must not fail a scan.
+    ledger.observe_scan(directory, scan)
     if keep > 0:
-        for stale in sorted(directory.glob("pending-*.json"))[:-(keep + 1)]:
+        for stale in sorted(directory.glob("pending-*.json"))[: -(keep + 1)]:
             if stale.name != "pending-latest.json":
                 stale.unlink(missing_ok=True)
     return scan_file
@@ -278,25 +455,34 @@ def pending_summary(
             continue
         hosts = data.get("hosts", {}) or {}
         lxc = data.get("lxc", {}) or {}
-        out.append({
-            # scan_file.stem is "pending-<ts>" — strip the prefix as a fallback.
-            "timestamp": data.get("timestamp", scan_file.stem[8:]),
-            "hosts_pending": sum(int(h.get("pending_count", 0)) for h in hosts.values()),
-            "lxc_os_pending": sum(int(c.get("os_pending_count", 0)) for c in lxc.values()),
-            "outdated_apps": sum(1 for c in lxc.values()
-                                 if (c.get("app") or {}).get("outdated")),
-            # Health signals — containers that need attention before they fail.
-            # Read defensively: scans written before these keys existed lack them.
-            "low_disk": sum(1 for c in lxc.values()
-                            if (c.get("disk_percent") or 0) >= disk_threshold),
-            "os_mismatch": sum(1 for c in lxc.values() if c.get("os_mismatch")),
-            # Unreachable hosts are reported separately: they are "could not
-            # look", not a broken scan, and they do not fail the run either.
-            "unreachable": sum(1 for entry in (*hosts.values(), *lxc.values())
-                               if entry.get("unreachable")),
-            "errors": sum(1 for entry in (*hosts.values(), *lxc.values())
-                          if entry.get("error") and not entry.get("unreachable")),
-        })
+        out.append(
+            {
+                # scan_file.stem is "pending-<ts>" — strip the prefix as a fallback.
+                "timestamp": data.get("timestamp", scan_file.stem[8:]),
+                "hosts_pending": sum(int(h.get("pending_count", 0)) for h in hosts.values()),
+                "lxc_os_pending": sum(int(c.get("os_pending_count", 0)) for c in lxc.values()),
+                "outdated_apps": sum(1 for c in lxc.values() if (c.get("app") or {}).get("outdated")),
+                # Security + reboot — read defensively: scans written before these
+                # keys existed (or on apk hosts, which track neither) lack them.
+                "security_pending": (
+                    sum(int(h.get("security_count", 0)) for h in hosts.values())
+                    + sum(int(c.get("os_security_count", 0)) for c in lxc.values())
+                ),
+                "reboot_hosts": sum(1 for entry in (*hosts.values(), *lxc.values()) if entry.get("reboot_required")),
+                # Health signals — containers that need attention before they fail.
+                # Read defensively: scans written before these keys existed lack them.
+                "low_disk": sum(1 for c in lxc.values() if (c.get("disk_percent") or 0) >= disk_threshold),
+                "os_mismatch": sum(1 for c in lxc.values() if c.get("os_mismatch")),
+                # Unreachable hosts are reported separately: they are "could not
+                # look", not a broken scan, and they do not fail the run either.
+                "unreachable": sum(1 for entry in (*hosts.values(), *lxc.values()) if entry.get("unreachable")),
+                "errors": sum(
+                    1
+                    for entry in (*hosts.values(), *lxc.values())
+                    if entry.get("error") and not entry.get("unreachable")
+                ),
+            }
+        )
     return out
 
 
@@ -342,11 +528,21 @@ def run_fleet_scan(
     vms = inventory.load_proxmox_vms(inventory_path, host_vars_dir=settings.host_vars_dir)
     nodes = inventory.load_proxmox_nodes(inventory_path, host_vars_dir=settings.host_vars_dir)
     inventory.validate_node_uniqueness(nodes)
+    node_clusters = {n["name"]: n["cluster"] for n in nodes}
 
-    limit_has_ids = limit is not None and any(t.isdigit() for t in limit)
+    def _vm_cluster_hint(v: inventory.VmSpec) -> str:
+        # Same cheap pre-execution guess as the driver's VM --limit filter:
+        # explicit cluster= var, else the pve_node hint's cluster, else default.
+        if v.cluster:
+            return v.cluster
+        if v.pve_node:
+            return node_clusters.get(v.pve_node, DEFAULT_CLUSTER)
+        return DEFAULT_CLUSTER
+
+    limit_has_ids = limit is not None and any(token_is_id(t) for t in limit)
     if limit is not None:
         remote = [h for h in remote if h.name in limit]
-        vms = [v for v in vms if v.name in limit or v.vmid in limit]
+        vms = [v for v in vms if v.name in limit or limit_selects_id(limit, _vm_cluster_hint(v), v.vmid)]
 
     scan: Dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"),
@@ -361,19 +557,19 @@ def run_fleet_scan(
         result["kind"] = kind
         return result
 
-    targets = ([("remote", h.name) for h in remote]
-               + [("vm", v.name) for v in vms]
-               + [("node", n["name"]) for n in nodes
-                  if limit is None or n["name"] in limit])
+    targets = (
+        [("remote", h.name) for h in remote]
+        + [("vm", v.name) for v in vms]
+        + [("node", n["name"]) for n in nodes if limit is None or n["name"] in limit]
+    )
 
-    results = run_concurrent(targets, lambda t: _scan_named(*t),
-                             max_workers=settings.remote_forks)
+    results = run_concurrent(targets, lambda t: _scan_named(*t), max_workers=settings.remote_forks)
     for (kind, name), result, run_err in results:
         if result is None:
-            result = {"kind": kind, "pkg_mgr": "", "pending_count": 0,
-                      "pending": [],
-                      "unreachable": is_unreachable_error(str(run_err)),
-                      "error": str(run_err)[:300]}
+            result = _empty_host_entry()
+            result["kind"] = kind
+            result["unreachable"] = is_unreachable_error(str(run_err))
+            result["error"] = str(run_err)[:300]
         scan["hosts"][name] = result
         # An unreachable host is "could not look", not "the scan is broken" —
         # a powered-off or down node must not make a read-only scan exit 1.
@@ -390,15 +586,15 @@ def run_fleet_scan(
         node_name = node_info["name"]
         if limit is not None and node_name not in limit and not limit_has_ids:
             continue
+        node_cluster = node_info["cluster"]
         ex = RunnerExecutor(node_name, inventory=inventory_path, check=False)
         print(f"[{node_name}] discovering LXCs...")
         try:
-            lxc_ids = _discover_lxcs(ex, settings)
+            lxc_ids = _discover_lxcs(ex, settings, cluster=node_cluster)
         except Exception as exc:  # noqa: BLE001
             entry = _empty_lxc_entry(node_name, node_name)
             entry["error"] = f"discovery failed: {exc}"[:300]
-            entry["unreachable"] = (isinstance(exc, UnreachableHostError)
-                                    or is_unreachable_error(str(exc)))
+            entry["unreachable"] = isinstance(exc, UnreachableHostError) or is_unreachable_error(str(exc))
             if entry["unreachable"]:
                 # Same rule as the update path: a node that never answered is
                 # skipped, not failed. No quorum check — a read-only scan takes
@@ -410,14 +606,13 @@ def run_fleet_scan(
             scan["lxc"][node_name] = entry
             continue
         if limit is not None and node_name not in limit:
-            lxc_ids = [i for i in lxc_ids if i in limit]
+            lxc_ids = [i for i in lxc_ids if limit_selects_id(limit, node_cluster, i)]
 
         def _scan_one(lxc_id: str, _node: str = node_name) -> Dict[str, Any]:
             cex = RunnerExecutor(_node, inventory=inventory_path, check=False)
             return scan_lxc(cex, lxc_id, _node)
 
-        for lxc_id, result, run_err in run_concurrent(
-                lxc_ids, _scan_one, max_workers=settings.lxc_forks):
+        for lxc_id, result, run_err in run_concurrent(lxc_ids, _scan_one, max_workers=settings.lxc_forks):
             if result is None:
                 result = _empty_lxc_entry(node_name, lxc_id)
                 result["error"] = str(run_err)[:300]
@@ -434,12 +629,13 @@ def run_fleet_scan(
                 app_str = f"  app {app['current'] or '?'} → {app['latest'] or '?'}{marker}"
             skip_str = f"  skipped ({result['skipped']})" if result.get("skipped") else ""
             err_str = f"  ERROR: {result['error']}" if result.get("error") else ""
-            print(f"  [{node_name}/{lxc_id}] {result['name']}: "
-                  f"os={result['os_pending_count']}{app_str}{skip_str}{err_str}")
+            print(
+                f"  [{node_name}/{lxc_id}] {result['name']}: "
+                f"os={result['os_pending_count']}{app_str}{skip_str}{err_str}"
+            )
 
     if settings.fleet_history_enabled:
-        path = write_pending(scan, history_dir=settings.fleet_history_dir,
-                             keep=settings.scan_history_keep)
+        path = write_pending(scan, history_dir=settings.fleet_history_dir, keep=settings.scan_history_keep)
         print(f"pending snapshot written to {path}")
 
     return 1 if failed else 0

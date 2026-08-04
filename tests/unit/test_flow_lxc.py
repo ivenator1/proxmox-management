@@ -75,6 +75,7 @@ class ScriptedLxcExecutor:
         self.snapshots_deleted: list = []
         self.rollback_called = False
         self.app_update_kwargs: dict = {}
+        self.snapshot_api_params: list = []
 
         self._introspect_facts = introspect_facts if introspect_facts is not None else dict(_INTROSPECT_NO_SCRIPT)
         self._lxc_os_result = lxc_os_result
@@ -101,6 +102,7 @@ class ScriptedLxcExecutor:
         return _ok()
 
     def snapshot(self, lxc_id, *, snap_state, **api_params):
+        self.snapshot_api_params.append(dict(api_params))
         if snap_state == "present":
             self.snapshots_created.append(lxc_id)
         else:
@@ -211,6 +213,69 @@ def test_version_updated(monkeypatch):
     assert out.record.id == "101"
 
 
+APT_REAL_DETAIL = (
+    "Unpacking libssl3:amd64 (3.0.13-1~deb12u1) over (3.0.11-1~deb12u2) ...\n"
+    "Unpacking curl (8.5.0-2) over (8.5.0-1) ...\n"
+    "2 upgraded, 0 newly installed, 0 to remove.\n"
+)
+
+
+def test_successful_run_captures_os_packages(monkeypatch):
+    """PR1: a real-run success record carries the exact OS packages (debian → apt)."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal(os_stdout=APT_REAL_DETAIL)
+    out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
+    assert out.failed is False
+    assert out.record is not None
+    assert out.record.packages == [
+        {"name": "libssl3", "from": "3.0.11-1~deb12u2", "to": "3.0.13-1~deb12u1"},
+        {"name": "curl", "from": "8.5.0-1", "to": "8.5.0-2"},
+    ]
+
+
+def test_alpine_os_packages_parsed_as_apk(monkeypatch):
+    """PR1: alpine containers route their OS stdout through the apk parser."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = ScriptedLxcExecutor(
+        introspect_facts={
+            "config_stdout": PCT_CONFIG_ALPINE,
+            "status_stdout": PCT_STATUS_RUNNING,
+            "pull_rc": 1,
+            "script_stdout": "",
+        },
+        script={"reboot-required": [_fail(rc=1)]},
+        lxc_os_result=_ok(
+            stdout="(1/2) Upgrading musl (1.2.4-r0 -> 1.2.5-r0)\n"
+                   "(2/2) Upgrading busybox (1.36.1-r0 -> 1.36.1-r1)\n",
+            changed=True,
+        ),
+    )
+    settings = _settings(os_only_lxc_list=["101"], lxc_backup_strategy="none")
+    out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10")
+    assert out.record is not None
+    assert out.record.packages == [
+        {"name": "musl", "from": "1.2.4-r0", "to": "1.2.5-r0"},
+        {"name": "busybox", "from": "1.36.1-r0", "to": "1.36.1-r1"},
+    ]
+
+
+def test_no_packages_on_os_failure(monkeypatch):
+    """PR1: an OS step that failed carries no packages — success records only."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = ScriptedLxcExecutor(
+        introspect_facts=_INTROSPECT_NO_SCRIPT,
+        script={"reboot-required": [_fail(rc=1)]},
+        lxc_os_result=PrimitiveResult(rc=1, failed=True, stderr="E: dpkg was interrupted"),
+    )
+    settings = _settings(os_only_lxc_list=["101"], lxc_backup_strategy="none")
+    out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10")
+    assert out.record is not None
+    assert out.record.packages is None
+
+
 def test_version_unchanged_noop(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda s: None)
     monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
@@ -219,6 +284,64 @@ def test_version_unchanged_noop(monkeypatch):
     assert out.record is None  # idle OK is suppressed
     assert out.changed is False
     assert out.failed is False
+
+
+# ---------------------------------------------------------------------------
+# Task 3: per-cluster API credentials reach the snapshot call
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_uses_global_creds_for_default_cluster(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal()
+    run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
+    assert ex.snapshot_api_params  # at least one snapshot call happened
+    for params in ex.snapshot_api_params:
+        assert params == {
+            "api_host": "192.168.1.10",
+            "api_user": "root@pam",
+            "api_token_id": "tok",
+            "api_token_secret": "secret",
+        }
+
+
+def test_snapshot_uses_beta_cluster_override(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal()
+    settings = _settings(pve_clusters={
+        "beta": {
+            "pve_api_user": "beta-user@pve",
+            "pve_api_token_id": "beta-tok",
+            "pve_api_token_secret": "beta-secret",
+        }
+    })
+    run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10", cluster="beta")
+    assert ex.snapshot_api_params
+    for params in ex.snapshot_api_params:
+        assert params == {
+            "api_host": "192.168.1.10",
+            "api_user": "beta-user@pve",
+            "api_token_id": "beta-tok",
+            "api_token_secret": "beta-secret",
+        }
+
+
+def test_snapshot_uses_globals_for_unconfigured_cluster(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal()
+    settings = _settings(pve_clusters={
+        "beta": {"pve_api_token_secret": "beta-secret"},
+    })
+    # cluster="alpha" has no override — falls back to globals, same as default.
+    run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10", cluster="alpha")
+    assert ex.snapshot_api_params
+    for params in ex.snapshot_api_params:
+        assert params["api_user"] == "root@pam"
+        assert params["api_token_id"] == "tok"
+        assert params["api_token_secret"] == "secret"
 
 
 CT_SCRIPT_WITH_REPO = (
@@ -243,6 +366,10 @@ def test_dry_run(monkeypatch):
     assert out.record is not None
     assert "→" in out.record.app
     assert out.changed is False
+    # PR1 roadmap: LXC dry-run does NOT retain package detail — the record is
+    # a version-compare only, no OS stdout was even collected.
+    assert out.record.packages is None
+    assert out.record.model_dump().get("packages") is None  # key omitted when None
     # No OS update or app update ran
     assert not any("apt-get" in c for c in ex.commands)
     assert not any("lxc_app_update" in c for c in ex.commands)
@@ -763,7 +890,7 @@ def test_app_update_failure_records_error_and_fails_run(monkeypatch):
     assert out.failed is True
     assert out.record is not None and out.record.app == "FAILED"
     assert len(out.errors) == 1
-    assert out.errors[0].host == "123"
+    assert out.errors[0].host == "pve-01/123"
     assert out.errors[0].task == "app update"
     assert "migration failed" in out.errors[0].error
 
@@ -917,7 +1044,7 @@ def test_disk_warning_fires_at_threshold(monkeypatch):
 
     disk = [w for w in out.warnings if w.task == "disk space"]
     assert len(disk) == 1
-    assert disk[0].host == "130"
+    assert disk[0].host == "pve-01/130"
     assert "90% full" in disk[0].warning
 
 
@@ -1047,3 +1174,109 @@ def test_scaling_inert_when_allocation_already_matches(monkeypatch):
     run_lxc_update("pve-01", "101", ex, _settings(lxc_resource_scaling=True),
                    api_host="192.168.1.10")
     assert ex.app_update_kwargs["lxc_needs_scale"] is False
+
+
+# ---------------------------------------------------------------------------
+# Multi-cluster qualified ids (Task 1) — cluster.py wiring
+# ---------------------------------------------------------------------------
+
+
+def test_discover_lxcs_qualified_os_only_matches_its_cluster():
+    ex = ScriptedLxcExecutor(default=_ok(stdout="101\n105\n"))
+    settings = _settings(os_only_lxc_list=["alpha/105"])
+    ids = _discover_lxcs(ex, settings, cluster="alpha")
+    # The cluster qualifier must never reach the shell regex — only the bare id.
+    assert "grep -qxE '(105)'" in ex.commands[0]
+    assert ids == ["101", "105"]
+
+
+def test_discover_lxcs_qualified_os_only_other_cluster_dropped_before_regex():
+    ex = ScriptedLxcExecutor(default=_ok(stdout="101\n"))
+    settings = _settings(os_only_lxc_list=["alpha/105"])
+    _discover_lxcs(ex, settings, cluster="beta")
+    # 105 only applies to "alpha" — beta's regex must not reference it at all.
+    assert "grep -qxE" not in ex.commands[0]
+
+
+def test_discover_lxcs_qualified_exclude_scopes_to_its_cluster():
+    ex = ScriptedLxcExecutor(default=_ok(stdout="101\n105\n"))
+    settings = _settings(exclude_list=["alpha/105"])
+    assert _discover_lxcs(ex, settings, cluster="alpha") == ["101"]
+
+    ex2 = ScriptedLxcExecutor(default=_ok(stdout="101\n105\n"))
+    assert _discover_lxcs(ex2, settings, cluster="beta") == ["101", "105"]
+
+
+def test_discover_lxcs_bare_exclude_applies_to_every_cluster():
+    settings = _settings(exclude_list=["105"])
+    ex_a = ScriptedLxcExecutor(default=_ok(stdout="101\n105\n"))
+    ex_b = ScriptedLxcExecutor(default=_ok(stdout="101\n105\n"))
+    assert _discover_lxcs(ex_a, settings, cluster="alpha") == ["101"]
+    assert _discover_lxcs(ex_b, settings, cluster="beta") == ["101"]
+
+
+def test_run_lxc_update_qualified_app_exclude_only_its_cluster(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    settings = _settings(app_update_exclude_list=["alpha/101"])
+
+    ex_alpha = ScriptedLxcExecutor(
+        introspect_facts=_INTROSPECT_WITH_SCRIPT,
+        script={"reboot-required": [_fail(rc=1)]},
+        lxc_os_result=_ok(stdout="2 upgraded, 0 newly installed", changed=True),
+    )
+    out_alpha = run_lxc_update("pve-01", "101", ex_alpha, settings,
+                               api_host="192.168.1.10", cluster="alpha")
+    assert out_alpha.record.app == "SKIPPED"
+    assert not any(c.startswith("lxc_app_update:") for c in ex_alpha.commands)
+
+    ex_beta = ScriptedLxcExecutor(
+        introspect_facts=_INTROSPECT_WITH_SCRIPT,
+        script={"reboot-required": [_fail(rc=1)]},
+        lxc_os_result=_ok(stdout="2 upgraded, 0 newly installed", changed=True),
+    )
+    out_beta = run_lxc_update("pve-01", "101", ex_beta, settings,
+                              api_host="192.168.1.10", cluster="beta")
+    assert out_beta.record.app != "SKIPPED"
+    assert any(c.startswith("lxc_app_update:") for c in ex_beta.commands)
+
+
+def test_run_lxc_update_bare_app_exclude_applies_to_every_cluster(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    settings = _settings(app_update_exclude_list=["101"])
+
+    for cluster in ("alpha", "beta"):
+        ex = ScriptedLxcExecutor(
+            introspect_facts=_INTROSPECT_WITH_SCRIPT,
+            script={"reboot-required": [_fail(rc=1)]},
+            lxc_os_result=_ok(stdout="2 upgraded, 0 newly installed", changed=True),
+        )
+        out = run_lxc_update("pve-01", "101", ex, settings,
+                             api_host="192.168.1.10", cluster=cluster)
+        assert out.record.app == "SKIPPED"
+
+
+def test_run_lxc_update_kuma_map_exact_qualified_key_wins(monkeypatch):
+    """map_lookup: an exact "cluster/id" kuma key beats the bare "id" key."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    monkeypatch.setattr(http_mod, "get_json", lambda url, **kw: {"heartbeatList": {}})
+
+    from proxmox_fleet.flows import lxc as lxc_mod
+
+    captured = {}
+
+    def _fake_kuma_healthy(payload, *, monitor_id):
+        captured["monitor_id"] = monitor_id
+        return True
+
+    monkeypatch.setattr(lxc_mod, "kuma_healthy", _fake_kuma_healthy)
+
+    settings = _settings(
+        lxc_kuma_map={"101": "5", "alpha/101": "9"},
+        kuma_url="http://kuma", kuma_slug="fleet",
+    )
+    ex = _exec_normal(ver_before="1.0", ver_after="1.1")
+    run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10", cluster="alpha")
+    assert captured["monitor_id"] == "9"

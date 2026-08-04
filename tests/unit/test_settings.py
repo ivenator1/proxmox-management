@@ -1,6 +1,6 @@
 """Tests for proxmox_fleet.models.settings.GlobalSettings."""
 
-from proxmox_fleet.models.settings import GlobalSettings
+from proxmox_fleet.models.settings import GlobalSettings, PveClusterCreds
 
 
 def test_all_defaults():
@@ -125,3 +125,99 @@ def test_canary_defaults():
     s = GlobalSettings()
     assert s.canary_hosts == []
     assert s.canary_soak_minutes == 0.0
+
+
+# --- Task 1: qualified-id (cluster/vmid) settings validation ----------------------
+
+
+def test_exclude_list_entries_coerced_to_str():
+    s = GlobalSettings.model_validate({"exclude_list": [103, "110"]})
+    assert s.exclude_list == ["103", "110"]
+
+
+def test_id_lists_accept_qualified_cluster_tokens():
+    s = GlobalSettings.model_validate({
+        "exclude_list": [103, "alpha/110"],
+        "os_update_exclude_list": ["alpha/120"],
+        "app_update_exclude_list": ["beta/130"],
+        "snapshot_exclude_list": ["alpha/117"],
+        "os_only_lxc_list": ["beta/140"],
+    })
+    assert s.exclude_list == ["103", "alpha/110"]
+    assert s.os_update_exclude_list == ["alpha/120"]
+    assert s.app_update_exclude_list == ["beta/130"]
+    assert s.snapshot_exclude_list == ["alpha/117"]
+    assert s.os_only_lxc_list == ["beta/140"]
+
+
+def test_id_lists_default_empty():
+    s = GlobalSettings()
+    assert s.exclude_list == []
+    assert s.os_update_exclude_list == []
+    assert s.app_update_exclude_list == []
+    assert s.snapshot_exclude_list == []
+    assert s.os_only_lxc_list == []
+
+
+def test_id_lists_load_mixed_int_and_qualified_from_yaml(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text(
+        "exclude_list:\n  - 103\n  - \"alpha/110\"\n"
+        "os_only_lxc_list:\n  - \"beta/140\"\n"
+    )
+    s = GlobalSettings.load(f)
+    assert s.exclude_list == ["103", "alpha/110"]
+    assert s.os_only_lxc_list == ["beta/140"]
+
+
+# --- Task 3: per-cluster PVE API credentials ----------------------------------------
+
+
+def test_pve_cluster_creds_defaults_empty():
+    c = PveClusterCreds()
+    assert c.pve_api_user == ""
+    assert c.pve_api_token_id == ""
+    assert c.pve_api_token_secret == ""
+
+
+def test_pve_clusters_defaults_empty_dict():
+    s = GlobalSettings()
+    assert s.pve_clusters == {}
+
+
+def test_pve_clusters_parses_nested_creds():
+    s = GlobalSettings.model_validate({
+        "pve_clusters": {
+            "alpha": {
+                "pve_api_user": "root@pam",
+                "pve_api_token_id": "ansible",
+                "pve_api_token_secret": "alpha-secret",
+            },
+            "beta": {
+                "pve_api_token_secret": "beta-secret",
+            },
+        }
+    })
+    assert s.pve_clusters["alpha"].pve_api_user == "root@pam"
+    assert s.pve_clusters["alpha"].pve_api_token_id == "ansible"
+    assert s.pve_clusters["alpha"].pve_api_token_secret == "alpha-secret"
+    # beta only overrides one field — the rest default to empty (fallback is
+    # api_creds()'s job, not the model's).
+    assert s.pve_clusters["beta"].pve_api_user == ""
+    assert s.pve_clusters["beta"].pve_api_token_secret == "beta-secret"
+
+
+def test_pve_clusters_loads_from_yaml(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text(
+        "pve_api_user: root@pam\n"
+        "pve_api_token_id: ansible\n"
+        "pve_api_token_secret: global-secret\n"
+        "pve_clusters:\n"
+        "  beta:\n"
+        "    pve_api_token_secret: beta-secret\n"
+    )
+    s = GlobalSettings.load(f)
+    assert s.pve_api_token_secret == "global-secret"
+    assert s.pve_clusters["beta"].pve_api_token_secret == "beta-secret"
+    assert s.pve_clusters["beta"].pve_api_user == ""

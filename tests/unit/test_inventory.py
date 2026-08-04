@@ -179,6 +179,30 @@ def test_proxmox_nodes_missing_section_returns_empty(tmp_path):
     assert load_proxmox_nodes(path) == []
 
 
+def test_proxmox_node_nvidia_host_defaults_false(tmp_path):
+    path = _write_ini(tmp_path, "[proxmox_nodes]\npve-01\n")
+    assert load_proxmox_nodes(path)[0]["nvidia_host"] is False
+
+
+def test_proxmox_node_nvidia_host_inline_true(tmp_path):
+    path = _write_ini(tmp_path, "[proxmox_nodes]\npve-01 nvidia_host=true\n")
+    assert load_proxmox_nodes(path)[0]["nvidia_host"] is True
+
+
+def test_proxmox_node_nvidia_host_from_host_vars(tmp_path):
+    path = _write_ini(tmp_path, "[proxmox_nodes]\npve-01\n")
+    _write_host_vars(tmp_path, "pve-01", "nvidia_host: true\n")
+    nodes = load_proxmox_nodes(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert nodes[0]["nvidia_host"] is True
+
+
+def test_proxmox_node_inline_nvidia_host_overrides_host_vars(tmp_path):
+    path = _write_ini(tmp_path, "[proxmox_nodes]\npve-01 nvidia_host=false\n")
+    _write_host_vars(tmp_path, "pve-01", "nvidia_host: true\n")
+    nodes = load_proxmox_nodes(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert nodes[0]["nvidia_host"] is False
+
+
 def test_proxmox_nodes_ansible_host_from_host_vars(tmp_path):
     """Regression: a node whose IP lives only in host_vars must resolve to the IP,
     not the bare name — that value becomes the snapshot API api_host (must be an IP)."""

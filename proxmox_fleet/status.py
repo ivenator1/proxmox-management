@@ -353,6 +353,8 @@ def node_status(
     reboot_needed: bool,
     rebooted: bool,
     is_manager: bool,
+    *,
+    reboot_disabled: bool = False,
 ) -> str:
     """Node OS-update status string (Phase 2; ports the old node_status_str set_fact).
 
@@ -360,12 +362,19 @@ def node_status(
       UPDATED & REBOOTED > UPDATED (MANUAL REBOOT REQ) > REBOOT FAILED > UPDATED > OK
     REBOOT FAILED is logically unreachable in normal flow (a failed reboot goes to
     rescue → FAILED) but kept for parity with the original template.
+
+    ``reboot_disabled`` models the auto-reboot policy being off for this node
+    (``node_auto_reboot=false`` or a dry-run): the node *needs* a reboot it will
+    not get automatically, so it reports ``UPDATED (MANUAL REBOOT REQ)`` rather
+    than ``REBOOT FAILED`` — REBOOT FAILED stays reserved for a genuine
+    attempted-and-failed reboot (which the flow turns into a FAILED record via
+    its rescue path anyway).
     """
     if rebooted:
         return "UPDATED & REBOOTED"
-    if reboot_needed and is_manager:
+    if reboot_needed and (is_manager or reboot_disabled):
         return "UPDATED (MANUAL REBOOT REQ)"
-    if reboot_needed and not is_manager:
+    if reboot_needed:
         return "REBOOT FAILED"
     if apt_changed:
         return "UPDATED"

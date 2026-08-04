@@ -27,6 +27,17 @@ def _fail(rc=1, stderr="boom"):
 
 # apt upgrade stdout — packages were upgraded
 APT_UPGRADED = "3 upgraded, 0 newly installed, 0 to remove.\nSetting up foo (1.2) ...\n"
+# apt real-run output with per-package Unpacking lines (PR1 packages detail)
+APT_REAL_DETAIL = (
+    "Unpacking libssl3:amd64 (3.0.13-1~deb12u1) over (3.0.11-1~deb12u2) ...\n"
+    "Unpacking curl (8.5.0-2) over (8.5.0-1) ...\n"
+    "2 upgraded, 0 newly installed, 0 to remove.\n"
+)
+APT_SIM_DETAIL = (
+    "Inst libssl3:amd64 [3.0.11-1~deb12u2] "
+    "(3.0.13-1~deb12u1 Debian:12-security/stable-security [amd64])\n"
+    "Inst curl [8.5.0-1] (8.5.0-2 Debian:12/stable [amd64])\n"
+)
 # apt upgrade stdout — nothing to upgrade
 APT_NOOP = "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
 # pkg-manager detection stdout
@@ -34,14 +45,16 @@ PKG_DETECT_APT = "/usr/bin/apt-get\napt\n"
 
 
 def _settings(**kwargs) -> GlobalSettings:
-    return GlobalSettings.model_validate({
-        "vm_auto_reboot": True,
-        "vm_backup_strategy": "snapshot",
-        "pve_api_user": "root@pam",
-        "pve_api_token_id": "test",
-        "pve_api_token_secret": "secret",
-        **kwargs,
-    })
+    return GlobalSettings.model_validate(
+        {
+            "vm_auto_reboot": True,
+            "vm_backup_strategy": "snapshot",
+            "pve_api_user": "root@pam",
+            "pve_api_token_id": "test",
+            "pve_api_token_secret": "secret",
+            **kwargs,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +80,7 @@ class ScriptedVmExecutor:
         self.snap_changed = snap_changed
         self.snapshots_created = []
         self.snapshots_deleted = []
+        self.snapshot_api_params = []
 
     def _resp(self, command):
         for key, queue in self.script.items():
@@ -86,6 +100,7 @@ class ScriptedVmExecutor:
         return _ok()
 
     def snapshot(self, vmid, *, snap_state, **api_params):
+        self.snapshot_api_params.append(dict(api_params))
         if snap_state == "present":
             self.snapshots_created.append(vmid)
         else:
@@ -108,7 +123,11 @@ def _call(node_ex, vm_ex=None, settings=None, **kwargs):
     if vm_ex is None:
         vm_ex = _vm_ex()
     return run_vm_update(
-        "pve-01", "200", "my-vm", vm_ex, node_ex,
+        "pve-01",
+        "200",
+        "my-vm",
+        vm_ex,
+        node_ex,
         settings or _settings(),
         dry_run=kwargs.pop("dry_run", False),
         api_host=kwargs.pop("api_host", "1.2.3.4"),
@@ -123,15 +142,16 @@ def _call(node_ex, vm_ex=None, settings=None, **kwargs):
 
 def test_normal_update_apt():
     """Packages upgraded, no reboot required — UPDATED reported."""
-    vm_ex = _vm_ex(**{
-        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "reboot-required": [_ok(rc=1, changed=False)],
-    })
+    vm_ex = _vm_ex(
+        **{
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "dist-upgrade": [_ok(stdout=APT_REAL_DETAIL)],
+            "reboot-required": [_ok(rc=1, changed=False)],
+        }
+    )
     node_ex = _node_ex()
 
-    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, node_ex, _settings(),
-                            dry_run=False, api_host="1.2.3.4")
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, node_ex, _settings(), dry_run=False, api_host="1.2.3.4")
 
     assert not outcome.failed
     assert outcome.changed is True
@@ -139,6 +159,11 @@ def test_normal_update_apt():
     assert outcome.record.status == "UPDATED"
     assert outcome.record.vmid == "200"
     assert outcome.record.node == "pve-01"
+    # PR1: exact OS packages land on the success record (from the upgrade stdout)
+    assert outcome.record.packages == [
+        {"name": "libssl3", "from": "3.0.11-1~deb12u2", "to": "3.0.13-1~deb12u1"},
+        {"name": "curl", "from": "8.5.0-1", "to": "8.5.0-2"},
+    ]
     # Snapshot created and deleted via the VM executor (snapshot() is a separate method)
     assert "200" in vm_ex.snapshots_created
     assert "200" in vm_ex.snapshots_deleted
@@ -146,15 +171,74 @@ def test_normal_update_apt():
     assert not any("qm" in c for c in vm_ex.commands)
 
 
+# ---------------------------------------------------------------------------
+# Task 3: per-cluster API credentials reach the snapshot call
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_uses_global_creds_for_default_cluster():
+    vm_ex = _vm_ex(
+        **{
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "reboot-required": [_ok(rc=1, changed=False)],
+        }
+    )
+    node_ex = _node_ex()
+
+    run_vm_update("pve-01", "200", "my-vm", vm_ex, node_ex, _settings(), dry_run=False, api_host="1.2.3.4")
+
+    assert vm_ex.snapshot_api_params
+    for params in vm_ex.snapshot_api_params:
+        assert params == {
+            "api_host": "1.2.3.4",
+            "api_user": "root@pam",
+            "api_token_id": "test",
+            "api_token_secret": "secret",
+        }
+
+
+def test_snapshot_uses_beta_cluster_override():
+    vm_ex = _vm_ex(
+        **{
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "reboot-required": [_ok(rc=1, changed=False)],
+        }
+    )
+    node_ex = _node_ex()
+    settings = _settings(
+        pve_clusters={
+            "beta": {
+                "pve_api_user": "beta-user@pve",
+                "pve_api_token_id": "beta-tok",
+                "pve_api_token_secret": "beta-secret",
+            }
+        }
+    )
+
+    run_vm_update("pve-01", "200", "my-vm", vm_ex, node_ex, settings, dry_run=False, api_host="1.2.3.4", cluster="beta")
+
+    assert vm_ex.snapshot_api_params
+    for params in vm_ex.snapshot_api_params:
+        assert params == {
+            "api_host": "1.2.3.4",
+            "api_user": "beta-user@pve",
+            "api_token_id": "beta-tok",
+            "api_token_secret": "beta-secret",
+        }
+
+
 def test_update_with_reboot():
     """Packages upgraded AND reboot-required flag set — UPDATED & REBOOTED."""
-    vm_ex = _vm_ex(**{
-        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "reboot-required": [_ok(rc=0)],
-    })
-    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), _settings(),
-                            dry_run=False, api_host="1.2.3.4")
+    vm_ex = _vm_ex(
+        **{
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "reboot-required": [_ok(rc=0)],
+        }
+    )
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), _settings(), dry_run=False, api_host="1.2.3.4")
 
     assert not outcome.failed
     assert outcome.record is not None
@@ -164,12 +248,13 @@ def test_update_with_reboot():
 
 def test_idle_nothing_to_upgrade():
     """Nothing upgraded — no record appended (idle suppressed)."""
-    vm_ex = _vm_ex(**{
-        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-        "dist-upgrade": [_ok(stdout=APT_NOOP)],
-    })
-    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), _settings(),
-                            dry_run=False, api_host="1.2.3.4")
+    vm_ex = _vm_ex(
+        **{
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "dist-upgrade": [_ok(stdout=APT_NOOP)],
+        }
+    )
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), _settings(), dry_run=False, api_host="1.2.3.4")
 
     assert not outcome.failed
     assert outcome.changed is False
@@ -177,30 +262,42 @@ def test_idle_nothing_to_upgrade():
 
 
 def test_dry_run_would_update():
-    """Dry-run with pending upgrades — WOULD UPDATE."""
-    vm_ex = _vm_ex(**{
-        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-        "apt-get -s": [_ok(stdout=APT_UPGRADED)],  # -s comes before dist-upgrade
-    })
+    """Dry-run with pending upgrades — WOULD UPDATE.
+
+    PR1 roadmap: simulated (would-update) output IS retained as package detail
+    so the dashboard can show what WOULD change; pkg_count stays None because
+    cumulative totals must count only actual updates."""
+    vm_ex = _vm_ex(
+        **{
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "apt-get -s": [_ok(stdout=APT_SIM_DETAIL)],  # -s comes before dist-upgrade
+        }
+    )
     settings = _settings(vm_backup_strategy="none")
-    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings,
-                            dry_run=True, api_host="1.2.3.4")
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings, dry_run=True, api_host="1.2.3.4")
 
     assert not outcome.failed
     assert outcome.record is not None
     assert outcome.record.status == "WOULD UPDATE"
+    # would-update detail retained from the simulate output
+    assert outcome.record.packages == [
+        {"name": "libssl3", "from": "3.0.11-1~deb12u2", "to": "3.0.13-1~deb12u1"},
+        {"name": "curl", "from": "8.5.0-1", "to": "8.5.0-2"},
+    ]
+    assert outcome.record.pkg_count is None  # totals count real updates only
     assert vm_ex.snapshots_created == []  # no snapshot in dry-run
 
 
 def test_dry_run_ok():
     """Dry-run with nothing pending — record suppressed."""
-    vm_ex = _vm_ex(**{
-        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-        "apt-get -s": [_ok(stdout=APT_NOOP)],
-    })
+    vm_ex = _vm_ex(
+        **{
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "apt-get -s": [_ok(stdout=APT_NOOP)],
+        }
+    )
     settings = _settings(vm_backup_strategy="none")
-    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings,
-                            dry_run=True, api_host="1.2.3.4")
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings, dry_run=True, api_host="1.2.3.4")
 
     assert not outcome.failed
     assert outcome.record is None
@@ -208,13 +305,16 @@ def test_dry_run_ok():
 
 def test_snapshot_failure_warns_continues():
     """Snapshot API returns changed=False → warning appended, update still proceeds."""
-    vm_ex = ScriptedVmExecutor(host="my-vm", snap_changed=False, script={
-        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "reboot-required": [_ok(rc=1, changed=False)],
-    })
-    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), _settings(),
-                            dry_run=False, api_host="1.2.3.4")
+    vm_ex = ScriptedVmExecutor(
+        host="my-vm",
+        snap_changed=False,
+        script={
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "reboot-required": [_ok(rc=1, changed=False)],
+        },
+    )
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), _settings(), dry_run=False, api_host="1.2.3.4")
 
     assert not outcome.failed
     assert outcome.record is not None
@@ -228,17 +328,20 @@ def test_rescue_rollback_on_update_failure():
 
     Key assertion: qm commands go to node_ex, never to vm_ex.
     """
-    vm_ex = _vm_ex(**{
-        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-        "dist-upgrade": [_fail()],
-    })
-    node_ex = _node_ex(**{
-        "qm rollback": [_ok()],
-        "qm status": [_ok(stdout="status: running")],
-    })
+    vm_ex = _vm_ex(
+        **{
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "dist-upgrade": [_fail()],
+        }
+    )
+    node_ex = _node_ex(
+        **{
+            "qm rollback": [_ok()],
+            "qm status": [_ok(stdout="status: running")],
+        }
+    )
 
-    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, node_ex, _settings(),
-                            dry_run=False, api_host="1.2.3.4")
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, node_ex, _settings(), dry_run=False, api_host="1.2.3.4")
 
     assert outcome.failed is True
     assert outcome.record is not None
@@ -254,16 +357,19 @@ def test_rescue_rollback_on_update_failure():
 
 def test_rescue_rollback_not_done_when_qm_fails():
     """qm rollback command itself fails → rollback_done stays False → plain FAILED."""
-    vm_ex = _vm_ex(**{
-        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-        "dist-upgrade": [_fail()],
-    })
-    node_ex = _node_ex(**{
-        "qm rollback": [_fail()],  # rollback command fails
-    })
+    vm_ex = _vm_ex(
+        **{
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "dist-upgrade": [_fail()],
+        }
+    )
+    node_ex = _node_ex(
+        **{
+            "qm rollback": [_fail()],  # rollback command fails
+        }
+    )
 
-    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, node_ex, _settings(),
-                            dry_run=False, api_host="1.2.3.4")
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, node_ex, _settings(), dry_run=False, api_host="1.2.3.4")
 
     assert outcome.failed is True
     assert outcome.record is not None
@@ -273,13 +379,14 @@ def test_rescue_rollback_not_done_when_qm_fails():
 
 def test_rescue_no_snapshot_strategy_none():
     """backup_strategy=none → no snapshot → rescue records plain FAILED."""
-    vm_ex = _vm_ex(**{
-        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-        "dist-upgrade": [_fail()],
-    })
+    vm_ex = _vm_ex(
+        **{
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "dist-upgrade": [_fail()],
+        }
+    )
     settings = _settings(vm_backup_strategy="none")
-    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings,
-                            dry_run=False, api_host="1.2.3.4")
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings, dry_run=False, api_host="1.2.3.4")
 
     assert outcome.failed is True
     assert outcome.record.status == "FAILED"
@@ -291,12 +398,15 @@ def test_rescue_no_snapshot_strategy_none():
 
 def test_rescue_snapshot_failed_no_rollback():
     """Snapshot API failed (changed=False) → rescue records FAILED (NO SNAPSHOT)."""
-    vm_ex = ScriptedVmExecutor(host="my-vm", snap_changed=False, script={
-        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-        "dist-upgrade": [_fail()],
-    })
-    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), _settings(),
-                            dry_run=False, api_host="1.2.3.4")
+    vm_ex = ScriptedVmExecutor(
+        host="my-vm",
+        snap_changed=False,
+        script={
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "dist-upgrade": [_fail()],
+        },
+    )
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), _settings(), dry_run=False, api_host="1.2.3.4")
 
     assert outcome.failed is True
     assert outcome.record.status == "FAILED (NO SNAPSHOT)"
@@ -308,11 +418,13 @@ def test_kuma_health_check_called_on_change(monkeypatch):
     monkeypatch.setattr(http_mod, "poll_until", lambda *a, **kw: polled.append(True))
     monkeypatch.setattr(http_mod, "get_json", lambda _: {"heartbeatList": {"1": [{"status": 1}]}})
 
-    vm_ex = _vm_ex(**{
-        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "reboot-required": [_ok(rc=1, changed=False)],
-    })
+    vm_ex = _vm_ex(
+        **{
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "reboot-required": [_ok(rc=1, changed=False)],
+        }
+    )
     settings = _settings(
         vm_kuma_map={"my-vm": "1"},
         kuma_url="http://kuma.local",
@@ -320,8 +432,7 @@ def test_kuma_health_check_called_on_change(monkeypatch):
         kuma_health_check_retries=1,
         kuma_health_check_delay=0,
     )
-    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings,
-                            dry_run=False, api_host="1.2.3.4")
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings, dry_run=False, api_host="1.2.3.4")
 
     assert not outcome.failed
     assert len(polled) == 1
@@ -332,17 +443,18 @@ def test_kuma_not_called_when_idle(monkeypatch):
     polled = []
     monkeypatch.setattr(http_mod, "poll_until", lambda *a, **kw: polled.append(True))
 
-    vm_ex = _vm_ex(**{
-        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-        "dist-upgrade": [_ok(stdout=APT_NOOP)],
-    })
+    vm_ex = _vm_ex(
+        **{
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "dist-upgrade": [_ok(stdout=APT_NOOP)],
+        }
+    )
     settings = _settings(
         vm_kuma_map={"my-vm": "1"},
         kuma_url="http://kuma.local",
         kuma_slug="fleet",
     )
-    run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings,
-                  dry_run=False, api_host="1.2.3.4")
+    run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings, dry_run=False, api_host="1.2.3.4")
     assert polled == []
 
 
@@ -352,17 +464,18 @@ def test_kuma_not_called_in_dry_run(monkeypatch):
     polled = []
     monkeypatch.setattr(http_mod, "poll_until", lambda *a, **kw: polled.append(True))
 
-    vm_ex = _vm_ex(**{
-        "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-    })
+    vm_ex = _vm_ex(
+        **{
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+        }
+    )
     settings = _settings(
         vm_kuma_map={"my-vm": "1"},
         kuma_url="http://kuma.local",
         kuma_slug="fleet",
     )
-    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings,
-                            dry_run=True, api_host="1.2.3.4")
+    outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings, dry_run=True, api_host="1.2.3.4")
     assert polled == []
     assert not outcome.failed
 
@@ -370,6 +483,7 @@ def test_kuma_not_called_in_dry_run(monkeypatch):
 # ---------------------------------------------------------------------------
 # snapshot_with_retry (VM variant — same helper, parallel assertion)
 # ---------------------------------------------------------------------------
+
 
 def test_snapshot_with_retry_vm_succeeds_after_failure():
     from proxmox_fleet.executor import snapshot_with_retry
@@ -382,15 +496,21 @@ def test_snapshot_with_retry_vm_succeeds_after_failure():
 
     class LockedThenOkEx:
         host = "my-vm"
+
         def snapshot(self, vmid, *, snap_state, **kw):
             calls.append(snap_state)
             return results.pop(0)
 
     result = snapshot_with_retry(
-        LockedThenOkEx(), "200", snap_state="present",
-        api_host="1.2.3.4", api_user="root@pam",
-        api_token_id="tok", api_token_secret="sec",
-        retries=2, _sleep=lambda s: None,
+        LockedThenOkEx(),
+        "200",
+        snap_state="present",
+        api_host="1.2.3.4",
+        api_user="root@pam",
+        api_token_id="tok",
+        api_token_secret="sec",
+        retries=2,
+        _sleep=lambda s: None,
     )
     assert result.changed is True
     assert len(calls) == 2

@@ -22,6 +22,51 @@ def _ts_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
+# Buckets whose records may carry PR1 `packages` detail.
+_PACKAGE_BUCKETS = ("lxc", "vm", "remote", "node")
+
+
+def _drop_packages(data: Dict[str, Any]) -> bool:
+    """Remove ``packages`` keys from every record in the run summary; True if any."""
+    removed = False
+    for bucket in _PACKAGE_BUCKETS:
+        for record in data.get(bucket) or []:
+            if isinstance(record, dict) and "packages" in record:
+                del record["packages"]
+                removed = True
+    return removed
+
+
+def _strip_package_detail(directory: Path, keep_detail: int) -> None:
+    """Strip per-record ``packages`` detail from run files older than the newest N.
+
+    Short retention for package-level detail: weeks-old package lists are noise,
+    not signal, so ``write_history`` keeps them only on the newest
+    *keep_detail* timestamped run files and removes the key in place from the
+    rest. Idempotent — a file is rewritten only when at least one ``packages``
+    key was actually removed. Never touches ``latest.json`` (it mirrors the
+    newest run, which is always in the retained set) and never touches
+    ``totals.json`` (package totals come from status strings / ``pkg_count``,
+    not the stripped detail). ``keep_detail <= 0`` → never strip.
+    """
+    if keep_detail <= 0:
+        return
+    runs = sorted(directory.glob("run-*.json"))
+    for stale in runs[:-keep_detail]:
+        try:
+            data = json.loads(stale.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # ValueError also covers non-UTF-8 stale files.
+            continue
+        if not isinstance(data, dict):
+            continue
+        if _drop_packages(data):
+            stale.write_text(
+                json.dumps(data, indent=4, sort_keys=True, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+
 def build_run_summary(
     state: FleetState,
     *,
@@ -73,10 +118,17 @@ def write_history(
     *,
     history_dir: Union[str, Path] = "/var/log/fleet-update",
     keep: int = 30,
+    keep_detail: int = 0,
     timestamp: Optional[str] = None,
     briefing: Optional[str] = None,
 ) -> Path:
     """Write ``run-<ts>.json`` + ``latest.json`` and prune to the newest *keep* runs.
+
+    *keep_detail* limits per-record ``packages`` detail to the newest
+    *keep_detail* run files (older timestamped runs are stripped in place by
+    :func:`_strip_package_detail`); 0/None disables stripping. Package totals
+    (``count_packages``) are status-string/``pkg_count`` based, so stripping
+    never changes ``totals.json``.
 
     Returns the path of the timestamped run file. Mirrors persist-history.yml:
     ``to_nice_json`` → ``json.dump(indent=4, sort_keys=True)``.
@@ -93,6 +145,7 @@ def write_history(
     (directory / "latest.json").write_text(payload, encoding="utf-8")
 
     _accumulate_totals(directory, summary)
+    _observe_ledger(directory, summary)
 
     if keep > 0:
         # Timestamps sort lexically; newest last. Keep the newest `keep`, drop the rest.
@@ -100,7 +153,22 @@ def write_history(
         for stale in runs[:-keep]:
             stale.unlink(missing_ok=True)
 
+    _strip_package_detail(directory, keep_detail)
+
     return run_file
+
+
+def _observe_ledger(directory: Path, summary: Mapping[str, Any]) -> None:
+    """Fold this run into the per-host ledger (PR3) after the totals.
+
+    Imported lazily — ledger imports history's ``_UPDATED_RE`` predicate, so
+    a top-level import would cycle. ``observe_run`` never raises: the ledger
+    is an auxiliary accumulator and a corrupt/unwritable ``hosts.json`` must
+    not fail the run.
+    """
+    from proxmox_fleet import ledger
+
+    ledger.observe_run(directory, summary)
 
 
 # "Applied" statuses all contain the word "updated" ("UPDATED",
@@ -116,19 +184,13 @@ def count_updates(run: Mapping[str, Any]) -> Dict[str, int]:
     plus vm/remote/node ``status``); ``app``: LXCs whose community-script app
     was updated (lxc ``app`` line). Counts records, not packages.
     """
-    os_updates = sum(
-        1 for rec in run.get("lxc") or []
-        if _UPDATED_RE.search(str(rec.get("os") or ""))
-    ) + sum(
+    os_updates = sum(1 for rec in run.get("lxc") or [] if _UPDATED_RE.search(str(rec.get("os") or ""))) + sum(
         1
         for bucket in ("vm", "remote", "node")
         for rec in run.get(bucket) or []
-        if _UPDATED_RE.search(str(rec.get("status") or ""))
+        if (not rec.get("dry_run", False) and _UPDATED_RE.search(str(rec.get("status") or "")))
     )
-    app_updates = sum(
-        1 for rec in run.get("lxc") or []
-        if _UPDATED_RE.search(str(rec.get("app") or ""))
-    )
+    app_updates = sum(1 for rec in run.get("lxc") or [] if _UPDATED_RE.search(str(rec.get("app") or "")))
     return {"os": os_updates, "app": app_updates}
 
 
@@ -168,7 +230,7 @@ def _seed_totals(directory: Path) -> Dict[str, Any]:
     for run_file in sorted(directory.glob("run-*.json")):
         try:
             data = json.loads(run_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
             continue
         if totals["since"] is None:
             totals["since"] = data.get("timestamp", run_file.stem[4:])
@@ -176,6 +238,14 @@ def _seed_totals(directory: Path) -> Dict[str, Any]:
         totals["packages"] += count_packages(data)
         totals["app_updates"] += count_updates(data)["app"]
     return totals
+
+
+def _as_int(value: Any) -> int:
+    """Best-effort integer coercion for persisted accumulator values."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _accumulate_totals(directory: Path, summary: Mapping[str, Any]) -> None:
@@ -190,14 +260,12 @@ def _accumulate_totals(directory: Path, summary: Mapping[str, Any]) -> None:
     totals: Any = None
     try:
         totals = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         pass
     if isinstance(totals, dict):
-        totals["packages"] = int(totals.get("packages") or 0) + count_packages(summary)
-        totals["app_updates"] = (
-            int(totals.get("app_updates") or 0) + count_updates(summary)["app"]
-        )
-        totals["runs"] = int(totals.get("runs") or 0) + 1
+        totals["packages"] = _as_int(totals.get("packages")) + count_packages(summary)
+        totals["app_updates"] = _as_int(totals.get("app_updates")) + count_updates(summary)["app"]
+        totals["runs"] = _as_int(totals.get("runs")) + 1
         totals.setdefault("since", summary.get("timestamp"))
     else:
         totals = _seed_totals(directory)
@@ -217,13 +285,13 @@ def read_totals(history_dir: Union[str, Path]) -> Dict[str, Any]:
     directory = Path(history_dir)
     try:
         data = json.loads((directory / "totals.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         data = None
     if isinstance(data, dict):
         return {
-            "packages": int(data.get("packages") or 0),
-            "app_updates": int(data.get("app_updates") or 0),
-            "runs": int(data.get("runs") or 0),
+            "packages": _as_int(data.get("packages")),
+            "app_updates": _as_int(data.get("app_updates")),
+            "runs": _as_int(data.get("runs")),
             "since": data.get("since"),
         }
     return _seed_totals(directory)
@@ -251,16 +319,18 @@ def history_summary(
     for run_file in runs:
         try:
             data = json.loads(run_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
             continue
-        out.append({
-            # run_file.stem is "run-<ts>" — strip the prefix as a fallback.
-            "timestamp": data.get("timestamp", run_file.stem[4:]),
-            "changed": bool(data.get("changed", False)),
-            "failed": bool(data.get("failed", False)),
-            "counts": data.get("counts", {}),
-            "updates": count_updates(data),
-        })
+        out.append(
+            {
+                # run_file.stem is "run-<ts>" — strip the prefix as a fallback.
+                "timestamp": data.get("timestamp", run_file.stem[4:]),
+                "changed": bool(data.get("changed", False)),
+                "failed": bool(data.get("failed", False)),
+                "counts": data.get("counts", {}),
+                "updates": count_updates(data),
+            }
+        )
     return out
 
 

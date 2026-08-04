@@ -33,6 +33,7 @@
         <a href="/" {% if path == "/" %}class="active"{% endif %}>Overview</a>
         <a href="/pending" {% if path.startswith("/pending") %}class="active"{% endif %}>Pending</a>
         <a href="/history" {% if path.startswith("/history") %}class="active"{% endif %}>History</a>
+        <a href="/packages" {% if path.startswith("/packages") %}class="active"{% endif %}>Packages</a>
         <a href="/trigger" {% if path.startswith("/trigger") or path.startswith("/runs") %}class="active"{% endif %}>Trigger</a>
         <a href="/inventory" {% if path.startswith("/inventory") or path.startswith("/ssh") %}class="active"{% endif %}>Inventory</a>
         <a href="/settings" {% if path.startswith("/settings") %}class="active"{% endif %}>Settings</a>

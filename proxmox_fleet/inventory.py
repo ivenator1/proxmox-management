@@ -95,29 +95,32 @@ def load_proxmox_nodes(
     inventory_path: str = "hosts.ini",
     *,
     host_vars_dir: str = "host_vars",
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
     """Parse ``[proxmox_nodes]`` from *inventory_path* and merge per-host vars.
 
-    Returns a list of ``{name, ansible_host, cluster}`` dicts in inventory order.
-    ansible_host resolution order: inline var → host_vars/<node>.yml → node name.
-    Merging host_vars matters because ``ansible_host`` becomes the snapshot API
-    ``api_host`` (which must be an IP, not the inventory name). ``cluster``
-    resolves the same way, falling back to DEFAULT_CLUSTER — single-cluster
-    inventories need no ``cluster=`` vars at all.
+    Returns a list of ``{name, ansible_host, cluster, nvidia_host}`` dicts in
+    inventory order. ansible_host resolution order: inline var →
+    host_vars/<node>.yml → node name. Merging host_vars matters because
+    ``ansible_host`` becomes the snapshot API ``api_host`` (which must be an IP,
+    not the inventory name). ``cluster`` resolves the same way, falling back to
+    DEFAULT_CLUSTER — single-cluster inventories need no ``cluster=`` vars at
+    all. ``nvidia_host`` is a real bool (inline string or host_vars YAML value),
+    default False — it gates the read-only NVIDIA post-upgrade driver checks.
     """
     hvdir = Path(host_vars_dir)
-    nodes: List[Dict[str, str]] = []
+    nodes: List[Dict[str, Any]] = []
     for name, inline in _iter_section(inventory_path, "proxmox_nodes"):
         host_vars = _load_host_vars(name, hvdir)
         nodes.append({
             "name": name,
             "ansible_host": str(inline.get("ansible_host", host_vars.get("ansible_host", name))),
             "cluster": str(inline.get("cluster", host_vars.get("cluster", DEFAULT_CLUSTER))),
+            "nvidia_host": _as_bool(inline.get("nvidia_host", host_vars.get("nvidia_host", False))),
         })
     return nodes
 
 
-def validate_node_uniqueness(nodes: List[Dict[str, str]]) -> None:
+def validate_node_uniqueness(nodes: List[Dict[str, Any]]) -> None:
     """Fail loud on duplicate node names; warn on cross-cluster IP reuse.
 
     Node names are the join key everywhere (records, briefing grouping, the
@@ -245,7 +248,7 @@ def load_custom_hosts(
             HostSpec(
                 name=name,
                 ansible_host=str(inline.get("ansible_host", host_vars.get("ansible_host", name))),
-                custom_config=inline.get("custom_config", host_vars.get("custom_config", "")),
+                custom_config=str(inline.get("custom_config", host_vars.get("custom_config", "")) or ""),
                 depends_on=host_vars.get("depends_on", []),
                 maintenance_window=MaintenanceWindow(**raw_mw) if isinstance(raw_mw, dict) else None,
                 custom_overrides=host_vars.get("custom_overrides", {}),

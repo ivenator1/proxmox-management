@@ -19,12 +19,13 @@ from typing import Any, Dict, List, Optional
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import pkg_changed as _pkg_changed
-from proxmox_fleet.cluster import DEFAULT_CLUSTER
+from proxmox_fleet.cluster import DEFAULT_CLUSTER, api_creds
 from proxmox_fleet.changes import vm_pkg_count as _vm_pkg_count
 from proxmox_fleet.executor import Executor, snapshot_with_retry
 from proxmox_fleet.flows._pkg import detect_pkg_mgr, kuma_healthy, upgrade_cmd
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import ErrorEntry, VmRecord, WarningEntry
+from proxmox_fleet.pkg_detail import parse_upgraded
 from proxmox_fleet.status import vm_rescue_status, vm_should_report, vm_status
 
 
@@ -66,11 +67,10 @@ def run_vm_update(
         settings:           GlobalSettings from vars.yml.
         dry_run:            When True, simulate upgrade but apply no changes.
         api_host:           The node's ansible_host IP for Proxmox API (snapshot).
-        cluster:            The owning cluster (driver-resolved). Unused today;
-                            reserved for cluster-qualified settings matching and
-                            per-cluster API credentials.
+        cluster:            The owning cluster (driver-resolved) — selects the
+                            per-cluster API credential override, if any
+                            (see ``cluster.api_creds``).
     """
-    del cluster  # reserved — see docstring
 
     snap_taken = False
     snapshot_failed = False
@@ -79,9 +79,7 @@ def run_vm_update(
 
     api_params: Dict[str, Any] = {
         "api_host": api_host,
-        "api_user": settings.pve_api_user,
-        "api_token_id": settings.pve_api_token_id,
-        "api_token_secret": settings.pve_api_token_secret,
+        **api_creds(settings, cluster),
     }
 
     try:
@@ -98,17 +96,23 @@ def run_vm_update(
                 executor.run_shell(vzdump_cmd)
 
             if strategy in ("snapshot", "both"):
-                snap_res = snapshot_with_retry(executor, vmid, snap_state="present",
-                                               retries=settings.snapshot_retries,
-                                               delay=settings.snapshot_retry_delay,
-                                               **api_params)
+                snap_res = snapshot_with_retry(
+                    executor,
+                    vmid,
+                    snap_state="present",
+                    retries=settings.snapshot_retries,
+                    delay=settings.snapshot_retry_delay,
+                    **api_params,
+                )
                 snap_taken = snap_res.changed
                 if not snap_taken:
-                    outcome.warnings.append(WarningEntry(
-                        host=f"{node}/vm-{vmid}",
-                        task=f"Snapshot {vmid}",
-                        warning="snapshot failed — automatic rollback unavailable for this update",
-                    ))
+                    outcome.warnings.append(
+                        WarningEntry(
+                            host=f"{node}/vm-{vmid}",
+                            task=f"Snapshot {vmid}",
+                            warning="snapshot failed — automatic rollback unavailable for this update",
+                        )
+                    )
                     snapshot_failed = True
 
         # ------------------------------------------------------------------
@@ -121,11 +125,12 @@ def run_vm_update(
         # ------------------------------------------------------------------
         pkg_res = executor.run_shell(upgrade_cmd(pkg_mgr, dry_run=dry_run), ignore_errors=True)
         if pkg_res.failed and not dry_run:
-            raise RuntimeError(
-                f"Package upgrade failed (rc={pkg_res.rc}): {pkg_res.stderr or pkg_res.stdout}"
-            )
+            raise RuntimeError(f"Package upgrade failed (rc={pkg_res.rc}): {pkg_res.stderr or pkg_res.stdout}")
         changed = _pkg_changed(pkg_res.stdout, pkg_mgr)
         pkg_count = _vm_pkg_count(pkg_res.stdout, pkg_mgr) if (changed and not dry_run) else None
+        # Simulated output is intentionally retained as would-update detail;
+        # pkg_count remains real-run-only so cumulative totals stay factual.
+        packages = (parse_upgraded(pkg_res.stdout, pkg_mgr) or None) if changed else None
 
         # ------------------------------------------------------------------
         # Reboot check (only when something actually changed, not dry-run)
@@ -148,9 +153,7 @@ def run_vm_update(
         # same summary), but nothing was touched — never poll Kuma for a dry-run.
         kuma_id = str(settings.vm_kuma_map.get(inventory_hostname, ""))
         if kuma_id and settings.kuma_url and not dry_run and (changed or rebooted):
-            kuma_url = (
-                f"{settings.kuma_url}/api/status-page/heartbeat/{settings.kuma_slug}"
-            )
+            kuma_url = f"{settings.kuma_url}/api/status-page/heartbeat/{settings.kuma_slug}"
             try:
                 http_mod.poll_until(
                     lambda: http_mod.get_json(kuma_url),
@@ -159,21 +162,21 @@ def run_vm_update(
                     delay=settings.kuma_health_check_delay,
                 )
             except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(
-                    f"Kuma health check failed for vm-{vmid}: {exc}"
-                ) from exc
+                raise RuntimeError(f"Kuma health check failed for vm-{vmid}: {exc}") from exc
 
         # ------------------------------------------------------------------
         # Report
         # ------------------------------------------------------------------
-        status_str = vm_status(
-            pkg_changed=changed, rebooted=rebooted, dry_run=dry_run, failed=False
-        )
+        status_str = vm_status(pkg_changed=changed, rebooted=rebooted, dry_run=dry_run, failed=False)
         outcome.changed = changed or rebooted
         if vm_should_report(pkg_changed=changed, rebooted=rebooted, failed=False):
             outcome.record = VmRecord(
-                node=node, vmid=vmid, name=inventory_hostname,
-                status=status_str, pkg_count=pkg_count,
+                node=node,
+                vmid=vmid,
+                name=inventory_hostname,
+                status=status_str,
+                pkg_count=pkg_count,
+                packages=packages,
             )
         return outcome
 
@@ -196,25 +199,17 @@ def run_vm_update(
                     # Poll until VM is running again (up to 12 × 10 s)
                     for _ in range(12):
                         time.sleep(10)
-                        chk = node_executor.run_shell(
-                            f"qm status {vmid}", changed_when=False, ignore_errors=True
-                        )
+                        chk = node_executor.run_shell(f"qm status {vmid}", changed_when=False, ignore_errors=True)
                         if "running" in chk.stdout:
                             rollback_done = True
                             break
             except Exception:  # noqa: BLE001
                 pass
 
-        rescue_str = vm_rescue_status(
-            rollback_done=rollback_done, snapshot_failed=snapshot_failed
-        )
+        rescue_str = vm_rescue_status(rollback_done=rollback_done, snapshot_failed=snapshot_failed)
         outcome.failed = True
-        outcome.record = VmRecord(
-            node=node, vmid=vmid, name=inventory_hostname, status=rescue_str
-        )
-        outcome.error = ErrorEntry(
-            host=f"{node}/vm-{vmid}", task=str(failed_task), error=str(exc)[:300]
-        )
+        outcome.record = VmRecord(node=node, vmid=vmid, name=inventory_hostname, status=rescue_str)
+        outcome.error = ErrorEntry(host=f"{node}/vm-{vmid}", task=str(failed_task), error=str(exc)[:300])
         outcome.warnings = list(outcome.warnings)
         return outcome
 
@@ -223,7 +218,11 @@ def run_vm_update(
         # Always — delete snapshot
         # ------------------------------------------------------------------
         if snap_taken:
-            snapshot_with_retry(executor, vmid, snap_state="absent",
-                                retries=settings.snapshot_retries,
-                                delay=settings.snapshot_retry_delay,
-                                **api_params)
+            snapshot_with_retry(
+                executor,
+                vmid,
+                snap_state="absent",
+                retries=settings.snapshot_retries,
+                delay=settings.snapshot_retry_delay,
+                **api_params,
+            )
