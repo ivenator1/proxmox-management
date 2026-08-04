@@ -143,7 +143,21 @@ The `vars.yml` file is the central intelligence of the orchestrator.
 * **Note:** Phase 2 (node OS updates) runs serially with abort-on-first-failure to protect cluster quorum.
 
 ### 🎮 NVIDIA Node Post-Upgrade Checks
-Proxmox nodes with NVIDIA GPUs can be flagged `nvidia_host=true` — inline in `hosts.ini` or in `host_vars/<node>.yml`. After the node's OS update they get read-only driver diagnostics, executed from the Manager LXC via Ansible SSH on the Proxmox node itself (never inside a workload LXC). The control plane classifies the results:
+Proxmox nodes with NVIDIA GPUs must opt in with `nvidia_host=true`, either inline in `hosts.ini`:
+
+```ini
+[proxmox_nodes]
+gpu-node ansible_host=10.10.10.10 nvidia_host=true
+```
+
+or in host vars:
+
+```yaml
+# host_vars/gpu-node.yml
+nvidia_host: true
+```
+
+Keep the flag absent or `false` on non-NVIDIA nodes. After an opted-in node's OS update it gets read-only driver diagnostics, executed from the Manager LXC via Ansible SSH on the Proxmox node itself (never inside a workload LXC). The control plane classifies the results:
 
 * **Installed vs. loaded module mismatch** — a newer driver is installed than the one the running kernel has loaded: the node is flagged as requiring a reboot.
 * **Missing DKMS build for the running kernel** — a hard failure; the node reports `FAILED` rather than being rebooted.
