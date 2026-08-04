@@ -1,0 +1,122 @@
+{% extends "base.html" %} {% block title %}Package search — Fleet Dashboard{%
+endblock %} {% block content %}
+<div class="page-head">
+  <h1>Package search</h1>
+  <span class="sub">
+    {% if retention_keep > 0 %} package detail is kept on the newest {{
+    retention_keep }} run(s) (<code>fleet_package_detail_keep</code>); search
+    scans all retained runs, while older runs have their detail stripped in
+    place {% else %} package detail is retained on every run (<code
+      >fleet_package_detail_keep ≤ 0</code
+    >) {% endif %}
+  </span>
+</div>
+
+<form method="get" action="/packages" class="search-form">
+  <input
+    type="search"
+    name="q"
+    value="{{ q }}"
+    placeholder="package name or version…"
+    aria-label="Search packages"
+    {%
+    if
+    not
+    q
+    %}
+    autofocus{%
+    endif
+    %}
+  />
+  <button type="submit">Search</button>
+</form>
+
+{% if q %} {% if groups %}
+<p class="muted" style="font-size: 0.85rem">
+  {{ total }} hit(s) for <code>{{ q }}</code> across {{ groups | length }}
+  run(s) — newest first.
+</p>
+{% for group in groups %}
+<div class="card-head" style="margin-top: var(--sp-5)">
+  <h2 style="margin: 0">
+    <a class="mono" href="/history/{{ group.timestamp }}"
+      >{{ group.timestamp | ts_span }}</a
+    >
+  </h2>
+  <span class="pill muted">{{ group.hits | length }}</span>
+</div>
+<div class="table-card">
+  <table>
+    <thead>
+      <tr>
+        <th>Bucket</th>
+        <th>Host</th>
+        <th>Package</th>
+        <th>Version</th>
+        <th class="num"></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for hit in group.hits %}
+      <tr>
+        <td><span class="pill muted">{{ hit.bucket }}</span></td>
+        <td>
+          {% if hit.host and hit.host_url != "/hosts/" %}
+          <a href="{{ hit.host_url }}">{{ hit.host }}</a>
+          {% elif hit.host %}<span class="muted">{{ hit.host }}</span> {% else
+          %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td class="mono">{{ hit.name }}</td>
+        <td>
+          <span class="mono"
+            >{{ hit.from }}{% if hit.from %} → {% endif %}{{ hit.to }}</span
+          >
+        </td>
+        <td class="num">
+          <button
+            class="copy-pkg icon-btn"
+            type="button"
+            title="Copy package and versions"
+            aria-label="Copy {{ hit.name }}"
+            data-copy="{{ hit.name }} {{ hit.from }} {{ hit.to }}"
+          >
+            ⧉
+          </button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endfor %} {% else %}
+<div class="empty">
+  <span class="glyph" aria-hidden="true">⌁</span>
+  <p>No package matches <code>{{ q }}</code> in the retained runs.</p>
+</div>
+{% endif %} {% else %}
+<div class="empty">
+  <span class="glyph" aria-hidden="true">⌕</span>
+  <p>
+    Type a package name or version (e.g. <code>openssl</code>,
+    <code>3.0.13</code>) to search the exact OS package lists recorded by runs.
+    Matches package names and both the old (<code>from</code>) and new
+    (<code>to</code>) versions.
+  </p>
+</div>
+{% endif %}
+
+<script>
+  /* Copy button — progressive enhancement only; the page works with JS off. */
+  document.querySelectorAll(".copy-pkg").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (!navigator.clipboard) return;
+      navigator.clipboard.writeText(btn.dataset.copy);
+      const old = btn.textContent;
+      btn.textContent = "✓";
+      setTimeout(() => {
+        btn.textContent = old;
+      }, 1200);
+    });
+  });
+</script>
+{% endblock %}

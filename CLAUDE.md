@@ -91,8 +91,10 @@ proxmox_fleet/
   executor.py              # Executor protocol + RunnerExecutor; snapshot()/snapshot_with_retry(); 8 primitive methods
   http.py                  # get_json, poll_until, request, post_json
   inventory.py             # manual hosts.ini parsers + host_vars merge; MaintenanceWindow typing
+  ledger.py                # hosts.json per-host accumulator (last-updated + os-upgrade events)
   lxc_parse.py             # parse_pct_config/status, parse_ct_script, script_name_from_update
   orchestration.py         # run_serial(), run_concurrent(), retry()
+  pkg_detail.py            # parse_upgraded()/pkg_mgr_for_ostype() — exact package list parsers
   runner.py                # invoke_primitive() — ansible-runner wrapper (project_dir=os.getcwd())
   steps.py                 # run_steps(): update_steps with per-step timeout + when gate
   status.py                # all status decision trees (custom/lxc/vm/remote/node/manager)
@@ -179,25 +181,29 @@ merges purely in-memory.
   Telegram `sendMessage` (plain text by default — briefing markdown is Discord-flavoured).
 - **Run history** (`history.py`): `write_history()` writes `run-<UTC-ts>.json` + `latest.json`
   to `fleet_history_dir`, pruned to `fleet_history_keep`; gated on `fleet_history_enabled`.
-  Read back via `history_summary()`/`read_run()` — surfaced as `--history [N]` /
+  `write_history(keep_detail=…)` also strips per-record `packages` detail from runs older
+  than `fleet_package_detail_keep` (see "Observability layer"). Read back via
+  `history_summary()`/`read_run()` — surfaced as `--history [N]` /
   `--history-show <ts|latest>` (`cli.history_main()`, shared by both entry points, early-exits
   before any driver import).
 - **Dead-man's switch**: `notifiers.ping_deadmans()` pings `fleet_deadmans_url` (`/fail` on
   failure) so its absence alerts when the orchestrator stops running.
 - **Pending-updates scan** (`scan.py`, `--scan`): strictly read-only fleet walk — pending OS
   packages per host (apt `-s dist-upgrade` / `dnf check-update` rc-100-tolerant / `apk version
-  -l '<'`, parsed by `parse_pending()`) plus per-LXC app current→latest (the lxc dry-check
-  detect chain, reused). Stopped CTs/templates are skipped, never started. Writes
-  `pending-<ts>.json` + `pending-latest.json` to `fleet_history_dir` (pruned to
-  `scan_history_keep`); obeys `--limit`; exit 1 if any scan errored. Bypasses `run_fleet()`
-  entirely (no phases, no notify).
+  -l "<"`, parsed by `parse_pending()`) plus per-LXC app current→latest (the lxc dry-check
+  detect chain, reused). One sentinel-delimited command per host also reports the security
+  subset, reboot-required flag and `/etc/os-release` (see "Observability layer"). Stopped
+  CTs/templates are skipped, never started. Writes `pending-<ts>.json` + `pending-latest.json`
+  to `fleet_history_dir` (pruned to `scan_history_keep`); obeys `--limit`; exit 1 if any scan
+  errored. Bypasses `run_fleet()` entirely (no phases, no notify).
 
 ### Web dashboard (`web/`, `fleet-dashboard`)
 
 Optional `.[web]` extra (fastapi + uvicorn + python-multipart + fastapi-users + aiosqlite).
-`web/app.py` serves five server-rendered pages (overview / pending / history+run detail /
-per-host drill-down / trigger) purely from `fleet_history_dir` via the `history.py`/`scan.py`
-readers — the dashboard never runs fleet operations itself (its only direct host contact is
+`web/app.py` serves six server-rendered pages (overview / pending / history+run detail /
+per-host drill-down / package search / trigger) purely from `fleet_history_dir` via the
+`history.py`/`scan.py`/`ledger.py` readers — the dashboard never runs fleet operations
+itself (its only direct host contact is
 the SSH-enrollment helpers `/ssh/push`/`/ssh/test`). Every route except `/login`, `/static`
 and `/auth/*` hangs off one auth-protected `APIRouter` (session cookie via fastapi-users:
 `CookieTransport` + `JWTStrategy`, single `admin@fleet.lan` user in
@@ -212,6 +218,62 @@ same `lock.py` flock. Trigger args are composed only from validated tokens
 (`build_run_args()` — never raw strings into argv). Start the dashboard from the project root
 (the subprocess inherits CWD; `invoke_primitive` needs it). Tests: `test_web.py`
 (fastapi.testclient + stub subprocess commands).
+
+### Observability layer (package detail · scan metadata · per-host ledger · search)
+
+Spans `pkg_detail.py`, `scan.py`, `ledger.py`, `history.py` and `web/app.py` (landed as one
+changeset; see `docs/observability-roadmap.md`).
+
+- **Exact package detail (records)**: `packages: Optional[List[{name, from, to}]]` on
+  lxc/vm/remote/node records (`None` → key absent, so idle/dry/old records stay key-free).
+  `pkg_detail.parse_upgraded()` parses manager-side `LC_ALL=C` output — apt real
+  `Unpacking … over …` + simulate `Inst …`, dnf real `Upgraded:` block + `--assumeno`
+  table, apk `(i/n) Upgrading … (old -> new)` (prefix optional); garbage/drift → `[]`,
+  never an exception. Captured on success records only; LXC detail is dropped when the OS
+  step failed; vm/remote/node keep simulated dry-run output as would-update detail, but
+  `pkg_count` (a field remote/node records also gained) stays real-run-only so cumulative
+  totals stay factual. `changes.vm_pkg_count`'s apk branch delegates to `parse_upgraded`
+  (the old `^Upgrading` regex missed the `(i/n)` prefix and always counted 0).
+- **Retention / totals independence**: `fleet_package_detail_keep` (default 7; ≤0 → never
+  strip) keeps package detail only on the newest N run files. `write_history(keep_detail=…)`
+  strips `packages` keys in place from older timestamped runs
+  (`history._strip_package_detail`, idempotent) and never touches `latest.json` or
+  `totals.json` — `count_packages()` reads status strings / `pkg_count`, so totals are
+  independent of the stripped detail.
+- **Pending scan metadata (schema)**: `scan_cmd()` emits sentinel-delimited sections in one
+  command — `__FLEET_SEC__` (dnf only: `check-update --security`) and `__FLEET_META__`
+  (reboot flag + `/etc/os-release`), then `exit $rc`. No single quotes anywhere (apk uses
+  `"<"` — a `'` breaks `pct exec … -c '…'`). `parse_scan_output()` →
+  `{pending, security, reboot_required, os_release}`; `parse_os_release()` →
+  `{id, version_id, pretty_name}`; apt security = the subset of `Inst` lines whose archive
+  matches `*-security` (no extra command). Snapshot keys: hosts
+  `security_count`/`security`/`reboot_required`/`os_release`; lxc
+  `os_security_count`/`os_security`/`reboot_required`/`os_release` (named to match
+  `os_pending*`), lxc entries keyed `node/id`. Old snapshots lack the keys → `.get()`;
+  `pending_summary()` adds `security_pending`/`reboot_hosts`.
+- **Per-host ledger (`hosts.json`, survives run pruning)**: `ledger.read_ledger()` →
+  `{hosts: {key: {last_run_ts, last_status, last_changed_ts, os_release}},
+  events: [...]}`. Identities are multi-cluster-safe: **lxc → `node/id`** (bare vmids are
+  not fleet-unique), vm → `name`, remote → `host`, node/manager → `node`; custom excluded.
+  Scan lxc entries normalise to `node/id` (`_scan_lxc_key`; pre-PR3 bare-id keys
+  normalised, no-node entries skipped). `last_changed_ts` only for an **applied** OS update
+  (shared `history._UPDATED_RE`, not dry-run — NodeRecord persists a `dry_run` marker,
+  since node status strings have no dry-run variant). `observe_run` is called from
+  `write_history()` after totals; `observe_scan` from `scan.write_pending()` before
+  pruning. OS-upgrade events (`{type, host, from, to, ts}`, newest first, cap 100) come
+  from scans only — the first observation is a baseline; a `version_id` (fallback
+  `pretty_name`) change emits an event. **Corrupt recovery**: any read problem
+  (missing/unreadable/invalid JSON — syntactic or structural) yields a fresh empty ledger;
+  the observe functions swallow write errors; the ledger never fails a run or scan. Dead
+  hosts linger — `rm hosts.json` rebuilds it observationally.
+- **Package search + host timeline (routes)**: `GET /packages?q=` → `packages.html`
+  (`_search_packages`): case-insensitive substring over `packages` (name/from/to) in
+  timestamped `run-*.json` only (never `latest.json`), de-duplicated, newest run first,
+  grouped by run with `/history/{ts}` and `/hosts/{node}/{id}` links; the retention note
+  reads `fleet_package_detail_keep`. The host page timeline (`_host_timeline`) merges run
+  records, per-snapshot pending entries (`_host_pending_entries`, `pending-latest.json`
+  excluded) and ledger os-upgrade events — same timestamp shape, one lexical sort; pending
+  items render counts / reboot pill / package `<details>`.
 
 ### Cross-cutting subsystems
 
@@ -229,6 +291,7 @@ same `lock.py` flock. Trigger args are composed only from validated tokens
 ### Flow structure (`flows/lxc.py` and friends)
 
 `run_lxc_update()`'s `try/except/finally` reproduces the old `block/rescue/always`:
+
 - **Introspect runs outside `try`** (fail loud on bad `pct config`): parse name/os_type/template,
   read status, start the container if stopped.
 - **`try`**: detect (pull `/usr/bin/update`, parse ct script, fetch GitHub script) → dry-check
@@ -444,7 +507,8 @@ stubs `snapshot()`/`reboot()`); status/parse/helper functions are tested directl
 shared `conftest.py`. `ruff`/`mypy` run clean over `proxmox_fleet/` (and `ruff` over `tests/`).
 
 Coverage by area: `test_{config_model,state_model,settings,changes,deps,window,inventory,pkg,
-orchestration,http,steps,history,notifiers,runner,executor,cli}.py` for the model/helper layer;
+orchestration,http,steps,history,notifiers,runner,executor,cli}.py` plus `test_pkg_detail.py`
+and `test_ledger.py` for the model/helper layer;
 `test_status_{custom,lxc,vm,remote,node}.py` for decision trees; `test_flow_{custom,lxc,vm,
 remote,node}.py` for end-to-end flows via scripted executors; `test_driver.py` for phase
 orchestration (dep-abort, window skip, dry-run, abort-on-first-failure); `test_briefing.py`

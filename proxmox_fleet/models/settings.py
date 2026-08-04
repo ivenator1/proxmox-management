@@ -124,6 +124,11 @@ class GlobalSettings(BaseModel):
     fleet_history_enabled: bool = True
     fleet_history_dir: str = "/var/log/fleet-update"
     fleet_history_keep: int = 30
+    # How many of the NEWEST run files keep their per-record `packages` detail
+    # (the exact OS package lists, PR1). Older timestamped runs are stripped in
+    # place by history._strip_package_detail; latest.json and totals.json are
+    # never touched. <=0 → never strip (keep all detail).
+    fleet_package_detail_keep: int = 7
     scan_history_keep: int = 30
     force_notify: bool = False
 

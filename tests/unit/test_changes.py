@@ -153,7 +153,10 @@ def test_vm_pkg_count_dnf_case_insensitive():
 
 
 def test_vm_pkg_count_apk_multiple_lines():
-    stdout = "Upgrading musl\nUpgrading busybox\n"
+    stdout = (
+        "(1/2) Upgrading musl (1.2.4-r0 -> 1.2.5-r0)\n"
+        "(2/2) Upgrading busybox (1.36.1-r0 -> 1.36.1-r1)\n"
+    )
     assert vm_pkg_count(stdout, "apk") == 2
 
 

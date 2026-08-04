@@ -27,6 +27,12 @@ def _fail(rc=1, stderr="boom"):
 
 APT_UPGRADED = "3 upgraded, 0 newly installed, 0 to remove.\n"
 APT_NOOP = "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+# apt real-run output with per-package Unpacking lines (PR1 packages detail)
+APT_REAL_DETAIL = (
+    "Unpacking libssl3:amd64 (3.0.13-1~deb12u1) over (3.0.11-1~deb12u2) ...\n"
+    "Unpacking curl (8.5.0-2) over (8.5.0-1) ...\n"
+    "2 upgraded, 0 newly installed, 0 to remove.\n"
+)
 
 # pct list echo $? responses: "0" = manager host, "1" = not manager host
 NOT_MANAGER = _ok(stdout="1\n", changed=False)
@@ -37,11 +43,13 @@ NO_REBOOT = _ok(stdout="ok\n", changed=False)
 
 
 def _settings(**kwargs) -> GlobalSettings:
-    return GlobalSettings.model_validate({
-        "manager_lxc_id": "121",
-        "node_auto_reboot": True,
-        **kwargs,
-    })
+    return GlobalSettings.model_validate(
+        {
+            "manager_lxc_id": "121",
+            "node_auto_reboot": True,
+            **kwargs,
+        }
+    )
 
 
 def _no_sleep(seconds: float) -> None:
@@ -90,11 +98,13 @@ class ScriptedNodeExecutor:
 
 def test_normal_update_no_reboot():
     """apt upgrades packages, no reboot needed — UPDATED."""
-    ex = ScriptedNodeExecutor(script={
-        "pct list": [NOT_MANAGER],
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "vmlinuz": [NO_REBOOT],
-    })
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "vmlinuz": [NO_REBOOT],
+        }
+    )
     outcome = run_node_update("pve-01", ex, _settings(), dry_run=False, _sleep=_no_sleep)
 
     assert not outcome.failed
@@ -105,20 +115,62 @@ def test_normal_update_no_reboot():
     assert ex.reboots == 0
 
 
+def test_normal_update_captures_pkg_count_and_packages(monkeypatch):
+    """PR1: node success records carry pkg_count AND the exact apt package list."""
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_REAL_DETAIL)],
+            "vmlinuz": [NO_REBOOT],
+        }
+    )
+    outcome = run_node_update("pve-01", ex, _settings(), dry_run=False, _sleep=_no_sleep)
+
+    assert not outcome.failed
+    assert outcome.record is not None
+    assert outcome.record.status == "UPDATED"
+    assert outcome.record.pkg_count == 2
+    assert outcome.record.packages == [
+        {"name": "libssl3", "from": "3.0.11-1~deb12u2", "to": "3.0.13-1~deb12u1"},
+        {"name": "curl", "from": "8.5.0-1", "to": "8.5.0-2"},
+    ]
+
+
+def test_idle_node_has_no_packages():
+    """PR1: an OK node record stays key-free (no packages/pkgs when nothing changed)."""
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_NOOP)],
+            "vmlinuz": [NO_REBOOT],
+        }
+    )
+    outcome = run_node_update("pve-01", ex, _settings(), dry_run=False, _sleep=_no_sleep)
+
+    assert outcome.record is not None
+    assert outcome.record.status == "OK"
+    assert outcome.record.pkg_count is None
+    assert outcome.record.packages is None
+
+
 def test_update_with_reboot(monkeypatch):
     """apt upgrades, reboot needed, not manager — UPDATED & REBOOTED; wait_for_port called."""
     port_calls = []
     monkeypatch.setattr(http_mod, "wait_for_port", lambda h, p, **kw: port_calls.append((h, p)))
 
-    ex = ScriptedNodeExecutor(script={
-        "pct list": [NOT_MANAGER],
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "vmlinuz": [REBOOT_NEEDED],
-    })
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "vmlinuz": [REBOOT_NEEDED],
+        }
+    )
     outcome = run_node_update(
-        "pve-01", ex,
+        "pve-01",
+        ex,
         _settings(apt_proxy_ip="10.0.0.1", apt_proxy_port=3142),
-        dry_run=False, _sleep=_no_sleep,
+        dry_run=False,
+        _sleep=_no_sleep,
     )
 
     assert not outcome.failed
@@ -133,11 +185,13 @@ def test_reboot_no_proxy_when_ip_empty(monkeypatch):
     port_calls = []
     monkeypatch.setattr(http_mod, "wait_for_port", lambda h, p, **kw: port_calls.append((h, p)))
 
-    ex = ScriptedNodeExecutor(script={
-        "pct list": [NOT_MANAGER],
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "vmlinuz": [REBOOT_NEEDED],
-    })
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "vmlinuz": [REBOOT_NEEDED],
+        }
+    )
     outcome = run_node_update("pve-01", ex, _settings(apt_proxy_ip=""), dry_run=False, _sleep=_no_sleep)
 
     assert not outcome.failed
@@ -147,11 +201,13 @@ def test_reboot_no_proxy_when_ip_empty(monkeypatch):
 
 def test_manager_host_skip_reboot():
     """is_manager=True + reboot needed — UPDATED (MANUAL REBOOT REQ); no reboot call."""
-    ex = ScriptedNodeExecutor(script={
-        "pct list": [IS_MANAGER],
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "vmlinuz": [REBOOT_NEEDED],
-    })
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [IS_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "vmlinuz": [REBOOT_NEEDED],
+        }
+    )
     outcome = run_node_update("pve-01", ex, _settings(), dry_run=False, _sleep=_no_sleep)
 
     assert not outcome.failed
@@ -163,11 +219,13 @@ def test_manager_host_skip_reboot():
 
 def test_no_changes_ok():
     """Nothing to upgrade — UPDATED is False, record still created (OK)."""
-    ex = ScriptedNodeExecutor(script={
-        "pct list": [NOT_MANAGER],
-        "dist-upgrade": [_ok(stdout=APT_NOOP)],
-        "vmlinuz": [NO_REBOOT],
-    })
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_NOOP)],
+            "vmlinuz": [NO_REBOOT],
+        }
+    )
     outcome = run_node_update("pve-01", ex, _settings(), dry_run=False, _sleep=_no_sleep)
 
     assert not outcome.failed
@@ -185,7 +243,9 @@ def test_rescue_on_apt_failure():
         default=_fail(),  # all apt calls fail
     )
     outcome = run_node_update(
-        "pve-01", ex, _settings(),
+        "pve-01",
+        ex,
+        _settings(),
         dry_run=False,
         _sleep=lambda s: sleeps.append(s),
     )
@@ -211,12 +271,16 @@ def test_apt_retry_succeeds_on_third_attempt():
                 return _ok(stdout=APT_UPGRADED)
             return self._resp(command)
 
-    ex = RetryNodeExecutor(script={
-        "pct list": [NOT_MANAGER],
-        "vmlinuz": [NO_REBOOT],
-    })
+    ex = RetryNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "vmlinuz": [NO_REBOOT],
+        }
+    )
     outcome = run_node_update(
-        "pve-01", ex, _settings(),
+        "pve-01",
+        ex,
+        _settings(),
         dry_run=False,
         _sleep=_no_sleep,
     )
@@ -226,28 +290,82 @@ def test_apt_retry_succeeds_on_third_attempt():
     assert call_count[0] == 3
 
 
+APT_SIM_DETAIL = (
+    "Inst libssl3:amd64 [3.0.11-1~deb12u2] (3.0.13-1~deb12u1 Debian:12-security/stable-security [amd64])\n"
+    "Inst curl [8.5.0-1] (8.5.0-2 Debian:12-security/stable-security [amd64])\n"
+    "2 upgraded, 0 newly installed, 0 to remove.\n"
+)
+
+
 def test_dry_run_would_update():
-    """Dry-run: apt -s shows pending upgrades — status reflects what would happen."""
-    ex = ScriptedNodeExecutor(script={
-        "pct list": [NOT_MANAGER],
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "vmlinuz": [NO_REBOOT],
-    })
+    """Dry-run: apt -s shows pending upgrades — status reflects what would happen.
+
+    PR1 roadmap: the node's simulated (would-update) output IS retained as
+    package detail; pkg_count stays None so cumulative totals count only
+    actual updates."""
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_SIM_DETAIL)],
+            "vmlinuz": [NO_REBOOT],
+        }
+    )
     outcome = run_node_update("pve-01", ex, _settings(), dry_run=True, _sleep=_no_sleep)
 
     assert not outcome.failed
     assert outcome.record is not None
     assert outcome.record.status == "UPDATED"
+    assert outcome.record.packages == [
+        {"name": "libssl3", "from": "3.0.11-1~deb12u2", "to": "3.0.13-1~deb12u1"},
+        {"name": "curl", "from": "8.5.0-1", "to": "8.5.0-2"},
+    ]
+    assert outcome.record.pkg_count is None  # totals count real updates only
     assert ex.reboots == 0  # never reboot in dry-run
+
+
+def test_dry_run_record_serializes_dry_run_true():
+    """PR3: a node dry run persists dry_run=true in the record so the ledger
+    never treats its simulated 'UPDATED' status as an applied update."""
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_SIM_DETAIL)],
+            "vmlinuz": [NO_REBOOT],
+        }
+    )
+    outcome = run_node_update("pve-01", ex, _settings(), dry_run=True, _sleep=_no_sleep)
+
+    assert outcome.record is not None
+    assert outcome.record.dry_run is True
+    assert outcome.record.model_dump()["dry_run"] is True
+
+
+def test_real_run_record_omits_dry_run_key():
+    """PR3: a real node run leaves dry_run out of the serialized record — the
+    exact legacy byte shape."""
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "vmlinuz": [NO_REBOOT],
+        }
+    )
+    outcome = run_node_update("pve-01", ex, _settings(), dry_run=False, _sleep=_no_sleep)
+
+    assert outcome.record is not None
+    assert outcome.record.dry_run is None
+    assert "dry_run" not in outcome.record.model_dump()
 
 
 def test_dry_run_ok():
     """Dry-run: nothing pending — status OK."""
-    ex = ScriptedNodeExecutor(script={
-        "pct list": [NOT_MANAGER],
-        "dist-upgrade": [_ok(stdout=APT_NOOP)],
-        "vmlinuz": [NO_REBOOT],
-    })
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_NOOP)],
+            "vmlinuz": [NO_REBOOT],
+        }
+    )
     outcome = run_node_update("pve-01", ex, _settings(), dry_run=True, _sleep=_no_sleep)
 
     assert not outcome.failed
@@ -257,13 +375,18 @@ def test_dry_run_ok():
 
 def test_manager_lxc_id_empty_skips_check():
     """When manager_lxc_id is empty, is_manager check is skipped (no pct list call)."""
-    ex = ScriptedNodeExecutor(script={
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "vmlinuz": [NO_REBOOT],
-    })
+    ex = ScriptedNodeExecutor(
+        script={
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "vmlinuz": [NO_REBOOT],
+        }
+    )
     outcome = run_node_update(
-        "pve-01", ex, _settings(manager_lxc_id=""),
-        dry_run=False, _sleep=_no_sleep,
+        "pve-01",
+        ex,
+        _settings(manager_lxc_id=""),
+        dry_run=False,
+        _sleep=_no_sleep,
     )
 
     assert not outcome.failed
@@ -279,13 +402,19 @@ def test_qualified_manager_id_skips_probe_on_other_cluster():
     matching an unrelated container with the same numeric id and wrongly
     suppressing that node's reboot.
     """
-    ex = ScriptedNodeExecutor(script={
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "vmlinuz": [REBOOT_NEEDED],
-    })
+    ex = ScriptedNodeExecutor(
+        script={
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "vmlinuz": [REBOOT_NEEDED],
+        }
+    )
     outcome = run_node_update(
-        "pve-01", ex, _settings(manager_lxc_id="alpha/121"),
-        dry_run=False, cluster="beta", _sleep=_no_sleep,
+        "pve-01",
+        ex,
+        _settings(manager_lxc_id="alpha/121"),
+        dry_run=False,
+        cluster="beta",
+        _sleep=_no_sleep,
     )
 
     assert not outcome.failed
@@ -297,14 +426,20 @@ def test_qualified_manager_id_skips_probe_on_other_cluster():
 
 def test_qualified_manager_id_runs_probe_on_matching_cluster():
     """manager_lxc_id="alpha/121" + node cluster="alpha" — probe IS issued."""
-    ex = ScriptedNodeExecutor(script={
-        "pct list": [IS_MANAGER],
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "vmlinuz": [REBOOT_NEEDED],
-    })
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [IS_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "vmlinuz": [REBOOT_NEEDED],
+        }
+    )
     outcome = run_node_update(
-        "pve-01", ex, _settings(manager_lxc_id="alpha/121"),
-        dry_run=False, cluster="alpha", _sleep=_no_sleep,
+        "pve-01",
+        ex,
+        _settings(manager_lxc_id="alpha/121"),
+        dry_run=False,
+        cluster="alpha",
+        _sleep=_no_sleep,
     )
 
     assert not outcome.failed
@@ -315,14 +450,20 @@ def test_qualified_manager_id_runs_probe_on_matching_cluster():
 
 def test_bare_manager_id_runs_probe_regardless_of_cluster():
     """manager_lxc_id="121" (bare) — probe IS issued no matter the node's cluster."""
-    ex = ScriptedNodeExecutor(script={
-        "pct list": [NOT_MANAGER],
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "vmlinuz": [NO_REBOOT],
-    })
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "vmlinuz": [NO_REBOOT],
+        }
+    )
     outcome = run_node_update(
-        "pve-01", ex, _settings(manager_lxc_id="121"),
-        dry_run=False, cluster="beta", _sleep=_no_sleep,
+        "pve-01",
+        ex,
+        _settings(manager_lxc_id="121"),
+        dry_run=False,
+        cluster="beta",
+        _sleep=_no_sleep,
     )
 
     assert not outcome.failed
@@ -335,13 +476,16 @@ def test_settle_sleep_called_after_reboot(monkeypatch):
     monkeypatch.setattr(http_mod, "wait_for_port", lambda *a, **kw: None)
     sleeps = []
 
-    ex = ScriptedNodeExecutor(script={
-        "pct list": [NOT_MANAGER],
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "vmlinuz": [REBOOT_NEEDED],
-    })
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "vmlinuz": [REBOOT_NEEDED],
+        }
+    )
     run_node_update(
-        "pve-01", ex,
+        "pve-01",
+        ex,
         _settings(apt_proxy_ip="10.0.0.1"),
         dry_run=False,
         _sleep=lambda s: sleeps.append(s),
@@ -356,11 +500,13 @@ def test_settle_sleep_called_after_reboot(monkeypatch):
 
 
 def test_manager_update_changed():
-    """apt upgrades packages on manager — UPDATED."""
-    ex = ScriptedNodeExecutor(script={
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "reboot-required": [_ok(rc=1, changed=False)],
-    })
+    """apt upgrades packages on manager — UPDATED, with exact packages (PR1)."""
+    ex = ScriptedNodeExecutor(
+        script={
+            "dist-upgrade": [_ok(stdout=APT_REAL_DETAIL)],
+            "reboot-required": [_ok(rc=1, changed=False)],
+        }
+    )
     ex.host = "localhost"
     outcome = run_manager_update(ex, _settings())
 
@@ -369,15 +515,22 @@ def test_manager_update_changed():
     assert outcome.record is not None
     assert outcome.record.status == "UPDATED"
     assert outcome.record.node == "Ansible-Manager"
+    assert outcome.record.pkg_count == 2
+    assert outcome.record.packages == [
+        {"name": "libssl3", "from": "3.0.11-1~deb12u2", "to": "3.0.13-1~deb12u1"},
+        {"name": "curl", "from": "8.5.0-1", "to": "8.5.0-2"},
+    ]
     assert ex.reboots == 0
 
 
 def test_manager_update_reboot_required():
     """apt upgrades packages AND reboot-required — UPDATED (MANUAL REBOOT REQ)."""
-    ex = ScriptedNodeExecutor(script={
-        "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
-        "reboot-required": [_ok(stdout="reboot\n", changed=False)],
-    })
+    ex = ScriptedNodeExecutor(
+        script={
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "reboot-required": [_ok(stdout="reboot\n", changed=False)],
+        }
+    )
     ex.host = "localhost"
     outcome = run_manager_update(ex, _settings())
 
@@ -388,10 +541,12 @@ def test_manager_update_reboot_required():
 
 def test_manager_update_ok():
     """Nothing to upgrade on manager — OK."""
-    ex = ScriptedNodeExecutor(script={
-        "dist-upgrade": [_ok(stdout=APT_NOOP)],
-        "reboot-required": [_ok(rc=1, changed=False)],
-    })
+    ex = ScriptedNodeExecutor(
+        script={
+            "dist-upgrade": [_ok(stdout=APT_NOOP)],
+            "reboot-required": [_ok(rc=1, changed=False)],
+        }
+    )
     ex.host = "localhost"
     outcome = run_manager_update(ex, _settings())
 
@@ -434,3 +589,36 @@ def test_manager_dry_run():
     assert not outcome.failed
     assert any("-s" in cmd for cmd in commands), "dry-run should use apt-get -s"
     assert ex.reboots == 0
+
+
+def test_manager_dry_run_serializes_dry_run_true():
+    """PR3: manager dry runs persist dry_run=true — manager status strings have
+    no simulation variant, so the flag is what keeps the ledger honest."""
+    ex = ScriptedNodeExecutor(
+        script={
+            "dist-upgrade": [_ok(stdout=APT_NOOP)],
+            "reboot-required": [_ok(rc=1, changed=False)],
+        }
+    )
+    ex.host = "localhost"
+    outcome = run_manager_update(ex, _settings(), dry_run=True)
+
+    assert outcome.record is not None
+    assert outcome.record.dry_run is True
+    assert outcome.record.model_dump()["dry_run"] is True
+
+
+def test_manager_real_run_omits_dry_run_key():
+    """PR3: a real manager run leaves dry_run out of the serialized record."""
+    ex = ScriptedNodeExecutor(
+        script={
+            "dist-upgrade": [_ok(stdout=APT_NOOP)],
+            "reboot-required": [_ok(rc=1, changed=False)],
+        }
+    )
+    ex.host = "localhost"
+    outcome = run_manager_update(ex, _settings(), dry_run=False)
+
+    assert outcome.record is not None
+    assert outcome.record.dry_run is None
+    assert "dry_run" not in outcome.record.model_dump()

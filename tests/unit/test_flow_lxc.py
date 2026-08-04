@@ -213,6 +213,69 @@ def test_version_updated(monkeypatch):
     assert out.record.id == "101"
 
 
+APT_REAL_DETAIL = (
+    "Unpacking libssl3:amd64 (3.0.13-1~deb12u1) over (3.0.11-1~deb12u2) ...\n"
+    "Unpacking curl (8.5.0-2) over (8.5.0-1) ...\n"
+    "2 upgraded, 0 newly installed, 0 to remove.\n"
+)
+
+
+def test_successful_run_captures_os_packages(monkeypatch):
+    """PR1: a real-run success record carries the exact OS packages (debian → apt)."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = _exec_normal(os_stdout=APT_REAL_DETAIL)
+    out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
+    assert out.failed is False
+    assert out.record is not None
+    assert out.record.packages == [
+        {"name": "libssl3", "from": "3.0.11-1~deb12u2", "to": "3.0.13-1~deb12u1"},
+        {"name": "curl", "from": "8.5.0-1", "to": "8.5.0-2"},
+    ]
+
+
+def test_alpine_os_packages_parsed_as_apk(monkeypatch):
+    """PR1: alpine containers route their OS stdout through the apk parser."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = ScriptedLxcExecutor(
+        introspect_facts={
+            "config_stdout": PCT_CONFIG_ALPINE,
+            "status_stdout": PCT_STATUS_RUNNING,
+            "pull_rc": 1,
+            "script_stdout": "",
+        },
+        script={"reboot-required": [_fail(rc=1)]},
+        lxc_os_result=_ok(
+            stdout="(1/2) Upgrading musl (1.2.4-r0 -> 1.2.5-r0)\n"
+                   "(2/2) Upgrading busybox (1.36.1-r0 -> 1.36.1-r1)\n",
+            changed=True,
+        ),
+    )
+    settings = _settings(os_only_lxc_list=["101"], lxc_backup_strategy="none")
+    out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10")
+    assert out.record is not None
+    assert out.record.packages == [
+        {"name": "musl", "from": "1.2.4-r0", "to": "1.2.5-r0"},
+        {"name": "busybox", "from": "1.36.1-r0", "to": "1.36.1-r1"},
+    ]
+
+
+def test_no_packages_on_os_failure(monkeypatch):
+    """PR1: an OS step that failed carries no packages — success records only."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    ex = ScriptedLxcExecutor(
+        introspect_facts=_INTROSPECT_NO_SCRIPT,
+        script={"reboot-required": [_fail(rc=1)]},
+        lxc_os_result=PrimitiveResult(rc=1, failed=True, stderr="E: dpkg was interrupted"),
+    )
+    settings = _settings(os_only_lxc_list=["101"], lxc_backup_strategy="none")
+    out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10")
+    assert out.record is not None
+    assert out.record.packages is None
+
+
 def test_version_unchanged_noop(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda s: None)
     monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
@@ -303,6 +366,10 @@ def test_dry_run(monkeypatch):
     assert out.record is not None
     assert "→" in out.record.app
     assert out.changed is False
+    # PR1 roadmap: LXC dry-run does NOT retain package detail — the record is
+    # a version-compare only, no OS stdout was even collected.
+    assert out.record.packages is None
+    assert out.record.model_dump().get("packages") is None  # key omitted when None
     # No OS update or app update ran
     assert not any("apt-get" in c for c in ex.commands)
     assert not any("lxc_app_update" in c for c in ex.commands)

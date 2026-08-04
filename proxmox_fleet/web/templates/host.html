@@ -1,40 +1,136 @@
-{% extends "base.html" %}
-{% block title %}{{ name }} — Fleet Dashboard{% endblock %}
-{% block content %}
+{% extends "base.html" %} {% block title %}{{ name }} — Fleet Dashboard{%
+endblock %} {% block content %}
 <div class="page-head">
   <h1>Host <code>{{ name }}</code></h1>
-  {% if records %}<span class="sub">{{ records | length }} record(s) across persisted runs</span>{% endif %}
+  {% if ledger %}
+  <span class="sub">
+    {% if ledger.get("last_changed_ts") %}last updated
+    <span data-ts="{{ ledger.last_changed_ts | ts_iso }}"
+      >{{ ledger.last_changed_ts | ts_human }}</span
+    >{% endif %} {% if ledger.get("last_run_ts") %}{% if
+    ledger.get("last_changed_ts") %} · {% endif %}last run
+    <span data-ts="{{ ledger.last_run_ts | ts_iso }}"
+      >{{ ledger.last_run_ts | ts_human }}</span
+    >{% endif %} {% set rel = ledger.get("os_release") or {} %} {% if
+    rel.get("pretty_name") or rel.get("id") %} {% if
+    ledger.get("last_changed_ts") or ledger.get("last_run_ts") %} · {% endif %}
+    {{ rel.get("pretty_name") or (rel.get("id") ~ " " ~ rel.get("version_id"))
+    }} {% endif %}
+  </span>
+  {% elif timeline %}
+  <span class="sub">{{ timeline | length }} item(s) across persisted runs</span>
+  {% endif %}
 </div>
 
-{% if records %}
-<p class="muted" style="font-size: 0.85rem;">Newest first. Idle hosts are
-suppressed from run records, so gaps mean "nothing changed that run".</p>
+{% if timeline %}
+<p class="muted" style="font-size: 0.85rem">
+  Newest first. Idle hosts are suppressed from run records, so gaps mean
+  "nothing changed that run". Pending-snapshot entries show what each retained
+  scan saw; OS-upgrade events come from the pending scans.
+</p>
 <div class="timeline">
-  {% for entry in records %}
-  {% set has_error = entry.record.get("error") %}
-  <div class="timeline-item{% if has_error %} fail{% endif %}">
+  {% for entry in timeline %} {% if entry.kind == "event" %}
+  <div class="timeline-item upgrade">
     <span class="when">
-      <a class="mono" href="/history/{{ entry.timestamp }}" title="{{ entry.timestamp }}">{{ entry.timestamp | ts_span }}</a>
-      · <span class="pill {% if entry.bucket == 'errors' %}fail{% elif entry.bucket == 'warnings' %}warn{% else %}muted{% endif %}">{{ entry.bucket }}</span>
+      <span class="ts" data-utc="{{ entry.timestamp | ts_iso }}"
+        >{{ entry.timestamp | ts_human }}</span
+      >
+      · <span class="pill info">os-upgrade</span>
     </span>
     <div class="body">
-      {% for col in entry.columns %}
-        {% set val = entry.record.get(col) %}
-        {% if val is not none and val != "" %}
-          <small style="margin-right: 0.8rem; display: inline-block;"><strong class="muted">{{ col }}</strong>
-          {% if col == "error" %}<span class="fail">{{ val }}</span>
-          {% elif col == "warning" %}<span class="warn">{{ val }}</span>
-          {% else %}{{ val }}{% endif %}</small>
-        {% endif %}
-      {% endfor %}
+      <strong>OS release upgraded</strong>
+      <span class="mono">{{ entry.event.from }}</span> →
+      <span class="mono">{{ entry.event.to }}</span>
     </div>
   </div>
-  {% endfor %}
+  {% elif entry.bucket == "pending" %} {% set p = entry.entry %} {% set os_count
+  = p.get("os_pending_count", p.get("pending_count", 0)) %} {% set sec_count =
+  p.get("os_security_count", p.get("security_count", 0)) %} {% set pending_names
+  = p.get("os_pending") or p.get("pending") or [] %} {% set sec_names =
+  p.get("os_security") or p.get("security") or [] %} {% set app = p.get("app")
+  or {} %}
+  <div class="timeline-item">
+    <span class="when">
+      <a
+        class="mono"
+        href="/pending?ref={{ entry.timestamp }}"
+        title="{{ entry.timestamp }}"
+        >{{ entry.timestamp | ts_span }}</a
+      >
+      · <span class="pill info">pending</span>
+    </span>
+    <div class="body">
+      <small style="margin-right: 0.8rem; display: inline-block">
+        <strong class="muted">OS</strong> {{ os_count }} pending {% if sec_count
+        %}<span class="pill fail" title="{{ sec_names | join(', ') }}"
+          >{{ sec_count }} security</span
+        >{% endif %} {% if p.get("reboot_required") %}<span class="pill warn"
+          >reboot required</span
+        >{% endif %} {% if app.get("script") %}
+        <code>{{ app.get("script", "") }}</code>
+        <span class="mono"
+          >{{ app.get("current") or "?" }} → {{ app.get("latest") or "?"
+          }}</span
+        >
+        {% if app.get("outdated") %}<span class="pill warn">outdated</span>{%
+        endif %} {% endif %} {% if p.get("skipped") %}<span class="pill muted"
+          >skipped ({{ p.skipped }})</span
+        >{% endif %} {% if p.get("unreachable") %}<span class="pill muted"
+          >unreachable — skipped</span
+        >{% endif %} {% if p.get("error") %}<span class="fail"
+          >{{ p.error }}</span
+        >{% endif %} {% if pending_names %}
+        <details class="pkg-list">
+          <summary>{{ pending_names | length }} pkg(s)</summary>
+          <div class="pkg-body">{{ pending_names | join(", ") }}</div>
+        </details>
+        {% endif %}
+      </small>
+    </div>
+  </div>
+  {% else %} {% set has_error = entry.record.get("error") %}
+  <div class="timeline-item{% if has_error %} fail{% endif %}">
+    <span class="when">
+      <a
+        class="mono"
+        href="/history/{{ entry.timestamp }}"
+        title="{{ entry.timestamp }}"
+        >{{ entry.timestamp | ts_span }}</a
+      >
+      ·
+      <span
+        class="pill {% if entry.bucket == 'errors' %}fail{% elif entry.bucket == 'warnings' %}warn{% else %}muted{% endif %}"
+        >{{ entry.bucket }}</span
+      >
+    </span>
+    <div class="body">
+      {% for col in entry.columns %} {% set val = entry.record.get(col) %} {% if
+      val is not none and val != "" %}
+      <small style="margin-right: 0.8rem; display: inline-block"
+        ><strong class="muted">{{ col }}</strong> {% if col == "error" %}<span
+          class="fail"
+          >{{ val }}</span
+        >
+        {% elif col == "warning" %}<span class="warn">{{ val }}</span>
+        {% elif col == "packages" and val %}
+        <details class="pkg-list">
+          <summary>{{ val | length }} pkgs</summary>
+          <div class="pkg-body">
+            {% for pkg in val %}<span class="mono">{{ pkg.name }}</span> {{
+            pkg.get("from", "") }} → {{ pkg.to }}{% if not loop.last %}<br />{%
+            endif %}{% endfor %}
+          </div>
+        </details>
+        {% else %}{{ val }}{% endif %}</small
+      >
+      {% endif %} {% endfor %}
+    </div>
+  </div>
+  {% endif %} {% endfor %}
 </div>
 {% else %}
 <div class="empty">
   <span class="glyph" aria-hidden="true">⌑</span>
   <p>No records for this host in any persisted run.</p>
 </div>
-{% endif %}
-{% endblock %}
+{% endif %} {% endblock %}

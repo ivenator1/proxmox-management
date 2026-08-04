@@ -986,6 +986,7 @@ def run_notify_phase(
             state,
             history_dir=settings.fleet_history_dir,
             keep=settings.fleet_history_keep,
+            keep_detail=settings.fleet_package_detail_keep,
             briefing=body,
         )
 
