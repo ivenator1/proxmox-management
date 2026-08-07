@@ -182,6 +182,33 @@ def test_lxc_filtered_per_node():
     assert "radarr" in sec2 and "sonarr" not in sec2
 
 
+def test_lxc_only_run_renders_guest_under_its_node():
+    out = render_briefing(_state(
+        fleet_lxc_data=[lxc(node="pve01", name="firecrawl", id="128", os="Updated (2 upgraded)")],
+    ))
+
+    assert "**pve01: (GUEST RESULTS)**" in out
+    assert "- LXC" in out
+    assert "firecrawl (128)" in out
+    assert "OS: Updated (2 upgraded)" in out
+
+
+def test_guest_only_run_groups_lxcs_and_vms_without_duplicate_node_headers():
+    out = render_briefing(_state(
+        fleet_lxc_data=[
+            lxc(node="pve01", name="firecrawl", id="128"),
+            lxc(node="pve02", name="loki", id="129"),
+        ],
+        fleet_vm_data=[vm(node="pve01", vmid="110", name="eve-ng")],
+    ))
+
+    assert out.count("**pve01: (GUEST RESULTS)**") == 1
+    assert out.count("**pve02: (GUEST RESULTS)**") == 1
+    pve01 = out.split("**pve02: (GUEST RESULTS)**", 1)[0]
+    assert "firecrawl (128)" in pve01
+    assert "eve-ng (110)" in pve01
+
+
 # --------------------------------------------------------------------------- #
 # Title / colour / should_notify
 # --------------------------------------------------------------------------- #

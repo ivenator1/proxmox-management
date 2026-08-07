@@ -30,6 +30,29 @@ def render_briefing(state: FleetState) -> str:
     """
     parts: list[str] = []
 
+    def append_guest_results(node_name: str) -> bool:
+        """Append this node's LXC/VM records and report whether any existed."""
+        node_lxcs = [lx for lx in state.lxc if lx.node == node_name]
+        node_vms = [vm for vm in state.vm if vm.node == node_name]
+        if node_lxcs:
+            parts.append("\n- LXC")
+            for lx in node_lxcs:
+                seg = f"\n  - {lx.name} ({lx.id}) — {lx.app}"
+                if lx.os and lx.os != "None":
+                    seg += f" | OS: {lx.os}"
+                if not lx.snap:
+                    seg += " *(no snap)*"
+                parts.append(seg)
+        if node_vms:
+            parts.append("\n- VM")
+            for vm in node_vms:
+                seg = f"\n  - {vm.name} ({vm.vmid}) — {vm.status}"
+                if vm.pkg_count:
+                    seg += f" ({vm.pkg_count} upgraded)"
+                parts.append(seg)
+        return bool(node_lxcs or node_vms)
+
+    rendered_nodes = {n.node for n in state.node}
     for i, n in enumerate(state.node):
         if i != 0:
             parts.append("\n\n")
@@ -38,27 +61,24 @@ def render_briefing(state: FleetState) -> str:
         # when the record carries them — legacy key-free records stay identical.
         for reason in (n.reboot_reasons or []):
             parts.append(f"\n- reboot required: {reason}")
-        if n.node != "Ansible-Manager":
-            node_lxcs = [lx for lx in state.lxc if lx.node == n.node]
-            node_vms = [vm for vm in state.vm if vm.node == n.node]
-            if node_lxcs:
-                parts.append("\n- LXC")
-                for lx in node_lxcs:
-                    seg = f"\n  - {lx.name} ({lx.id}) — {lx.app}"
-                    if lx.os and lx.os != "None":
-                        seg += f" | OS: {lx.os}"
-                    if not lx.snap:
-                        seg += " *(no snap)*"
-                    parts.append(seg)
-            if node_vms:
-                parts.append("\n- VM")
-                for vm in node_vms:
-                    seg = f"\n  - {vm.name} ({vm.vmid}) — {vm.status}"
-                    if vm.pkg_count:
-                        seg += f" ({vm.pkg_count} upgraded)"
-                    parts.append(seg)
-            if not node_lxcs and not node_vms:
-                parts.append("\n- *No container changes.*")
+        if n.node != "Ansible-Manager" and not append_guest_results(n.node):
+            parts.append("\n- *No container changes.*")
+
+    # Limited or guest-only runs do not execute the node phase, but their LXC
+    # and VM records still need a node section in notifications. Preserve first
+    # appearance order while rendering each otherwise-unrepresented node once.
+    guest_only_nodes: list[str] = []
+    for lxc_record in state.lxc:
+        if lxc_record.node not in rendered_nodes and lxc_record.node not in guest_only_nodes:
+            guest_only_nodes.append(lxc_record.node)
+    for vm_record in state.vm:
+        if vm_record.node not in rendered_nodes and vm_record.node not in guest_only_nodes:
+            guest_only_nodes.append(vm_record.node)
+    for node_name in guest_only_nodes:
+        if parts:
+            parts.append("\n\n")
+        parts.append(f"**{node_name}: (GUEST RESULTS)**")
+        append_guest_results(node_name)
 
     if state.remote:
         parts.append("\n\n**Remote Hosts**")
