@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml as pyyaml
 from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
 
 from proxmox_fleet.inventory_edit import _atomic_write
 from proxmox_fleet.models.settings import GlobalSettings
@@ -41,10 +42,17 @@ def read_raw(path: str) -> str:
 
 
 def load_data(path: str) -> Any:
-    """The round-trip document (CommentedMap), or an empty map for a missing file."""
+    """Return the round-trip mapping, or an empty map for a missing file."""
     raw = read_raw(path)
-    data = _yaml().load(raw) if raw.strip() else None
-    return data if data is not None else _yaml().map()
+    try:
+        data = _yaml().load(raw) if raw.strip() else None
+    except YAMLError as exc:
+        raise VarsEditError(f"vars.yml could not be parsed: {exc}") from exc
+    if data is None:
+        return _yaml().map()
+    if not isinstance(data, dict):
+        raise VarsEditError("vars.yml must be a YAML mapping at the top level")
+    return data
 
 
 def _dump(data: Any) -> str:

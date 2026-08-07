@@ -35,6 +35,7 @@ from proxmox_fleet.web.app import (  # noqa: E402
     _search_packages,
     build_run_args,
     create_app,
+    settings_form_fields,
     spark_points,
     ts_human,
     ts_span,
@@ -966,6 +967,35 @@ def test_settings_page_and_diffed_save(project):
     assert "discord_webhook" not in data  # blank secret kept
     text = (project / "vars.yml").read_text()
     assert "# hand-written comment that must survive" in text
+
+
+def test_settings_page_invalid_yaml_renders_raw_editor(project):
+    from html import unescape
+
+    invalid_yaml = 'lxc_kuma_map:\n  "102": "9"\n  "102": "11"\n'
+    (project / "vars.yml").write_text(invalid_yaml)
+
+    resp = _project_client(project).get("/settings")
+
+    assert resp.status_code == 200
+    assert "duplicate key" in resp.text.lower()
+    assert invalid_yaml in unescape(resp.text)
+
+
+def test_settings_page_keeps_nested_cluster_credentials_raw_only(project):
+    rows = settings_form_fields(
+        {
+            "pve_clusters": {
+                "alpha": {
+                    "pve_api_user": "root@pam",
+                    "pve_api_token_id": "ansible",
+                    "pve_api_token_secret": "secret",
+                }
+            }
+        }
+    )
+
+    assert "pve_clusters" not in {row["name"] for row in rows}
 
 
 def test_settings_invalid_value_400(project):

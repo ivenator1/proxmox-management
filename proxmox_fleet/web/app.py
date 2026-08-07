@@ -248,7 +248,7 @@ def _activity_weeks(
 # only costs a masked input, never a leak.
 _SECRET_FIELD_RE = re.compile(r"(token|secret|pass|webhook|deadmans)", re.IGNORECASE)
 # Structured editing can't represent these faithfully — raw editor only.
-_RAW_ONLY_FIELDS = {"notifiers"}
+_RAW_ONLY_FIELDS = {"notifiers", "pve_clusters"}
 
 
 def settings_form_fields(file_data: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -1120,26 +1120,31 @@ def create_app(
 
     @protected.get("/settings")
     def settings_page(request: Request) -> Any:
-        file_data = dict(vars_edit.load_data(vars_path))
+        parse_error = ""
+        try:
+            file_data = dict(vars_edit.load_data(vars_path))
+        except VarsEditError as exc:
+            file_data = {}
+            parse_error = str(exc)
         known = set(GlobalSettings.model_fields)
         return templates.TemplateResponse(
             request,
             "settings.html",
             {
-                "fields": settings_form_fields(file_data),
+                "fields": settings_form_fields(file_data) if not parse_error else [],
                 "raw": vars_edit.read_raw(vars_path),
                 "vars_path": vars_path,
                 "extra_keys": sorted(k for k in file_data if k not in known),
                 "ok": request.query_params.get("ok", ""),
-                "err": request.query_params.get("err", ""),
+                "err": parse_error or request.query_params.get("err", ""),
             },
         )
 
     @protected.post("/settings")
     async def settings_save(request: Request) -> Any:
         form = await request.form()
-        file_data = dict(vars_edit.load_data(vars_path))
         try:
+            file_data = dict(vars_edit.load_data(vars_path))
             changes = parse_settings_form(form, file_data)
             if changes:
                 vars_edit.apply_changes(vars_path, set_keys=changes)
