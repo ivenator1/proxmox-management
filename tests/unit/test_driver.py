@@ -1282,6 +1282,8 @@ def test_custom_phase_passes_snapshot_wiring(tmp_path, monkeypatch):
         "api_user": "root@pam",
         "api_token_id": "tk",
         "api_token_secret": "sec",
+        "timeout": 600,
+        "api_timeout": 30,
     }
     assert captured["node_executor"] is executors["pve-01"]
     assert captured["snapshot_retries"] == 2
@@ -1347,6 +1349,8 @@ def test_custom_phase_uses_beta_cluster_creds(tmp_path, monkeypatch):
         "api_user": "beta-user@pve",
         "api_token_id": "beta-tok",
         "api_token_secret": "beta-sec",
+        "timeout": 600,
+        "api_timeout": 30,
     }
 
 
@@ -1393,6 +1397,8 @@ def test_custom_phase_default_cluster_node_uses_globals_with_pve_clusters_set(tm
         "api_user": "root@pam",
         "api_token_id": "tk",
         "api_token_secret": "sec",
+        "timeout": 600,
+        "api_timeout": 30,
     }
 
 

@@ -56,6 +56,8 @@ class Executor(Protocol):
         api_user: str,
         api_token_id: str,
         api_token_secret: str,
+        timeout: int = 600,
+        api_timeout: int = 30,
     ) -> PrimitiveResult:
         """Create (snap_state='present') or delete (snap_state='absent') a snapshot.
 
@@ -189,6 +191,8 @@ class RunnerExecutor:
         api_user: str,
         api_token_id: str,
         api_token_secret: str,
+        timeout: int = 600,
+        api_timeout: int = 30,
     ) -> PrimitiveResult:
         result = invoke_primitive(
             "snapshot",
@@ -200,6 +204,8 @@ class RunnerExecutor:
                 "api_user": api_user,
                 "api_token_id": api_token_id,
                 "api_token_secret": api_token_secret,
+                "timeout": timeout,
+                "api_timeout": api_timeout,
             },
             check=self.check,
         )
@@ -337,6 +343,15 @@ def _merge_facts(result: PrimitiveResult) -> PrimitiveResult:
     return result
 
 
+def snapshot_failure_warning(result: PrimitiveResult) -> str:
+    """Build a useful non-fatal warning from a failed snapshot primitive."""
+    base = "snapshot failed — automatic rollback unavailable for this update"
+    detail = (result.stderr or result.stdout).strip().replace("\n", " ")
+    if not detail:
+        return base
+    return f"{base}: {detail[-400:]}"
+
+
 def snapshot_with_retry(
     executor: Executor,
     vmid: str,
@@ -356,14 +371,30 @@ def snapshot_with_retry(
     from proxmox_fleet import orchestration
 
     predicate = (lambda r: r.changed) if snap_state == "present" else (lambda r: not r.failed)
+    last_result: Optional[PrimitiveResult] = None
+
+    def attempt() -> PrimitiveResult:
+        nonlocal last_result
+        last_result = executor.snapshot(vmid, snap_state=snap_state, **api_params)
+        return last_result
+
     try:
         return orchestration.retry(
-            lambda: executor.snapshot(vmid, snap_state=snap_state, **api_params),
+            attempt,
             retries=retries,
             delay=delay,
             until=predicate,
             exceptions=(),
             sleep=_sleep,
         )
-    except Exception:  # noqa: BLE001 - contract: a failed snapshot is a warning, never a raise
-        return PrimitiveResult(rc=1, stdout="", stderr="", changed=False, failed=True, facts={})
+    except Exception as exc:  # noqa: BLE001 - snapshot failures remain non-fatal warnings
+        if last_result is not None:
+            return last_result
+        return PrimitiveResult(
+            rc=1,
+            stdout="",
+            stderr=str(exc),
+            changed=False,
+            failed=True,
+            facts={},
+        )

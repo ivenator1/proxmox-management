@@ -489,6 +489,9 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
   `ansible_host` IP, not the inventory name; `vmid` (not `lxc_id`) covers both LXC and QEMU.
 - **`snapshot_with_retry`**: free function wrapping `orchestration.retry()`; used by lxc & vm flows
   for create (`until=changed`) and delete (`until=not failed`); treats "CT is locked" as transient.
+  It preserves the final primitive result so non-fatal warnings include the actual module error.
+  `snapshot_timeout` (default 600s) and `snapshot_api_timeout` (default 30s) override the
+  community.proxmox defaults, which are too short for large disks or slow storage.
 - **`run_concurrent(timeout=...)`**: each `future.result(timeout=...)` raising `TimeoutError` is
   caught by `except BaseException` and becomes a per-item failure rather than hanging forever.
 - **`_discover_vm_locations()`** prints a `[vm phase] WARNING: ...` to stderr on failure before

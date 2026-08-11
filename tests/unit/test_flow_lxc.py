@@ -303,6 +303,8 @@ def test_snapshot_uses_global_creds_for_default_cluster(monkeypatch):
             "api_user": "root@pam",
             "api_token_id": "tok",
             "api_token_secret": "secret",
+            "timeout": 600,
+            "api_timeout": 30,
         }
 
 
@@ -325,6 +327,8 @@ def test_snapshot_uses_beta_cluster_override(monkeypatch):
             "api_user": "beta-user@pve",
             "api_token_id": "beta-tok",
             "api_token_secret": "beta-secret",
+            "timeout": 600,
+            "api_timeout": 30,
         }
 
 
@@ -517,19 +521,30 @@ def test_no_rollback_without_snapshot(monkeypatch):
 
 
 def test_snapshot_failure_warning(monkeypatch):
-    """snapshot() returns changed=False → warning appended, update continues."""
+    """Snapshot module errors are reported while the update continues."""
     monkeypatch.setattr(time, "sleep", lambda s: None)
     monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
-    ex = ScriptedLxcExecutor(
+
+    class TimedOutSnapshotExecutor(ScriptedLxcExecutor):
+        def snapshot(self, lxc_id, *, snap_state, **api_params):
+            if snap_state == "present":
+                return _fail(stderr="Reached timeout while waiting for creating VM snapshot")
+            return _ok()
+
+    ex = TimedOutSnapshotExecutor(
         introspect_facts=_INTROSPECT_NO_SCRIPT,
         script={"reboot-required": [_fail(rc=1)]},
         lxc_os_result=_ok(stdout="0 upgraded, 0 newly installed"),
-        snap_changed=False,
     )
 
-    out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
-    assert len(out.warnings) >= 1
-    assert any("snapshot" in w.warning.lower() for w in out.warnings)
+    out = run_lxc_update(
+        "pve-01",
+        "101",
+        ex,
+        _settings(snapshot_retries=0),
+        api_host="192.168.1.10",
+    )
+    assert any("Reached timeout" in w.warning for w in out.warnings)
     assert out.failed is False
 
 

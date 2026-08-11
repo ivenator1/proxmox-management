@@ -4,7 +4,12 @@ from __future__ import annotations
 from typing import Any, Dict, cast
 
 import proxmox_fleet.executor as executor_mod
-from proxmox_fleet.executor import RunnerExecutor, _merge_facts, snapshot_with_retry
+from proxmox_fleet.executor import (
+    RunnerExecutor,
+    _merge_facts,
+    snapshot_failure_warning,
+    snapshot_with_retry,
+)
 from proxmox_fleet.runner import PrimitiveResult
 
 
@@ -190,6 +195,38 @@ def test_snapshot_fact_merge_failed(monkeypatch):
     result = ex.snapshot("101", snap_state="present", api_host="1.2.3.4",
                          api_user="root@pam", api_token_id="tk", api_token_secret="sec")
     assert result.failed is True
+
+
+def test_snapshot_passes_operation_and_api_timeouts(monkeypatch):
+    captured = {}
+
+    def fake_invoke(primitive, *, extravars, **kw):
+        captured.update(extravars)
+        return _pr(facts={"changed": True, "failed": False})
+
+    monkeypatch.setattr(executor_mod, "invoke_primitive", fake_invoke)
+    ex = RunnerExecutor("node-01")
+    ex.snapshot(
+        "101",
+        snap_state="present",
+        api_host="1.2.3.4",
+        api_user="root@pam",
+        api_token_id="tk",
+        api_token_secret="sec",
+        timeout=900,
+        api_timeout=45,
+    )
+
+    assert captured["timeout"] == 900
+    assert captured["api_timeout"] == 45
+
+
+def test_snapshot_failure_warning_includes_module_error():
+    result = _pr(failed=True, stderr="Reached timeout while waiting for creating VM snapshot")
+
+    warning = snapshot_failure_warning(result)
+
+    assert warning.endswith(": Reached timeout while waiting for creating VM snapshot")
 
 
 # ---------------------------------------------------------------------------

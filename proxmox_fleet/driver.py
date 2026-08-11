@@ -237,6 +237,8 @@ def run_custom_phase(
             api_params = {
                 "api_host": node_info["ansible_host"],
                 **api_creds(settings, node_info["cluster"]),
+                "timeout": settings.snapshot_timeout,
+                "api_timeout": settings.snapshot_api_timeout,
             }
 
         outcome = run_custom_update(

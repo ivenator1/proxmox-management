@@ -24,7 +24,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import custom_changed, is_outdated
-from proxmox_fleet.executor import Executor, snapshot_with_retry
+from proxmox_fleet.executor import Executor, snapshot_failure_warning, snapshot_with_retry
 from proxmox_fleet.flows._pkg import kuma_healthy
 from proxmox_fleet.models.config import CustomConfig
 from proxmox_fleet.models.state import CustomRecord, ErrorEntry, WarningEntry
@@ -206,7 +206,7 @@ def run_custom_update(
                 snapshot_failed = True
                 outcome.warnings.append(WarningEntry(
                     host=host, task=f"Snapshot {config.pve_vmid}",
-                    warning="snapshot failed — automatic rollback unavailable for this update",
+                    warning=snapshot_failure_warning(snap_res),
                 ))
 
         # --- update (per-step, with Python interpolation) -------------------

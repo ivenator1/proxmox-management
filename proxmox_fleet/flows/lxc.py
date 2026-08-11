@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import lxc_os_changed, lxc_os_pkg_count
 from proxmox_fleet.cluster import DEFAULT_CLUSTER, api_creds, map_lookup, matches_any, split_qualified
-from proxmox_fleet.executor import Executor, snapshot_with_retry
+from proxmox_fleet.executor import Executor, snapshot_failure_warning, snapshot_with_retry
 from proxmox_fleet.flows._pkg import kuma_healthy
 from proxmox_fleet.lxc_parse import (
     os_version_matches,
@@ -309,6 +309,8 @@ def run_lxc_update(
     api_params: Dict[str, Any] = {
         "api_host": api_host,
         **api_creds(settings, cluster),
+        "timeout": settings.snapshot_timeout,
+        "api_timeout": settings.snapshot_api_timeout,
     }
 
     try:
@@ -410,7 +412,7 @@ def run_lxc_update(
             if not snap_taken:
                 outcome.warnings.append(WarningEntry(
                     host=f"{node}/{lxc_id}", task="Create snapshot",
-                    warning="snapshot failed — automatic rollback unavailable for this update",
+                    warning=snapshot_failure_warning(snap_res),
                 ))
                 snapshot_failed = True
 

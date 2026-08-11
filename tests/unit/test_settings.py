@@ -110,6 +110,8 @@ def test_new_timeout_fields_have_correct_defaults():
     assert s.node_reboot_port_wait_timeout == 300.0
     assert s.snapshot_retries == 3
     assert s.snapshot_retry_delay == 15.0
+    assert s.snapshot_timeout == 600
+    assert s.snapshot_api_timeout == 30
     assert s.notifier_retries == 15
     assert s.deadmans_retries == 5
     assert s.node_apt_retries == 5

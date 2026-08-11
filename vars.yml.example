@@ -121,6 +121,9 @@ lxc_resource_scaling: false
 # --- BACKUP STRATEGY ---
 # snapshot | vzdump | both | none
 lxc_backup_strategy: "snapshot"
+# Large disks or slow storage can exceed community.proxmox's 30-second default.
+snapshot_timeout: 600       # overall create/delete operation wait
+snapshot_api_timeout: 30    # timeout for each Proxmox API request
 # PVE storage name (set to your PBS storage name to route vzdump to PBS)
 lxc_backup_storage: "local"
 
