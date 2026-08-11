@@ -12,6 +12,8 @@
 #   api_user           PVE API user (e.g. root@pam)
 #   api_token_id       API token ID
 #   api_token_secret   API token secret
+#   timeout            Overall snapshot operation timeout in seconds
+#   api_timeout        Per-request Proxmox API timeout in seconds
 - name: "snapshot primitive"
   hosts: localhost
   connection: local
@@ -26,6 +28,8 @@
         # PVE nodes ship self-signed certs; community.proxmox 2.x flipped the
         # default to validate them, which breaks every direct-to-node API call.
         validate_certs: false
+        timeout: "{{ timeout }}"
+        api_timeout: "{{ api_timeout }}"
         vmid: "{{ vmid }}"
         snapname: "BEFORE_UPDATE_AUTO"
         state: "{{ snap_state }}"

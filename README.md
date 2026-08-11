@@ -170,6 +170,7 @@ All previously-hardcoded timeouts and retry counts are overridable per environme
 (see `vars.yml.example` / `GlobalSettings` for full defaults):
 * `apt_proxy_check_timeout` / `node_reboot_port_wait_timeout`: How long to wait for the apt-cacher-ng proxy / a rebooted node's SSH port to come back.
 * `snapshot_retries` / `snapshot_retry_delay`: Retry attempts and delay for transient `CT is locked` snapshot failures.
+* `snapshot_timeout` / `snapshot_api_timeout`: Overall snapshot-task wait (default 600s) and per-request Proxmox API timeout (default 30s), sized for large disks and slow storage.
 * `notifier_retries` / `deadmans_retries`: Retry attempts for notifier dispatch and dead-man's-switch pings.
 * `node_apt_retries` / `node_apt_retry_delay`: Retry attempts and delay for the Phase 2 node OS update.
 

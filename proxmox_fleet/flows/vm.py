@@ -21,7 +21,7 @@ from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import pkg_changed as _pkg_changed
 from proxmox_fleet.cluster import DEFAULT_CLUSTER, api_creds
 from proxmox_fleet.changes import vm_pkg_count as _vm_pkg_count
-from proxmox_fleet.executor import Executor, snapshot_with_retry
+from proxmox_fleet.executor import Executor, snapshot_failure_warning, snapshot_with_retry
 from proxmox_fleet.flows._pkg import detect_pkg_mgr, kuma_healthy, upgrade_cmd
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import ErrorEntry, VmRecord, WarningEntry
@@ -80,6 +80,8 @@ def run_vm_update(
     api_params: Dict[str, Any] = {
         "api_host": api_host,
         **api_creds(settings, cluster),
+        "timeout": settings.snapshot_timeout,
+        "api_timeout": settings.snapshot_api_timeout,
     }
 
     try:
@@ -110,7 +112,7 @@ def run_vm_update(
                         WarningEntry(
                             host=f"{node}/vm-{vmid}",
                             task=f"Snapshot {vmid}",
-                            warning="snapshot failed — automatic rollback unavailable for this update",
+                            warning=snapshot_failure_warning(snap_res),
                         )
                     )
                     snapshot_failed = True

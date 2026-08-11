@@ -195,6 +195,8 @@ def test_snapshot_uses_global_creds_for_default_cluster():
             "api_user": "root@pam",
             "api_token_id": "test",
             "api_token_secret": "secret",
+            "timeout": 600,
+            "api_timeout": 30,
         }
 
 
@@ -226,6 +228,8 @@ def test_snapshot_uses_beta_cluster_override():
             "api_user": "beta-user@pve",
             "api_token_id": "beta-tok",
             "api_token_secret": "beta-secret",
+            "timeout": 600,
+            "api_timeout": 30,
         }
 
 

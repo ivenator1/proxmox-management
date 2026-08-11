@@ -110,6 +110,10 @@ class GlobalSettings(BaseModel):
     node_reboot_port_wait_timeout: float = 300.0
     snapshot_retries: int = 3
     snapshot_retry_delay: float = 15.0
+    # community.proxmox defaults its overall snapshot wait to 30s and each API
+    # request to 5s, which is too short for large disks or slow storage.
+    snapshot_timeout: int = 600
+    snapshot_api_timeout: int = 30
     notifier_retries: int = 15
     deadmans_retries: int = 5
     node_apt_retries: int = 5
