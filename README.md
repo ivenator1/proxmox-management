@@ -29,7 +29,8 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 * **Maintenance Windows:** Per-host time/day windows in `host_vars`; `force_window=true` bypasses. Invalid window config fails loud at load time.
 * **Canary Staging:** Hosts flagged `canary=true` (or listed in `canary_hosts`) update first in the remote/LXC/VM phases; the rest run only if every canary succeeded and — after a configurable soak window — its Uptime Kuma monitor is healthy. A failed gate records the remainder as `SKIPPED (canary failed)`.
 * **Targeted Runs:** `--phases lxc,vm` runs only the named phases; `--limit pve-01,105` restricts every phase to specific host names and/or LXC/VM ids — ideal for re-running a single failed container.
-* **Pending-Updates Scan:** `fleet-update --scan` is a strictly read-only fleet walk (pending OS packages per host plus community-script app current → latest per LXC) that feeds the dashboard's pending view. `install.sh` schedules it every 6 hours via `fleet-scan.timer`.
+* **Pending-Updates Scan:** `fleet-update --scan` is a strictly read-only fleet walk (pending OS packages per host plus community-script app current → latest per LXC, plus read-only manual-update checks for `[manual_update_hosts]` appliances — see below) that feeds the dashboard's pending view. `install.sh` schedules it every 6 hours via `fleet-scan.timer`.
+* **Manual-Update Monitoring:** TrueNAS SCALE and OPNsense appliances are *tracked, never auto-updated* — the six-hour `--scan` runs fixed read-only vendor checks (`midclt` for TrueNAS, `opnsense-version` + `opnsense-update -c` for OPNsense) and reminds you through the normal notifier fan-out when an update is pending or a check fails. Applying the update always stays a manual GUI action on the appliance.
 * **Run History & Replay:** Every run persists a JSON record to `fleet_history_dir`; `--history [N]` tables recent runs and `--history-show latest` replays a stored briefing.
 * **Fleet Run Lock:** A fleet-wide `flock` guarantees the dashboard trigger, the systemd timer, cron, and manual shell runs can never mutate the fleet concurrently.
 * **Web Dashboard:** Optional `fleet-dashboard` web UI (`pip install -e '.[web]'`, or via `install.sh`) — session-based login (admin account, password set during install), pending updates across the fleet (agentless, PatchMon-style, including community-script app versions), browsable run history with per-host drill-down, a run trigger with live console output (SSE), an inventory & enrollment page (add hosts to `hosts.ini`, generate/push/test SSH keys from the browser — no manual `ssh-copy-id` needed), and a comment-preserving `vars.yml` settings editor. Triggered runs launch the CLI as a detached subprocess under the shared fleet run lock.
@@ -92,7 +93,9 @@ lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
 │   ├── executor.py                  # Executor protocol + RunnerExecutor + snapshot_with_retry()
 │   ├── status.py / changes.py       # Decision trees + change detection
 │   ├── briefing.py / notifiers.py / history.py   # Phase 4 (briefing/notify/history)
-│   ├── scan.py / lock.py            # Read-only pending-updates scan + fleet-wide run lock
+│   ├── scan.py / lock.py            # Read-only pending-updates scan (incl. manual-update checks + reminders) + fleet-wide run lock
+│   ├── scan_notifications.py        # Manual-mapping scan notifications (first/change/daily-reminder state machine)
+│   ├── manual_updates.py            # Read-only adapter checks: TrueNAS SCALE (midclt) / OPNsense (opnsense-update -c)
 │   ├── web/                         # fleet-dashboard FastAPI app ('.[web]' extra): pages, run trigger,
 │   │                                # inventory enrollment, SSH key setup, vars.yml settings editor
 │   └── models/                      # Pydantic schemas (config, state, settings)
@@ -141,6 +144,64 @@ The `vars.yml` file is the central intelligence of the orchestrator.
 * `os_only_lxc_list`: Pull these *untagged* LXC IDs into discovery for OS-only management — they have no `/usr/bin/update`, so the app line reports `NO SCRIPT`.
 * `snapshot_exclude_list`: Updates run but no snapshot is taken (use for LXCs with bind mounts).
 * **Note:** Phase 2 (node OS updates) runs serially with abort-on-first-failure to protect cluster quorum.
+
+### 📟 Manual-Update Monitoring (scan-only)
+Appliances the fleet must never auto-update — TrueNAS SCALE, OPNsense firewalls, vendor-managed boxes — are **tracked, not updated**. The existing six-hour `fleet-update --scan` runs read-only checks per `[manual_update_hosts]` host, records the results in the pending snapshot's `manual` bucket, and — when enabled — reminds you through the normal notifier fan-out when an update is pending or a check fails. This is part of the scan walk, **not** a `run_fleet()` phase: manual checks run under `--scan` only and never affect the run briefing, `FleetState.changed`, or run totals. Applying the update always stays a manual GUI action on the appliance.
+
+* `manual_update_notifications` (default `true`): Send manual-update reminders.
+* `manual_update_reminder_hours` (default `24`): Reminder cadence while a host stays pending — the first notice fires immediately, then again daily until the update is applied or the state changes.
+* `manual_update_forks` (default `2`): Parallel adapter checks during the scan.
+
+These three settings are **scan-only** — read only by the `--scan` path, never by `run_fleet()`, and deliberately **not** accepted as `-e` extra vars (the five-key `-e` allowlist is unchanged). Set them in `vars.yml`.
+
+#### Inventory: `[manual_update_hosts]`
+```ini
+[manual_update_hosts]
+truenas-01  ansible_host=10.10.10.60  manual_adapter=truenas_scale
+opnsense-01 ansible_host=10.10.10.61  manual_adapter=opnsense
+
+[manual_update_hosts:vars]
+ansible_user=root
+ansible_ssh_private_key_file=~/.ssh/id_ed25519
+ansible_python_interpreter=/usr/bin/python3
+```
+Every host requires `manual_adapter=truenas_scale|opnsense`; a missing or blank value fails loudly at inventory load time, before any host is contacted. Optional per-host `display_name` (report/reminder label) and `apply_hint` (free-form GUI note) go in `host_vars/<name>.yml`.
+
+**Overlap safety & migration:** a hostname in `[manual_update_hosts]` must NOT also appear in `[remote_hosts]`, `[proxmox_vms]`, `[custom_hosts]`, or `[proxmox_nodes]` — that overlap is rejected loudly (naming the host and both groups) both in the scan and in the `run_fleet()` pre-flight, so no machine is ever both manually and automatically updated. To move a TrueNAS/OPNsense box off auto-update: **remove** its line from *every* auto-update group first, then add it here with `manual_adapter=` — do it in its own commit so a stale checkout can never run both paths for the same host.
+
+**Transport:** manual hosts use the same SSH/Ansible transport as the rest of the fleet — passwordless root SSH from the manager (the `:vars` block above carries the standard defaults; on OPNsense enable root SSH under System → Settings → Administration → Secure Shell).
+
+#### Read-only check commands (never install anything)
+The scan runs one fixed, sentinel-delimited read-only command per adapter and parses the output manager-side. There is **no install/apply operation anywhere** — each adapter validates its command invariants before host contact and refuses to run if a forbidden token appears:
+
+| Adapter | Read-only command | Forbidden |
+|---|---|---|
+| `truenas_scale` | `midclt call system.version` + `midclt call update.check_available` (JSON parsed in Python) | `apt`, `jq`, `updater`, `apply`, `upgrade` |
+| `opnsense` | `opnsense-version` + `opnsense-update -c` (check mode only) | bare `pkg`, `upgrade`, `apply`, `updater` |
+
+TrueNAS status mapping: `AVAILABLE` → update pending, `REBOOT_REQUIRED` → reboot pending, `CURRENT`/`UNAVAILABLE` → up to date, anything else → check error. OPNsense classification uses rc + output: `A newer version is available` (or rc=2) → update pending, `Nothing to do.` / `Currently up to date.` → up to date, rc=1 or unrecognized output → **fails closed** with an error — the scan never guesses.
+
+> **Before first use on OPNsense:** run `opnsense-update -c` locally on the firewall (check-only, safe) and confirm its output matches one of the fixtures under `tests/unit/data/manual_updates/opnsense_*.txt`. If a future OPNsense release changes the wording, the scan reports an error instead of misclassifying — capture the local check-only output and confirm the parser fixture before the box goes quiet.
+
+#### Notifications (first → change → daily reminder)
+When `manual_update_notifications` is enabled, the scan dispatches through the same `notifiers.dispatch` fan-out as Phase 4 — Discord, ntfy, generic webhook, and Telegram share one body, and the legacy `discord_webhook` back-compat still applies. Per host: **first** notice immediately, **change** (state fingerprint differs) immediately, then a **reminder** every `manual_update_reminder_hours` (default 24 h) while the state is unchanged. Genuine check errors use the same failure severity as a failed run (red, `❌ Scan: Manual Check Errors`); pending updates are amber (`⚠️ Scan: Manual Updates Available`). **Unreachable hosts are skipped silently** — no alert and no state change. Reminder state lives in `manual-notify-state.json` next to the history; a clean host clears its own entry, and a `--limit` scan never wipes hosts it didn't look at.
+
+Concise sample notification body (identical across all notifier types):
+
+```
+**Manual updates required**
+- **truenas** — 25.04.0.2 → 25.10.0 (reboot required)
+  - upgrade: 25.04.0.2 -> 25.10.0
+  GUI apply: TrueNAS GUI → System Settings → Update
+- **firewall** — 24.7.11 → 25.1
+  - Target release: 25.1
+  GUI apply: OPNsense GUI → System → Firmware → Status
+```
+
+**Run totals stay untouched:** the `manual` bucket never enters `FleetState` — it cannot change `changed`/`failed` run totals, the run briefing, or run history. The scan's own exit code still turns 1 when a manual check errored (like any host scan error), and the dashboard health score applies a small per-pending-action deduction, but no run is ever marked changed because an appliance needs a manual update.
+
+#### Dashboard & snapshots
+Pending snapshots carry a top-level `manual` mapping (keyed by the stable inventory hostname) that feeds the dashboard's **/pending** page — the "Manual systems" table (platform, current → available, action pills, details, apply hint, notes) and the per-scan "Manual updates" / "Manual reboots" columns. Each manual entry links to its `/hosts/<name>` page, and the per-host ledger observes manual systems for OS release/upgrade events only — a manual update is an admin action, never a fleet-applied change.
 
 ### 🎮 NVIDIA Node Post-Upgrade Checks
 Proxmox nodes with NVIDIA GPUs must opt in with `nvidia_host=true`, either inline in `hosts.ini`:
@@ -244,7 +305,7 @@ ansible-galaxy collection install community.proxmox community.general
 ```
 
 ### 3. Establish SSH Trust (Passwordless Login)
-The orchestrator SSHs into your Proxmox nodes to run primitives and gather state.
+The orchestrator SSHs into your Proxmox nodes to run primitives and gather state. The same passwordless root SSH is required for every remote host, VM, and `[manual_update_hosts]` appliance (TrueNAS/OPNsense) the scan checks — see "Manual-Update Monitoring" below.
 
 > **GUI alternative:** if the dashboard is running (e.g. via `install.sh`), the
 > **Inventory & enrollment** page does all of this from the browser — generate an
@@ -348,7 +409,7 @@ flags, and a built-in `--help`. Run it from the project root.
 --force-window             Bypass per-host maintenance-window checks
 --limit HOST,ID,...        Restrict the run to these host names and/or LXC/VM ids
 --phases P1,P2             Run only these phases (remote,custom,lxc,vm,node,manager)
---scan                     Read-only pending-updates scan → pending-*.json (no fleet run)
+--scan                     Read-only pending-updates scan → pending-*.json (no fleet run; incl. manual-update checks + reminders)
 --history [N]              Show the last N persisted runs and exit (default: 10)
 --history-show TS|latest   Print one persisted run's briefing and exit
 -e KEY=VALUE               Raw extra var (repeatable). Only fleet_dry_run, lxc_verbose,
