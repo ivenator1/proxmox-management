@@ -2,9 +2,9 @@
 
 Collects what *would* update without changing anything: pending OS packages for
 remote hosts, VMs, and Proxmox nodes (simulate commands per package manager),
-and for managed LXCs both the pending OS packages (``pct exec`` simulate) and
-the community-script app version (installed ``~/.{script}`` file vs. the latest
-GitHub release — the same detect chain as the lxc flow's dry-check).
+for managed LXCs both pending OS packages and community-script app versions,
+and fixed vendor checks for appliances in ``[manual_update_hosts]``. Manual
+systems are reported for GUI action only and never enter mutating fleet phases.
 
 Results are written to ``pending-<UTC-ts>.json`` + ``pending-latest.json`` in
 ``fleet_history_dir`` (pruned to ``scan_history_keep``), next to the run
@@ -19,13 +19,15 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple, Union
 
 from proxmox_fleet import http as http_mod
 from proxmox_fleet import inventory
 from proxmox_fleet import ledger
+from proxmox_fleet import manual_updates, notifiers, scan_notifications
 from proxmox_fleet.cluster import DEFAULT_CLUSTER, limit_selects_id, token_is_id
 from proxmox_fleet.executor import Executor
 from proxmox_fleet.flows._pkg import detect_pkg_mgr
@@ -63,6 +65,14 @@ from proxmox_fleet.runner import UnreachableHostError, is_unreachable_error
 _SEC_SENTINEL = "__FLEET_SEC__"
 _META_SENTINEL = "__FLEET_META__"
 _REBOOT_MARKER = "reboot_required"
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    """Best-effort integer coercion for runner facts and legacy snapshots."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def scan_cmd(pkg_mgr: str) -> str:
@@ -283,7 +293,7 @@ def _lxc_app_pending(
     Mirrors the lxc flow's dry-check: script name from the pulled
     ``/usr/bin/update``, latest tag from the ct script's GitHub repo.
     """
-    if int(introspect_facts.get("pull_rc", 1)) != 0:
+    if _as_int(introspect_facts.get("pull_rc", 1), 1) != 0:
         return None, {}, ""
     script_name = script_name_from_update(str(introspect_facts.get("script_stdout", ""))) or ""
     if not script_name:
@@ -453,32 +463,43 @@ def pending_summary(
             data = json.loads(scan_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        hosts = data.get("hosts", {}) or {}
-        lxc = data.get("lxc", {}) or {}
+        def _entries(value: Any) -> Tuple[Mapping[str, Any], ...]:
+            if not isinstance(value, Mapping):
+                return ()
+            return tuple(entry for entry in value.values() if isinstance(entry, Mapping))
+
+        hosts = _entries(data.get("hosts"))
+        lxc = _entries(data.get("lxc"))
+        manual = _entries(data.get("manual"))
+        all_entries = (*hosts, *lxc, *manual)
         out.append(
             {
                 # scan_file.stem is "pending-<ts>" — strip the prefix as a fallback.
                 "timestamp": data.get("timestamp", scan_file.stem[8:]),
-                "hosts_pending": sum(int(h.get("pending_count", 0)) for h in hosts.values()),
-                "lxc_os_pending": sum(int(c.get("os_pending_count", 0)) for c in lxc.values()),
-                "outdated_apps": sum(1 for c in lxc.values() if (c.get("app") or {}).get("outdated")),
+                "hosts_pending": sum(_as_int(h.get("pending_count", 0)) for h in hosts),
+                "lxc_os_pending": sum(_as_int(c.get("os_pending_count", 0)) for c in lxc),
+                "outdated_apps": sum(1 for c in lxc if (c.get("app") or {}).get("outdated")),
+                # Manual appliances need operator action, not a fleet-applied update.
+                # Legacy snapshots have no manual mapping and therefore count zero.
+                "manual_updates": sum(1 for entry in manual if entry.get("update_available")),
+                "manual_reboots": sum(1 for entry in manual if entry.get("reboot_required")),
                 # Security + reboot — read defensively: scans written before these
                 # keys existed (or on apk hosts, which track neither) lack them.
                 "security_pending": (
-                    sum(int(h.get("security_count", 0)) for h in hosts.values())
-                    + sum(int(c.get("os_security_count", 0)) for c in lxc.values())
+                    sum(_as_int(h.get("security_count", 0)) for h in hosts)
+                    + sum(_as_int(c.get("os_security_count", 0)) for c in lxc)
                 ),
-                "reboot_hosts": sum(1 for entry in (*hosts.values(), *lxc.values()) if entry.get("reboot_required")),
+                "reboot_hosts": sum(1 for entry in (*hosts, *lxc) if entry.get("reboot_required")),
                 # Health signals — containers that need attention before they fail.
                 # Read defensively: scans written before these keys existed lack them.
-                "low_disk": sum(1 for c in lxc.values() if (c.get("disk_percent") or 0) >= disk_threshold),
-                "os_mismatch": sum(1 for c in lxc.values() if c.get("os_mismatch")),
+                "low_disk": sum(1 for c in lxc if (c.get("disk_percent") or 0) >= disk_threshold),
+                "os_mismatch": sum(1 for c in lxc if c.get("os_mismatch")),
                 # Unreachable hosts are reported separately: they are "could not
                 # look", not a broken scan, and they do not fail the run either.
-                "unreachable": sum(1 for entry in (*hosts.values(), *lxc.values()) if entry.get("unreachable")),
+                "unreachable": sum(1 for entry in all_entries if entry.get("unreachable")),
                 "errors": sum(
                     1
-                    for entry in (*hosts.values(), *lxc.values())
+                    for entry in all_entries
                     if entry.get("error") and not entry.get("unreachable")
                 ),
             }
@@ -519,15 +540,32 @@ def run_fleet_scan(
     """Walk the fleet read-only and persist the pending-updates snapshot.
 
     Covers [remote_hosts], [proxmox_vms] (guest SSH), [proxmox_nodes] (node OS
-    + per-container scans). ``--limit`` semantics match run_fleet(). Returns
-    exit code 1 when any host/container scan recorded an error, else 0.
+    + per-container scans), and read-only adapters for [manual_update_hosts].
+    ``--limit`` semantics match run_fleet(). Returns exit code 1 when any
+    reachable target records a genuine check error; unreachable targets are
+    persisted as skipped and do not fail the scan.
     """
-    from proxmox_fleet.executor import RunnerExecutor  # lazy: needs ansible-runner
+    # Safety pre-flight happens before the first executor is constructed. A
+    # manual appliance may never also be eligible for an automated phase, and
+    # every adapter name/command invariant must be known before host contact.
+    inventory.validate_manual_update_overlap(inventory_path)
+    manual_hosts = inventory.load_manual_update_hosts(
+        inventory_path, host_vars_dir=settings.host_vars_dir
+    )
+    for host in manual_hosts:
+        try:
+            manual_updates.MANUAL_UPDATE_REGISTRY.get(host.manual_adapter).validate()
+        except manual_updates.ManualUpdateError as exc:
+            raise SystemExit(
+                f"manual_update_hosts entry '{host.name}' is invalid: {exc}"
+            ) from exc
 
     remote = inventory.load_remote_hosts(inventory_path, host_vars_dir=settings.host_vars_dir)
     vms = inventory.load_proxmox_vms(inventory_path, host_vars_dir=settings.host_vars_dir)
     nodes = inventory.load_proxmox_nodes(inventory_path, host_vars_dir=settings.host_vars_dir)
     inventory.validate_node_uniqueness(nodes)
+
+    from proxmox_fleet.executor import RunnerExecutor  # lazy: needs ansible-runner
     node_clusters = {n["name"]: n["cluster"] for n in nodes}
 
     def _vm_cluster_hint(v: inventory.VmSpec) -> str:
@@ -543,11 +581,13 @@ def run_fleet_scan(
     if limit is not None:
         remote = [h for h in remote if h.name in limit]
         vms = [v for v in vms if v.name in limit or limit_selects_id(limit, _vm_cluster_hint(v), v.vmid)]
+        manual_hosts = [h for h in manual_hosts if h.name in limit]
 
     scan: Dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"),
         "hosts": {},
         "lxc": {},
+        "manual": {},
     }
     failed = False
 
@@ -580,6 +620,53 @@ def run_fleet_scan(
         else:
             err = f"  ERROR: {result['error']}" if result.get("error") else ""
             print(f"  [{name}] {result['pending_count']} OS package(s) pending{err}")
+
+    def _scan_manual(host: inventory.ManualUpdateHostSpec) -> Dict[str, Any]:
+        ex = RunnerExecutor(host.name, inventory=inventory_path, check=False)
+        result = manual_updates.run_manual_update_check(
+            host.manual_adapter, ex, host.name
+        )
+        if host.display_name:
+            result.display_name = host.display_name
+        if host.apply_hint:
+            result.apply_hint = host.apply_hint
+        entry = asdict(result)
+        # Match the rest of the persisted snapshot: successful checks carry a
+        # JSON null error rather than an empty display string.
+        entry["error"] = entry.get("error") or None
+        return entry
+
+    for host, result, run_err in run_concurrent(
+        manual_hosts, _scan_manual, max_workers=settings.manual_update_forks
+    ):
+        if result is None:
+            adapter = manual_updates.MANUAL_UPDATE_REGISTRY.get(host.manual_adapter)
+            result = asdict(
+                manual_updates.ManualUpdateResult(
+                    host=host.name,
+                    display_name=host.display_name or adapter.display_name,
+                    adapter=host.manual_adapter,
+                    apply_hint=host.apply_hint or adapter.apply_hint,
+                    unreachable=is_unreachable_error(str(run_err)),
+                    error=str(run_err)[:300],
+                )
+            )
+        scan["manual"][host.name] = result
+        if result.get("error") and not result.get("unreachable"):
+            failed = True
+        if result.get("unreachable"):
+            print(f"  [{host.name}] manual check unreachable — skipped")
+        elif result.get("error"):
+            print(f"  [{host.name}] manual check ERROR: {result['error']}")
+        elif result.get("update_available") or result.get("reboot_required"):
+            current = result.get("current") or "?"
+            latest = result.get("latest") or current
+            print(
+                f"  [{host.name}] {current} → {latest}; manual apply: "
+                f"{result.get('apply_hint') or 'vendor UI'}"
+            )
+        else:
+            print(f"  [{host.name}] current ({result.get('current') or 'version unknown'})")
 
     # Per-node container scans (same node-targeting rules as the lxc phase).
     for node_info in nodes:
@@ -637,5 +724,18 @@ def run_fleet_scan(
     if settings.fleet_history_enabled:
         path = write_pending(scan, history_dir=settings.fleet_history_dir, keep=settings.scan_history_keep)
         print(f"pending snapshot written to {path}")
+
+    if settings.manual_update_notifications:
+        # This scan-only briefing is intentionally separate from Phase 4 and
+        # FleetState.changed. It reuses the configured notifier fan-out while
+        # its own state file enforces first/change/reminder selection.
+        scan_notifications.run_manual_notifications(
+            list(scan["manual"].values()),
+            history_dir=settings.fleet_history_dir,
+            notifiers_list=notifiers.resolve_notifiers(settings),
+            reminder_hours=settings.manual_update_reminder_hours,
+            retries=settings.notifier_retries,
+            dispatch_fn=notifiers.dispatch,
+        )
 
     return 1 if failed else 0

@@ -226,7 +226,7 @@ class TrueNASScaleAdapter(BaseManualUpdateAdapter):
         changes = payload.get("changes")
         if not isinstance(changes, list):
             changes = []
-        outcome.current = version or _first_component(changes, "old")
+        outcome.current = _component_version(version) or _first_component(changes, "old")
         if payload.get("REBOOT_REQUIRED"):
             outcome.reboot_required = True
 
@@ -283,9 +283,9 @@ class OpnsenseAdapter(BaseManualUpdateAdapter):
     display_name = "OPNsense"
     apply_hint = "OPNsense GUI → System → Firmware → Status"
     check_command = (
-        "LC_ALL=C opnsense-version"
+        "LC_ALL=C opnsense-version 2>&1"
         " && printf '\\n@@MANUAL_UPDATE_SEPARATOR@@\\n'"
-        " && LC_ALL=C opnsense-update -c"
+        " && LC_ALL=C opnsense-update -c 2>&1"
     )
     forbidden_tokens = ("apt", "apply", "upgrade", "pkg", "jq", "updater")
 
@@ -360,15 +360,29 @@ def _split_sections(res: PrimitiveResult, label: str) -> Tuple[str, str]:
     return parts[0].strip(), parts[1].strip()
 
 
+def _truenas_version(value: str) -> str:
+    """Return the release token from TrueNAS' raw or JSON-string version."""
+    text = value.strip()
+    if text.startswith('"'):
+        try:
+            decoded = json.loads(text)
+        except ValueError:
+            decoded = text
+        if isinstance(decoded, str):
+            text = decoded.strip()
+    match = re.fullmatch(r"TrueNAS(?:-SCALE)?-(.+)", text, re.IGNORECASE)
+    return match.group(1) if match else text
+
+
 def _component_version(item: Any) -> str:
-    """Normalize a TrueNAS component version to a string (old/new may be a string or a dict)."""
+    """Normalize a TrueNAS component version (old/new may be str or dict)."""
     if isinstance(item, str):
-        return item.strip()
+        return _truenas_version(item)
     if isinstance(item, dict):
         for key in ("version", "id", "name"):
             value = item.get(key)
             if isinstance(value, str) and value.strip():
-                return value.strip()
+                return _truenas_version(value)
     return ""
 
 

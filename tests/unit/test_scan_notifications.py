@@ -34,7 +34,8 @@ NOW = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
 def _entry(**kw: Any) -> Dict[str, Any]:
     """A normalized manual mapping entry, overridable per test."""
     base = {
-        "adapter": "web-01",
+        "host": "web-01",
+        "adapter": "truenas_scale",
         "current": "1.2.3",
         "latest": "1.4.0",
         "update_available": True,
@@ -50,7 +51,7 @@ def _entry(**kw: Any) -> Dict[str, Any]:
 
 
 def _error_entry(**kw: Any) -> Dict[str, Any]:
-    entry = _entry(adapter="db-01", update_available=False, **kw)
+    entry = _entry(host="db-01", adapter="opnsense", update_available=False, **kw)
     if "error" not in kw:
         entry["error"] = "connection refused"
     return entry
@@ -104,7 +105,15 @@ def test_fingerprint_sensitive_to_semantics():
     assert fingerprint(base) != fingerprint(_entry(current="1.2.4"))
     assert fingerprint(base) != fingerprint(_entry(summary="1 package pending"))
     assert fingerprint(base) != fingerprint(_entry(error="boom"))
-    assert fingerprint(base) != fingerprint(_entry(adapter="db-01"))
+    assert fingerprint(base) != fingerprint(_entry(adapter="opnsense"))
+
+
+def test_hosts_using_same_adapter_keep_independent_state():
+    first = _entry(host="nas-a")
+    second = _entry(host="nas-b")
+    decision = decide_manual_notifications([first, second], {}, now=NOW)
+    assert decision.selected == ["nas-a", "nas-b"]
+    assert set(decision.new_state) == {"nas-a", "nas-b"}
 
 
 # --------------------------------------------------------------------------

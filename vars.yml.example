@@ -92,13 +92,13 @@ dashboard_port: 8421
 scan_history_keep: 30
 
 # --- MANUAL UPDATE TRACKING (scan-only) ---
-# Hosts listed in [manual_update_hosts] (hosts.ini) are never auto-updated:
-# the scan tracks their state and the manual_update phase reminds the operator
-# to apply updates. These three settings are read by the scan/reminder path
-# ONLY — they are NOT accepted as -e extra vars, so set them here in vars.yml.
-# manual_update_notifications: true   # send reminders for manual-update hosts
-# manual_update_reminder_hours: 24    # remind when no manual update applied in N hours
-# manual_update_forks: 2              # parallel adapter checks during the scan
+# Hosts listed in [manual_update_hosts] are never auto-updated. The six-hour
+# scan checks them read-only and notifies on first/change, then at this reminder
+# interval while action remains pending. These settings are scan-only and are
+# NOT accepted as -e extra vars.
+manual_update_notifications: true
+manual_update_reminder_hours: 24
+manual_update_forks: 2
 
 # --- LXC TAG DISCOVERY ---
 lxc_tags:

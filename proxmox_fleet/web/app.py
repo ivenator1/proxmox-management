@@ -176,8 +176,16 @@ def _endpoint_counts(inventory_path: str, latest_pending: Optional[Mapping[str, 
         # count comes from their inventory group like any other configured
         # endpoint. Defensive .get(): the group lands in another PR, so
         # older inventory_edit versions simply report zero.
-        {"label": "Manual systems", "value": len(groups.get("manual_hosts") or [])},
+        {"label": "Manual systems", "value": len(groups.get("manual_update_hosts") or [])},
     ]
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Best-effort integer conversion for legacy/corrupt persisted counters."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _health_score(latest_run: Optional[Mapping[str, Any]], pending_row: Optional[Mapping[str, Any]]) -> int:
@@ -194,16 +202,16 @@ def _health_score(latest_run: Optional[Mapping[str, Any]], pending_row: Optional
         counts = latest_run.get("counts") or {}
         if latest_run.get("failed"):
             score -= 25
-        score -= 5 * int(counts.get("errors", 0) or 0)
-        score -= 2 * int(counts.get("warnings", 0) or 0)
+        score -= 5 * _safe_int(counts.get("errors", 0))
+        score -= 2 * _safe_int(counts.get("warnings", 0))
     if pending_row:
-        score -= int(pending_row.get("outdated_apps", 0) or 0)
-        score -= min(20, 2 * int(pending_row.get("security_pending", 0) or 0))
-        score -= min(10, 2 * int(pending_row.get("reboot_hosts", 0) or 0))
+        score -= _safe_int(pending_row.get("outdated_apps", 0))
+        score -= min(20, 2 * _safe_int(pending_row.get("security_pending", 0)))
+        score -= min(10, 2 * _safe_int(pending_row.get("reboot_hosts", 0)))
         # Manual systems each need an admin action (apply the update / reboot)
         # — a small per-action deduction, unlike the auto-update penalties.
-        score -= int(pending_row.get("manual_updates", 0) or 0)
-        score -= int(pending_row.get("manual_reboots", 0) or 0)
+        score -= _safe_int(pending_row.get("manual_updates", 0))
+        score -= _safe_int(pending_row.get("manual_reboots", 0))
     return max(0, min(100, score))
 
 
@@ -236,7 +244,7 @@ def _activity_weeks(
         for d in range(7):
             day = week_start + timedelta(days=d)
             ent = per_day.get(day, {"count": 0, "failed": False})
-            count = int(ent["count"])
+            count = _safe_int(ent["count"])
             level = 0 if count == 0 else 1 if count == 1 else 2 if count <= 3 else 3
             col.append(
                 {
@@ -416,7 +424,7 @@ def _lxc_entry_id(key: str, entry: Dict[str, Any]) -> str:
 def _lxc_sort_key(item: Tuple[str, Dict[str, Any]]) -> Tuple[str, int, str]:
     key, entry = item
     lxc_id = _lxc_entry_id(key, entry)
-    return (str(entry.get("node", "")), int(lxc_id) if lxc_id.isdigit() else 0, key)
+    return (str(entry.get("node", "")), _safe_int(lxc_id) if lxc_id.isdigit() else 0, key)
 
 
 def _history_rows_with_deltas(history_dir: str) -> List[Dict[str, Any]]:
@@ -430,7 +438,9 @@ def _history_rows_with_deltas(history_dir: str) -> List[Dict[str, Any]]:
             continue
         parts = []
         for key in _COUNT_KEYS:
-            diff = int((row.get("counts") or {}).get(key, 0)) - int((prev.get("counts") or {}).get(key, 0))
+            diff = _safe_int((row.get("counts") or {}).get(key, 0)) - _safe_int(
+                (prev.get("counts") or {}).get(key, 0)
+            )
             if diff:
                 parts.append(f"{key} {diff:+d}")
         row["delta"] = ", ".join(parts)
@@ -1069,7 +1079,7 @@ def create_app(
                 if not custom_config:
                     raise InventoryEditError("custom_config is required")
                 inline["custom_config"] = custom_config
-            if group == "manual_hosts":
+            if group == "manual_update_hosts":
                 adapter = str(form.get("manual_adapter") or "").strip()
                 if adapter not in ("truenas_scale", "opnsense"):
                     raise InventoryEditError(

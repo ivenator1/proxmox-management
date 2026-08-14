@@ -90,7 +90,7 @@ class GlobalSettings(BaseModel):
     remote_kuma_map: Dict[str, Any] = Field(default_factory=dict)
     remote_forks: int = 5
 
-    # manual_update phase settings (scan-tracked hosts; never auto-updated).
+    # Read-only manual-adapter settings (scan-tracked hosts; never auto-updated).
     # Scan/reminder path only — deliberately NOT accepted as -e extra vars.
     manual_update_notifications: bool = True
     manual_update_reminder_hours: int = 24

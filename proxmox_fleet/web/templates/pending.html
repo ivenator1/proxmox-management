@@ -162,7 +162,7 @@
 {% if scans %}
 <div class="table-card">
 <table>
-  <thead><tr><th>Timestamp</th><th class="num">Host pkgs</th><th class="num">LXC OS pkgs</th><th class="num">Outdated apps</th><th class="num" title="Security packages pending across hosts and containers">Security pkgs</th><th class="num" title="Hosts/containers with the reboot-required flag set">Reboot</th><th class="num" title="Containers at or above {{ disk_threshold }}% rootfs">Low disk</th><th class="num" title="Containers whose OS is behind their ct script's target">OS outdated</th><th class="num" title="Hosts that never answered — skipped, not failed">Unreachable</th><th class="num">Errors</th></tr></thead>
+  <thead><tr><th>Timestamp</th><th class="num">Host pkgs</th><th class="num">LXC OS pkgs</th><th class="num">Outdated apps</th><th class="num">Manual updates</th><th class="num">Manual reboots</th><th class="num" title="Security packages pending across hosts and containers">Security pkgs</th><th class="num" title="Hosts/containers with the reboot-required flag set">Reboot</th><th class="num" title="Containers at or above {{ disk_threshold }}% rootfs">Low disk</th><th class="num" title="Containers whose OS is behind their ct script's target">OS outdated</th><th class="num" title="Hosts that never answered — skipped, not failed">Unreachable</th><th class="num">Errors</th></tr></thead>
   <tbody>
   {% for row in scans %}
     <tr>
@@ -170,6 +170,8 @@
       <td class="num {% if not row.hosts_pending %}zero{% endif %}">{{ row.hosts_pending }}</td>
       <td class="num {% if not row.lxc_os_pending %}zero{% endif %}">{{ row.lxc_os_pending }}</td>
       <td class="num {% if not row.outdated_apps %}zero{% endif %}">{{ row.outdated_apps }}</td>
+      <td class="num {% if not row.get('manual_updates') %}zero{% endif %}">{% if row.get('manual_updates') %}<span class="fail">{{ row.manual_updates }}</span>{% else %}0{% endif %}</td>
+      <td class="num {% if not row.get('manual_reboots') %}zero{% endif %}">{% if row.get('manual_reboots') %}<span class="fail">{{ row.manual_reboots }}</span>{% else %}0{% endif %}</td>
       <td class="num {% if not row.get('security_pending') %}zero{% endif %}">{% if row.get('security_pending') %}<span class="fail">{{ row.security_pending }}</span>{% else %}0{% endif %}</td>
       <td class="num {% if not row.get('reboot_hosts') %}zero{% endif %}">{% if row.get('reboot_hosts') %}<span class="fail">{{ row.reboot_hosts }}</span>{% else %}0{% endif %}</td>
       <td class="num {% if not row.get('low_disk') %}zero{% endif %}">{% if row.get('low_disk') %}<span class="fail">{{ row.low_disk }}</span>{% else %}0{% endif %}</td>

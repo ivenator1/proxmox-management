@@ -79,12 +79,11 @@ ansible_user=root
 ansible_ssh_private_key_file=~/.ssh/id_ed25519
 ansible_python_interpreter=/usr/bin/python3
 
-# Appliances and systems updated MANUALLY (TrueNAS, OPNsense firewalls,
-# vendor-managed boxes without a fleet-managed package manager). The fleet
-# never touches these — the manual_update scan only tracks their state and
-# reminds you to apply updates.
+# Appliances updated MANUALLY (initially TrueNAS SCALE and OPNsense). The
+# fleet never applies updates to these; `fleet-update --scan` only runs the
+# adapter's fixed read-only vendor checks and reminds you to use the GUI.
 #
-# Every host needs manual_adapter=<name> (TrueNAS/OPNsense/...); supported
+# Every host needs manual_adapter=<name>; supported
 # names are validated by the scan, and a missing/blank adapter fails loudly at
 # inventory load time, before any host is contacted.
 #
@@ -93,18 +92,17 @@ ansible_python_interpreter=/usr/bin/python3
 # overlap is rejected loudly so no machine is both manually and automatically
 # updated. MIGRATION: moving a host from an auto-update group into
 # [manual_update_hosts] is a one-line change (delete the old line, add it here
-# with manual_adapter=) — do it in its own commit so a stale checkout can
-# never run both paths for the same host.
+# with manual_adapter=) before running either scan or update.
 #
 # Optional per-host display_name (label for reports/reminders) and apply_hint
 # (free-form note, e.g. when the update should be applied). Values containing
 # spaces go in host_vars/<name>.yml (inline hosts.ini values must be single
 # tokens):
-#   # host_vars/truenas-01.yml →  display_name: "TrueNAS Main"
-#   #                             apply_hint: "apply within 7 days"
+#   # host_vars/truenas.yml →  display_name: "TrueNAS"
+#   #                          apply_hint: "TrueNAS GUI → System Settings → Update"
 [manual_update_hosts]
-# truenas-01   ansible_host=10.10.10.60  manual_adapter=TrueNAS
-# opnsense-01  ansible_host=10.10.10.61  manual_adapter=OPNsense
+# truenas  ansible_host=10.10.10.30  manual_adapter=truenas_scale
+# firewall ansible_host=10.10.10.1   manual_adapter=opnsense
 
 [manual_update_hosts:vars]
 ansible_user=root

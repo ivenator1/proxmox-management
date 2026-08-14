@@ -149,11 +149,11 @@ def test_truenas_available() -> None:
     assert result.unreachable is False
     assert result.update_available is True
     assert result.reboot_required is False
-    assert result.current == "TrueNAS-SCALE-24.10.0.1"
-    assert result.latest == "TrueNAS-SCALE-24.04.0"
+    assert result.current == "24.10.0.1"
+    assert result.latest == "24.04.0"
     assert "STABLE" in result.summary
     assert "TrueNAS update available" in result.summary
-    assert "upgrade: TrueNAS-SCALE-23.10.0.1 -> TrueNAS-SCALE-24.04.0" in result.details
+    assert "upgrade: 23.10.0.1 -> 24.04.0" in result.details
     assert result.apply_hint == "TrueNAS GUI → System Settings → Update"
 
 
@@ -164,8 +164,21 @@ def test_truenas_current_clean() -> None:
     assert not result.error
     assert result.update_available is False
     assert result.reboot_required is False
-    assert result.current == "TrueNAS-SCALE-24.10.0.1"
+    assert result.current == "24.10.0.1"
     assert "up to date" in result.summary
+
+
+def test_truenas_json_string_version_is_normalized() -> None:
+    """Some middleware builds serialize system.version as a JSON string."""
+    stdout = (
+        '"TrueNAS-SCALE-24.10.2.2"\n'
+        "@@MANUAL_UPDATE_SEPARATOR@@\n"
+        '{"status":"UNAVAILABLE","changes":[]}\n'
+    )
+    ex = ScriptedManualExecutor(script={"midclt": [_ok(stdout=stdout)]})
+    result = run_manual_update_check("truenas_scale", ex, "nas-01")
+    assert not result.error
+    assert result.current == "24.10.2.2"
 
 
 def test_truenas_unavailable_clean() -> None:
@@ -187,7 +200,7 @@ def test_truenas_reboot_required() -> None:
     assert result.update_available is False
     assert result.reboot_required is True
     assert "reboot" in result.summary.lower()
-    assert "upgrade: TrueNAS-SCALE-24.04.0 -> TrueNAS-SCALE-24.10.0.1" in result.details
+    assert "upgrade: 24.04.0 -> 24.10.0.1" in result.details
     assert "Reboot to complete the update." in result.details
 
 
@@ -224,7 +237,7 @@ def test_truenas_component_details_dict_form() -> None:
     assert not result.error
     assert result.update_available is True
     assert result.latest == "24.04.3"
-    assert result.current == "TrueNAS-SCALE-24.04.2.1"
+    assert result.current == "24.04.2.1"
     assert "upgrade: 24.04.2.1 -> 24.04.3" in result.details
     assert "Release notes: https://www.truenas.com/docs/changelog/" in result.details
 
@@ -447,8 +460,8 @@ def test_truenas_command_safety() -> None:
 
 def test_opnsense_command_safety() -> None:
     cmd = OpnsenseAdapter().check_command
-    assert "opnsense-version" in cmd
-    assert "opnsense-update -c" in cmd
+    assert "opnsense-version 2>&1" in cmd
+    assert "opnsense-update -c 2>&1" in cmd
     # every opnsense-update occurrence must be the -c check, never bare
     assert _OPNSENSE_BARE_RE.findall(cmd) == []
     for token in ("apt", "apply", "upgrade", "pkg"):

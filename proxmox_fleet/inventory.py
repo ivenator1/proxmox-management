@@ -264,8 +264,8 @@ class ManualUpdateHostSpec:
     """All driver-relevant data for one [manual_update_hosts] entry.
 
     Manual-update hosts are never touched by an automated phase — the
-    manual_update phase (scan-driven) only tracks their state and reminds the
-    operator to apply updates. ``manual_adapter`` selects the vendor driver
+    read-only scan adapter only tracks their state and reminds the operator to
+    apply updates. ``manual_adapter`` selects the vendor driver
     (TrueNAS/OPNsense/...); supported names are validated by the manual_update
     phase, but the loader requires the value to be present and non-blank so a
     misconfigured host fails loudly at load time, before any host contact.
@@ -298,7 +298,7 @@ def load_manual_update_hosts(
     required and must be non-blank — a missing/empty value raises SystemExit
     here (load time, before any executor or host contact) so the operator sees
     exactly which host is misconfigured. Supported adapter names are validated
-    by the manual_update phase (proxmox_fleet/manual_updates.py); this module
+    by the scan adapter registry (proxmox_fleet/manual_updates.py); this module
     deliberately does not import that phase module.
     """
     hvdir = Path(host_vars_dir)

@@ -20,7 +20,6 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from proxmox_fleet import briefing  # noqa: E402
-from proxmox_fleet import inventory_edit  # noqa: E402
 from proxmox_fleet import scan as scan_mod  # noqa: E402
 from proxmox_fleet.history import write_history  # noqa: E402
 from proxmox_fleet.lock import acquire_run_lock  # noqa: E402
@@ -264,27 +263,17 @@ def test_endpoint_counts_missing_inventory_and_scan(tmp_path):
     assert all(e["value"] == 0 for e in eps)
 
 
-def test_endpoint_counts_manual_systems_group(tmp_path, monkeypatch):
-    """The Manual systems endpoint count comes from the manual_hosts inventory
-    group. The group lands in another PR, so list_hosts is patched here to
-    simulate it — and the count must stay 0 when the group is absent."""
-    monkeypatch.setattr(
-        inventory_edit,
-        "list_hosts",
-        lambda path: {
-            "proxmox_nodes": [],
-            "proxmox_vms": [],
-            "remote_hosts": [],
-            "custom_hosts": [],
-            "manual_hosts": [
-                {"name": "nas-01", "vars": {"manual_adapter": "truenas_scale"}},
-                {"name": "fw-01", "vars": {"manual_adapter": "opnsense"}},
-            ],
-        },
+def test_endpoint_counts_manual_systems_group(tmp_path):
+    """Manual systems are counted from the real manual_update_hosts group."""
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[manual_update_hosts]\n"
+        "nas-01 ansible_host=10.0.0.9 manual_adapter=truenas_scale\n"
+        "fw-01 ansible_host=10.0.0.1 manual_adapter=opnsense\n",
+        encoding="utf-8",
     )
-    eps = {e["label"]: e["value"] for e in _endpoint_counts(str(tmp_path / "nope.ini"), None)}
+    eps = {e["label"]: e["value"] for e in _endpoint_counts(str(inv), None)}
     assert eps["Manual systems"] == 2
-    # other endpoints stay at their usual sources
     assert eps["LXCs"] == 0 and eps["VMs"] == 0
 
 
@@ -1007,17 +996,18 @@ def test_enroll_validation_errors_400(project):
     )
 
 
-def test_enroll_manual_requires_adapter(project, monkeypatch):
-    """The manual group needs a manual_adapter — missing or bogus values are
-    400; truenas_scale/opnsense are accepted and written to the inventory. The
-    group itself lands in another PR, so GROUPS is patched to simulate it."""
-    monkeypatch.setattr(inventory_edit, "GROUPS", (*inventory_edit.GROUPS, "manual_hosts"))
+def test_enroll_manual_requires_adapter(project):
+    """The manual group requires one of the supported adapter names."""
     client = _project_client(project)
     # missing adapter
     assert (
         client.post(
             "/inventory/add",
-            data={"group": "manual_hosts", "name": "nas-01", "ansible_host": "10.0.0.9"},
+            data={
+                "group": "manual_update_hosts",
+                "name": "nas-01",
+                "ansible_host": "10.0.0.9",
+            },
         ).status_code
         == 400
     )
@@ -1026,7 +1016,7 @@ def test_enroll_manual_requires_adapter(project, monkeypatch):
         client.post(
             "/inventory/add",
             data={
-                "group": "manual_hosts",
+                "group": "manual_update_hosts",
                 "name": "nas-01",
                 "ansible_host": "10.0.0.9",
                 "manual_adapter": "esxi",
@@ -1038,7 +1028,7 @@ def test_enroll_manual_requires_adapter(project, monkeypatch):
     resp = client.post(
         "/inventory/add",
         data={
-            "group": "manual_hosts",
+            "group": "manual_update_hosts",
             "name": "nas-01",
             "ansible_host": "10.0.0.9",
             "manual_adapter": "truenas_scale",
@@ -1050,12 +1040,11 @@ def test_enroll_manual_requires_adapter(project, monkeypatch):
     assert "nas-01" in ini and "manual_adapter=truenas_scale" in ini
 
 
-def test_inventory_page_shows_manual_group_and_adapter(project, monkeypatch):
+def test_inventory_page_shows_manual_group_and_adapter(project):
     """The enroll form exposes the manual group and its adapter select."""
-    monkeypatch.setattr(inventory_edit, "GROUPS", (*inventory_edit.GROUPS, "manual_hosts"))
     resp = _project_client(project).get("/inventory")
     assert resp.status_code == 200
-    assert "manual_hosts" in resp.text
+    assert "manual_update_hosts" in resp.text
     assert "truenas_scale" in resp.text
     assert "opnsense" in resp.text
 

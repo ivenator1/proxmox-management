@@ -1055,6 +1055,12 @@ def run_fleet(
     def _phase_on(name: str) -> bool:
         return phases is None or name in phases
 
+    # Safety pre-flight: a manual appliance may never also be eligible for an
+    # automated phase. Check the raw inventory before any phase can construct
+    # an executor, so a misplaced TrueNAS/OPNsense entry cannot reach apt/pkg
+    # or a custom updater.
+    inventory.validate_manual_update_overlap(inventory_path)
+
     # Pre-flight: node names must be unique across clusters — they are the join
     # key in records, briefing grouping, and the dashboard host pages.
     inventory.validate_node_uniqueness(

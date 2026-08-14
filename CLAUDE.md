@@ -203,8 +203,9 @@ merges purely in-memory.
   detect chain, reused). One sentinel-delimited command per host also reports the security
   subset, reboot-required flag and `/etc/os-release` (see "Observability layer"). Stopped
   CTs/templates are skipped, never started. Writes `pending-<ts>.json` + `pending-latest.json`
-  to `fleet_history_dir` (pruned to `scan_history_keep`); obeys `--limit`; exit 1 if any scan
-  errored. Bypasses `run_fleet()` entirely (no phases, no run briefing). It does dispatch
+  to `fleet_history_dir` (pruned to `scan_history_keep`); obeys `--limit`; exits 1 for genuine
+  check/parser errors, while SSH-unreachable targets are recorded and skipped. Bypasses
+  `run_fleet()` entirely (no phases, no run briefing). It does dispatch
   *manual-update* notifications (see "Manual-update monitoring" below): when
   `manual_update_notifications` is enabled, pending/errored `[manual_update_hosts]` entries fan
   out through the same `notifiers.dispatch` on a first/change/daily-reminder state machine — that

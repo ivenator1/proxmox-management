@@ -126,6 +126,15 @@ def _norm(value: Any) -> str:
     return " ".join(str(value if value is not None else "").split())
 
 
+def _entry_details(entry: Mapping[str, Any]) -> List[str]:
+    """Normalize the result's details list while tolerating legacy strings."""
+    value = entry.get("details")
+    if isinstance(value, (list, tuple)):
+        return [detail for item in value if (detail := _norm(item))]
+    detail = _norm(value)
+    return [detail] if detail else []
+
+
 def fingerprint(entry: Mapping[str, Any]) -> str:
     """Pure, deterministic semantic fingerprint of one manual mapping entry.
 
@@ -145,7 +154,7 @@ def fingerprint(entry: Mapping[str, Any]) -> str:
         "1" if entry.get("update_available") else "0",
         "1" if entry.get("reboot_required") else "0",
         _norm(entry.get("summary")),
-        _norm(entry.get("details")),
+        "\x1e".join(_entry_details(entry)),
         _norm(entry.get("error")),
     ]
     digest = hashlib.sha256()
@@ -160,9 +169,16 @@ def fingerprint(entry: Mapping[str, Any]) -> str:
 # --------------------------------------------------------------------------
 
 def _key(entry: Mapping[str, Any]) -> str:
-    """The per-host identity of an entry — its ``adapter``."""
-    key = str(entry.get("adapter") or "").strip()
+    """Stable inventory-host identity, with an adapter fallback for legacy data."""
+    key = str(entry.get("host") or entry.get("adapter") or "").strip()
     return key or "?"
+
+
+def _label(entry: Mapping[str, Any]) -> str:
+    """Human label that retains the inventory identity when it differs."""
+    host = _key(entry)
+    display = _norm(entry.get("display_name"))
+    return f"{display} ({host})" if display and display != host else host
 
 
 def _has_error(entry: Mapping[str, Any]) -> bool:
@@ -171,6 +187,17 @@ def _has_error(entry: Mapping[str, Any]) -> bool:
 
 def _is_pending(entry: Mapping[str, Any]) -> bool:
     return bool(entry.get("update_available") or entry.get("reboot_required"))
+
+
+def _entry_category(entry: Mapping[str, Any]) -> str:
+    """Classify one observed host for the notification state machine."""
+    if entry.get("unreachable"):
+        return "unreachable"
+    if _has_error(entry):
+        return "error"
+    if _is_pending(entry):
+        return "pending"
+    return "clean"
 
 
 def _notify_reason(
@@ -256,15 +283,13 @@ def render_body(
     if pending:
         lines = ["**Manual updates required**"]
         for entry in pending:
-            host = _key(entry)
             current = _norm(entry.get("current"))
             latest = _norm(entry.get("latest"))
             arrow = f"{current} → {latest}" if (current or latest) else "update available"
             reboot = " (reboot required)" if entry.get("reboot_required") else ""
-            lines.append(f"- **{host}** — {arrow}{reboot}")
-            details = _norm(entry.get("details"))
-            if details:
-                lines.append(f"  {details}")
+            lines.append(f"- **{_label(entry)}** — {arrow}{reboot}")
+            for detail in _entry_details(entry):
+                lines.append(f"  - {detail}")
             hint = _norm(entry.get("apply_hint"))
             if hint:
                 lines.append(f"  GUI apply: {hint}")
@@ -272,9 +297,8 @@ def render_body(
     if errors:
         lines = ["**Manual check errors**"]
         for entry in errors:
-            host = _key(entry)
             err = _norm(entry.get("error")) or "check failed"
-            lines.append(f"- **{host}** — {err}")
+            lines.append(f"- **{_label(entry)}** — {err}")
         sections.append("\n".join(lines))
     return _trim_body("\n\n".join(sections), limit)
 
@@ -314,28 +338,26 @@ def decide_manual_notifications(
 
     for entry in entries:
         host = _key(entry)
-        if entry.get("unreachable"):
+        category = _entry_category(entry)
+        if category == "unreachable":
             # Could not look — never a notification, and never a state change.
             continue
-        if _has_error(entry):
-            fp = fingerprint(entry)
-            reason = _notify_reason(new_state.get(host), fp, now_utc, reminder_hours, force)
-            if reason is not None:
-                selected.append(host)
-                reasons[host] = reason
-                error_selected.append(entry)
-                new_state[host] = {"fingerprint": fp, "last_notified": _to_iso(now_utc)}
-        elif _is_pending(entry):
-            fp = fingerprint(entry)
-            reason = _notify_reason(new_state.get(host), fp, now_utc, reminder_hours, force)
-            if reason is not None:
-                selected.append(host)
-                reasons[host] = reason
-                pending_selected.append(entry)
-                new_state[host] = {"fingerprint": fp, "last_notified": _to_iso(now_utc)}
-        else:
+        if category == "clean":
             # Currently clean — this host's own state entry is cleared.
             new_state.pop(host, None)
+            continue
+
+        fp = fingerprint(entry)
+        reason = _notify_reason(new_state.get(host), fp, now_utc, reminder_hours, force)
+        if reason is None:
+            continue
+        selected.append(host)
+        reasons[host] = reason
+        if category == "error":
+            error_selected.append(entry)
+        else:
+            pending_selected.append(entry)
+        new_state[host] = {"fingerprint": fp, "last_notified": _to_iso(now_utc)}
 
     return ManualDecision(
         notify=bool(selected),
