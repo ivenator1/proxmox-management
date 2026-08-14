@@ -90,6 +90,12 @@ class GlobalSettings(BaseModel):
     remote_kuma_map: Dict[str, Any] = Field(default_factory=dict)
     remote_forks: int = 5
 
+    # manual_update phase settings (scan-tracked hosts; never auto-updated).
+    # Scan/reminder path only — deliberately NOT accepted as -e extra vars.
+    manual_update_notifications: bool = True
+    manual_update_reminder_hours: int = 24
+    manual_update_forks: int = 2
+
     # node_update / manager phase settings (Phase 2 + Phase 3)
     node_dry_run: bool = False
     node_auto_reboot: bool = True

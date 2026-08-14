@@ -78,3 +78,35 @@ ansible_python_interpreter=/usr/bin/python3
 ansible_user=root
 ansible_ssh_private_key_file=~/.ssh/id_ed25519
 ansible_python_interpreter=/usr/bin/python3
+
+# Appliances and systems updated MANUALLY (TrueNAS, OPNsense firewalls,
+# vendor-managed boxes without a fleet-managed package manager). The fleet
+# never touches these — the manual_update scan only tracks their state and
+# reminds you to apply updates.
+#
+# Every host needs manual_adapter=<name> (TrueNAS/OPNsense/...); supported
+# names are validated by the scan, and a missing/blank adapter fails loudly at
+# inventory load time, before any host is contacted.
+#
+# Overlap safety: a hostname here must NOT also appear in any auto-update group
+# ([remote_hosts], [proxmox_vms], [custom_hosts], [proxmox_nodes]) — that
+# overlap is rejected loudly so no machine is both manually and automatically
+# updated. MIGRATION: moving a host from an auto-update group into
+# [manual_update_hosts] is a one-line change (delete the old line, add it here
+# with manual_adapter=) — do it in its own commit so a stale checkout can
+# never run both paths for the same host.
+#
+# Optional per-host display_name (label for reports/reminders) and apply_hint
+# (free-form note, e.g. when the update should be applied). Values containing
+# spaces go in host_vars/<name>.yml (inline hosts.ini values must be single
+# tokens):
+#   # host_vars/truenas-01.yml →  display_name: "TrueNAS Main"
+#   #                             apply_hint: "apply within 7 days"
+[manual_update_hosts]
+# truenas-01   ansible_host=10.10.10.60  manual_adapter=TrueNAS
+# opnsense-01  ansible_host=10.10.10.61  manual_adapter=OPNsense
+
+[manual_update_hosts:vars]
+ansible_user=root
+ansible_ssh_private_key_file=~/.ssh/id_ed25519
+ansible_python_interpreter=/usr/bin/python3

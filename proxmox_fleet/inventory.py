@@ -255,3 +255,105 @@ def load_custom_hosts(
             )
         )
     return specs
+
+
+# --- manual_update_hosts (scan-tracked, never auto-updated) -----------------
+
+@dataclass
+class ManualUpdateHostSpec:
+    """All driver-relevant data for one [manual_update_hosts] entry.
+
+    Manual-update hosts are never touched by an automated phase — the
+    manual_update phase (scan-driven) only tracks their state and reminds the
+    operator to apply updates. ``manual_adapter`` selects the vendor driver
+    (TrueNAS/OPNsense/...); supported names are validated by the manual_update
+    phase, but the loader requires the value to be present and non-blank so a
+    misconfigured host fails loudly at load time, before any host contact.
+    """
+
+    name: str                 # inventory hostname — must not overlap auto-update groups
+    ansible_host: str         # SSH reachable IP
+    manual_adapter: str       # required; supported names validated later (manual_updates.py)
+    display_name: Optional[str] = None  # human-friendly label for reports/reminders
+    apply_hint: Optional[str] = None    # free-form note for the reminder (when/how to apply)
+
+
+def _optional_str(value: Any) -> Optional[str]:
+    """Coerce an inline/host_vars value to str; blank or missing → None."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def load_manual_update_hosts(
+    inventory_path: str = "hosts.ini",
+    *,
+    host_vars_dir: str = "host_vars",
+) -> List[ManualUpdateHostSpec]:
+    """Parse ``[manual_update_hosts]`` and merge per-host vars.
+
+    Returns hosts in inventory-file order. Inline vars win over
+    host_vars/<name>.yml, matching every other loader. ``manual_adapter`` is
+    required and must be non-blank — a missing/empty value raises SystemExit
+    here (load time, before any executor or host contact) so the operator sees
+    exactly which host is misconfigured. Supported adapter names are validated
+    by the manual_update phase (proxmox_fleet/manual_updates.py); this module
+    deliberately does not import that phase module.
+    """
+    hvdir = Path(host_vars_dir)
+    specs: List[ManualUpdateHostSpec] = []
+    for name, inline in _iter_section(inventory_path, "manual_update_hosts"):
+        host_vars = _load_host_vars(name, hvdir)
+        adapter = _optional_str(inline.get("manual_adapter", host_vars.get("manual_adapter")))
+        if not adapter:
+            raise SystemExit(
+                f"manual_update_hosts entry '{name}' has no manual_adapter — "
+                "set manual_adapter=<name> inline or in host_vars/<name>.yml"
+            )
+        specs.append(ManualUpdateHostSpec(
+            name=name,
+            ansible_host=str(inline.get("ansible_host", host_vars.get("ansible_host", name))),
+            manual_adapter=adapter,
+            display_name=_optional_str(inline.get("display_name", host_vars.get("display_name"))),
+            apply_hint=_optional_str(inline.get("apply_hint", host_vars.get("apply_hint"))),
+        ))
+    return specs
+
+
+# Auto-update groups: a host listed here is updated by an automated phase, so it
+# must never also be a [manual_update_hosts] entry (which is tracked/reminded
+# only). Overlap between the auto-update groups themselves stays legal.
+_AUTO_UPDATE_GROUPS = ("remote_hosts", "proxmox_vms", "custom_hosts", "proxmox_nodes")
+
+
+def validate_manual_update_overlap(
+    inventory_path: str = "hosts.ini",
+) -> None:
+    """Fail loud when a [manual_update_hosts] name also appears in an
+    auto-update group ([remote_hosts], [proxmox_vms], [custom_hosts],
+    [proxmox_nodes]).
+
+    A host in both groups would be double-managed: an automated phase updates
+    it while the manual_update phase treats it as operator-owned. Overlap is
+    judged by inventory hostname only. The check is pure inventory parsing —
+    no executors, no host contact — so it is safe to run in pre-flight before
+    any executor is constructed. The error names every offending host and the
+    groups it collides with.
+    """
+    manual = [name for name, _ in _iter_section(inventory_path, "manual_update_hosts")]
+    if not manual:
+        return
+    manual_set = set(manual)
+    clashes: List[Tuple[str, str]] = []
+    for group in _AUTO_UPDATE_GROUPS:
+        for name, _ in _iter_section(inventory_path, group):
+            if name in manual_set:
+                clashes.append((name, group))
+    if clashes:
+        details = ", ".join(f"'{name}' in [{group}]" for name, group in clashes)
+        raise SystemExit(
+            f"manual-update overlap: {details} — hosts in [manual_update_hosts] "
+            "must not also appear in any auto-update group "
+            "([remote_hosts], [proxmox_vms], [custom_hosts], [proxmox_nodes])"
+        )

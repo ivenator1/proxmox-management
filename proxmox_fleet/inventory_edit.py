@@ -21,7 +21,14 @@ from typing import Any, Dict, List
 
 from proxmox_fleet import inventory
 
-GROUPS = ("proxmox_nodes", "proxmox_vms", "remote_hosts", "custom_hosts")
+GROUPS = ("proxmox_nodes", "proxmox_vms", "remote_hosts", "custom_hosts", "manual_update_hosts")
+
+# Manual-update hosts are tracked/reminded only and must never be auto-updated,
+# so a name is forbidden from appearing in both [manual_update_hosts] and any
+# auto-update group. Cross-group duplicates among the auto groups themselves
+# stay legal (ordinary multi-group hosts are preserved).
+_MANUAL_GROUP = "manual_update_hosts"
+_AUTO_GROUPS = tuple(g for g in GROUPS if g != _MANUAL_GROUP)
 
 # Same shape as web.app._TOKEN_RE — inventory-safe identifiers only.
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -59,6 +66,13 @@ ansible_python_interpreter=/usr/bin/python3
 [custom_hosts]
 
 [custom_hosts:vars]
+ansible_user=root
+ansible_ssh_private_key_file=~/.ssh/id_ed25519
+ansible_python_interpreter=/usr/bin/python3
+
+[manual_update_hosts]
+
+[manual_update_hosts:vars]
 ansible_user=root
 ansible_ssh_private_key_file=~/.ssh/id_ed25519
 ansible_python_interpreter=/usr/bin/python3
@@ -163,6 +177,24 @@ def add_host(path: str, group: str, name: str, inline_vars: Dict[str, str]) -> N
     inline_vars = validate_inline_vars(inline_vars)
     if name in _group_names(path, group):
         raise InventoryEditError(f"host {name!r} already exists in [{group}]")
+
+    # A host can sit in several auto-update groups (ordinary cross-group
+    # duplicates are preserved) but never in both an auto-update group and
+    # [manual_update_hosts] — a manual-update host must not be auto-updated.
+    if group == _MANUAL_GROUP:
+        clashes = [g for g in _AUTO_GROUPS if name in _group_names(path, g)]
+        if clashes:
+            groups = ", ".join(f"[{g}]" for g in clashes)
+            raise InventoryEditError(
+                f"host {name!r} already exists in {groups} — manual-update hosts "
+                "must not overlap any auto-update group")
+        if "manual_adapter" not in inline_vars:
+            raise InventoryEditError(
+                f"host {name!r} in [{_MANUAL_GROUP}] requires manual_adapter=<name>")
+    elif name in _group_names(path, _MANUAL_GROUP):
+        raise InventoryEditError(
+            f"host {name!r} already exists in [{_MANUAL_GROUP}] — manual-update "
+            "hosts must not overlap any auto-update group")
 
     host_line = name
     if inline_vars:
