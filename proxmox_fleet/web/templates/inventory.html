@@ -95,6 +95,16 @@
     <label>Custom config <input type="text" name="custom_config" placeholder="gitea"></label>
     <p class="hint">configs/&lt;name&gt;.yml must exist on the manager</p>
   </div>
+  <div class="field" data-groups="manual_hosts">
+    <label>Manual adapter
+      <select name="manual_adapter" style="width: 100%; margin-top: 0.3rem; padding: 0.55rem 0.75rem; font: inherit; color: var(--fg-strong); background: var(--bg-inset); border: 1px solid var(--border); border-radius: var(--radius-sm);">
+        <option value="">— select adapter —</option>
+        <option value="truenas_scale">TrueNAS SCALE</option>
+        <option value="opnsense">OPNsense</option>
+      </select>
+    </label>
+    <p class="hint">required — drives the manual update flow for this appliance</p>
+  </div>
   <div class="field" data-groups="remote_hosts">
     <label>Pre-update command <input type="text" name="pre_update_cmd" placeholder="systemctl stop myapp"></label>
     <p class="hint">optional hook, stored in host_vars/&lt;host&gt;.yml</p>

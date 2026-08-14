@@ -172,6 +172,11 @@ def _endpoint_counts(inventory_path: str, latest_pending: Optional[Mapping[str, 
         {"label": "PVE hosts", "value": len(groups.get("proxmox_nodes") or [])},
         {"label": "remote hosts", "value": len(groups.get("remote_hosts") or [])},
         {"label": "custom systems", "value": len(groups.get("custom_hosts") or [])},
+        # Manual appliances (TrueNAS SCALE / OPNsense) are admin-updated; the
+        # count comes from their inventory group like any other configured
+        # endpoint. Defensive .get(): the group lands in another PR, so
+        # older inventory_edit versions simply report zero.
+        {"label": "Manual systems", "value": len(groups.get("manual_hosts") or [])},
     ]
 
 
@@ -179,10 +184,10 @@ def _health_score(latest_run: Optional[Mapping[str, Any]], pending_row: Optional
     """Fleet health 0–100 for the overview gauge: start at 100; −25 if the
     latest run failed, −5 per error, −2 per warning, −1 per outdated app,
     −2 per pending security package (capped at −20), −2 per reboot-required
-    host (capped at −10).
+    host (capped at −10), −1 per manual update/reboot pending (admin actions).
 
-    Legacy pending rows (written before the security/reboot keys existed)
-    read as 0 via ``.get()`` — no deduction, no crash.
+    Legacy pending rows (written before the security/reboot/manual keys
+    existed) read as 0 via ``.get()`` — no deduction, no crash.
     """
     score = 100
     if latest_run:
@@ -195,6 +200,10 @@ def _health_score(latest_run: Optional[Mapping[str, Any]], pending_row: Optional
         score -= int(pending_row.get("outdated_apps", 0) or 0)
         score -= min(20, 2 * int(pending_row.get("security_pending", 0) or 0))
         score -= min(10, 2 * int(pending_row.get("reboot_hosts", 0) or 0))
+        # Manual systems each need an admin action (apply the update / reboot)
+        # — a small per-action deduction, unlike the auto-update penalties.
+        score -= int(pending_row.get("manual_updates", 0) or 0)
+        score -= int(pending_row.get("manual_reboots", 0) or 0)
     return max(0, min(100, score))
 
 
@@ -503,12 +512,14 @@ def _host_pending_entries(history_dir: str, name: str) -> List[Dict[str, Any]]:
     file and the /pending page already renders it in full; the host page's
     timeline shows the *history* of pending updates, newest snapshot first.
     Host entries (name-keyed, ``kind == "host"``) match by snapshot key;
-    lxc entries (``kind == "lxc"``) match canonically via
-    :func:`_pending_entry_matches` — composite ``node/id`` names, bare
-    container names, and both the new explicit-``id`` and legacy bare-id key
-    shapes. Corrupt/unreadable snapshots are skipped; each hit carries
-    ``timestamp`` + ``bucket == "pending"`` so the merged timeline sort and
-    the template treat it like a run record.
+    manual entries (``kind == "manual"``) are keyed by their stable inventory
+    hostname and match the same way; lxc entries (``kind == "lxc"``) match
+    canonically via :func:`_pending_entry_matches` — composite ``node/id``
+    names, bare container names, and both the new explicit-``id`` and legacy
+    bare-id key shapes. Corrupt/unreadable snapshots are skipped; each hit
+    carries ``timestamp`` + ``bucket == "pending"`` so the merged timeline
+    sort and the template treat it like a run record. Old snapshots without a
+    ``manual`` key simply contribute no manual entries.
     """
     out: List[Dict[str, Any]] = []
     for scan_file in sorted(Path(history_dir).glob("pending-*.json"), reverse=True):
@@ -526,6 +537,11 @@ def _host_pending_entries(history_dir: str, name: str) -> List[Dict[str, Any]]:
             entry = hosts[name]
             if isinstance(entry, dict):
                 out.append({"timestamp": ts, "bucket": "pending", "kind": "host", "entry": entry})
+        manual = scan.get("manual")
+        if isinstance(manual, dict):
+            for key, entry in sorted(manual.items()):
+                if isinstance(entry, dict) and key == name:
+                    out.append({"timestamp": ts, "bucket": "pending", "kind": "manual", "entry": entry})
         lxc = scan.get("lxc")
         if isinstance(lxc, dict):
             for key, entry in sorted(lxc.items()):
@@ -746,6 +762,10 @@ def create_app(
         if pending_snapshot:
             for name in pending_snapshot.get("hosts") or {}:
                 _add_host(str(name))
+            # Manual systems are keyed by their stable inventory hostname —
+            # the same name the /hosts/{name} page resolves.
+            for name in pending_snapshot.get("manual") or {}:
+                _add_host(str(name))
             for lxc_key, entry in (pending_snapshot.get("lxc") or {}).items():
                 identity = f"{entry['node']}/{entry['id']}" if entry.get("node") and entry.get("id") else str(lxc_key)
                 _add_host(str(entry.get("name") or _lxc_entry_id(lxc_key, entry)), identity)
@@ -836,6 +856,10 @@ def create_app(
         if snapshot is None and ref != "latest":
             raise HTTPException(404, f"no pending snapshot {ref!r}")
         hosts = sorted((snapshot.get("hosts") or {}).items()) if snapshot else []
+        # Manual systems are keyed by their stable inventory hostname — render
+        # them sorted like the host section. Old snapshots without a ``manual``
+        # mapping simply render an empty section.
+        manual = sorted((snapshot.get("manual") or {}).items()) if snapshot else []
         # The template renders (display_id, entry) pairs — derive the id here so
         # both node/id-keyed (new) and bare-id-keyed (legacy) snapshots work.
         lxc = (
@@ -853,6 +877,7 @@ def create_app(
                 "ref": ref,
                 "snapshot": snapshot,
                 "hosts": hosts,
+                "manual": manual,
                 "lxc": lxc,
                 "disk_threshold": disk_threshold,
                 "scans": scan_mod.pending_summary(history_dir, limit=0, disk_threshold=disk_threshold),
@@ -1044,6 +1069,13 @@ def create_app(
                 if not custom_config:
                     raise InventoryEditError("custom_config is required")
                 inline["custom_config"] = custom_config
+            if group == "manual_hosts":
+                adapter = str(form.get("manual_adapter") or "").strip()
+                if adapter not in ("truenas_scale", "opnsense"):
+                    raise InventoryEditError(
+                        "manual_adapter is required (truenas_scale or opnsense)"
+                    )
+                inline["manual_adapter"] = adapter
             if _truthy(form.get("canary")) and group in ("proxmox_vms", "remote_hosts"):
                 inline["canary"] = "true"
 

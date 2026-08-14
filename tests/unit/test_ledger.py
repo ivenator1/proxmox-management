@@ -14,6 +14,7 @@ from proxmox_fleet.history import write_history
 from proxmox_fleet.ledger import (
     _EVENTS_CAP,
     _host_key,
+    _manual_os_release,
     _scan_lxc_key,
     observe_run,
     observe_scan,
@@ -29,8 +30,11 @@ def _run(records, ts="20260101T000000000000Z"):
     return summary
 
 
-def _scan(ts="20260101T000000000000Z", hosts=None, lxc=None):
-    return {"timestamp": ts, "hosts": hosts or {}, "lxc": lxc or {}}
+def _scan(ts="20260101T000000000000Z", hosts=None, lxc=None, manual=None):
+    data = {"timestamp": ts, "hosts": hosts or {}, "lxc": lxc or {}}
+    if manual is not None:
+        data["manual"] = manual
+    return data
 
 
 # --- read_ledger: fresh recovery ------------------------------------------- #
@@ -540,6 +544,115 @@ def test_observe_scan_entries_without_os_release_skipped(tmp_path):
         ),
     )
     assert read_ledger(tmp_path)["hosts"] == {}
+
+
+# --- manual entries --------------------------------------------------------- #
+
+
+def test_observe_scan_manual_first_observation_is_baseline_no_event(tmp_path):
+    """The first scan of a manual system baselines its current version and
+    emits no event; the synthesised release carries the adapter + version."""
+    observe_scan(
+        tmp_path,
+        _scan(
+            ts="20260101T000000000000Z",
+            manual={
+                "nas-01": {
+                    "adapter": "truenas_scale",
+                    "display_name": "TrueNAS at 10.0.0.9",
+                    "current": "24.04.0",
+                    "latest": "24.04.2",
+                    "update_available": True,
+                }
+            },
+        ),
+    )
+    data = read_ledger(tmp_path)
+    assert data["events"] == []
+    assert data["hosts"]["nas-01"]["os_release"] == {
+        "id": "truenas_scale",
+        "version_id": "24.04.0",
+        "pretty_name": "TrueNAS at 10.0.0.9",
+    }
+
+
+def test_observe_scan_manual_current_change_emits_event(tmp_path):
+    """A manual system whose current version moves emits an os-upgrade event
+    keyed on its stable inventory hostname."""
+    observe_scan(
+        tmp_path,
+        _scan(ts="20260101T000000000000Z", manual={"nas-01": {"adapter": "truenas_scale", "current": "24.04.0"}}),
+    )
+    observe_scan(
+        tmp_path,
+        _scan(ts="20260102T000000000000Z", manual={"nas-01": {"adapter": "truenas_scale", "current": "24.04.2"}}),
+    )
+    data = read_ledger(tmp_path)
+    assert data["events"] == [
+        {"type": "os-upgrade", "host": "nas-01", "from": "24.04.0", "to": "24.04.2", "ts": "20260102T000000000000Z"}
+    ]
+    assert data["hosts"]["nas-01"]["os_release"]["version_id"] == "24.04.2"
+
+
+def test_observe_scan_manual_unchanged_version_no_event(tmp_path):
+    """Re-observing the same current version is a no-op, not a new event."""
+    observe_scan(tmp_path, _scan(ts="20260101T000000000000Z", manual={"fw-01": {"adapter": "opnsense", "current": "24.1"}}))
+    observe_scan(tmp_path, _scan(ts="20260102T000000000000Z", manual={"fw-01": {"adapter": "opnsense", "current": "24.1"}}))
+    assert read_ledger(tmp_path)["events"] == []
+
+
+def test_observe_scan_manual_without_useful_current_skipped(tmp_path):
+    """Unreachable/errored/not-yet-queried manual entries without a usable
+    current version create no ledger host — the ledger never invents one."""
+    observe_scan(
+        tmp_path,
+        _scan(
+            ts="20260101T000000000000Z",
+            manual={
+                "down-01": {
+                    "adapter": "truenas_scale",
+                    "current": "",
+                    "unreachable": True,
+                    "error": "No route to host",
+                },
+                "new-01": {"adapter": "opnsense", "current": None, "error": "login failed"},
+                "n-a": {"adapter": "truenas_scale"},
+            },
+        ),
+    )
+    assert read_ledger(tmp_path)["hosts"] == {}
+
+
+def test_observe_scan_manual_never_gains_run_metadata(tmp_path):
+    """Manual observations touch os_release only — a manual system must never
+    gain last_run_ts/last_status/last_changed_ts (it is admin-updated, not
+    fleet-updated), so it can never count toward applied-run totals."""
+    observe_scan(
+        tmp_path,
+        _scan(ts="20260101T000000000000Z", manual={"nas-01": {"adapter": "truenas_scale", "current": "24.04.0"}}),
+    )
+    entry = read_ledger(tmp_path)["hosts"]["nas-01"]
+    assert set(entry) == {"os_release"}
+    assert "last_run_ts" not in entry
+    assert "last_status" not in entry
+    assert "last_changed_ts" not in entry
+
+
+def test_manual_os_release_helper():
+    """The synthesised release keys comparison on ``current`` (version_id)
+    and falls back to ``display_name`` for the pretty label."""
+    assert _manual_os_release({"adapter": "truenas_scale", "current": "24.04.0", "display_name": "NAS"}) == {
+        "id": "truenas_scale",
+        "version_id": "24.04.0",
+        "pretty_name": "NAS",
+    }
+    # display_name missing → pretty_name falls back to the version
+    assert _manual_os_release({"adapter": "opnsense", "current": "24.1"})["pretty_name"] == "24.1"
+    # no useful current data → None (never invented)
+    assert _manual_os_release({"adapter": "truenas_scale", "current": ""}) is None
+    assert _manual_os_release({"adapter": "truenas_scale", "current": None}) is None
+    assert _manual_os_release({"adapter": "truenas_scale"}) is None
+    assert _manual_os_release({}) is None
 
 
 def test_observe_scan_corrupt_ledger_recovers(tmp_path):

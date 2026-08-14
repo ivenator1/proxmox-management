@@ -20,6 +20,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from proxmox_fleet import briefing  # noqa: E402
+from proxmox_fleet import inventory_edit  # noqa: E402
 from proxmox_fleet import scan as scan_mod  # noqa: E402
 from proxmox_fleet.history import write_history  # noqa: E402
 from proxmox_fleet.lock import acquire_run_lock  # noqa: E402
@@ -240,13 +241,51 @@ def test_endpoint_counts_from_inventory_and_scan(tmp_path):
     inv.write_text(_INVENTORY, encoding="utf-8")
     pending = {"lxc": {"101": {}, "102": {}}, "hosts": {}}
     eps = {e["label"]: e["value"] for e in _endpoint_counts(str(inv), pending)}
-    assert eps == {"LXCs": 2, "VMs": 1, "PVE hosts": 2, "remote hosts": 1, "custom systems": 0}
+    assert eps == {
+        "LXCs": 2,
+        "VMs": 1,
+        "PVE hosts": 2,
+        "remote hosts": 1,
+        "custom systems": 0,
+        "Manual systems": 0,
+    }
 
 
 def test_endpoint_counts_missing_inventory_and_scan(tmp_path):
     eps = _endpoint_counts(str(tmp_path / "nope.ini"), None)
-    assert {e["label"] for e in eps} == {"LXCs", "VMs", "PVE hosts", "remote hosts", "custom systems"}
+    assert {e["label"] for e in eps} == {
+        "LXCs",
+        "VMs",
+        "PVE hosts",
+        "remote hosts",
+        "custom systems",
+        "Manual systems",
+    }
     assert all(e["value"] == 0 for e in eps)
+
+
+def test_endpoint_counts_manual_systems_group(tmp_path, monkeypatch):
+    """The Manual systems endpoint count comes from the manual_hosts inventory
+    group. The group lands in another PR, so list_hosts is patched here to
+    simulate it — and the count must stay 0 when the group is absent."""
+    monkeypatch.setattr(
+        inventory_edit,
+        "list_hosts",
+        lambda path: {
+            "proxmox_nodes": [],
+            "proxmox_vms": [],
+            "remote_hosts": [],
+            "custom_hosts": [],
+            "manual_hosts": [
+                {"name": "nas-01", "vars": {"manual_adapter": "truenas_scale"}},
+                {"name": "fw-01", "vars": {"manual_adapter": "opnsense"}},
+            ],
+        },
+    )
+    eps = {e["label"]: e["value"] for e in _endpoint_counts(str(tmp_path / "nope.ini"), None)}
+    assert eps["Manual systems"] == 2
+    # other endpoints stay at their usual sources
+    assert eps["LXCs"] == 0 and eps["VMs"] == 0
 
 
 def test_index_shows_endpoints_and_update_trends(history_dir, tmp_path):
@@ -379,6 +418,83 @@ def test_pending_page_node_qualified_keys(tmp_path):
 
 def test_pending_unknown_ref_404(history_dir):
     assert _client(history_dir).get("/pending", params={"ref": "nope"}).status_code == 404
+
+
+# --- manual systems (pending table) ----------------------------------------- #
+
+
+def _manual_snapshot(history_dir, ts="20260109T000000000000Z"):
+    """A pending snapshot with two manual entries: one update-available TrueNAS
+    with details/apply-hint, one errored OPNsense."""
+    scan_mod.write_pending(
+        {
+            "timestamp": ts,
+            "hosts": {},
+            "lxc": {},
+            "manual": {
+                "nas-01": {
+                    "adapter": "truenas_scale",
+                    "display_name": "TrueNAS at 10.0.0.9",
+                    "current": "24.04.0",
+                    "latest": "24.04.2",
+                    "update_available": True,
+                    "reboot_required": True,
+                    "summary": "3 train updates",
+                    "details": ["zfs 2.2.4", "samba 4.19"],
+                    "apply_hint": "apply via the TrueNAS UI",
+                    "unreachable": False,
+                    "error": None,
+                },
+                "fw-01": {
+                    "adapter": "opnsense",
+                    "display_name": "OPNsense firewall",
+                    "current": "24.1",
+                    "latest": "24.1",
+                    "update_available": False,
+                    "reboot_required": False,
+                    "summary": "",
+                    "details": [],
+                    "apply_hint": "",
+                    "unreachable": False,
+                    "error": "API token expired",
+                },
+            },
+        },
+        history_dir=history_dir,
+        keep=0,
+    )
+
+
+def test_pending_page_manual_table(history_dir):
+    """The Manual systems table renders platform/current/available/action/
+    details/apply-hint/errors for every manual entry."""
+    _manual_snapshot(history_dir)
+    resp = _client(history_dir).get("/pending", params={"ref": "20260109T000000000000Z"})
+    assert resp.status_code == 200
+    text = resp.text
+    assert "Manual systems" in text
+    assert "truenas_scale" in text and "opnsense" in text
+    assert "TrueNAS at 10.0.0.9" in text
+    assert "24.04.0" in text and "24.04.2" in text
+    assert "update available" in text
+    assert "reboot required" in text
+    assert ">2 detail(s)</summary>" in text
+    assert "zfs 2.2.4" in text and "samba 4.19" in text
+    assert "apply via the TrueNAS UI" in text
+    assert "API token expired" in text  # the errored OPNsense entry
+    # each system links to its host drill-down by inventory hostname
+    assert 'href="/hosts/nas-01"' in text
+    assert 'href="/hosts/fw-01"' in text
+
+
+def test_pending_page_manual_legacy_snapshot_without_manual(history_dir):
+    """Pre-manual snapshots have no manual mapping — the section renders its
+    empty state, the rest of the page is unaffected, no crash."""
+    resp = _client(history_dir).get("/pending")
+    assert resp.status_code == 200
+    assert "Manual systems" in resp.text
+    assert "No manual systems in this snapshot." in resp.text
+    assert "web-01" in resp.text  # host section still renders
 
 
 def test_host_drilldown_across_runs(history_dir):
@@ -891,6 +1007,59 @@ def test_enroll_validation_errors_400(project):
     )
 
 
+def test_enroll_manual_requires_adapter(project, monkeypatch):
+    """The manual group needs a manual_adapter — missing or bogus values are
+    400; truenas_scale/opnsense are accepted and written to the inventory. The
+    group itself lands in another PR, so GROUPS is patched to simulate it."""
+    monkeypatch.setattr(inventory_edit, "GROUPS", (*inventory_edit.GROUPS, "manual_hosts"))
+    client = _project_client(project)
+    # missing adapter
+    assert (
+        client.post(
+            "/inventory/add",
+            data={"group": "manual_hosts", "name": "nas-01", "ansible_host": "10.0.0.9"},
+        ).status_code
+        == 400
+    )
+    # unknown adapter
+    assert (
+        client.post(
+            "/inventory/add",
+            data={
+                "group": "manual_hosts",
+                "name": "nas-01",
+                "ansible_host": "10.0.0.9",
+                "manual_adapter": "esxi",
+            },
+        ).status_code
+        == 400
+    )
+    # valid enrollment writes manual_adapter into hosts.ini
+    resp = client.post(
+        "/inventory/add",
+        data={
+            "group": "manual_hosts",
+            "name": "nas-01",
+            "ansible_host": "10.0.0.9",
+            "manual_adapter": "truenas_scale",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    ini = (project / "hosts.ini").read_text()
+    assert "nas-01" in ini and "manual_adapter=truenas_scale" in ini
+
+
+def test_inventory_page_shows_manual_group_and_adapter(project, monkeypatch):
+    """The enroll form exposes the manual group and its adapter select."""
+    monkeypatch.setattr(inventory_edit, "GROUPS", (*inventory_edit.GROUPS, "manual_hosts"))
+    resp = _project_client(project).get("/inventory")
+    assert resp.status_code == 200
+    assert "manual_hosts" in resp.text
+    assert "truenas_scale" in resp.text
+    assert "opnsense" in resp.text
+
+
 def test_remove_with_cleanup(project):
     client = _project_client(project)
     client.post(
@@ -1113,6 +1282,21 @@ def test_health_score():
     assert _health_score(floor, None) == 0  # clamped
 
 
+def test_health_score_deducts_manual_actions():
+    """Each pending manual update/reboot pulls the score down a small amount,
+    independently of the auto-update penalties."""
+    row = {"manual_updates": 2, "manual_reboots": 1}
+    assert _health_score(None, row) == 100 - 2 - 1
+    mixed = {"outdated_apps": 1, "security_pending": 2, "reboot_hosts": 1, "manual_updates": 3, "manual_reboots": 2}
+    assert _health_score(None, mixed) == 100 - 1 - 4 - 2 - 3 - 2
+
+
+def test_health_score_manual_keys_absent_no_deduction():
+    """Pre-manual summary rows lack the manual keys — no deduction, no crash."""
+    assert _health_score(None, {"outdated_apps": 0}) == 100
+    assert _health_score(None, {}) == 100
+
+
 def test_activity_weeks_grid_shape_and_levels():
     from datetime import date
 
@@ -1260,6 +1444,34 @@ def test_palette_multi_cluster_lxc_ids_get_distinct_canonical_urls(tmp_path):
     assert label_by_url["/hosts/alpha-01/101"] == "sonarr"
     assert label_by_url["/hosts/beta-01/101"] == "radarr"
     assert "/hosts/101" not in urls
+
+
+def test_palette_manual_entries_from_pending_snapshot(tmp_path):
+    """Manual systems from the latest pending snapshot are discoverable via
+    the command palette under their stable inventory hostname."""
+    d = tmp_path / "history"
+    scan_mod.write_pending(
+        {
+            "timestamp": "20260103T000000000000Z",
+            "hosts": {},
+            "lxc": {},
+            "manual": {
+                "nas-01": {
+                    "adapter": "truenas_scale",
+                    "display_name": "TrueNAS at 10.0.0.9",
+                    "current": "24.04.0",
+                    "update_available": True,
+                },
+                "fw-01": {"adapter": "opnsense", "current": "24.1"},
+            },
+        },
+        history_dir=d,
+        keep=0,
+    )
+    hosts = [item for item in _palette_items(_client(d).get("/")) if item["kind"] == "host"]
+    by_label = {item["label"]: item["url"] for item in hosts}
+    assert by_label["nas-01"] == "/hosts/nas-01"
+    assert by_label["fw-01"] == "/hosts/fw-01"
 
 
 def test_history_renders_activity_heatmap(history_dir):
@@ -1604,6 +1816,46 @@ def test_overview_pending_card_shows_security_and_reboot_stats(history_dir):
     # 1 host + 2 containers' security packages, and 2 reboot-required entries
     assert '<span class="value">3</span>' in resp.text
     assert resp.text.count('<span class="value">2</span>') >= 1
+
+
+def test_overview_pending_card_shows_manual_stats(history_dir, monkeypatch):
+    """The overview's pending card surfaces manual_updates / manual_reboots.
+    The summary-row counts land in scan.pending_summary in another PR, so the
+    row is faked here to prove the page renders and counts them."""
+    monkeypatch.setattr(
+        scan_mod,
+        "pending_summary",
+        lambda *a, **k: [
+            {
+                "timestamp": "20260109T000000000000Z",
+                "hosts_pending": 0,
+                "lxc_os_pending": 0,
+                "outdated_apps": 0,
+                "security_pending": 0,
+                "reboot_hosts": 0,
+                "errors": 0,
+                "manual_updates": 2,
+                "manual_reboots": 1,
+            }
+        ],
+    )
+    resp = _client(history_dir).get("/")
+    assert resp.status_code == 200
+    assert "manual updates" in resp.text
+    assert "manual reboots" in resp.text
+    assert '<span class="value">2</span>' in resp.text
+    assert '<span class="value">1</span>' in resp.text
+
+
+def test_overview_pending_card_legacy_row_without_manual_keys(history_dir):
+    """Pre-manual summary rows lack the manual keys — the cards render zero
+    and the page never crashes (the real scan.pending_summary still emits rows
+    without them until the other PR lands)."""
+    resp = _client(history_dir).get("/")
+    assert resp.status_code == 200
+    assert "manual updates" in resp.text
+    assert "manual reboots" in resp.text
+    assert '<span class="value">0</span>' in resp.text
 
 
 def test_health_score_deducts_security_and_reboot():
@@ -2067,6 +2319,45 @@ def test_host_pending_entries_unknown_host_empty(tmp_path):
     assert _host_pending_entries(str(d), "ghost") == []
 
 
+def test_host_pending_entries_manual_matches_by_hostname(tmp_path):
+    """A manual system's pending entry is keyed by its stable inventory
+    hostname — exactly the name the /hosts/{name} page resolves."""
+    d = tmp_path / "history"
+    scan_mod.write_pending(
+        {
+            "timestamp": "20260112T000000000000Z",
+            "hosts": {},
+            "lxc": {},
+            "manual": {
+                "nas-01": {
+                    "adapter": "truenas_scale",
+                    "current": "24.04.0",
+                    "update_available": True,
+                }
+            },
+        },
+        history_dir=d,
+        keep=0,
+    )
+    entries = _host_pending_entries(str(d), "nas-01")
+    assert len(entries) == 1
+    assert entries[0]["kind"] == "manual"
+    assert entries[0]["bucket"] == "pending"
+    assert entries[0]["entry"]["adapter"] == "truenas_scale"
+    assert _host_pending_entries(str(d), "ghost") == []
+
+
+def test_host_pending_entries_legacy_snapshot_without_manual(tmp_path):
+    """Old snapshots predate the manual mapping — the host timeline gains no
+    manual entries and never crashes."""
+    d = tmp_path / "history"
+    _seed_pr4(d)
+    entries = _host_pending_entries(str(d), "web-01")
+    assert entries  # the host section still works
+    assert all(e["kind"] != "manual" for e in entries)
+    assert all(e["kind"] != "manual" for e in _host_pending_entries(str(d), "sonarr"))
+
+
 # --- host page pending timeline ---------------------------------------------- #
 
 
@@ -2113,6 +2404,87 @@ def test_host_page_timeline_newest_first_interleaved(tmp_path):
         < text.index("/pending?ref=20260112T000000000000Z")
         < text.index("/history/20260111T000000000000Z")
     )
+
+
+def test_host_page_manual_timeline(tmp_path):
+    """A manual system's pending-snapshot entry renders on its host page:
+    display name, current → latest, update/reboot pills, summary, apply hint,
+    details disclosure and errors."""
+    d = tmp_path / "history"
+    scan_mod.write_pending(
+        {
+            "timestamp": "20260112T000000000000Z",
+            "hosts": {},
+            "lxc": {},
+            "manual": {
+                "nas-01": {
+                    "adapter": "truenas_scale",
+                    "display_name": "TrueNAS at 10.0.0.9",
+                    "current": "24.04.0",
+                    "latest": "24.04.2",
+                    "update_available": True,
+                    "reboot_required": True,
+                    "summary": "3 train updates",
+                    "details": ["zfs 2.2.4", "samba 4.19"],
+                    "apply_hint": "apply via the TrueNAS UI",
+                    "unreachable": False,
+                    "error": None,
+                }
+            },
+        },
+        history_dir=d,
+        keep=0,
+    )
+    resp = _client(d).get("/hosts/nas-01")
+    assert resp.status_code == 200
+    text = resp.text
+    assert ">pending</span>" in text
+    assert "TrueNAS at 10.0.0.9" in text
+    assert "24.04.0 → 24.04.2" in text
+    assert "update available" in text
+    assert "reboot required" in text
+    assert "3 train updates" in text
+    assert "apply via the TrueNAS UI" in text
+    assert "zfs 2.2.4" in text and "samba 4.19" in text
+    assert ">2 detail(s)</summary>" in text
+    assert 'href="/pending?ref=20260112T000000000000Z"' in text
+
+
+def test_host_page_manual_timeline_errors_and_legacy_absence(tmp_path):
+    """A manual entry with an error renders it; a legacy snapshot without any
+    manual mapping renders no manual timeline item and no crash."""
+    d = tmp_path / "history"
+    _seed_pr4(d)
+    scan_mod.write_pending(
+        {
+            "timestamp": "20260113T000000000000Z",
+            "hosts": {},
+            "lxc": {},
+            "manual": {
+                "fw-01": {
+                    "adapter": "opnsense",
+                    "current": "",
+                    "latest": "",
+                    "update_available": False,
+                    "reboot_required": False,
+                    "details": [],
+                    "apply_hint": "",
+                    "unreachable": True,
+                    "error": "No route to host",
+                }
+            },
+        },
+        history_dir=d,
+        keep=0,
+    )
+    text = _client(d).get("/hosts/fw-01").text
+    assert "unreachable — skipped" in text
+    assert "No route to host" in text
+    # a host that exists only in legacy (pre-manual) snapshots renders fine
+    assert _client(d).get("/hosts/web-01").status_code == 200
+    legacy = _client(d).get("/hosts/sonarr").text
+    assert ">pending</span>" in legacy
+    assert "Manual" not in legacy
 
 
 def test_host_page_timeline_merges_pending_events_and_runs(history_dir):

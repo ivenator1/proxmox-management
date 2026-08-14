@@ -43,6 +43,42 @@ endblock %} {% block content %}
       <span class="mono">{{ entry.event.to }}</span>
     </div>
   </div>
+  {% elif entry.bucket == "pending" and entry.kind == "manual" %} {% set m =
+  entry.entry %}
+  <div class="timeline-item">
+    <span class="when">
+      <a
+        class="mono"
+        href="/pending?ref={{ entry.timestamp }}"
+        title="{{ entry.timestamp }}"
+        >{{ entry.timestamp | ts_span }}</a
+      >
+      · <span class="pill info">pending</span>
+    </span>
+    <div class="body">
+      <small style="margin-right: 0.8rem; display: inline-block">
+        <strong class="muted">Manual</strong>
+        {% if m.get("display_name") %}<code>{{ m.display_name }}</code>{% endif
+        %} <span class="mono">{{ m.get("current") or "?" }} → {{
+        m.get("latest") or "?" }}</span> {% if m.get("update_available")
+        %}<span class="pill warn">update available</span>{% endif %} {% if
+        m.get("reboot_required") %}<span class="pill warn"
+          >reboot required</span
+        >{% endif %} {% if m.get("summary") %}<span class="muted"
+          >{{ m.summary }}</span
+        >{% endif %} {% if m.get("apply_hint") %}
+        <code>{{ m.apply_hint }}</code>{% endif %} {% if m.get("unreachable")
+        %}<span class="pill muted">unreachable — skipped</span>{% endif %} {% if
+        m.get("error") %}<span class="fail">{{ m.error }}</span>{% endif %} {%
+        if m.get("details") %}
+        <details class="pkg-list">
+          <summary>{{ m.details | length }} detail(s)</summary>
+          <div class="pkg-body">{{ m.details | join(", ") }}</div>
+        </details>
+        {% endif %}
+      </small>
+    </div>
+  </div>
   {% elif entry.bucket == "pending" %} {% set p = entry.entry %} {% set os_count
   = p.get("os_pending_count", p.get("pending_count", 0)) %} {% set sec_count =
   p.get("os_security_count", p.get("security_count", 0)) %} {% set pending_names

@@ -109,6 +109,47 @@
   </table>
   </div>
   {% else %}<p class="muted">No container scans in this snapshot.</p>{% endif %}
+
+  <h2>Manual systems</h2>
+  {% if manual %}
+  <div class="table-card">
+  <table>
+    <thead><tr><th>System</th><th>Platform</th><th class="num" title="Installed version reported by the appliance">Current</th><th class="num" title="Version available from the vendor">Available</th><th>Action</th><th>Details</th><th>Apply hint</th><th>Notes</th></tr></thead>
+    <tbody>
+    {% for name, entry in manual %}
+      <tr>
+        <td><a href="/hosts/{{ name }}">{{ entry.get("display_name") or name }}</a></td>
+        <td><code>{{ entry.get("adapter", "") }}</code></td>
+        <td class="num"><span class="mono">{{ entry.get("current") or "—" }}</span></td>
+        <td class="num"><span class="mono">{{ entry.get("latest") or "—" }}</span></td>
+        <td>
+          {% if entry.get("update_available") %}<span class="pill warn" title="{{ entry.get("summary", "") }}">update available</span>{% endif %}
+          {% if entry.get("reboot_required") %}<span class="pill warn">reboot required</span>{% endif %}
+          {% if not entry.get("update_available") and not entry.get("reboot_required") %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td>
+          {% if entry.get("details") %}
+            <details class="pkg-list">
+              <summary>{{ entry.details | length }} detail(s)</summary>
+              <div class="pkg-body">{{ entry.details | join(", ") }}</div>
+            </details>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td>
+          {% if entry.get("apply_hint") %}<code>{{ entry.apply_hint }}</code>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td>
+          {% if entry.get("unreachable") %}<span class="pill muted" title="{{ entry.get("error", "") }}">unreachable — skipped</span>
+          {% elif entry.get("error") %}<span class="fail">{{ entry.error }}</span>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}<p class="muted">No manual systems in this snapshot.</p>{% endif %}
 {% else %}
 <div class="empty">
   <span class="glyph" aria-hidden="true">⌁</span>
