@@ -28,6 +28,7 @@ bound to the target host (SSH adapters only; API adapters take a
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import ssl
@@ -635,8 +636,10 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
     /api/core/firmware/upgradestatus`` is polled until it finishes — since
     OPNsense ~22.7 ``GET /api/core/firmware/status`` only reports the *last*
     check, so without the trigger the monitor would go stale. Finally ``GET
-    /api/core/firmware/status`` is read, authenticated with
-    ``X-API-Key``/``X-API-Secret`` headers. Status mapping covers both the
+    /api/core/firmware/status`` is read, authenticated with HTTP Basic
+    (``api_key``:``api_secret`` — the canonical OPNsense API method; the
+    X-API-Key/X-API-Secret header variant is not honored consistently on
+    modern releases). Status mapping covers both the
     modern machine values and the legacy ``opnsense-update`` strings:
     ``update``/``update_available``/``update_available_major`` → update
     available (target from ``upgrade_version``/``upgrade_major_version``/
@@ -688,7 +691,11 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
         if config is None:
             raise ManualUpdateParseError(f"{self.name}: missing API config")
         base_url = (config.api_url or f"https://{host}").rstrip("/")
-        headers = {"X-API-Key": config.api_key, "X-API-Secret": config.api_secret}
+        # OPNsense's canonical API auth is HTTP Basic with key:secret (the
+        # X-API-Key/X-API-Secret header variant is not honored consistently on
+        # modern releases and can 200 with an empty body).
+        token = base64.b64encode(f"{config.api_key}:{config.api_secret}".encode()).decode()
+        headers = {"Authorization": f"Basic {token}"}
         timeout = config.timeout
         verify = config.verify_ssl
 

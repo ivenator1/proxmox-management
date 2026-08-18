@@ -6,6 +6,7 @@ scripted executors (no Ansible/PVE), with GitHub HTTP monkeypatched.
 
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any, Dict, List
 
@@ -939,8 +940,7 @@ def test_run_fleet_scan_manual_api_host_builds_no_executor(tmp_path, monkeypatch
         assert url.startswith("https://10.0.0.1/api/core/firmware/")
         assert kw["timeout"] == 7.0  # settings.manual_update_api_timeout
         assert kw["verify"] is False  # per-host verify_ssl=false
-        assert kw["headers"]["X-API-Key"] == "KEY"
-        assert kw["headers"]["X-API-Secret"] == "SECRET"
+        assert kw["headers"]["Authorization"] == "Basic " + base64.b64encode(b"KEY:SECRET").decode()
     latest = json.loads((tmp_path / "hist" / "pending-latest.json").read_text())
     assert latest["manual"]["firewall"] == {
         "host": "firewall",

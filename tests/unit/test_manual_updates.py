@@ -10,6 +10,7 @@ no live host is ever contacted.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from pathlib import Path
@@ -1068,12 +1069,13 @@ def test_opnsense_api_available(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "Components: base system, kernel, packages" in result.details
     assert result.adapter == "opnsense_api"
     assert result.display_name == "OPNsense"
-    # Key/secret headers on all calls, default https://<host> base URL.
+    # Basic auth (key:secret) on all calls, default https://<host> base URL.
     assert len(fake.calls) == 4  # info, check POST, upgradestatus, status
+    expected_basic = "Basic " + base64.b64encode(b"TEST-KEY:SECRET").decode()
     for _, url, headers, _, _ in fake.calls:
         assert url.startswith("https://fw-01/api/core/firmware/")
-        assert headers.get("X-API-Key") == "TEST-KEY"
-        assert headers.get("X-API-Secret") == "SECRET"
+        assert headers.get("Authorization") == expected_basic
+        assert "X-API-Key" not in headers
 
 
 def test_opnsense_api_custom_port_via_api_url(monkeypatch: pytest.MonkeyPatch) -> None:
