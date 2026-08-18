@@ -26,7 +26,13 @@ jobs:
       - name: Install ansible-lint
         run: pip install ansible-lint
       - name: Install collections
-        run: ansible-galaxy collection install community.proxmox community.general
+        run: |
+          # galaxy.ansible.com downloads occasionally time out — retry before failing
+          for i in 1 2 3; do
+            ansible-galaxy collection install community.proxmox community.general && break
+            echo "collection download attempt $i failed, retrying..."
+            sleep 15
+          done
       - name: Run ansible-lint
         run: ansible-lint ansible/primitives/
 
@@ -38,7 +44,13 @@ jobs:
       - name: Install ansible
         run: pip install ansible
       - name: Install collections
-        run: ansible-galaxy collection install community.proxmox community.general
+        run: |
+          # galaxy.ansible.com downloads occasionally time out — retry before failing
+          for i in 1 2 3; do
+            ansible-galaxy collection install community.proxmox community.general && break
+            echo "collection download attempt $i failed, retrying..."
+            sleep 15
+          done
       - name: Syntax check execution primitives
         run: |
           for f in ansible/primitives/*.yml; do
@@ -120,7 +132,13 @@ jobs:
       - name: Install molecule, ansible, proxmox_fleet, and ansible-runner
         run: pip install molecule ansible ansible-runner && pip install -e .
       - name: Install collections
-        run: ansible-galaxy collection install community.proxmox community.general
+        run: |
+          # galaxy.ansible.com downloads occasionally time out — retry before failing
+          for i in 1 2 3; do
+            ansible-galaxy collection install community.proxmox community.general && break
+            echo "collection download attempt $i failed, retrying..."
+            sleep 15
+          done
       - name: Run molecule scenario
         run: molecule test -s ${{ matrix.scenario }}
         working-directory: roles/lxc_update
