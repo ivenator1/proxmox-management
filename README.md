@@ -166,7 +166,7 @@ ansible_user=root
 ansible_ssh_private_key_file=~/.ssh/id_ed25519
 ansible_python_interpreter=/usr/bin/python3
 ```
-Every host requires `manual_adapter=truenas_scale|opnsense|truenas_scale_api|opnsense_api`; a missing or blank value fails loudly at inventory load time, before any host is contacted. Optional per-host `display_name` (report/reminder label) and `apply_hint` (free-form GUI note) go in `host_vars/<name>.yml`.
+Every host requires `manual_adapter=truenas_scale|opnsense|truenas_scale_api|opnsense_api|truenas_scale_ws`; a missing or blank value fails loudly at inventory load time, before any host is contacted. Optional per-host `display_name` (report/reminder label) and `apply_hint` (free-form GUI note) go in `host_vars/<name>.yml`.
 
 **Overlap safety & migration:** a hostname in `[manual_update_hosts]` must NOT also appear in `[remote_hosts]`, `[proxmox_vms]`, `[custom_hosts]`, or `[proxmox_nodes]` — that overlap is rejected loudly (naming the host and both groups) both in the scan and in the `run_fleet()` pre-flight, so no machine is ever both manually and automatically updated. To move a TrueNAS/OPNsense box off auto-update: **remove** its line from *every* auto-update group first, then add it here with `manual_adapter=` — do it in its own commit so a stale checkout can never run both paths for the same host.
 
@@ -184,6 +184,7 @@ The scan runs one fixed, sentinel-delimited read-only command per adapter (or fi
 | `truenas_scale` | `midclt call system.version` + `midclt call update.check_available` (JSON parsed in Python) | `apt`, `jq`, `updater`, `apply`, `upgrade` |
 | `opnsense` | `opnsense-version` + `opnsense-update -c` (check mode only) | bare `pkg`, `upgrade`, `apply`, `updater` |
 | `truenas_scale_api` | `GET /api/v2.0/system/version` + `POST /api/v2.0/update/check_available` (Bearer token) | — (GET/POST-check only; never update/apply endpoints) |
+| `truenas_scale_ws` | WebSocket JSON-RPC `wss://<host>/api/current`: `auth.login_with_api_key` → `system.version` → `update.check_available` | — (read methods only; never update/apply methods) |
 | `opnsense_api` | `GET /api/core/firmware/info` → `POST /api/core/firmware/check` → poll `GET /api/core/firmware/upgradestatus` → `GET /api/core/firmware/status` (HTTP Basic `api_key`:`api_secret`) | — (check endpoint only; never update/apply endpoints) |
 
 TrueNAS status mapping: `AVAILABLE` → update pending, `REBOOT_REQUIRED` → reboot pending, `CURRENT`/`UNAVAILABLE` → up to date, anything else → check error. OPNsense classification uses rc + output for SSH: `A newer version is available` (or rc=2) → update pending, `Nothing to do.` / `Currently up to date.` → up to date, rc=1 or unrecognized output → **fails closed** with an error — the scan never guesses. The API adapter maps the machine statuses (`update`/`update_available`/`update_available_major` → pending, `none`/`nothing_to_do` → up to date, `reboot_required` → reboot, `error`/`connection_failure` → check error) and **triggers a fresh check first** — since OPNsense ~22.7 the status endpoint only reports the *last* check, so the adapter POSTs `/api/core/firmware/check` and polls `upgradestatus` until the check finishes before reading the result, keeping the monitor from going stale.

@@ -39,6 +39,8 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from proxmox_fleet import http
 from proxmox_fleet.http import HttpResponse
+from proxmox_fleet import ws
+from proxmox_fleet.ws import WebSocketError
 from proxmox_fleet.executor import Executor
 from proxmox_fleet.runner import PrimitiveResult, UnreachableHostError, is_unreachable_error
 
@@ -537,6 +539,59 @@ class TrueNASScaleApiAdapter(BaseApiManualUpdateAdapter):
                 "TrueNAS update.check_available returned a non-object value"
             )
         _apply_truenas_payload(outcome, version_resp.body, payload)
+        return outcome
+
+
+class TrueNASScaleWsAdapter(BaseApiManualUpdateAdapter):
+    """Read-only update check for TrueNAS SCALE via the WebSocket JSON-RPC API.
+
+    The REST API is deprecated since TrueNAS 25.04 and **removed in 26**, so
+    modern boxes use JSON-RPC 2.0 over WebSocket (``wss://<host>/api/current``):
+    ``auth.login_with_api_key``, then ``system.version`` and
+    ``update.check_available``. The payload normalizes through the same
+    :func:`_apply_truenas_payload` as the other TrueNAS adapters. Read-only:
+    no update/apply method is ever invoked.
+    """
+
+    name = "truenas_scale_ws"
+    display_name = "TrueNAS SCALE"
+    apply_hint = "TrueNAS GUI → System Settings → Update"
+    transport = "api"
+
+    def _check_api(
+        self,
+        outcome: ManualUpdateResult,
+        host: str,
+        config: Optional[ManualUpdateApiConfig],
+    ) -> ManualUpdateResult:
+        if config is None:
+            raise ManualUpdateParseError(f"{self.name}: missing API config")
+        base_url = (config.api_url or f"https://{host}").rstrip("/")
+        if base_url.startswith("https://"):
+            ws_url = "wss://" + base_url[len("https://"):] + "/api/current"
+        elif base_url.startswith("http://"):
+            ws_url = "ws://" + base_url[len("http://"):] + "/api/current"
+        else:
+            ws_url = base_url.rstrip("/") + "/api/current"
+
+        conn = ws.connect(ws_url, timeout=config.timeout, verify=config.verify_ssl)
+        try:
+            try:
+                conn.rpc("auth.login_with_api_key", [config.api_key])
+            except WebSocketError as exc:
+                raise ManualUpdateParseError(
+                    f"TrueNAS API key rejected: {exc}"
+                ) from exc
+            version = conn.rpc("system.version", [])
+            payload = conn.rpc("update.check_available", [])
+        finally:
+            conn.close()
+
+        if not isinstance(payload, dict):
+            raise ManualUpdateParseError(
+                "TrueNAS update.check_available returned a non-object value"
+            )
+        _apply_truenas_payload(outcome, str(version or ""), payload)
         return outcome
 
 
@@ -1043,14 +1098,17 @@ class ManualUpdateRegistry:
         return len(self._adapters)
 
 
-# The default registry ships the two appliance adapters in both transports:
-# SSH (midclt / opnsense-update -c) and REST API (truenas_scale_api /
-# opnsense_api). Hosts pick one per entry via manual_adapter=.
+# The default registry ships the appliance adapters in both transports:
+# SSH (midclt / opnsense-update -c), REST API (truenas_scale_api /
+# opnsense_api), and the TrueNAS WebSocket JSON-RPC adapter (truenas_scale_ws,
+# for TrueNAS 25.10+ where REST is deprecated). Hosts pick one per entry via
+# manual_adapter=.
 MANUAL_UPDATE_REGISTRY = ManualUpdateRegistry()
 MANUAL_UPDATE_REGISTRY.register(TrueNASScaleAdapter())
 MANUAL_UPDATE_REGISTRY.register(OpnsenseAdapter())
 MANUAL_UPDATE_REGISTRY.register(TrueNASScaleApiAdapter())
 MANUAL_UPDATE_REGISTRY.register(OpnsenseApiAdapter())
+MANUAL_UPDATE_REGISTRY.register(TrueNASScaleWsAdapter())
 
 
 def run_manual_update_check(
