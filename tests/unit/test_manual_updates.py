@@ -903,14 +903,47 @@ def test_opnsense_api_cert_verify_failure_is_error(monkeypatch: pytest.MonkeyPat
     assert "verify_ssl=false" in result.error
 
 
-def test_opnsense_api_non_json_response_names_the_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A non-JSON/empty body from an endpoint is reported with its URL."""
+def test_opnsense_api_empty_upgradestatus_race_is_tolerated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 200-with-nothing upgradestatus right after the check starts is a race.
+
+    The configd task has not registered yet; the poll loop keeps going instead
+    of failing (this is what made the real 26.7 scan report
+    "Expecting value: line 1 column 1" on the very first poll).
+    """
+    monkeypatch.setattr(
+        "proxmox_fleet.manual_updates.time.sleep", lambda secs: None
+    )
     fake = ScriptedHttp(
         responses={
             "firmware/info": HttpResponse(status=200, body='{"version":"24.1.10"}'),
             "firmware/check": HttpResponse(status=200, body="{}"),
-            "firmware/upgradestatus": HttpResponse(status=200, body="not json at all"),
-        },
+            # first poll: newline-only body (json.loads rejects it); then done.
+            "firmware/upgradestatus": [
+                HttpResponse(status=200, body="\n"),
+                HttpResponse(status=200, body='{"status":"done"}'),
+            ],
+            "firmware/status": HttpResponse(status=200, body='{"status":"nothing_to_do"}'),
+        }
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert not result.error
+    assert "up to date" in result.summary
+    assert len([c for c in fake.calls if "upgradestatus" in c[1]]) == 2
+
+
+def test_opnsense_api_non_json_status_names_the_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-JSON body from the terminal status call is reported with its URL."""
+    fake = ScriptedHttp(
+        responses={
+            "firmware/info": HttpResponse(status=200, body='{"version":"24.1.10"}'),
+            "firmware/check": HttpResponse(status=200, body="{}"),
+            "firmware/upgradestatus": HttpResponse(status=200, body='{"status":"done"}'),
+            "firmware/status": HttpResponse(status=200, body="\n"),
+        }
     )
     _patch_http(monkeypatch, fake)
     result = run_manual_update_check(
@@ -918,7 +951,7 @@ def test_opnsense_api_non_json_response_names_the_url(monkeypatch: pytest.Monkey
     )
 
     assert result.error
-    assert "upgradestatus" in result.error
+    assert "firmware/status" in result.error
     assert "Non-JSON/empty response" in result.error
     assert result.unreachable is False
 
