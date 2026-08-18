@@ -903,6 +903,26 @@ def test_opnsense_api_cert_verify_failure_is_error(monkeypatch: pytest.MonkeyPat
     assert "verify_ssl=false" in result.error
 
 
+def test_opnsense_api_non_json_response_names_the_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-JSON/empty body from an endpoint is reported with its URL."""
+    fake = ScriptedHttp(
+        responses={
+            "firmware/info": HttpResponse(status=200, body='{"version":"24.1.10"}'),
+            "firmware/check": HttpResponse(status=200, body="{}"),
+            "firmware/upgradestatus": HttpResponse(status=200, body="not json at all"),
+        },
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert result.error
+    assert "upgradestatus" in result.error
+    assert "Non-JSON/empty response" in result.error
+    assert result.unreachable is False
+
+
 def test_truenas_api_verify_ssl_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = ScriptedHttp(
         responses={

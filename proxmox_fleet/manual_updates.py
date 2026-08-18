@@ -443,7 +443,14 @@ class BaseApiManualUpdateAdapter(BaseManualUpdateAdapter):
             raise OSError(f"{exc} (while fetching {url})") from exc
 
     def _get_json(self, url: str, **kw: Any) -> Any:
-        return self._api_request(url, lambda: http.get_json(url, **kw))
+        try:
+            return self._api_request(url, lambda: http.get_json(url, **kw))
+        except ValueError as exc:
+            # Empty or non-JSON body (e.g. an endpoint that 200s with nothing)
+            # is diagnosed much faster when the failing URL is named.
+            raise ManualUpdateParseError(
+                f"Non-JSON/empty response from {url}: {exc}"
+            ) from exc
 
     def _post_json(self, url: str, payload: Any, **kw: Any) -> HttpResponse:
         return self._api_request(url, lambda: http.post_json(url, payload, **kw))
