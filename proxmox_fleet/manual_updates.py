@@ -34,9 +34,10 @@ import ssl
 import time
 import urllib.error
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from proxmox_fleet import http
+from proxmox_fleet.http import HttpResponse
 from proxmox_fleet.executor import Executor
 from proxmox_fleet.runner import PrimitiveResult, UnreachableHostError, is_unreachable_error
 
@@ -417,6 +418,36 @@ class BaseApiManualUpdateAdapter(BaseManualUpdateAdapter):
             outcome.error = f"Manual update check failed: {exc}"
             return outcome
 
+    def _api_request(self, url: str, fn: Callable[[], HttpResponse]) -> HttpResponse:
+        """Run an API HTTP call, annotating connection errors with the URL.
+
+        DNS/refused/timeout failures are diagnosed much faster when the error
+        names the exact URL that failed (e.g. an ``api_url`` hostname that does
+        not resolve). HTTP status errors pass through untouched so callers can
+        inspect ``exc.code``; TLS verification failures keep their type so the
+        caller classifies them as errors, not unreachable.
+        """
+        try:
+            return fn()
+        except urllib.error.HTTPError:
+            raise
+        except ssl.SSLCertVerificationError as exc:
+            raise ssl.SSLCertVerificationError(f"{exc} (while fetching {url})") from exc
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, ssl.SSLCertVerificationError):
+                raise ssl.SSLCertVerificationError(
+                    f"{exc.reason} (while fetching {url})"
+                ) from exc
+            raise urllib.error.URLError(f"{exc} (while fetching {url})") from exc
+        except OSError as exc:
+            raise OSError(f"{exc} (while fetching {url})") from exc
+
+    def _get_json(self, url: str, **kw: Any) -> Any:
+        return self._api_request(url, lambda: http.get_json(url, **kw))
+
+    def _post_json(self, url: str, payload: Any, **kw: Any) -> HttpResponse:
+        return self._api_request(url, lambda: http.post_json(url, payload, **kw))
+
     def _check_api(
         self,
         outcome: ManualUpdateResult,
@@ -460,14 +491,17 @@ class TrueNASScaleApiAdapter(BaseApiManualUpdateAdapter):
         timeout = config.timeout
         verify = config.verify_ssl
 
-        version_resp = http.request(
+        version_resp = self._api_request(
             f"{base_url}{self._VERSION_PATH}",
-            method="GET",
-            headers=headers,
-            timeout=timeout,
-            verify=verify,
+            lambda: http.request(
+                f"{base_url}{self._VERSION_PATH}",
+                method="GET",
+                headers=headers,
+                timeout=timeout,
+                verify=verify,
+            ),
         )
-        check_resp = http.post_json(
+        check_resp = self._post_json(
             f"{base_url}{self._CHECK_PATH}",
             {},
             headers=headers,
@@ -649,7 +683,7 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
         timeout = config.timeout
         verify = config.verify_ssl
 
-        info = http.get_json(
+        info = self._get_json(
             f"{base_url}{self._INFO_PATH}",
             headers=headers,
             retries=self._API_RETRIES,
@@ -669,7 +703,7 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
         # Since OPNsense ~22.7 the status endpoint only reports the last
         # check's result — trigger a fresh background check and wait for it so
         # the scan never reports stale state.
-        check_resp = http.post_json(
+        check_resp = self._post_json(
             f"{base_url}{self._CHECK_PATH}",
             {},
             headers=headers,
@@ -685,7 +719,7 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
             )
         self._wait_for_check(base_url, headers, timeout, verify)
 
-        status = http.get_json(
+        status = self._get_json(
             f"{base_url}{self._STATUS_PATH}",
             headers=headers,
             retries=self._API_RETRIES,
@@ -746,7 +780,7 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
         state = ""
         for attempt in range(self._POLL_ATTEMPTS):
             try:
-                progress = http.get_json(
+                progress = self._get_json(
                     f"{base_url}{self._UPGRADE_STATUS_PATH}",
                     headers=headers,
                     retries=self._API_RETRIES,

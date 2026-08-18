@@ -91,23 +91,40 @@ def post_json(
     timeout: float = 30.0,
     verify: bool = True,
 ) -> HttpResponse:
-    """POST a JSON body; retry until status is in ``ok_statuses``."""
+    """POST a JSON body; retry until status is in ``ok_statuses``.
+
+    When every attempt answers with a non-ok status (e.g. a persistent 401),
+    the **last response** is returned instead of raising — callers should
+    inspect ``HttpResponse.status`` rather than assume success. Connection
+    failures (``URLError``/``OSError``) still raise after the retries.
+    """
     body = json.dumps(payload).encode("utf-8")
     hdrs = {"Content-Type": "application/json", **(headers or {})}
+    last: Dict[str, HttpResponse] = {}
 
     def _once() -> HttpResponse:
         try:
-            return request(url, method="POST", headers=hdrs, data=body, timeout=timeout, verify=verify)
+            resp = request(url, method="POST", headers=hdrs, data=body, timeout=timeout, verify=verify)
         except urllib.error.HTTPError as exc:
-            return HttpResponse(status=exc.code, body=exc.read().decode("utf-8", "replace"))
+            resp = HttpResponse(status=exc.code, body=exc.read().decode("utf-8", "replace"))
+        last["resp"] = resp
+        return resp
 
-    return retry(
-        _once,
-        retries=retries,
-        delay=delay,
-        until=lambda r: r.status in ok_statuses,
-        exceptions=(urllib.error.URLError, OSError),
-    )
+    try:
+        return retry(
+            _once,
+            retries=retries,
+            delay=delay,
+            until=lambda r: r.status in ok_statuses,
+            exceptions=(urllib.error.URLError, OSError),
+        )
+    except RuntimeError:
+        # The server answered (with an error status) on every attempt — surface
+        # the last response so callers see the real status (e.g. 401) instead
+        # of an opaque "condition never satisfied" failure.
+        if last.get("resp") is not None:
+            return last["resp"]
+        raise
 
 
 def poll_until(
