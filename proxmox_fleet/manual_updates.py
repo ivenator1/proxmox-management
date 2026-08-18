@@ -443,7 +443,14 @@ class BaseApiManualUpdateAdapter(BaseManualUpdateAdapter):
             raise OSError(f"{exc} (while fetching {url})") from exc
 
     def _get_json(self, url: str, **kw: Any) -> Any:
-        return self._api_request(url, lambda: http.get_json(url, **kw))
+        try:
+            return self._api_request(url, lambda: http.get_json(url, **kw))
+        except ValueError as exc:
+            # Empty or non-JSON body (e.g. an endpoint that 200s with nothing)
+            # is diagnosed much faster when the failing URL is named.
+            raise ManualUpdateParseError(
+                f"Non-JSON/empty response from {url}: {exc}"
+            ) from exc
 
     def _post_json(self, url: str, payload: Any, **kw: Any) -> HttpResponse:
         return self._api_request(url, lambda: http.post_json(url, payload, **kw))
@@ -661,6 +668,8 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
     _CONNECTION_FAILURE_STATUS = "connection_failure"
     _ERROR_STATUS = "error"
     _IN_PROGRESS_STATUSES = ("running",)
+    # Terminal upgradestatus values — the check finished (or never registered).
+    _UPGRADE_TERMINAL_STATUSES = ("done", "reboot", "error")
 
     def _validate_api_config(self, config: Optional[ManualUpdateApiConfig]) -> None:
         super()._validate_api_config(config)
@@ -744,7 +753,7 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
 
         if state in self._AVAILABLE_STATUSES:
             outcome.update_available = True
-            latest = _opnsense_upgrade_target(status)
+            latest = _opnsense_target_from_status(status) or _opnsense_upgrade_target(status)
             outcome.latest = latest
             if latest:
                 outcome.summary = f"OPNsense update available: {outcome.current} -> {latest}"
@@ -765,6 +774,19 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
         else:
             raise ManualUpdateParseError(f"Unknown OPNsense update status: {state!r}")
 
+        # Modern OPNsense flags a pending reboot in the status payload
+        # (``status_reboot``/``needs_reboot`` == "1") even when an update is
+        # available — surface it rather than waiting for a separate scan.
+        if str(status.get("status_reboot") or status.get("needs_reboot") or "").strip() in ("1", "true"):
+            outcome.reboot_required = True
+            if outcome.update_available:
+                outcome.summary += "; reboot required to complete"
+            else:
+                outcome.summary = "OPNsense reboot required to complete the pending update"
+
+        status_msg = str(status.get("status_msg") or "").strip()
+        if status_msg and status_msg not in outcome.details:
+            outcome.details.append(status_msg)
         outcome.details.append(f"Firmware check status: {state}")
         return outcome
 
@@ -773,9 +795,12 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
     ) -> None:
         """Block until the background firmware check finishes, or raise.
 
-        Polls ``/api/core/firmware/upgradestatus`` while it reports
-        ``running``. A 404 means no task is registered (the check already
-        finished); any other HTTP error is a real failure.
+        Polls ``/api/core/firmware/upgradestatus`` until it reports a terminal
+        state (``done``/``reboot``/``error``). A 404 means no task is registered
+        (the check already finished). An empty/non-JSON body — a 200-with-nothing
+        race right after the check starts, before the configd task registers —
+        carries no progress info, so the loop keeps polling rather than reading
+        a stale status. Exhausting the budget fails closed.
         """
         state = ""
         for attempt in range(self._POLL_ATTEMPTS):
@@ -792,11 +817,21 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
                 if exc.code != 404:
                     raise
                 return
-            state = str((progress or {}).get("status") or "").strip() if isinstance(progress, dict) else ""
-            if state not in self._IN_PROGRESS_STATUSES:
-                return
-            if attempt < self._POLL_ATTEMPTS - 1:
-                time.sleep(self._POLL_DELAY)
+            except ManualUpdateParseError:
+                progress = None
+            if isinstance(progress, dict):
+                state = str(progress.get("status") or "").strip()
+                if state in self._UPGRADE_TERMINAL_STATUSES:
+                    return
+            else:
+                state = ""
+            # "running" or no progress info yet → keep polling (bounded); an
+            # unknown value is left for the status endpoint to fail closed on.
+            if state in self._IN_PROGRESS_STATUSES or not state:
+                if attempt < self._POLL_ATTEMPTS - 1:
+                    time.sleep(self._POLL_DELAY)
+                continue
+            return
         raise ManualUpdateParseError(
             f"OPNsense update check still running after "
             f"{self._POLL_ATTEMPTS * self._POLL_DELAY:.0f}s (upgradestatus {state!r})"
@@ -932,6 +967,41 @@ def _opnsense_upgrade_target(status: Dict[str, Any]) -> str:
     message = status.get("status_msg")
     if isinstance(message, str):
         token = _parse_opnsense_release(message)
+        if token:
+            return token
+    return ""
+
+
+def _opnsense_target_from_status(status: Dict[str, Any]) -> str:
+    """Target release from the modern status payload (OPNsense ~23+).
+
+    The modern response carries the target under ``all_packages.opnsense.new``
+    (or ``upgrade_packages``' opnsense entry's ``new_version``) and
+    ``product_latest`` — checked before falling back to the legacy fields.
+    """
+    for container_key in ("all_packages", "upgrade_packages"):
+        container = status.get(container_key)
+        if isinstance(container, dict):
+            entry = container.get("opnsense")
+            if isinstance(entry, dict):
+                for key in ("new", "new_version"):
+                    value = entry.get(key)
+                    if isinstance(value, str) and value.strip():
+                        token = _release_token(value)
+                        if token:
+                            return token
+        elif isinstance(container, list):
+            for entry in container:
+                if isinstance(entry, dict) and entry.get("name") == "opnsense":
+                    for key in ("new_version", "new"):
+                        value = entry.get(key)
+                        if isinstance(value, str) and value.strip():
+                            token = _release_token(value)
+                            if token:
+                                return token
+    latest = status.get("product_latest")
+    if isinstance(latest, str) and latest.strip():
+        token = _release_token(latest)
         if token:
             return token
     return ""

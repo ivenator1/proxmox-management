@@ -903,6 +903,59 @@ def test_opnsense_api_cert_verify_failure_is_error(monkeypatch: pytest.MonkeyPat
     assert "verify_ssl=false" in result.error
 
 
+def test_opnsense_api_empty_upgradestatus_race_is_tolerated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 200-with-nothing upgradestatus right after the check starts is a race.
+
+    The configd task has not registered yet; the poll loop keeps going instead
+    of failing (this is what made the real 26.7 scan report
+    "Expecting value: line 1 column 1" on the very first poll).
+    """
+    monkeypatch.setattr(
+        "proxmox_fleet.manual_updates.time.sleep", lambda secs: None
+    )
+    fake = ScriptedHttp(
+        responses={
+            "firmware/info": HttpResponse(status=200, body='{"version":"24.1.10"}'),
+            "firmware/check": HttpResponse(status=200, body="{}"),
+            # first poll: newline-only body (json.loads rejects it); then done.
+            "firmware/upgradestatus": [
+                HttpResponse(status=200, body="\n"),
+                HttpResponse(status=200, body='{"status":"done"}'),
+            ],
+            "firmware/status": HttpResponse(status=200, body='{"status":"nothing_to_do"}'),
+        }
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert not result.error
+    assert "up to date" in result.summary
+    assert len([c for c in fake.calls if "upgradestatus" in c[1]]) == 2
+
+
+def test_opnsense_api_non_json_status_names_the_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-JSON body from the terminal status call is reported with its URL."""
+    fake = ScriptedHttp(
+        responses={
+            "firmware/info": HttpResponse(status=200, body='{"version":"24.1.10"}'),
+            "firmware/check": HttpResponse(status=200, body="{}"),
+            "firmware/upgradestatus": HttpResponse(status=200, body='{"status":"done"}'),
+            "firmware/status": HttpResponse(status=200, body="\n"),
+        }
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert result.error
+    assert "firmware/status" in result.error
+    assert "Non-JSON/empty response" in result.error
+    assert result.unreachable is False
+
+
 def test_truenas_api_verify_ssl_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = ScriptedHttp(
         responses={
@@ -1021,6 +1074,23 @@ def test_opnsense_api_available(monkeypatch: pytest.MonkeyPatch) -> None:
         assert url.startswith("https://fw-01/api/core/firmware/")
         assert headers.get("X-API-Key") == "TEST-KEY"
         assert headers.get("X-API-Secret") == "SECRET"
+
+
+def test_opnsense_api_custom_port_via_api_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An api_url with a non-default port (e.g. :8443) is used verbatim."""
+    fake = _opnsense_api_http(monkeypatch, {"status": "nothing_to_do"})
+    result = run_manual_update_check(
+        "opnsense_api",
+        None,
+        "fw-01",
+        config=_api_config(api_secret="SECRET", api_url="https://10.10.10.1:8443"),
+    )
+
+    assert not result.error
+    assert "up to date" in result.summary
+    for _, url, _, _, _ in fake.calls:
+        assert url.startswith("https://10.10.10.1:8443/api/core/firmware/")
+        assert "/firmware/" in url and url.split("?")[0].count(":") >= 1
 
 
 def test_opnsense_api_available_major(monkeypatch: pytest.MonkeyPatch) -> None:
