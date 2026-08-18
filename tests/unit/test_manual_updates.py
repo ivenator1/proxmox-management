@@ -357,17 +357,20 @@ def test_registry_ships_both_adapters_in_both_transports() -> None:
         "opnsense_api",
         "truenas_scale",
         "truenas_scale_api",
+        "truenas_scale_ws",
     ]
     assert "truenas_scale" in MANUAL_UPDATE_REGISTRY
     assert "opnsense" in MANUAL_UPDATE_REGISTRY
     assert "truenas_scale_api" in MANUAL_UPDATE_REGISTRY
     assert "opnsense_api" in MANUAL_UPDATE_REGISTRY
-    assert len(MANUAL_UPDATE_REGISTRY) == 4
-    # Transport split: the bare names stay SSH, the *_api names are API.
+    assert "truenas_scale_ws" in MANUAL_UPDATE_REGISTRY
+    assert len(MANUAL_UPDATE_REGISTRY) == 5
+    # Transport split: the bare names stay SSH, the *_api/*_ws names are API.
     assert MANUAL_UPDATE_REGISTRY.get("opnsense").transport == "ssh"
     assert MANUAL_UPDATE_REGISTRY.get("truenas_scale").transport == "ssh"
     assert MANUAL_UPDATE_REGISTRY.get("opnsense_api").transport == "api"
     assert MANUAL_UPDATE_REGISTRY.get("truenas_scale_api").transport == "api"
+    assert MANUAL_UPDATE_REGISTRY.get("truenas_scale_ws").transport == "api"
 
 
 def test_unknown_adapter_no_host_contact() -> None:
@@ -1362,3 +1365,164 @@ def test_api_adapters_reject_http_error_status(monkeypatch: pytest.MonkeyPatch) 
     assert result.error
     assert "403" in result.error
     assert result.unreachable is False
+
+
+# --- TrueNAS SCALE WebSocket adapter (truenas_scale_ws) ----------------------
+
+
+class ScriptedWs:
+    """Scripted fake for proxmox_fleet.ws.WebSocket: method → result/exception."""
+
+    def __init__(
+        self,
+        responses: Optional[Dict[str, Any]] = None,
+        raises: Optional[Dict[str, Exception]] = None,
+    ) -> None:
+        self.responses = responses or {}
+        self.raises = raises or {}
+        self.calls: List[tuple] = []
+        self.closed = False
+
+    def rpc(self, method: str, params: Any = None) -> Any:
+        self.calls.append((method, params))
+        if method in self.raises:
+            raise self.raises[method]
+        if method in self.responses:
+            return self.responses[method]
+        raise AssertionError(f"unscripted rpc: {method}")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _patch_ws(monkeypatch: pytest.MonkeyPatch, fake: ScriptedWs) -> ScriptedWs:
+    import proxmox_fleet.ws as ws_module
+
+    monkeypatch.setattr(ws_module, "connect", lambda url, **kw: fake)
+    return fake
+
+
+_TRUENAS_WS_AVAILABLE = {
+    "status": "AVAILABLE",
+    "train": "25.10-STABLE",
+    "version": "TrueNAS-SCALE-25.10.5",
+    "changes": [{"operation": "upgrade", "old": "25.04.2", "new": "25.10.5"}],
+}
+
+
+def test_truenas_scale_ws_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = ScriptedWs(
+        responses={
+            "auth.login_with_api_key": None,
+            "system.version": "TrueNAS-SCALE-25.10.5",
+            "update.check_available": dict(_TRUENAS_WS_AVAILABLE),
+        }
+    )
+    _patch_ws(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_ws", None, "nas-01", config=_api_config()
+    )
+
+    assert not result.error
+    assert result.update_available is True
+    assert result.current == "25.10.5"
+    assert result.latest == "25.10.5"
+    assert "STABLE" in result.summary
+    assert result.adapter == "truenas_scale_ws"
+    assert fake.closed is True
+    assert [c[0] for c in fake.calls] == [
+        "auth.login_with_api_key",
+        "system.version",
+        "update.check_available",
+    ]
+    assert fake.calls[0][1] == ["TEST-KEY"]
+
+
+def test_truenas_scale_ws_connects_to_api_current(monkeypatch: pytest.MonkeyPatch) -> None:
+    import proxmox_fleet.ws as ws_module
+
+    captured = {}
+
+    def _connect(url, **kw):
+        captured["url"] = url
+        captured["verify"] = kw.get("verify")
+        captured["timeout"] = kw.get("timeout")
+        return ScriptedWs(responses={"auth.login_with_api_key": None})
+
+    monkeypatch.setattr(ws_module, "connect", _connect)
+    result = run_manual_update_check(
+        "truenas_scale_ws",
+        None,
+        "nas-01",
+        config=_api_config(verify_ssl=False, timeout=45.0),
+    )
+
+    assert result.error  # no system.version scripted → unscripted rpc
+    assert captured["url"] == "wss://nas-01/api/current"
+    assert captured["verify"] is False
+    assert captured["timeout"] == 45.0
+
+
+def test_truenas_scale_ws_auth_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    from proxmox_fleet.ws import WebSocketError
+
+    fake = ScriptedWs(raises={"auth.login_with_api_key": WebSocketError("bad key")})
+    _patch_ws(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_ws", None, "nas-01", config=_api_config()
+    )
+
+    assert result.error
+    assert "API key rejected" in result.error
+    assert result.unreachable is False
+    assert fake.closed is True
+
+
+def test_truenas_scale_ws_connect_timeout_is_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    import socket
+    import proxmox_fleet.ws as ws_module
+
+    def _connect(url, **kw):
+        raise socket.timeout("timed out")
+
+    monkeypatch.setattr(ws_module, "connect", _connect)
+    result = run_manual_update_check(
+        "truenas_scale_ws", None, "nas-01", config=_api_config()
+    )
+
+    assert result.unreachable is True
+    assert result.error
+
+
+def test_truenas_scale_ws_cert_failure_is_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ssl
+    import proxmox_fleet.ws as ws_module
+
+    def _connect(url, **kw):
+        raise ssl.SSLCertVerificationError("certificate verify failed: self-signed")
+
+    monkeypatch.setattr(ws_module, "connect", _connect)
+    result = run_manual_update_check(
+        "truenas_scale_ws", None, "nas-01", config=_api_config()
+    )
+
+    assert result.error
+    assert result.unreachable is False
+    assert "verify_ssl=false" in result.error
+
+
+def test_truenas_scale_ws_reboot_and_clean(monkeypatch: pytest.MonkeyPatch) -> None:
+    reboot = dict(_TRUENAS_WS_AVAILABLE, status="REBOOT_REQUIRED", REBOOT_REQUIRED=True)
+    fake = ScriptedWs(
+        responses={
+            "auth.login_with_api_key": None,
+            "system.version": "TrueNAS-SCALE-25.10.5",
+            "update.check_available": reboot,
+        }
+    )
+    _patch_ws(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_ws", None, "nas-01", config=_api_config()
+    )
+    assert not result.error
+    assert result.reboot_required is True

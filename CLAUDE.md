@@ -108,7 +108,8 @@ proxmox_fleet/
   history.py               # build_run_summary() + write_history(); history_summary()/read_run() readers
   notifiers.py             # resolve_notifiers(), dispatch() (discord/ntfy/webhook/telegram), ping_deadmans()
   manual_updates.py        # read-only manual-update adapter checks: SSH (TrueNAS midclt /
-                           # OPNsense opnsense-update -c) + REST-API (*_api) adapters;
+                           # OPNsense opnsense-update -c) + REST-API (*_api) + TrueNAS
+                           # WebSocket JSON-RPC (truenas_scale_ws) adapters;
                            # registry + fail-closed parsers
   scan.py                  # --scan: read-only pending-updates walk → pending-*.json (next to history);
                            # runs manual_update adapter checks + reminder notifications
@@ -303,9 +304,11 @@ top-level `manual` mapping (keyed by the stable inventory hostname; fields: `ada
 `changed`/`failed` run totals, the run briefing, or run history.
 
 Each host's `manual_adapter` selects the transport: the default `opnsense`/`truenas_scale` names
-run the fixed SSH checks, while `opnsense_api`/`truenas_scale_api` switch that host to
-manager-side HTTPS checks against the appliance REST API — TrueNAS `/api/v2.0` with a bearer
-token, OPNsense `/api/core` with key/secret headers. Per-host vars (inline key=value in
+run the fixed SSH checks, while `opnsense_api`/`truenas_scale_api`/`truenas_scale_ws` switch that
+host to manager-side HTTPS/WebSocket checks against the appliance API — TrueNAS `/api/v2.0` with
+a bearer token (or the WebSocket JSON-RPC API at `wss://<host>/api/current` via `truenas_scale_ws`,
+for TrueNAS 25.10+ where REST is deprecated and removed in 26), OPNsense `/api/core` HTTP Basic
+(`api_key`:`api_secret`). Per-host vars (inline key=value in
 hosts.ini or `host_vars/<name>.yml`, inline wins): `api_url` (blank → defaults to
 `https://<ansible_host>`), `api_key`, `api_secret` (OPNsense only), `verify_ssl` (default true;
 set `false` for self-signed appliance certs). Both transports are strictly read-only —
