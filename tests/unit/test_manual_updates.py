@@ -831,6 +831,78 @@ def test_truenas_api_urlerror_is_unreachable(monkeypatch: pytest.MonkeyPatch) ->
     assert result.update_available is False
 
 
+def test_truenas_api_cert_verify_failure_is_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A self-signed cert is a config problem, not an unreachable host."""
+    import ssl
+
+    fake = ScriptedHttp(
+        raises={
+            "system/version": ssl.SSLCertVerificationError(
+                "certificate verify failed: self-signed certificate"
+            )
+        }
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_api", None, "nas-01", config=_api_config()
+    )
+
+    assert result.error
+    assert result.unreachable is False
+    assert "verify_ssl=false" in result.error
+    assert "certificate" in result.error
+    assert result.update_available is False
+
+
+def test_truenas_api_cert_verify_failure_wrapped_in_urlerror(monkeypatch: pytest.MonkeyPatch) -> None:
+    """urllib sometimes wraps TLS failures in URLError — still an error."""
+    import ssl
+    from urllib.error import URLError
+
+    fake = ScriptedHttp(
+        raises={
+            "system/version": URLError(
+                ssl.SSLCertVerificationError(
+                    "certificate verify failed: self-signed certificate"
+                )
+            )
+        }
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_api", None, "nas-01", config=_api_config()
+    )
+
+    assert result.error
+    assert result.unreachable is False
+    assert "verify_ssl=false" in result.error
+    assert result.update_available is False
+
+
+def test_opnsense_api_cert_verify_failure_is_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The OPNsense API adapter classifies cert failures the same way."""
+    import ssl
+
+    fake = ScriptedHttp(
+        responses={
+            "firmware/info": HttpResponse(status=200, body='{"version":"24.1.10"}'),
+        },
+        raises={
+            "firmware/check": ssl.SSLCertVerificationError(
+                "certificate verify failed: self-signed certificate"
+            )
+        },
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert result.error
+    assert result.unreachable is False
+    assert "verify_ssl=false" in result.error
+
+
 def test_truenas_api_verify_ssl_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = ScriptedHttp(
         responses={

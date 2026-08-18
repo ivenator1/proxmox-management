@@ -30,12 +30,14 @@ from __future__ import annotations
 
 import json
 import re
+import ssl
 import time
 import urllib.error
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from proxmox_fleet import http
+from proxmox_fleet.http import HttpResponse
 from proxmox_fleet.executor import Executor
 from proxmox_fleet.runner import PrimitiveResult, UnreachableHostError, is_unreachable_error
 
@@ -334,6 +336,19 @@ def _body_excerpt(body: str) -> str:
     return (body or "(empty)").strip().replace("\n", " ")[:300]
 
 
+def _tls_verify_error(name: str, exc: ssl.SSLCertVerificationError) -> str:
+    """Actionable error for a certificate verification failure.
+
+    Classified as an error (not unreachable): a self-signed appliance cert is
+    a per-host config problem — set ``verify_ssl=false`` or install a trusted
+    certificate on the appliance.
+    """
+    return (
+        f"{name}: HTTPS certificate verification failed — set verify_ssl=false "
+        f"for this host (self-signed cert) or install a trusted certificate: {exc}"
+    )
+
+
 class BaseApiManualUpdateAdapter(BaseManualUpdateAdapter):
     """HTTP-API transport for a vendor's read-only update check.
 
@@ -342,6 +357,9 @@ class BaseApiManualUpdateAdapter(BaseManualUpdateAdapter):
 
     - connection-level failures (``URLError``/``OSError``/``TimeoutError``)
       normalize to ``unreachable=True`` — the host could not be reached;
+    - TLS certificate verification failures are **errors, not unreachable** —
+      a self-signed appliance cert is a config problem (``verify_ssl=false``
+      or a trusted cert), not a reachability one, so they fail loudly;
     - HTTP error statuses (4xx/5xx, including 401/403) are genuine errors
       with ``unreachable=False`` — the host answered, the check failed;
     - malformed/unknown payloads fail closed via :class:`ManualUpdateParseError`.
@@ -381,13 +399,54 @@ class BaseApiManualUpdateAdapter(BaseManualUpdateAdapter):
         except urllib.error.HTTPError as exc:
             outcome.error = f"{self.name} API check failed ({exc})"
             return outcome
-        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        except ssl.SSLCertVerificationError as exc:
+            outcome.error = _tls_verify_error(self.name, exc)
+            return outcome
+        except urllib.error.URLError as exc:
+            # urllib wraps TLS failures in URLError; surface them as errors too.
+            if isinstance(exc.reason, ssl.SSLCertVerificationError):
+                outcome.error = _tls_verify_error(self.name, exc.reason)
+                return outcome
+            outcome.unreachable = True
+            outcome.error = f"Host unreachable: {exc}"
+            return outcome
+        except (OSError, TimeoutError) as exc:
             outcome.unreachable = True
             outcome.error = f"Host unreachable: {exc}"
             return outcome
         except Exception as exc:  # noqa: BLE001 - an API check never raises
             outcome.error = f"Manual update check failed: {exc}"
             return outcome
+
+    def _api_request(self, url: str, fn: Callable[[], HttpResponse]) -> HttpResponse:
+        """Run an API HTTP call, annotating connection errors with the URL.
+
+        DNS/refused/timeout failures are diagnosed much faster when the error
+        names the exact URL that failed (e.g. an ``api_url`` hostname that does
+        not resolve). HTTP status errors pass through untouched so callers can
+        inspect ``exc.code``; TLS verification failures keep their type so the
+        caller classifies them as errors, not unreachable.
+        """
+        try:
+            return fn()
+        except urllib.error.HTTPError:
+            raise
+        except ssl.SSLCertVerificationError as exc:
+            raise ssl.SSLCertVerificationError(f"{exc} (while fetching {url})") from exc
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, ssl.SSLCertVerificationError):
+                raise ssl.SSLCertVerificationError(
+                    f"{exc.reason} (while fetching {url})"
+                ) from exc
+            raise urllib.error.URLError(f"{exc} (while fetching {url})") from exc
+        except OSError as exc:
+            raise OSError(f"{exc} (while fetching {url})") from exc
+
+    def _get_json(self, url: str, **kw: Any) -> Any:
+        return self._api_request(url, lambda: http.get_json(url, **kw))
+
+    def _post_json(self, url: str, payload: Any, **kw: Any) -> HttpResponse:
+        return self._api_request(url, lambda: http.post_json(url, payload, **kw))
 
     def _check_api(
         self,
@@ -432,14 +491,17 @@ class TrueNASScaleApiAdapter(BaseApiManualUpdateAdapter):
         timeout = config.timeout
         verify = config.verify_ssl
 
-        version_resp = http.request(
+        version_resp = self._api_request(
             f"{base_url}{self._VERSION_PATH}",
-            method="GET",
-            headers=headers,
-            timeout=timeout,
-            verify=verify,
+            lambda: http.request(
+                f"{base_url}{self._VERSION_PATH}",
+                method="GET",
+                headers=headers,
+                timeout=timeout,
+                verify=verify,
+            ),
         )
-        check_resp = http.post_json(
+        check_resp = self._post_json(
             f"{base_url}{self._CHECK_PATH}",
             {},
             headers=headers,
@@ -621,7 +683,7 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
         timeout = config.timeout
         verify = config.verify_ssl
 
-        info = http.get_json(
+        info = self._get_json(
             f"{base_url}{self._INFO_PATH}",
             headers=headers,
             retries=self._API_RETRIES,
@@ -641,7 +703,7 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
         # Since OPNsense ~22.7 the status endpoint only reports the last
         # check's result — trigger a fresh background check and wait for it so
         # the scan never reports stale state.
-        check_resp = http.post_json(
+        check_resp = self._post_json(
             f"{base_url}{self._CHECK_PATH}",
             {},
             headers=headers,
@@ -657,7 +719,7 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
             )
         self._wait_for_check(base_url, headers, timeout, verify)
 
-        status = http.get_json(
+        status = self._get_json(
             f"{base_url}{self._STATUS_PATH}",
             headers=headers,
             retries=self._API_RETRIES,
@@ -718,7 +780,7 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
         state = ""
         for attempt in range(self._POLL_ATTEMPTS):
             try:
-                progress = http.get_json(
+                progress = self._get_json(
                     f"{base_url}{self._UPGRADE_STATUS_PATH}",
                     headers=headers,
                     retries=self._API_RETRIES,

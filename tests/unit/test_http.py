@@ -63,6 +63,34 @@ def test_post_json_retries_until_ok(monkeypatch):
     assert resp.status == 204
 
 
+def test_post_json_returns_last_response_on_persistent_error_status(monkeypatch):
+    """Every attempt answers with a non-ok status → the last response is returned.
+
+    A persistent 401 must surface as ``HttpResponse(status=401)`` so callers
+    see the real status instead of an opaque "condition never satisfied"
+    RuntimeError (e.g. the TrueNAS check_available path).
+    """
+    seq = iter([HttpResponse(status=401, body="Unauthorized")] * 3)
+    monkeypatch.setattr(http, "request", lambda url, **kw: next(seq))
+    monkeypatch.setattr(http.time, "sleep", lambda _: None)
+    resp = http.post_json("http://x", {}, retries=2, delay=0)
+    assert resp.status == 401
+    assert resp.body == "Unauthorized"
+
+
+def test_post_json_still_raises_connection_errors(monkeypatch):
+    """Connection-level failures (not HTTP statuses) still raise after retries."""
+    import urllib.error
+
+    def boom(url, **kw):
+        raise urllib.error.URLError("no route to host")
+
+    monkeypatch.setattr(http, "request", boom)
+    monkeypatch.setattr(http.time, "sleep", lambda _: None)
+    with pytest.raises(urllib.error.URLError, match="no route"):
+        http.post_json("http://x", {}, retries=2, delay=0)
+
+
 class _FakeResponse:
     """Minimal urlopen return value: enough to satisfy http.request."""
 

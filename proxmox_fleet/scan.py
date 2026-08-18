@@ -680,7 +680,9 @@ def run_fleet_scan(
         if result.get("error") and not result.get("unreachable"):
             failed = True
         if result.get("unreachable"):
-            print(f"  [{host.name}] manual check unreachable — skipped")
+            reason = str(result.get("error") or "").strip()
+            suffix = f" — {reason[:160]}" if reason else ""
+            print(f"  [{host.name}] manual check unreachable — skipped{suffix}")
         elif result.get("error"):
             print(f"  [{host.name}] manual check ERROR: {result['error']}")
         elif result.get("update_available") or result.get("reboot_required"):
