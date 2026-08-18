@@ -1526,3 +1526,127 @@ def test_truenas_scale_ws_reboot_and_clean(monkeypatch: pytest.MonkeyPatch) -> N
     )
     assert not result.error
     assert result.reboot_required is True
+
+
+# --- TrueNAS 25.10+ WS fallback (update.check_available removed) ------------
+
+
+def _ws_25_fake(**responses: Any) -> ScriptedWs:
+    from proxmox_fleet.ws import WebSocketError
+
+    fake = ScriptedWs(
+        responses={
+            "auth.login_with_api_key": None,
+            "system.version": "TrueNAS-SCALE-25.10.5",
+        },
+        raises={
+            "update.check_available": WebSocketError(
+                "TrueNAS update.check_available failed: "
+                "{'code': -32601, 'message': 'Method does not exist'}"
+            )
+        },
+    )
+    fake.responses.update(responses)
+    return fake
+
+
+def test_truenas_scale_ws_25_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    """25.10 removed check_available → available_versions carries the check."""
+    fake = _ws_25_fake(
+        **{
+            "update.available_versions": [
+                {
+                    "train": "TrueNAS-SCALE-Goldeye",
+                    "version": {"version": "25.10.6"},
+                }
+            ],
+            "update.status": {
+                "code": "NORMAL",
+                "status": {
+                    "current_version": {"train": "TrueNAS-SCALE-Goldeye", "matches_profile": True},
+                    "new_version": {"version": "25.10.6"},
+                },
+                "error": None,
+                "update_download_progress": {"percent": 100.0, "description": "Update downloaded."},
+            },
+        }
+    )
+    _patch_ws(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_ws", None, "nas-01", config=_api_config()
+    )
+
+    assert not result.error
+    assert result.update_available is True
+    assert result.current == "25.10.5"
+    assert result.latest == "25.10.6"
+    assert "25.10.5 -> 25.10.6" in result.summary
+    assert any("Update downloaded" in d for d in result.details)
+    methods = [c[0] for c in fake.calls]
+    assert "update.check_available" in methods
+    assert "update.available_versions" in methods
+    assert "update.status" in methods
+
+
+def test_truenas_scale_ws_25_uptodate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty available_versions list → up to date."""
+    fake = _ws_25_fake(
+        **{
+            "update.available_versions": [],
+            "update.status": {
+                "code": "NORMAL",
+                "status": {"current_version": {"train": "TrueNAS-SCALE-Goldeye"}},
+                "error": None,
+                "update_download_progress": None,
+            },
+        }
+    )
+    _patch_ws(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_ws", None, "nas-01", config=_api_config()
+    )
+
+    assert not result.error
+    assert result.update_available is False
+    assert result.reboot_required is False
+    assert "up to date" in result.summary
+
+
+def test_truenas_scale_ws_25_reboot_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A REBOOT status code surfaces the reboot flag."""
+    fake = _ws_25_fake(
+        **{
+            "update.available_versions": [
+                {"train": "TrueNAS-SCALE-Goldeye", "version": {"version": "25.10.6"}}
+            ],
+            "update.status": {"code": "REBOOT_REQUIRED", "status": {}},
+        }
+    )
+    _patch_ws(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_ws", None, "nas-01", config=_api_config()
+    )
+
+    assert not result.error
+    assert result.update_available is True
+    assert result.reboot_required is True
+
+
+def test_truenas_scale_ws_real_25_10_error_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-missing-method JSON-RPC error is not swallowed by the fallback."""
+    from proxmox_fleet.ws import WebSocketError
+
+    fake = ScriptedWs(
+        raises={
+            "auth.login_with_api_key": WebSocketError(
+                "TrueNAS update.check_available failed: {'code': -32603, 'message': 'Internal error'}"
+            )
+        }
+    )
+    _patch_ws(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_ws", None, "nas-01", config=_api_config()
+    )
+
+    assert result.error
+    assert "API key rejected" in result.error
