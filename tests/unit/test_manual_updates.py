@@ -1023,6 +1023,23 @@ def test_opnsense_api_available(monkeypatch: pytest.MonkeyPatch) -> None:
         assert headers.get("X-API-Secret") == "SECRET"
 
 
+def test_opnsense_api_custom_port_via_api_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An api_url with a non-default port (e.g. :8443) is used verbatim."""
+    fake = _opnsense_api_http(monkeypatch, {"status": "nothing_to_do"})
+    result = run_manual_update_check(
+        "opnsense_api",
+        None,
+        "fw-01",
+        config=_api_config(api_secret="SECRET", api_url="https://10.10.10.1:8443"),
+    )
+
+    assert not result.error
+    assert "up to date" in result.summary
+    for _, url, _, _, _ in fake.calls:
+        assert url.startswith("https://10.10.10.1:8443/api/core/firmware/")
+        assert "/firmware/" in url and url.split("?")[0].count(":") >= 1
+
+
 def test_opnsense_api_available_major(monkeypatch: pytest.MonkeyPatch) -> None:
     _opnsense_api_http(
         monkeypatch,
