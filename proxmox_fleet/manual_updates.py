@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, Tuple
@@ -560,14 +561,20 @@ class OpnsenseAdapter(BaseManualUpdateAdapter):
 class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
     """Read-only update check for OPNsense via the REST API.
 
-    ``GET /api/core/firmware/info`` (current version) then
-    ``GET /api/core/firmware/status`` (synchronous mirror check), authenticated
-    with ``X-API-Key``/``X-API-Secret`` headers. Machine status strings map:
-    ``update_available``/``update_available_major`` → update available (target
-    from ``upgrade_version``/``upgrade_major_version`` when present),
-    ``nothing_to_do`` → up to date, ``reboot_required`` → reboot flag,
-    ``connection_failure`` → error, anything else → fail closed. Read-only:
-    no update/apply endpoint is ever invoked.
+    ``GET /api/core/firmware/info`` (current version), then a fresh check is
+    triggered with ``POST /api/core/firmware/check`` and ``GET
+    /api/core/firmware/upgradestatus`` is polled until it finishes — since
+    OPNsense ~22.7 ``GET /api/core/firmware/status`` only reports the *last*
+    check, so without the trigger the monitor would go stale. Finally ``GET
+    /api/core/firmware/status`` is read, authenticated with
+    ``X-API-Key``/``X-API-Secret`` headers. Status mapping covers both the
+    modern machine values and the legacy ``opnsense-update`` strings:
+    ``update``/``update_available``/``update_available_major`` → update
+    available (target from ``upgrade_version``/``upgrade_major_version``/
+    ``status_msg`` when present), ``none``/``nothing_to_do`` → up to date,
+    ``reboot_required`` → reboot flag, ``error``/``connection_failure`` →
+    check error, anything else → fail closed. Read-only: the check endpoint
+    only probes for updates; no update/apply endpoint is ever invoked.
     """
 
     name = "opnsense_api"
@@ -576,14 +583,22 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
     transport = "api"
 
     _INFO_PATH = "/api/core/firmware/info"
+    _CHECK_PATH = "/api/core/firmware/check"
+    _UPGRADE_STATUS_PATH = "/api/core/firmware/upgradestatus"
     _STATUS_PATH = "/api/core/firmware/status"
     _API_RETRIES = 1
     _API_RETRY_DELAY = 10.0
+    # Budget for the background check to finish: 13 × 10s ≈ 2 minutes, in line
+    # with the synchronous SSH check's mirror-contact time.
+    _POLL_ATTEMPTS = 13
+    _POLL_DELAY = 10.0
 
-    _AVAILABLE_STATUSES = ("update_available", "update_available_major")
-    _NO_UPDATE_STATUSES = ("nothing_to_do",)
+    _AVAILABLE_STATUSES = ("update", "update_available", "update_available_major")
+    _NO_UPDATE_STATUSES = ("none", "nothing_to_do")
     _REBOOT_STATUS = "reboot_required"
     _CONNECTION_FAILURE_STATUS = "connection_failure"
+    _ERROR_STATUS = "error"
+    _IN_PROGRESS_STATUSES = ("running",)
 
     def _validate_api_config(self, config: Optional[ManualUpdateApiConfig]) -> None:
         super()._validate_api_config(config)
@@ -623,6 +638,25 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
         outcome.current = current
         outcome.details.append(f"Installed: {current}")
 
+        # Since OPNsense ~22.7 the status endpoint only reports the last
+        # check's result — trigger a fresh background check and wait for it so
+        # the scan never reports stale state.
+        check_resp = http.post_json(
+            f"{base_url}{self._CHECK_PATH}",
+            {},
+            headers=headers,
+            retries=self._API_RETRIES,
+            delay=self._API_RETRY_DELAY,
+            timeout=timeout,
+            verify=verify,
+        )
+        if check_resp.status not in (200, 201, 202, 204):
+            raise ManualUpdateParseError(
+                f"OPNsense update check could not be started (HTTP {check_resp.status}): "
+                f"{_body_excerpt(check_resp.body)}"
+            )
+        self._wait_for_check(base_url, headers, timeout, verify)
+
         status = http.get_json(
             f"{base_url}{self._STATUS_PATH}",
             headers=headers,
@@ -641,6 +675,10 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
             raise ManualUpdateParseError(
                 "OPNsense firmware status response has no 'status' field"
             )
+        if state in self._IN_PROGRESS_STATUSES:
+            raise ManualUpdateParseError(
+                f"OPNsense update check still running (firmware status {state!r})"
+            )
 
         if state in self._AVAILABLE_STATUSES:
             outcome.update_available = True
@@ -658,15 +696,49 @@ class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
         elif state == self._REBOOT_STATUS:
             outcome.reboot_required = True
             outcome.summary = "OPNsense reboot required to complete the pending update"
-        elif state == self._CONNECTION_FAILURE_STATUS:
-            raise ManualUpdateParseError(
-                "OPNsense update check failed: connection_failure (update mirror unreachable)"
-            )
+        elif state in (self._ERROR_STATUS, self._CONNECTION_FAILURE_STATUS):
+            status_msg = str(status.get("status_msg") or "").strip()
+            detail = f": {status_msg}" if status_msg else ""
+            raise ManualUpdateParseError(f"OPNsense update check failed ({state}){detail}")
         else:
             raise ManualUpdateParseError(f"Unknown OPNsense update status: {state!r}")
 
         outcome.details.append(f"Firmware check status: {state}")
         return outcome
+
+    def _wait_for_check(
+        self, base_url: str, headers: Dict[str, str], timeout: float, verify: bool
+    ) -> None:
+        """Block until the background firmware check finishes, or raise.
+
+        Polls ``/api/core/firmware/upgradestatus`` while it reports
+        ``running``. A 404 means no task is registered (the check already
+        finished); any other HTTP error is a real failure.
+        """
+        state = ""
+        for attempt in range(self._POLL_ATTEMPTS):
+            try:
+                progress = http.get_json(
+                    f"{base_url}{self._UPGRADE_STATUS_PATH}",
+                    headers=headers,
+                    retries=self._API_RETRIES,
+                    delay=self._API_RETRY_DELAY,
+                    timeout=timeout,
+                    verify=verify,
+                )
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    raise
+                return
+            state = str((progress or {}).get("status") or "").strip() if isinstance(progress, dict) else ""
+            if state not in self._IN_PROGRESS_STATUSES:
+                return
+            if attempt < self._POLL_ATTEMPTS - 1:
+                time.sleep(self._POLL_DELAY)
+        raise ManualUpdateParseError(
+            f"OPNsense update check still running after "
+            f"{self._POLL_ATTEMPTS * self._POLL_DELAY:.0f}s (upgradestatus {state!r})"
+        )
 
 
 def _split_sections(res: PrimitiveResult, label: str) -> Tuple[str, str]:
@@ -793,6 +865,13 @@ def _opnsense_upgrade_target(status: Dict[str, Any]) -> str:
             token = _release_token(value)
             if token:
                 return token
+    # Modern OPNsense advertises the release inside status_msg, e.g.
+    # "A new version of OPNsense 25.1.6 is available." — scan it defensively.
+    message = status.get("status_msg")
+    if isinstance(message, str):
+        token = _parse_opnsense_release(message)
+        if token:
+            return token
     return ""
 
 

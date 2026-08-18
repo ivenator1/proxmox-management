@@ -910,12 +910,19 @@ def test_run_fleet_scan_manual_api_host_builds_no_executor(tmp_path, monkeypatch
     calls = []
 
     def _get_json(url, **kw):
-        calls.append((url, kw))
+        calls.append(("GET", url, kw))
+        if "firmware/upgradestatus" in url:
+            return {"status": "done"}
         if "firmware/status" in url:
             return {"status": "nothing_to_do"}
         return {"version": "24.1.10"}
 
+    def _post_json(url, payload, **kw):
+        calls.append(("POST", url, kw))
+        return http_mod.HttpResponse(status=200, body="{}")
+
     monkeypatch.setattr(http_mod, "get_json", _get_json)
+    monkeypatch.setattr(http_mod, "post_json", _post_json)
     settings = GlobalSettings(
         fleet_history_dir=str(tmp_path / "hist"),
         manual_update_notifications=False,
@@ -925,8 +932,10 @@ def test_run_fleet_scan_manual_api_host_builds_no_executor(tmp_path, monkeypatch
 
     assert rc == 0
     assert constructions == []  # API transport never builds an SSH executor
-    assert len(calls) == 2
-    for url, kw in calls:
+    # info, check POST, upgradestatus, status
+    assert [c[0] for c in calls] == ["GET", "POST", "GET", "GET"]
+    assert calls[1][1].endswith("/api/core/firmware/check")
+    for _, url, kw in calls:
         assert url.startswith("https://10.0.0.1/api/core/firmware/")
         assert kw["timeout"] == 7.0  # settings.manual_update_api_timeout
         assert kw["verify"] is False  # per-host verify_ssl=false

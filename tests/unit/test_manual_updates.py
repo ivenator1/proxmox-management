@@ -621,14 +621,15 @@ def test_result_full_shape_on_unreachable() -> None:
 class ScriptedHttp:
     """Scripted fake for proxmox_fleet.http: URL substring → response/exception.
 
-    ``responses`` maps a URL substring to an HttpResponse; ``raises`` maps a
-    URL substring to an exception to raise instead. Every call is recorded so
+    ``responses`` maps a URL substring to an HttpResponse (or a list of them
+    served in order, like ScriptedManualExecutor); ``raises`` maps a URL
+    substring to an exception to raise instead. Every call is recorded so
     tests can assert on method, URL, headers, timeout, and verify.
     """
 
     def __init__(
         self,
-        responses: Optional[Dict[str, HttpResponse]] = None,
+        responses: Optional[Dict[str, Any]] = None,
         raises: Optional[Dict[str, Exception]] = None,
     ) -> None:
         self.responses = responses or {}
@@ -641,6 +642,10 @@ class ScriptedHttp:
                 raise exc
         for key, resp in self.responses.items():
             if key in url:
+                if isinstance(resp, list):
+                    if not resp:
+                        raise AssertionError(f"scripted sequence exhausted for: {url}")
+                    return resp.pop(0)
                 return resp
         raise AssertionError(f"unscripted URL: {url}")
 
@@ -881,11 +886,34 @@ def test_truenas_api_never_calls_executor(monkeypatch: pytest.MonkeyPatch) -> No
 # --- OPNsense API -----------------------------------------------------------
 
 
-def _opnsense_api_http(monkeypatch: pytest.MonkeyPatch, status: Dict[str, Any]) -> ScriptedHttp:
+def _opnsense_api_http(
+    monkeypatch: pytest.MonkeyPatch,
+    status: Dict[str, Any],
+    *,
+    progress: Any = None,
+) -> ScriptedHttp:
+    """Script the full OPNsense flow: info → check POST → upgradestatus → status.
+
+    ``progress`` overrides the upgradestatus payload(s) — pass a list to
+    script a sequence (e.g. running → running → done).
+    """
+
+    def _as_resp(value: Any) -> Any:
+        if isinstance(value, list):
+            return [_as_resp(v) for v in value]
+        if isinstance(value, HttpResponse):
+            return value
+        return HttpResponse(status=200, body=json.dumps(value))
+
     fake = ScriptedHttp(
         responses={
             "firmware/info": HttpResponse(
-                status=200, body='{"product":{"product_name":"OPNsense","product_version":"24.1.10"},"version":"24.1.10"}'
+                status=200,
+                body='{"product":{"product_name":"OPNsense","product_version":"24.1.10"},"version":"24.1.10"}',
+            ),
+            "firmware/check": HttpResponse(status=200, body="{}"),
+            "firmware/upgradestatus": _as_resp(
+                progress if progress is not None else {"status": "done"}
             ),
             "firmware/status": HttpResponse(status=200, body=json.dumps(status)),
         }
@@ -915,8 +943,8 @@ def test_opnsense_api_available(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "Components: base system, kernel, packages" in result.details
     assert result.adapter == "opnsense_api"
     assert result.display_name == "OPNsense"
-    # Key/secret headers on both calls, default https://<host> base URL.
-    assert len(fake.calls) == 2
+    # Key/secret headers on all calls, default https://<host> base URL.
+    assert len(fake.calls) == 4  # info, check POST, upgradestatus, status
     for _, url, headers, _, _ in fake.calls:
         assert url.startswith("https://fw-01/api/core/firmware/")
         assert headers.get("X-API-Key") == "TEST-KEY"
@@ -1021,6 +1049,8 @@ def test_opnsense_api_urlerror_is_unreachable(monkeypatch: pytest.MonkeyPatch) -
     fake = ScriptedHttp(
         responses={
             "firmware/info": HttpResponse(status=200, body='{"version":"24.1.10"}'),
+            "firmware/check": HttpResponse(status=200, body="{}"),
+            "firmware/upgradestatus": HttpResponse(status=200, body='{"status":"done"}'),
         },
         raises={"firmware/status": URLError("timed out")},
     )
@@ -1034,6 +1064,134 @@ def test_opnsense_api_urlerror_is_unreachable(monkeypatch: pytest.MonkeyPatch) -
     assert result.update_available is False
 
 
+def test_opnsense_api_never_calls_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The OPNsense API adapter also ignores the executor entirely."""
+    ex = ScriptedManualExecutor()  # raises if any command runs
+    _opnsense_api_http(monkeypatch, {"status": "nothing_to_do"})
+    result = run_manual_update_check(
+        "opnsense_api", ex, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert not result.error
+    assert ex.commands == []
+
+
+def test_opnsense_api_triggers_check_before_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The adapter kicks a fresh check and polls upgradestatus before reading status."""
+    fake = _opnsense_api_http(monkeypatch, {"status": "nothing_to_do"})
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert not result.error
+    methods = [call[0] for call in fake.calls]
+    urls = [call[1] for call in fake.calls]
+    assert methods == ["GET", "POST", "GET", "GET"]
+    assert urls[0].endswith("/api/core/firmware/info")
+    assert urls[1].endswith("/api/core/firmware/check")
+    assert urls[2].endswith("/api/core/firmware/upgradestatus")
+    assert urls[3].endswith("/api/core/firmware/status")
+
+
+def test_opnsense_api_polls_while_check_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    """upgradestatus running → done: the adapter waits between polls."""
+    sleeps = []
+    monkeypatch.setattr(
+        "proxmox_fleet.manual_updates.time.sleep", lambda secs: sleeps.append(secs)
+    )
+    fake = _opnsense_api_http(
+        monkeypatch,
+        {"status": "nothing_to_do"},
+        progress=[{"status": "running"}, {"status": "running"}, {"status": "done"}],
+    )
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert not result.error
+    assert "up to date" in result.summary
+    upgradestatus_calls = [c for c in fake.calls if "upgradestatus" in c[1]]
+    assert len(upgradestatus_calls) == 3
+    assert sleeps == [10.0, 10.0]
+
+
+def test_opnsense_api_upgradestatus_404_proceeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 404 from upgradestatus (task already finished) is not a failure."""
+    from email.message import Message
+    from urllib.error import HTTPError
+
+    hdrs = Message()
+    fake = ScriptedHttp(
+        responses={
+            "firmware/info": HttpResponse(status=200, body='{"version":"24.1.10"}'),
+            "firmware/check": HttpResponse(status=200, body="{}"),
+            "firmware/status": HttpResponse(status=200, body='{"status":"nothing_to_do"}'),
+        },
+        raises={
+            "firmware/upgradestatus": HTTPError(
+                "https://fw-01/api/core/firmware/upgradestatus", 404, "Not Found", hdrs, None
+            )
+        },
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert not result.error
+    assert "up to date" in result.summary
+
+
+def test_opnsense_api_check_running_exhausts_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A check that never finishes fails closed after the poll budget."""
+    monkeypatch.setattr(
+        "proxmox_fleet.manual_updates.time.sleep", lambda secs: None
+    )
+    _opnsense_api_http(
+        monkeypatch, {"status": "nothing_to_do"}, progress={"status": "running"}
+    )
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert result.error
+    assert "still running" in result.error
+    assert result.unreachable is False
+    assert result.update_available is False
+
+
+def test_opnsense_api_modern_status_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Modern OPNsense returns update/none/error from the status endpoint."""
+    _opnsense_api_http(
+        monkeypatch,
+        {"status": "update", "status_msg": "A new version of OPNsense 25.1.6 is available."},
+    )
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert not result.error
+    assert result.update_available is True
+    assert result.latest == "25.1.6"
+    assert "25.1.6" in result.summary
+
+    _opnsense_api_http(monkeypatch, {"status": "none"})
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+    assert not result.error
+    assert result.update_available is False
+    assert "up to date" in result.summary
+
+    _opnsense_api_http(monkeypatch, {"status": "error", "status_msg": "check aborted"})
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+    assert result.error
+    assert "check aborted" in result.error
+    assert result.unreachable is False
+
+
 def test_api_adapters_reject_http_error_status(monkeypatch: pytest.MonkeyPatch) -> None:
     """HTTPError from the GET path (e.g. 403) is an error, not unreachable."""
     from email.message import Message
@@ -1041,7 +1199,11 @@ def test_api_adapters_reject_http_error_status(monkeypatch: pytest.MonkeyPatch) 
 
     hdrs = Message()
     fake = ScriptedHttp(
-        responses={"firmware/info": HttpResponse(status=200, body='{"version":"24.1.10"}')},
+        responses={
+            "firmware/info": HttpResponse(status=200, body='{"version":"24.1.10"}'),
+            "firmware/check": HttpResponse(status=200, body="{}"),
+            "firmware/upgradestatus": HttpResponse(status=200, body='{"status":"done"}'),
+        },
         raises={
             "firmware/status": HTTPError(
                 "https://fw-01/api/core/firmware/status", 403, "Forbidden", hdrs, None

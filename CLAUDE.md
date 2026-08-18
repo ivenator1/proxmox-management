@@ -313,6 +313,15 @@ version/status endpoints only, never apply/update endpoints — and share the sa
 dashboard/ledger/notification handling, and overlap guard; applying the update remains a manual
 GUI action in both.
 
+Credentials: OPNsense API keys come from a dedicated user (System → Access → Users) with the
+single **System: Firmware** privilege — OPNsense ACLs are page-level with no read-only variant,
+so the key also *could* hit write endpoints; never use the admin key. TrueNAS SCALE keys are
+generated under the top-right user menu → API Keys and are shown only once; the key inherits the
+account's permissions. The `opnsense_api` adapter never trusts cached state: since OPNsense
+~22.7 `GET /api/core/firmware/status` only reports the *last* check, it POSTs
+`/api/core/firmware/check` and polls `/api/core/firmware/upgradestatus` (404 = already done,
+bounded ~2 min budget) before reading status, so the monitor cannot go stale.
+
 - **Inventory** (`inventory.py`): `[manual_update_hosts]` entries need a non-blank
   `manual_adapter` (inline or host_vars) — fails loud at load time, before host contact.
   `validate_manual_update_overlap()` rejects a hostname that also appears in `[remote_hosts]`,
