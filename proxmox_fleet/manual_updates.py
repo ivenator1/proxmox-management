@@ -292,8 +292,8 @@ def _apply_truenas_payload(
 ) -> None:
     """Normalize a TrueNAS ``update.check_available`` payload into *outcome*.
 
-    Shared by the midclt (SSH) and REST adapters so both transports produce
-    identical current/latest/summary/detail fields. Raises
+    Shared by the midclt (SSH), REST, and legacy WebSocket paths so all
+    transports produce identical current/latest/summary/detail fields. Raises
     :class:`ManualUpdateParseError` on unknown status values (fail closed).
     """
     changes = payload.get("changes")
@@ -332,6 +332,70 @@ def _apply_truenas_payload(
 
     _append_changes(outcome, changes)
     _append_notice(outcome, payload)
+
+
+def _truenas_method_missing(exc: WebSocketError) -> bool:
+    """True whether the JSON-RPC failure is a missing method (-32601)."""
+    text = str(exc)
+    return "-32601" in text or "Method does not exist" in text
+
+
+def _apply_truenas_25_payload(
+    outcome: ManualUpdateResult, version_text: str, conn: Any
+) -> None:
+    """Normalize the TrueNAS 25.10+ update payloads into *outcome*.
+
+    TrueNAS 25.10 removed ``update.check_available``; the check result lives
+    in ``update.available_versions`` (a list of ``{train, version: {version}}``
+    — empty means up to date) and ``update.status`` (train context, downloaded
+    progress, reboot code). ``conn`` is a live WebSocket JSON-RPC connection.
+    """
+    outcome.current = _component_version(version_text) or ""
+    available = conn.rpc("update.available_versions", [])
+    status = conn.rpc("update.status", [])
+    status_map = status if isinstance(status, dict) else {}
+
+    current_train = ""
+    st = status_map.get("status")
+    if isinstance(st, dict):
+        cv = st.get("current_version")
+        if isinstance(cv, dict):
+            current_train = str(cv.get("train") or "")
+
+    entries = [e for e in available if isinstance(e, dict)] if isinstance(available, list) else []
+    if not entries:
+        outcome.summary = "TrueNAS is up to date"
+        return
+
+    chosen = next((e for e in entries if e.get("train") == current_train), entries[0])
+    latest = ""
+    v = chosen.get("version")
+    if isinstance(v, dict):
+        latest = _truenas_version(str(v.get("version") or ""))
+    outcome.update_available = True
+    outcome.latest = latest
+    if outcome.current and latest:
+        outcome.summary = f"TrueNAS update available: {outcome.current} -> {latest}"
+    elif latest:
+        outcome.summary = f"TrueNAS update available: {latest}"
+    else:
+        outcome.summary = "TrueNAS update available"
+
+    code = str(status_map.get("code") or "").strip()
+    if "REBOOT" in code.upper():
+        outcome.reboot_required = True
+    progress = status_map.get("update_download_progress")
+    if isinstance(progress, dict):
+        percent = progress.get("percent")
+        description = str(progress.get("description") or "").strip()
+        try:
+            downloaded = percent is not None and float(percent) >= 100.0
+        except (TypeError, ValueError):
+            downloaded = False
+        if downloaded:
+            outcome.details.append("Update downloaded — apply it in the TrueNAS GUI to finish.")
+        elif description:
+            outcome.details.append(f"Update download: {description}")
 
 
 def _body_excerpt(body: str) -> str:
@@ -582,16 +646,22 @@ class TrueNASScaleWsAdapter(BaseApiManualUpdateAdapter):
                 raise ManualUpdateParseError(
                     f"TrueNAS API key rejected: {exc}"
                 ) from exc
-            version = conn.rpc("system.version", [])
-            payload = conn.rpc("update.check_available", [])
+            version_text = str(conn.rpc("system.version", []) or "")
+            try:
+                payload = conn.rpc("update.check_available", [])
+                if not isinstance(payload, dict):
+                    raise ManualUpdateParseError(
+                        "TrueNAS update.check_available returned a non-object value"
+                    )
+                _apply_truenas_payload(outcome, version_text, payload)
+            except WebSocketError as exc:
+                if not _truenas_method_missing(exc):
+                    raise
+                # TrueNAS 25.10+ removed update.check_available; the check
+                # result lives in update.available_versions + update.status.
+                _apply_truenas_25_payload(outcome, version_text, conn)
         finally:
             conn.close()
-
-        if not isinstance(payload, dict):
-            raise ManualUpdateParseError(
-                "TrueNAS update.check_available returned a non-object value"
-            )
-        _apply_truenas_payload(outcome, str(version or ""), payload)
         return outcome
 
 
