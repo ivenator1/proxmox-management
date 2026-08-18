@@ -90,6 +90,16 @@ class GlobalSettings(BaseModel):
     remote_kuma_map: Dict[str, Any] = Field(default_factory=dict)
     remote_forks: int = 5
 
+    # Read-only manual-adapter settings (scan-tracked hosts; never auto-updated).
+    # Scan/reminder path only — deliberately NOT accepted as -e extra vars.
+    manual_update_notifications: bool = True
+    manual_update_reminder_hours: int = 24
+    manual_update_forks: int = 2
+    # Per-request timeout for the *_api manual-update adapters. OPNsense
+    # firmware/status performs its mirror check synchronously and can exceed
+    # the 30s http default; TrueNAS check_available is likewise slow.
+    manual_update_api_timeout: float = 120.0
+
     # node_update / manager phase settings (Phase 2 + Phase 3)
     node_dry_run: bool = False
     node_auto_reboot: bool = True

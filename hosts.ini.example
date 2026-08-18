@@ -78,3 +78,46 @@ ansible_python_interpreter=/usr/bin/python3
 ansible_user=root
 ansible_ssh_private_key_file=~/.ssh/id_ed25519
 ansible_python_interpreter=/usr/bin/python3
+
+# Appliances updated MANUALLY (initially TrueNAS SCALE and OPNsense). The
+# fleet never applies updates to these; `fleet-update --scan` only runs the
+# adapter's fixed read-only vendor checks and reminds you to use the GUI.
+#
+# Every host needs manual_adapter=<name>; supported
+# names are validated by the scan, and a missing/blank adapter fails loudly at
+# inventory load time, before any host is contacted.
+#
+# Overlap safety: a hostname here must NOT also appear in any auto-update group
+# ([remote_hosts], [proxmox_vms], [custom_hosts], [proxmox_nodes]) — that
+# overlap is rejected loudly so no machine is both manually and automatically
+# updated. MIGRATION: moving a host from an auto-update group into
+# [manual_update_hosts] is a one-line change (delete the old line, add it here
+# with manual_adapter=) before running either scan or update.
+#
+# Optional per-host display_name (label for reports/reminders) and apply_hint
+# (free-form note, e.g. when the update should be applied). Values containing
+# spaces go in host_vars/<name>.yml (inline hosts.ini values must be single
+# tokens):
+#   # host_vars/truenas.yml →  display_name: "TrueNAS"
+#   #                          apply_hint: "TrueNAS GUI → System Settings → Update"
+#
+# Optional HTTP-API transport: set manual_adapter=opnsense_api or
+# truenas_scale_api to run the checks manager-side over the appliance REST API
+# instead of SSH; the plain opnsense/truenas_scale (SSH) names above remain
+# the default. Per-host vars (inline key=value or host_vars/<name>.yml, inline
+# wins): api_url (blank → defaults to https://<ansible_host>), api_key (TrueNAS
+# bearer token / OPNsense API key), api_secret (OPNsense only — key/secret
+# pair), verify_ssl (default true; set verify_ssl=false for self-signed
+# appliance certs). API credentials are secrets — keep them in hosts.ini
+# (gitignored) or host_vars/ (gitignored), never in a committed file.
+[manual_update_hosts]
+# truenas  ansible_host=10.10.10.30  manual_adapter=truenas_scale
+# firewall ansible_host=10.10.10.1   manual_adapter=opnsense
+# API transport variants:
+# firewall ansible_host=10.10.10.1   manual_adapter=opnsense_api  api_key=...  api_secret=...
+# truenas  ansible_host=10.10.10.30  manual_adapter=truenas_scale_api  api_key=...  verify_ssl=false
+
+[manual_update_hosts:vars]
+ansible_user=root
+ansible_ssh_private_key_file=~/.ssh/id_ed25519
+ansible_python_interpreter=/usr/bin/python3

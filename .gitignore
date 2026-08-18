@@ -1,5 +1,7 @@
+# Inventory + per-host vars — both may hold secrets (e.g. manual-update API keys)
 vars.yml
 hosts.ini
+host_vars/
 session_notes.md
 __pycache__/
 *.pyc

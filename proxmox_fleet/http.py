@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import socket
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -37,16 +38,27 @@ def request(
     headers: Optional[Dict[str, str]] = None,
     data: Optional[bytes] = None,
     timeout: float = 30.0,
+    verify: bool = True,
 ) -> HttpResponse:
     """Single HTTP request. Raises urllib.error.HTTPError on 4xx/5xx.
 
     Sets a browser-like ``User-Agent`` by default — urllib's stock
     ``Python-urllib/x.y`` is blocked by Cloudflare-fronted hosts (e.g. Discord
     webhooks return 403 Forbidden) unless overridden via ``headers``.
+
+    ``verify=False`` disables TLS certificate verification (for appliances
+    with self-signed certs); the default keeps urllib's verified context.
     """
     req_headers = {"User-Agent": "proxmox-fleet/1.0", **(headers or {})}
     req = urllib.request.Request(url, data=data, method=method, headers=req_headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # nosec B310 - operator-controlled URLs
+    if verify:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # nosec B310 - operator-controlled URLs
+            raw = resp.read().decode("utf-8", errors="replace")
+            return HttpResponse(status=resp.status, body=raw, headers=dict(resp.headers.items()))
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:  # noqa: S310  # nosec B310 - operator-controlled URLs
         raw = resp.read().decode("utf-8", errors="replace")
         return HttpResponse(status=resp.status, body=raw, headers=dict(resp.headers.items()))
 
@@ -58,11 +70,12 @@ def get_json(
     retries: int = 0,
     delay: float = 10.0,
     timeout: float = 30.0,
+    verify: bool = True,
 ) -> Any:
     """GET a URL and parse JSON, with optional retry on transient errors."""
 
     def _once() -> Any:
-        return request(url, method="GET", headers=headers, timeout=timeout).json()
+        return request(url, method="GET", headers=headers, timeout=timeout, verify=verify).json()
 
     return retry(_once, retries=retries, delay=delay, exceptions=(urllib.error.URLError, OSError))
 
@@ -76,6 +89,7 @@ def post_json(
     delay: float = 10.0,
     ok_statuses: tuple = (200, 201, 202, 204),
     timeout: float = 30.0,
+    verify: bool = True,
 ) -> HttpResponse:
     """POST a JSON body; retry until status is in ``ok_statuses``."""
     body = json.dumps(payload).encode("utf-8")
@@ -83,7 +97,7 @@ def post_json(
 
     def _once() -> HttpResponse:
         try:
-            return request(url, method="POST", headers=hdrs, data=body, timeout=timeout)
+            return request(url, method="POST", headers=hdrs, data=body, timeout=timeout, verify=verify)
         except urllib.error.HTTPError as exc:
             return HttpResponse(status=exc.code, body=exc.read().decode("utf-8", "replace"))
 

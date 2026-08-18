@@ -294,10 +294,22 @@
       <span class="value">{{ pending_row.security_pending }}</span>
     </div>
     <div
-      class="stat {% if not pending_row.reboot_hosts %}zero{% endif %} {% if pending_row.reboot_hosts %}tint-warn{% endif %}"
+      class="stat {% if not pending_row.get('reboot_hosts') %}zero{% endif %} {% if pending_row.get('reboot_hosts') %}tint-warn{% endif %}"
     >
       <span class="label">reboot required</span>
-      <span class="value">{{ pending_row.reboot_hosts }}</span>
+      <span class="value">{{ pending_row.get("reboot_hosts", 0) }}</span>
+    </div>
+    <div
+      class="stat {% if not pending_row.get('manual_updates') %}zero{% endif %} {% if pending_row.get('manual_updates') %}tint-warn{% endif %}"
+    >
+      <span class="label">manual updates</span>
+      <span class="value">{{ pending_row.get("manual_updates", 0) }}</span>
+    </div>
+    <div
+      class="stat {% if not pending_row.get('manual_reboots') %}zero{% endif %} {% if pending_row.get('manual_reboots') %}tint-warn{% endif %}"
+    >
+      <span class="label">manual reboots</span>
+      <span class="value">{{ pending_row.get("manual_reboots", 0) }}</span>
     </div>
     <div
       class="stat {% if not pending_row.errors %}zero{% endif %} {% if pending_row.errors %}tint-fail{% endif %}"

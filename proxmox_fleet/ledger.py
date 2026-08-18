@@ -41,6 +41,14 @@ version is stored but no event is emitted. A later change of ``version_id``
 (falling back to ``pretty_name``) appends
 ``{"type": "os-upgrade", "host", "from", "to", "ts"}``.
 
+Manual systems (TrueNAS SCALE / OPNsense etc., the pending scan's top-level
+``manual`` mapping) are observed the same way but *only* for their OS
+release/version: the ``current`` version is synthesised into an
+``os_release`` (baseline, then an ``os-upgrade`` event on change). They never
+gain run metadata (``last_run_ts``/``last_status``/``last_changed_ts``) — a
+manual system is updated by an admin, not by the fleet run, so it must never
+count toward applied-update totals or the auto-update timeline.
+
 The ledger never fails a run or scan: :func:`read_ledger` returns a fresh
 empty ledger on any read problem, and the observe functions swallow write
 errors (an auxiliary accumulator must not abort the fleet update).
@@ -215,6 +223,7 @@ def _observe_release(
     entry: Mapping[str, Any],
     ts: str,
     events: List[Dict[str, Any]],
+    release: Optional[Mapping[str, Any]] = None,
 ) -> bool:
     """Record one entry's os_release; emit an os-upgrade event on change.
 
@@ -222,9 +231,12 @@ def _observe_release(
     A change of the resolved version (``version_id``, else ``pretty_name``)
     prepends ``{"type": "os-upgrade", "host", "from", "to", "ts"}`` (newest
     first) and drops anything beyond the newest 100. Returns True when the
-    ledger changed.
+    ledger changed. *release* defaults to the entry's own ``os_release``
+    field; callers may pass a synthesised release instead (manual entries
+    report a bare ``current`` version, not an os-release dict).
     """
-    release = entry.get("os_release")
+    if release is None:
+        release = entry.get("os_release")
     if not isinstance(release, Mapping):
         return False
     new_ver = _os_version(release)
@@ -249,11 +261,30 @@ def _observe_release(
     return True
 
 
+def _manual_os_release(entry: Mapping[str, Any]) -> Optional[Dict[str, str]]:
+    """Synthesise an ``os_release`` from a manual entry's ``current`` version.
+
+    Manual systems (TrueNAS SCALE / OPNsense) report a bare ``current``
+    version string rather than an os-release dict, so the shared
+    release-observation path needs one synthesised with the version as the
+    comparable ``version_id``. Returns None when no useful ``current`` data
+    exists (unreachable/errored entries, or a not-yet-queried one) — the
+    ledger never invents a version for a system it could not read.
+    """
+    version = str(entry.get("current") or "").strip()
+    if not version:
+        return None
+    adapter = str(entry.get("adapter") or "")
+    display = str(entry.get("display_name") or "")
+    return {"id": adapter, "version_id": version, "pretty_name": display or version}
+
+
 def observe_scan(history_dir: Union[str, Path], scan: Mapping[str, Any]) -> None:
     """Fold one pending scan into the ledger; emit OS-upgrade events.
 
     Host entries keep their snapshot name; lxc entries are normalised to
-    ``node/id``. Entries without a usable ``os_release`` are skipped. Never
+    ``node/id``; manual entries keep their snapshot key (the stable inventory
+    hostname). Entries without a usable ``os_release`` are skipped. Never
     raises.
     """
     if not isinstance(scan, Mapping):
@@ -275,6 +306,15 @@ def observe_scan(history_dir: Union[str, Path], scan: Mapping[str, Any]) -> None
                 host_key = _scan_lxc_key(str(key), entry)
                 if host_key is not None:
                     changed |= _observe_release(hosts, host_key, entry, ts, events)
+    manual_map = scan.get("manual")
+    if isinstance(manual_map, Mapping):
+        for key, entry in manual_map.items():
+            if not isinstance(entry, Mapping):
+                continue
+            release = _manual_os_release(entry)
+            if release is None:
+                continue
+            changed |= _observe_release(hosts, str(key), entry, ts, events, release=release)
     if changed:
         try:
             _write_ledger(history_dir, data)

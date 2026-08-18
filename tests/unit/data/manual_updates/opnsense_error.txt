@@ -1,0 +1,4 @@
+OPNsense 24.1.10 (amd64/OpenSSL)
+@@MANUAL_UPDATE_SEPARATOR@@
+Fetching changelog entries...
+Cannot fetch changelog: mirror unreachable

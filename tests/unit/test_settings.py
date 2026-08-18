@@ -223,3 +223,53 @@ def test_pve_clusters_loads_from_yaml(tmp_path):
     assert s.pve_api_token_secret == "global-secret"
     assert s.pve_clusters["beta"].pve_api_token_secret == "beta-secret"
     assert s.pve_clusters["beta"].pve_api_user == ""
+
+
+# --- manual_update settings (scan-only, no -e support) -----------------------
+
+
+def test_manual_update_settings_defaults():
+    s = GlobalSettings()
+    assert s.manual_update_notifications is True
+    assert s.manual_update_reminder_hours == 24
+    assert s.manual_update_forks == 2
+
+
+def test_manual_update_settings_load_from_yaml(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text(
+        "manual_update_notifications: false\n"
+        "manual_update_reminder_hours: 48\n"
+        "manual_update_forks: 4\n"
+    )
+    s = GlobalSettings.load(f)
+    assert s.manual_update_notifications is False
+    assert s.manual_update_reminder_hours == 48
+    assert s.manual_update_forks == 4
+
+
+def test_manual_update_settings_missing_file_keeps_defaults(tmp_path):
+    s = GlobalSettings.load(tmp_path / "nonexistent.yml")
+    assert s.manual_update_notifications is True
+    assert s.manual_update_reminder_hours == 24
+    assert s.manual_update_forks == 2
+
+
+def test_manual_update_settings_accept_missing_keys_in_yaml(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text("kuma_url: http://kuma:3001\n")
+    s = GlobalSettings.load(f)
+    assert s.manual_update_notifications is True
+    assert s.manual_update_reminder_hours == 24
+    assert s.manual_update_forks == 2
+
+
+def test_manual_update_settings_int_types(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text(
+        "manual_update_reminder_hours: 12\n"
+        "manual_update_forks: 1\n"
+    )
+    s = GlobalSettings.load(f)
+    assert s.manual_update_reminder_hours == 12
+    assert s.manual_update_forks == 1

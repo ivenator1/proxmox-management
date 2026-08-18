@@ -1,0 +1,3 @@
+TrueNAS-SCALE-24.10.0.1
+@@MANUAL_UPDATE_SEPARATOR@@
+{"status": "AVAILABLE", "changes": [{"operation": "upgrade", "old": "TrueNAS-SCALE-23.10.0.1", "new": "TrueNAS-SCALE-24.04.0"}], "train": "STABLE", "version": "TrueNAS-SCALE-24.04.0", "notice": null}

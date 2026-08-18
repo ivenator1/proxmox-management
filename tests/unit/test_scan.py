@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
+import pytest
+
 from proxmox_fleet import http as http_mod
 from proxmox_fleet import scan as scan_mod
 from proxmox_fleet.models.settings import GlobalSettings
@@ -837,11 +839,293 @@ def test_run_fleet_scan_error_sets_exit_code(tmp_path, monkeypatch):
     assert rc == 1
 
 
+_TRUENAS_AVAILABLE = """\
+TrueNAS-SCALE-24.10.2.2
+@@MANUAL_UPDATE_SEPARATOR@@
+{"status":"AVAILABLE","version":"TrueNAS-SCALE-25.04.2.1","train":"25.04-STABLE","changes":[]}
+"""
+
+
+def test_run_fleet_scan_persists_manual_host_and_overrides(tmp_path, monkeypatch):
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[manual_update_hosts]\n"
+        "truenas ansible_host=10.0.0.30 manual_adapter=truenas_scale\n"
+        "[remote_hosts]\n[proxmox_nodes]\n[proxmox_vms]\n[custom_hosts]\n",
+        encoding="utf-8",
+    )
+    host_vars = tmp_path / "host_vars"
+    host_vars.mkdir()
+    (host_vars / "truenas.yml").write_text(
+        "display_name: Storage NAS\napply_hint: Open the maintenance UI\n",
+        encoding="utf-8",
+    )
+    constructions = []
+
+    def _factory(host, **kw):
+        constructions.append((host, kw))
+        return ScriptedExecutor(script={"midclt": [_ok(_TRUENAS_AVAILABLE)]})
+
+    _patch_executors(monkeypatch, _factory)
+    settings = GlobalSettings(
+        fleet_history_dir=str(tmp_path / "hist"),
+        host_vars_dir=str(host_vars),
+        manual_update_notifications=False,
+    )
+    rc = scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv))
+
+    assert rc == 0
+    assert constructions == [("truenas", {"inventory": str(inv), "check": False})]
+    latest = json.loads((tmp_path / "hist" / "pending-latest.json").read_text())
+    assert latest["manual"]["truenas"] == {
+        "host": "truenas",
+        "display_name": "Storage NAS",
+        "adapter": "truenas_scale",
+        "current": "24.10.2.2",
+        "latest": "25.04.2.1",
+        "update_available": True,
+        "reboot_required": False,
+        "summary": "TrueNAS update available: 24.10.2.2 -> 25.04.2.1 (train 25.04-STABLE)",
+        "details": [],
+        "apply_hint": "Open the maintenance UI",
+        "unreachable": False,
+        "error": None,
+    }
+
+
+def test_run_fleet_scan_manual_api_host_builds_no_executor(tmp_path, monkeypatch):
+    """API-transport manual hosts run manager-side HTTPS; no RunnerExecutor."""
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[manual_update_hosts]\n"
+        "firewall ansible_host=10.0.0.1 manual_adapter=opnsense_api "
+        "api_key=KEY api_secret=SECRET verify_ssl=false\n"
+        "[remote_hosts]\n[proxmox_nodes]\n[proxmox_vms]\n[custom_hosts]\n",
+        encoding="utf-8",
+    )
+    constructions = []
+    _patch_executors(
+        monkeypatch, lambda host, **kw: constructions.append(host) or ScriptedExecutor()
+    )
+    calls = []
+
+    def _get_json(url, **kw):
+        calls.append((url, kw))
+        if "firmware/status" in url:
+            return {"status": "nothing_to_do"}
+        return {"version": "24.1.10"}
+
+    monkeypatch.setattr(http_mod, "get_json", _get_json)
+    settings = GlobalSettings(
+        fleet_history_dir=str(tmp_path / "hist"),
+        manual_update_notifications=False,
+        manual_update_api_timeout=7.0,
+    )
+    rc = scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv))
+
+    assert rc == 0
+    assert constructions == []  # API transport never builds an SSH executor
+    assert len(calls) == 2
+    for url, kw in calls:
+        assert url.startswith("https://10.0.0.1/api/core/firmware/")
+        assert kw["timeout"] == 7.0  # settings.manual_update_api_timeout
+        assert kw["verify"] is False  # per-host verify_ssl=false
+        assert kw["headers"]["X-API-Key"] == "KEY"
+        assert kw["headers"]["X-API-Secret"] == "SECRET"
+    latest = json.loads((tmp_path / "hist" / "pending-latest.json").read_text())
+    assert latest["manual"]["firewall"] == {
+        "host": "firewall",
+        "display_name": "OPNsense",
+        "adapter": "opnsense_api",
+        "current": "24.1.10",
+        "latest": "",
+        "update_available": False,
+        "reboot_required": False,
+        "summary": "OPNsense is up to date (24.1.10)",
+        "details": ["Installed: 24.1.10", "Firmware check status: nothing_to_do"],
+        "apply_hint": "OPNsense GUI → System → Firmware → Status",
+        "unreachable": False,
+        "error": None,
+    }
+
+
+def test_run_fleet_scan_manual_api_missing_key_aborts_before_executor(tmp_path, monkeypatch):
+    """Missing api_key on an *_api host fails loudly before any host contact."""
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[manual_update_hosts]\n"
+        "nas manual_adapter=truenas_scale_api\n"
+        "[remote_hosts]\n[proxmox_nodes]\n[proxmox_vms]\n[custom_hosts]\n",
+        encoding="utf-8",
+    )
+    contacted = []
+    _patch_executors(monkeypatch, lambda host, **kw: contacted.append(host))
+    with pytest.raises(SystemExit, match="api_key is required"):
+        scan_mod.run_fleet_scan(
+            settings=GlobalSettings(fleet_history_enabled=False),
+            inventory_path=str(inv),
+        )
+    assert contacted == []
+
+
+def test_run_fleet_scan_manual_limit_selects_name(tmp_path, monkeypatch):
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[manual_update_hosts]\n"
+        "nas-a manual_adapter=truenas_scale\n"
+        "nas-b manual_adapter=truenas_scale\n"
+        "[remote_hosts]\n[proxmox_nodes]\n[proxmox_vms]\n[custom_hosts]\n",
+        encoding="utf-8",
+    )
+    contacted = []
+
+    def _factory(host, **kw):
+        contacted.append(host)
+        return ScriptedExecutor(script={"midclt": [_ok(_TRUENAS_AVAILABLE)]})
+
+    _patch_executors(monkeypatch, _factory)
+    settings = GlobalSettings(fleet_history_enabled=False, manual_update_notifications=False)
+    assert scan_mod.run_fleet_scan(
+        settings=settings, inventory_path=str(inv), limit={"nas-b"}
+    ) == 0
+    assert contacted == ["nas-b"]
+
+
+def test_run_fleet_scan_manual_unreachable_does_not_fail(tmp_path, monkeypatch):
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[manual_update_hosts]\nfirewall manual_adapter=opnsense\n"
+        "[remote_hosts]\n[proxmox_nodes]\n[proxmox_vms]\n[custom_hosts]\n",
+        encoding="utf-8",
+    )
+
+    def _factory(host, **kw):
+        return ScriptedExecutor(
+            default=PrimitiveResult(
+                rc=4, failed=True, unreachable=True, stderr=_UNREACHABLE_ERR
+            )
+        )
+
+    _patch_executors(monkeypatch, _factory)
+    settings = GlobalSettings(
+        fleet_history_dir=str(tmp_path / "hist"), manual_update_notifications=False
+    )
+    assert scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv)) == 0
+    entry = json.loads((tmp_path / "hist" / "pending-latest.json").read_text())["manual"]["firewall"]
+    assert entry["unreachable"] is True
+    assert entry["error"]
+
+
+def test_run_fleet_scan_manual_parser_error_fails(tmp_path, monkeypatch):
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[manual_update_hosts]\nnas manual_adapter=truenas_scale\n"
+        "[remote_hosts]\n[proxmox_nodes]\n[proxmox_vms]\n[custom_hosts]\n",
+        encoding="utf-8",
+    )
+    malformed = "TrueNAS-SCALE-24.10\n@@MANUAL_UPDATE_SEPARATOR@@\n{bad json"
+    _patch_executors(
+        monkeypatch,
+        lambda host, **kw: ScriptedExecutor(script={"midclt": [_ok(malformed)]}),
+    )
+    settings = GlobalSettings(
+        fleet_history_dir=str(tmp_path / "hist"), manual_update_notifications=False
+    )
+    assert scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv)) == 1
+    entry = json.loads((tmp_path / "hist" / "pending-latest.json").read_text())["manual"]["nas"]
+    assert "Malformed" in entry["error"]
+    assert entry["unreachable"] is False
+
+
+def test_run_fleet_scan_validates_manual_safety_before_executor(tmp_path, monkeypatch):
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[manual_update_hosts]\nnas manual_adapter=truenas_scale\n"
+        "[remote_hosts]\nnas\n[proxmox_nodes]\n[proxmox_vms]\n[custom_hosts]\n",
+        encoding="utf-8",
+    )
+    contacted = []
+    _patch_executors(monkeypatch, lambda host, **kw: contacted.append(host))
+    with pytest.raises(SystemExit, match="manual-update overlap"):
+        scan_mod.run_fleet_scan(
+            settings=GlobalSettings(fleet_history_enabled=False),
+            inventory_path=str(inv),
+        )
+    assert contacted == []
+
+
+def test_run_fleet_scan_rejects_unknown_adapter_before_executor(tmp_path, monkeypatch):
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[manual_update_hosts]\nappliance manual_adapter=unknown\n"
+        "[remote_hosts]\n[proxmox_nodes]\n[proxmox_vms]\n[custom_hosts]\n",
+        encoding="utf-8",
+    )
+    contacted = []
+    _patch_executors(monkeypatch, lambda host, **kw: contacted.append(host))
+    with pytest.raises(SystemExit, match="Unknown manual update adapter"):
+        scan_mod.run_fleet_scan(
+            settings=GlobalSettings(fleet_history_enabled=False),
+            inventory_path=str(inv),
+        )
+    assert contacted == []
+
+
+def test_run_fleet_scan_manual_notification_reuses_all_notifiers(tmp_path, monkeypatch):
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[manual_update_hosts]\nnas manual_adapter=truenas_scale\n"
+        "[remote_hosts]\n[proxmox_nodes]\n[proxmox_vms]\n[custom_hosts]\n",
+        encoding="utf-8",
+    )
+    _patch_executors(
+        monkeypatch,
+        lambda host, **kw: ScriptedExecutor(
+            script={"midclt": [_ok(_TRUENAS_AVAILABLE)]}
+        ),
+    )
+    destinations = [
+        {"type": "discord", "webhook": "https://discord.test"},
+        {"type": "ntfy", "url": "https://ntfy.test"},
+        {"type": "webhook", "url": "https://webhook.test"},
+        {"type": "telegram", "bot_token": "x", "chat_id": "1"},
+    ]
+    calls = []
+    monkeypatch.setattr(
+        scan_mod.notifiers,
+        "dispatch",
+        lambda resolved, **kw: calls.append((resolved, kw)),
+    )
+    settings = GlobalSettings(
+        fleet_history_dir=str(tmp_path / "hist"),
+        fleet_history_enabled=False,
+        notifiers=destinations,
+    )
+    assert scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv)) == 0
+    assert len(calls) == 1
+    assert calls[0][0] == destinations
+    assert calls[0][1]["failed"] is False
+    assert "Manual updates required" in calls[0][1]["body"]
+
+    # The unchanged state is below the 24-hour reminder boundary.
+    assert scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv)) == 0
+    assert len(calls) == 1
+
+
 # --- pending_summary / read_pending (readers) ------------------------------------
 
 
-def _write_scan(tmp_path, *, ts, hosts=None, lxc=None):
-    scan_mod.write_pending({"timestamp": ts, "hosts": hosts or {}, "lxc": lxc or {}}, history_dir=tmp_path, keep=0)
+def _write_scan(tmp_path, *, ts, hosts=None, lxc=None, manual=None):
+    scan_mod.write_pending(
+        {
+            "timestamp": ts,
+            "hosts": hosts or {},
+            "lxc": lxc or {},
+            "manual": manual or {},
+        },
+        history_dir=tmp_path,
+        keep=0,
+    )
 
 
 def test_pending_summary_newest_first_with_aggregates(tmp_path):
@@ -878,6 +1162,56 @@ def test_pending_summary_newest_first_with_aggregates(tmp_path):
     assert newest["lxc_os_pending"] == 2
     assert newest["outdated_apps"] == 1
     assert newest["errors"] == 1
+
+
+def test_pending_summary_counts_manual_actions_and_failures(tmp_path):
+    _write_scan(
+        tmp_path,
+        ts="20260103T000000000000Z",
+        manual={
+            "nas": {
+                "update_available": True,
+                "reboot_required": False,
+                "unreachable": False,
+                "error": None,
+            },
+            "firewall": {
+                "update_available": False,
+                "reboot_required": True,
+                "unreachable": False,
+                "error": None,
+            },
+            "broken": {
+                "update_available": False,
+                "reboot_required": False,
+                "unreachable": False,
+                "error": "unknown firmware output",
+            },
+            "offline": {
+                "update_available": False,
+                "reboot_required": False,
+                "unreachable": True,
+                "error": "ssh timeout",
+            },
+        },
+    )
+    row = scan_mod.pending_summary(tmp_path)[0]
+    assert row["manual_updates"] == 1
+    assert row["manual_reboots"] == 1
+    assert row["errors"] == 1
+    assert row["unreachable"] == 1
+
+
+def test_pending_summary_legacy_snapshot_has_zero_manual_counts(tmp_path):
+    # Deliberately omit the manual mapping: old persisted snapshots must load.
+    scan_mod.write_pending(
+        {"timestamp": "20260101T000000000000Z", "hosts": {}, "lxc": {}},
+        history_dir=tmp_path,
+        keep=0,
+    )
+    row = scan_mod.pending_summary(tmp_path)[0]
+    assert row["manual_updates"] == 0
+    assert row["manual_reboots"] == 0
 
 
 def test_pending_summary_excludes_latest_and_limit(tmp_path):
@@ -1064,8 +1398,6 @@ _UNREACHABLE_ERR = (
 
 
 def test_scan_host_flags_unreachable_rather_than_a_plain_error():
-    from proxmox_fleet.runner import PrimitiveResult
-
     class Dead:
         host = "ONeill"
 
@@ -1086,8 +1418,6 @@ def test_scan_host_genuine_failure_is_not_flagged_unreachable():
 
 
 def test_scan_lxc_typed_unreachable_is_flagged():
-    from proxmox_fleet.runner import UnreachableHostError
-
     class Dead:
         host = "ONeill"
 

@@ -47,6 +47,12 @@ def test_list_hosts_matches_parser(ini):
     assert [h["name"] for h in hosts["custom_hosts"]] == ["db-01", "gitea-01"]
 
 
+def test_list_hosts_includes_manual_group(ini):
+    hosts = list_hosts(ini)
+    assert "manual_update_hosts" in hosts
+    assert hosts["manual_update_hosts"] == []  # missing section → empty list
+
+
 def test_add_host_appends_to_group_block(ini):
     add_host(ini, "remote_hosts", "web-01", {"ansible_host": "192.168.1.5"})
     hosts = list_hosts(ini)
@@ -134,7 +140,7 @@ def test_ensure_inventory_bootstrap(tmp_path):
     path = tmp_path / "hosts.ini"
     assert ensure_inventory(str(path)) is True
     text = path.read_text()
-    for group in ("proxmox_nodes", "proxmox_vms", "remote_hosts", "custom_hosts"):
+    for group in ("proxmox_nodes", "proxmox_vms", "remote_hosts", "custom_hosts", "manual_update_hosts"):
         assert f"[{group}]" in text
         assert f"[{group}:vars]" in text
     assert "ansible_user=root" in text
@@ -143,3 +149,63 @@ def test_ensure_inventory_bootstrap(tmp_path):
     # and the bootstrap can be enrolled into immediately
     add_host(str(path), "proxmox_nodes", "pve-01", {"ansible_host": "10.0.0.10"})
     assert list_hosts(str(path))["proxmox_nodes"][0]["name"] == "pve-01"
+    add_host(str(path), "manual_update_hosts", "truenas-01", {"manual_adapter": "TrueNAS"})
+    assert list_hosts(str(path))["manual_update_hosts"][0]["name"] == "truenas-01"
+
+
+# --- manual_update_hosts group (editor boundary) ---
+
+def test_add_host_manual_requires_adapter(ini):
+    with pytest.raises(InventoryEditError, match="manual_adapter"):
+        add_host(ini, "manual_update_hosts", "truenas-01", {"ansible_host": "10.0.0.60"})
+    # with the adapter present it succeeds and round-trips through the loader
+    add_host(ini, "manual_update_hosts", "truenas-01",
+             {"manual_adapter": "TrueNAS", "ansible_host": "10.0.0.60"})
+    hosts = list_hosts(ini)
+    assert hosts["manual_update_hosts"] == [{
+        "name": "truenas-01",
+        "vars": {"manual_adapter": "TrueNAS", "ansible_host": "10.0.0.60"},
+    }]
+    specs = inventory.load_manual_update_hosts(ini, host_vars_dir="nonexistent")
+    assert [s.name for s in specs] == ["truenas-01"]
+    assert specs[0].manual_adapter == "TrueNAS"
+
+
+def test_add_host_manual_adapter_blank_rejected(ini):
+    with pytest.raises(InventoryEditError, match="without whitespace"):
+        add_host(ini, "manual_update_hosts", "truenas-01", {"manual_adapter": " "})
+
+
+def test_remove_host_manual(ini):
+    add_host(ini, "manual_update_hosts", "truenas-01",
+             {"manual_adapter": "TrueNAS", "ansible_host": "10.0.0.60"})
+    remove_host(ini, "manual_update_hosts", "truenas-01")
+    assert list_hosts(ini)["manual_update_hosts"] == []
+    with pytest.raises(InventoryEditError, match="not found"):
+        remove_host(ini, "manual_update_hosts", "truenas-01")
+
+
+def test_add_host_manual_rejects_auto_overlap(ini):
+    # pve-01 lives in [proxmox_nodes], db-01 in [custom_hosts] (sample inventory)
+    with pytest.raises(InventoryEditError, match="proxmox_nodes"):
+        add_host(ini, "manual_update_hosts", "pve-01", {"manual_adapter": "TrueNAS"})
+    with pytest.raises(InventoryEditError, match="custom_hosts"):
+        add_host(ini, "manual_update_hosts", "db-01", {"manual_adapter": "TrueNAS"})
+
+
+def test_add_host_auto_rejects_manual_overlap(ini):
+    add_host(ini, "manual_update_hosts", "truenas-01",
+             {"manual_adapter": "TrueNAS", "ansible_host": "10.0.0.60"})
+    with pytest.raises(InventoryEditError, match="manual_update_hosts"):
+        add_host(ini, "remote_hosts", "truenas-01", {"ansible_host": "10.0.0.99"})
+    with pytest.raises(InventoryEditError, match="manual_update_hosts"):
+        add_host(ini, "proxmox_nodes", "truenas-01", {"ansible_host": "10.0.0.99"})
+
+
+def test_add_host_preserves_cross_auto_duplicates(ini):
+    """A host in several auto-update groups stays legal — only manual↔auto
+    overlap is forbidden (matches validate_manual_update_overlap)."""
+    add_host(ini, "custom_hosts", "pve-01", {"custom_config": "x"})  # pve-01 also in [proxmox_nodes]
+    hosts = list_hosts(ini)
+    assert "pve-01" in [h["name"] for h in hosts["custom_hosts"]]
+    assert "pve-01" in [h["name"] for h in hosts["proxmox_nodes"]]

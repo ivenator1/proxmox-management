@@ -3,10 +3,13 @@
 import pytest
 
 from proxmox_fleet.inventory import (
+    ManualUpdateHostSpec,
     load_custom_hosts,
+    load_manual_update_hosts,
     load_proxmox_nodes,
     load_proxmox_vms,
     load_remote_hosts,
+    validate_manual_update_overlap,
     validate_node_uniqueness,
 )
 
@@ -384,3 +387,311 @@ def test_canary_from_host_vars(tmp_path):
     (hv / "web-01.yml").write_text("canary: true\n")
     hosts = load_remote_hosts(path, host_vars_dir=str(hv))
     assert hosts[0].canary is True
+
+
+# --- load_manual_update_hosts ---
+
+def test_manual_update_hosts_basic_parse(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[manual_update_hosts]\n"
+        "truenas-01 ansible_host=10.0.0.60 manual_adapter=TrueNAS\n",
+    )
+    specs = load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert len(specs) == 1
+    s = specs[0]
+    assert isinstance(s, ManualUpdateHostSpec)
+    assert s.name == "truenas-01"
+    assert s.ansible_host == "10.0.0.60"
+    assert s.manual_adapter == "TrueNAS"
+    assert s.display_name is None
+    assert s.apply_hint is None
+
+
+def test_manual_update_hosts_order_preserved(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[manual_update_hosts]\n"
+        "opnsense-01 manual_adapter=OPNsense\n"
+        "truenas-01 manual_adapter=TrueNAS\n",
+    )
+    specs = load_manual_update_hosts(path)
+    assert [s.name for s in specs] == ["opnsense-01", "truenas-01"]
+
+
+def test_manual_update_hosts_missing_section_returns_empty(tmp_path):
+    path = _write_ini(tmp_path, "[remote_hosts]\nweb-01\n")
+    assert load_manual_update_hosts(path) == []
+
+
+def test_manual_update_hosts_vars_section_not_parsed_as_hosts(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[manual_update_hosts]\n"
+        "truenas-01 manual_adapter=TrueNAS\n"
+        "[manual_update_hosts:vars]\n"
+        "ansible_user=root\n",
+    )
+    specs = load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "hv"))
+    assert [s.name for s in specs] == ["truenas-01"]
+
+
+def test_manual_update_hosts_adapter_from_host_vars(tmp_path):
+    path = _write_ini(tmp_path, "[manual_update_hosts]\ntruenas-01\n")
+    _write_host_vars(tmp_path, "truenas-01", "manual_adapter: TrueNAS\n")
+    specs = load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert specs[0].manual_adapter == "TrueNAS"
+
+
+def test_manual_update_hosts_inline_adapter_wins_over_host_vars(tmp_path):
+    path = _write_ini(tmp_path, "[manual_update_hosts]\ntruenas-01 manual_adapter=TrueNAS\n")
+    _write_host_vars(tmp_path, "truenas-01", "manual_adapter: OPNsense\n")
+    specs = load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert specs[0].manual_adapter == "TrueNAS"
+
+
+def test_manual_update_hosts_ansible_host_defaults_to_name(tmp_path):
+    path = _write_ini(tmp_path, "[manual_update_hosts]\ntruenas-01 manual_adapter=TrueNAS\n")
+    assert load_manual_update_hosts(path)[0].ansible_host == "truenas-01"
+
+
+def test_manual_update_hosts_ansible_host_inline_wins_over_host_vars(tmp_path):
+    path = _write_ini(tmp_path, "[manual_update_hosts]\ntruenas-01 ansible_host=10.0.0.60\n")
+    _write_host_vars(tmp_path, "truenas-01", "ansible_host: 9.9.9.9\nmanual_adapter: TrueNAS\n")
+    specs = load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert specs[0].ansible_host == "10.0.0.60"
+
+
+def test_manual_update_hosts_optional_fields_from_host_vars(tmp_path):
+    path = _write_ini(tmp_path, "[manual_update_hosts]\ntruenas-01 manual_adapter=TrueNAS\n")
+    _write_host_vars(
+        tmp_path,
+        "truenas-01",
+        "display_name: TrueNAS Main\napply_hint: apply within 7 days\n",
+    )
+    s = load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))[0]
+    assert s.display_name == "TrueNAS Main"
+    assert s.apply_hint == "apply within 7 days"
+
+
+def test_manual_update_hosts_inline_optional_fields_win(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[manual_update_hosts]\ntruenas-01 manual_adapter=TrueNAS display_name=Prod\n",
+    )
+    _write_host_vars(tmp_path, "truenas-01", "display_name: Backup\n")
+    s = load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))[0]
+    assert s.display_name == "Prod"
+
+
+def test_manual_update_hosts_blank_optional_fields_become_none(tmp_path):
+    path = _write_ini(tmp_path, "[manual_update_hosts]\ntruenas-01 manual_adapter=TrueNAS\n")
+    _write_host_vars(tmp_path, "truenas-01", "display_name: ''\napply_hint: ''\n")
+    s = load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))[0]
+    assert s.display_name is None
+    assert s.apply_hint is None
+
+
+# --- api transport fields (manual_adapter=*_api only) ---
+
+def test_manual_update_hosts_api_fields_inline(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[manual_update_hosts]\n"
+        "nas ansible_host=10.0.0.30 manual_adapter=truenas_scale_api "
+        "api_url=https://10.0.0.30 api_key=KEY api_secret=SEC verify_ssl=false\n",
+    )
+    s = load_manual_update_hosts(path)[0]
+    assert s.api_url == "https://10.0.0.30"
+    assert s.api_key == "KEY"
+    assert s.api_secret == "SEC"
+    assert s.verify_ssl is False
+
+
+def test_manual_update_hosts_api_fields_from_host_vars(tmp_path):
+    path = _write_ini(tmp_path, "[manual_update_hosts]\nopn manual_adapter=opnsense_api\n")
+    _write_host_vars(
+        tmp_path,
+        "opn",
+        "api_url: https://opn.lan\n"
+        "api_key: HVKEY\n"
+        "api_secret: HVSEC\n"
+        "verify_ssl: true\n",
+    )
+    s = load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))[0]
+    assert s.api_url == "https://opn.lan"
+    assert s.api_key == "HVKEY"
+    assert s.api_secret == "HVSEC"
+    assert s.verify_ssl is True
+
+
+def test_manual_update_hosts_inline_api_field_wins_over_host_vars(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[manual_update_hosts]\ntruenas-01 manual_adapter=truenas_scale_api verify_ssl=false\n",
+    )
+    _write_host_vars(
+        tmp_path,
+        "truenas-01",
+        "api_url: https://hv.lan\napi_key: HVKEY\nverify_ssl: true\n",
+    )
+    s = load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))[0]
+    assert s.api_url == "https://hv.lan"  # not overridden inline → host_vars wins
+    assert s.api_key == "HVKEY"
+    assert s.verify_ssl is False  # inline false beats host_vars true
+
+
+def test_manual_update_hosts_verify_ssl_true_forms(tmp_path):
+    cases = [
+        ("verify_ssl=true", True),
+        ("verify_ssl=yes", True),
+        ("verify_ssl=1", True),
+        ("verify_ssl=on", True),
+        ("verify_ssl=false", False),
+        ("verify_ssl=no", False),
+        ("verify_ssl=0", False),
+        ("verify_ssl=off", False),
+    ]
+    for i, (inline, expected) in enumerate(cases):
+        path = _write_ini(
+            tmp_path,
+            f"[manual_update_hosts]\nhost-{i} manual_adapter=opnsense_api {inline}\n",
+        )
+        s = load_manual_update_hosts(path)[0]
+        assert s.verify_ssl is expected, f"{inline} → {s.verify_ssl}"
+
+
+def test_manual_update_hosts_verify_ssl_yaml_bool_and_strings(tmp_path):
+    # YAML `false` parses to a real Python False; quoted strings stay strings.
+    path = _write_ini(tmp_path, "[manual_update_hosts]\nopn manual_adapter=opnsense_api\n")
+    _write_host_vars(
+        tmp_path,
+        "opn",
+        "verify_ssl: false\n",
+    )
+    s = load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))[0]
+    assert s.verify_ssl is False
+    _write_host_vars(
+        tmp_path,
+        "opn",
+        "verify_ssl: 'true'\n",
+    )
+    s = load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))[0]
+    assert s.verify_ssl is True
+
+
+def test_manual_update_hosts_invalid_verify_ssl_fails_loud(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[manual_update_hosts]\ntruenas-01 manual_adapter=truenas_scale_api verify_ssl=maybe\n",
+    )
+    with pytest.raises(SystemExit, match="verify_ssl"):
+        load_manual_update_hosts(path)
+
+
+def test_manual_update_hosts_invalid_verify_ssl_from_host_vars_fails_loud(tmp_path):
+    path = _write_ini(tmp_path, "[manual_update_hosts]\ntruenas-01 manual_adapter=TrueNAS\n")
+    _write_host_vars(tmp_path, "truenas-01", "verify_ssl: maybe\n")
+    with pytest.raises(SystemExit, match="verify_ssl"):
+        load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))
+
+
+def test_manual_update_hosts_api_fields_default_when_absent(tmp_path):
+    path = _write_ini(tmp_path, "[manual_update_hosts]\ntruenas-01 manual_adapter=TrueNAS\n")
+    s = load_manual_update_hosts(path)[0]
+    assert s.api_url is None
+    assert s.api_key is None
+    assert s.api_secret is None
+    assert s.verify_ssl is True
+
+
+# --- required manual_adapter (fails at load time, before host contact) ---
+
+def test_manual_update_hosts_missing_adapter_fails_before_contact(tmp_path):
+    path = _write_ini(tmp_path, "[manual_update_hosts]\ntruenas-01\n")
+    with pytest.raises(SystemExit) as exc:
+        load_manual_update_hosts(path)
+    assert "truenas-01" in str(exc.value)
+    assert "manual_adapter" in str(exc.value)
+
+
+def test_manual_update_hosts_blank_inline_adapter_fails(tmp_path):
+    # a blank inline value never survives _parse_inline_vars → same as missing
+    path = _write_ini(tmp_path, "[manual_update_hosts]\ntruenas-01 manual_adapter=\n")
+    with pytest.raises(SystemExit) as exc:
+        load_manual_update_hosts(path)
+    assert "manual_adapter" in str(exc.value)
+
+
+def test_manual_update_hosts_blank_host_vars_adapter_fails(tmp_path):
+    path = _write_ini(tmp_path, "[manual_update_hosts]\ntruenas-01\n")
+    _write_host_vars(tmp_path, "truenas-01", "manual_adapter: ''\n")
+    with pytest.raises(SystemExit) as exc:
+        load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))
+    assert "manual_adapter" in str(exc.value)
+
+
+# --- manual/auto overlap validation (pure parsing, pre-executor) ---
+
+def test_manual_update_overlap_ok_when_no_overlap(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[manual_update_hosts]\ntruenas-01 manual_adapter=TrueNAS\n"
+        "[remote_hosts]\nweb-01\n",
+    )
+    validate_manual_update_overlap(path)  # must not raise
+
+
+def test_manual_update_overlap_empty_manual_ok(tmp_path):
+    path = _write_ini(tmp_path, "[remote_hosts]\nweb-01\n[custom_hosts]\napp-01 custom_config=x\n")
+    validate_manual_update_overlap(path)  # must not raise
+
+
+def test_manual_update_overlap_rejects_each_auto_group(tmp_path):
+    for group in ("remote_hosts", "proxmox_vms", "custom_hosts", "proxmox_nodes"):
+        path = _write_ini(
+            tmp_path,
+            f"[manual_update_hosts]\nshared manual_adapter=TrueNAS\n[{group}]\nshared\n",
+        )
+        with pytest.raises(SystemExit) as exc:
+            validate_manual_update_overlap(path)
+        msg = str(exc.value)
+        assert "shared" in msg
+        assert "[manual_update_hosts]" in msg
+        assert f"[{group}]" in msg
+
+
+def test_manual_update_overlap_names_multiple_groups(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[manual_update_hosts]\nshared manual_adapter=TrueNAS\n"
+        "[remote_hosts]\nshared\n"
+        "[custom_hosts]\nshared\n",
+    )
+    with pytest.raises(SystemExit) as exc:
+        validate_manual_update_overlap(path)
+    msg = str(exc.value)
+    assert "[remote_hosts]" in msg
+    assert "[custom_hosts]" in msg
+
+
+def test_manual_update_overlap_allows_cross_auto_duplicates(tmp_path):
+    """A host in several auto-update groups is legal — only manual↔auto overlap
+    is forbidden, and the validator never contacts a host (pure parsing)."""
+    path = _write_ini(
+        tmp_path,
+        "[manual_update_hosts]\ntruenas-01 manual_adapter=TrueNAS\n"
+        "[remote_hosts]\nshared\n"
+        "[custom_hosts]\nshared\n",
+    )
+    validate_manual_update_overlap(path)  # must not raise
+
+
+def test_manual_update_overlap_ignores_commented_hosts(tmp_path):
+    """Commented-out lines are inactive and must not trip the overlap check."""
+    path = _write_ini(
+        tmp_path,
+        "[manual_update_hosts]\ntruenas-01 manual_adapter=TrueNAS\n"
+        "[remote_hosts]\n# truenas-01\nweb-01\n",
+    )
+    validate_manual_update_overlap(path)  # must not raise
