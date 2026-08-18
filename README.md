@@ -30,7 +30,7 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 * **Canary Staging:** Hosts flagged `canary=true` (or listed in `canary_hosts`) update first in the remote/LXC/VM phases; the rest run only if every canary succeeded and — after a configurable soak window — its Uptime Kuma monitor is healthy. A failed gate records the remainder as `SKIPPED (canary failed)`.
 * **Targeted Runs:** `--phases lxc,vm` runs only the named phases; `--limit pve-01,105` restricts every phase to specific host names and/or LXC/VM ids — ideal for re-running a single failed container.
 * **Pending-Updates Scan:** `fleet-update --scan` is a strictly read-only fleet walk (pending OS packages per host plus community-script app current → latest per LXC, plus read-only manual-update checks for `[manual_update_hosts]` appliances — see below) that feeds the dashboard's pending view. `install.sh` schedules it every 6 hours via `fleet-scan.timer`.
-* **Manual-Update Monitoring:** TrueNAS SCALE and OPNsense appliances are *tracked, never auto-updated* — the six-hour `--scan` runs fixed read-only vendor checks (`midclt` for TrueNAS, `opnsense-version` + `opnsense-update -c` for OPNsense) and reminds you through the normal notifier fan-out when an update is pending or a check fails. Applying the update always stays a manual GUI action on the appliance.
+* **Manual-Update Monitoring:** TrueNAS SCALE and OPNsense appliances are *tracked, never auto-updated* — the six-hour `--scan` runs fixed read-only vendor checks, over SSH by default (`midclt` for TrueNAS, `opnsense-version` + `opnsense-update -c` for OPNsense) or optionally over the appliance REST API (`manual_adapter=opnsense_api` / `truenas_scale_api` with per-host `api_url`/`api_key`/`api_secret`/`verify_ssl`) — and reminds you through the normal notifier fan-out when an update is pending or a check fails. Applying the update always stays a manual GUI action on the appliance.
 * **Run History & Replay:** Every run persists a JSON record to `fleet_history_dir`; `--history [N]` tables recent runs and `--history-show latest` replays a stored briefing.
 * **Fleet Run Lock:** A fleet-wide `flock` guarantees the dashboard trigger, the systemd timer, cron, and manual shell runs can never mutate the fleet concurrently.
 * **Web Dashboard:** Optional `fleet-dashboard` web UI (`pip install -e '.[web]'`, or via `install.sh`) — session-based login (admin account, password set during install), pending updates across the fleet (agentless, PatchMon-style, including community-script app versions), browsable run history with per-host drill-down, a run trigger with live console output (SSE), an inventory & enrollment page (add hosts to `hosts.ini`, generate/push/test SSH keys from the browser — no manual `ssh-copy-id` needed), and a comment-preserving `vars.yml` settings editor. Triggered runs launch the CLI as a detached subprocess under the shared fleet run lock.
@@ -95,7 +95,7 @@ lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
 │   ├── briefing.py / notifiers.py / history.py   # Phase 4 (briefing/notify/history)
 │   ├── scan.py / lock.py            # Read-only pending-updates scan (incl. manual-update checks + reminders) + fleet-wide run lock
 │   ├── scan_notifications.py        # Manual-mapping scan notifications (first/change/daily-reminder state machine)
-│   ├── manual_updates.py            # Read-only adapter checks: TrueNAS SCALE (midclt) / OPNsense (opnsense-update -c)
+│   ├── manual_updates.py            # Read-only adapter checks: SSH (midclt / opnsense-update -c) + REST-API (*_api) variants
 │   ├── web/                         # fleet-dashboard FastAPI app ('.[web]' extra): pages, run trigger,
 │   │                                # inventory enrollment, SSH key setup, vars.yml settings editor
 │   └── models/                      # Pydantic schemas (config, state, settings)
@@ -151,8 +151,9 @@ Appliances the fleet must never auto-update — TrueNAS SCALE, OPNsense firewall
 * `manual_update_notifications` (default `true`): Send manual-update reminders.
 * `manual_update_reminder_hours` (default `24`): Reminder cadence while a host stays pending — the first notice fires immediately, then again daily until the update is applied or the state changes.
 * `manual_update_forks` (default `2`): Parallel adapter checks during the scan.
+* `manual_update_api_timeout` (default `120`): Per-request timeout (seconds) for the HTTP-API manual checks (`manual_adapter=*_api`); OPNsense's firmware/status check hits update mirrors synchronously and can exceed the default 30s.
 
-These three settings are **scan-only** — read only by the `--scan` path, never by `run_fleet()`, and deliberately **not** accepted as `-e` extra vars (the five-key `-e` allowlist is unchanged). Set them in `vars.yml`.
+These settings are **scan-only** — read only by the `--scan` path, never by `run_fleet()`, and deliberately **not** accepted as `-e` extra vars (the five-key `-e` allowlist is unchanged). Set them in `vars.yml`.
 
 #### Inventory: `[manual_update_hosts]`
 ```ini
@@ -165,11 +166,11 @@ ansible_user=root
 ansible_ssh_private_key_file=~/.ssh/id_ed25519
 ansible_python_interpreter=/usr/bin/python3
 ```
-Every host requires `manual_adapter=truenas_scale|opnsense`; a missing or blank value fails loudly at inventory load time, before any host is contacted. Optional per-host `display_name` (report/reminder label) and `apply_hint` (free-form GUI note) go in `host_vars/<name>.yml`.
+Every host requires `manual_adapter=truenas_scale|opnsense|truenas_scale_api|opnsense_api`; a missing or blank value fails loudly at inventory load time, before any host is contacted. Optional per-host `display_name` (report/reminder label) and `apply_hint` (free-form GUI note) go in `host_vars/<name>.yml`.
 
 **Overlap safety & migration:** a hostname in `[manual_update_hosts]` must NOT also appear in `[remote_hosts]`, `[proxmox_vms]`, `[custom_hosts]`, or `[proxmox_nodes]` — that overlap is rejected loudly (naming the host and both groups) both in the scan and in the `run_fleet()` pre-flight, so no machine is ever both manually and automatically updated. To move a TrueNAS/OPNsense box off auto-update: **remove** its line from *every* auto-update group first, then add it here with `manual_adapter=` — do it in its own commit so a stale checkout can never run both paths for the same host.
 
-**Transport:** manual hosts use the same SSH/Ansible transport as the rest of the fleet — passwordless root SSH from the manager (the `:vars` block above carries the standard defaults; on OPNsense enable root SSH under System → Settings → Administration → Secure Shell).
+**Transport:** manual hosts use the same SSH/Ansible transport as the rest of the fleet by default — passwordless root SSH from the manager (the `:vars` block above carries the standard defaults; on OPNsense enable root SSH under System → Settings → Administration → Secure Shell). Alternatively, `manual_adapter=opnsense_api` / `truenas_scale_api` runs the same checks manager-side over HTTPS against the appliance REST API (TrueNAS `/api/v2.0` bearer token; OPNsense `/api/core` key/secret headers) — per-host `api_url` (blank → defaults to `https://<ansible_host>`), `api_key`, `api_secret` (OPNsense only), and `verify_ssl` (default `true`; set `false` for self-signed appliance certs), inline in `hosts.ini` or in `host_vars/<name>.yml` (both gitignored). Both transports are strictly read-only — version/status endpoints only, never apply/update endpoints — and share the same result shape; SSH remains the default.
 
 #### Read-only check commands (never install anything)
 The scan runs one fixed, sentinel-delimited read-only command per adapter and parses the output manager-side. There is **no install/apply operation anywhere** — each adapter validates its command invariants before host contact and refuses to run if a forbidden token appears:

@@ -20,6 +20,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from proxmox_fleet import briefing  # noqa: E402
+from proxmox_fleet import manual_updates  # noqa: E402
 from proxmox_fleet import scan as scan_mod  # noqa: E402
 from proxmox_fleet.history import write_history  # noqa: E402
 from proxmox_fleet.lock import acquire_run_lock  # noqa: E402
@@ -32,6 +33,7 @@ from proxmox_fleet.web.app import (  # noqa: E402
     _health_score,
     _host_pending_entries,
     _host_timeline,
+    _manual_platform,
     _search_packages,
     build_run_args,
     create_app,
@@ -462,7 +464,8 @@ def test_pending_page_manual_table(history_dir):
     assert resp.status_code == 200
     text = resp.text
     assert "Manual systems" in text
-    assert "truenas_scale" in text and "opnsense" in text
+    # the platform cell resolves registry display names, not raw adapter keys
+    assert ">TrueNAS SCALE<" in text and ">OPNsense<" in text
     assert "TrueNAS at 10.0.0.9" in text
     assert "24.04.0" in text and "24.04.2" in text
     assert "update available" in text
@@ -476,6 +479,30 @@ def test_pending_page_manual_table(history_dir):
     assert 'href="/hosts/fw-01"' in text
 
 
+@pytest.fixture
+def api_adapters():
+    """Register the ``opnsense_api``/``truenas_scale_api`` transport-variant
+    adapters for the duration of the test, then restore the registry.
+
+    The registry change that adds these adapters may or may not have landed;
+    registering stubs here keeps the page tests deterministic either way.
+    """
+
+    class _ApiAdapter(manual_updates.BaseManualUpdateAdapter):
+        name = ""
+        display_name = ""
+
+    saved = dict(manual_updates.MANUAL_UPDATE_REGISTRY._adapters)
+    for name, display in (("opnsense_api", "OPNsense"), ("truenas_scale_api", "TrueNAS SCALE")):
+        adapter = _ApiAdapter()
+        adapter.name = name
+        adapter.display_name = display
+        manual_updates.MANUAL_UPDATE_REGISTRY.register(adapter)
+    yield
+    manual_updates.MANUAL_UPDATE_REGISTRY._adapters.clear()
+    manual_updates.MANUAL_UPDATE_REGISTRY._adapters.update(saved)
+
+
 def test_pending_page_manual_legacy_snapshot_without_manual(history_dir):
     """Pre-manual snapshots have no manual mapping — the section renders its
     empty state, the rest of the page is unaffected, no crash."""
@@ -484,6 +511,82 @@ def test_pending_page_manual_legacy_snapshot_without_manual(history_dir):
     assert "Manual systems" in resp.text
     assert "No manual systems in this snapshot." in resp.text
     assert "web-01" in resp.text  # host section still renders
+
+
+def test_manual_platform_registered_and_legacy_keys(api_adapters):
+    """_manual_platform resolves registered adapter keys to the registry's
+    human display name (transport variants included) and falls back to the
+    raw key for unknown/legacy keys."""
+    assert _manual_platform("truenas_scale") == "TrueNAS SCALE"
+    assert _manual_platform("opnsense") == "OPNsense"
+    assert _manual_platform("opnsense_api") == "OPNsense"
+    assert _manual_platform("truenas_scale_api") == "TrueNAS SCALE"
+    assert _manual_platform("some_old_adapter") == "some_old_adapter"
+    assert _manual_platform("") == ""
+
+
+def test_pending_page_manual_platform_labels(history_dir, api_adapters):
+    """The Manual systems Platform cell shows the adapter's human display
+    name: the api transport variant ``opnsense_api`` renders as "OPNsense"
+    (raw key never leaks into the table), while an unknown legacy adapter key
+    falls back to the raw key text."""
+    scan_mod.write_pending(
+        {
+            "timestamp": "20260110T000000000000Z",
+            "hosts": {},
+            "lxc": {},
+            "manual": {
+                "fw-01": {
+                    "adapter": "opnsense_api",
+                    "display_name": "FW at 10.0.0.1",
+                    "current": "24.1",
+                    "latest": "24.1.2",
+                    "update_available": True,
+                    "reboot_required": False,
+                    "summary": "",
+                    "details": [],
+                    "apply_hint": "",
+                    "unreachable": False,
+                    "error": None,
+                },
+                "nas-01": {
+                    "adapter": "truenas_scale",
+                    "display_name": "NAS at 10.0.0.9",
+                    "current": "24.04.0",
+                    "latest": "24.04.2",
+                    "update_available": True,
+                    "reboot_required": False,
+                    "summary": "",
+                    "details": [],
+                    "apply_hint": "",
+                    "unreachable": False,
+                    "error": None,
+                },
+                "legacy-01": {
+                    "adapter": "some_old_adapter",
+                    "display_name": "Legacy box",
+                    "current": "1.0",
+                    "latest": "1.0",
+                    "update_available": False,
+                    "reboot_required": False,
+                    "summary": "",
+                    "details": [],
+                    "apply_hint": "",
+                    "unreachable": False,
+                    "error": None,
+                },
+            },
+        },
+        history_dir=history_dir,
+        keep=0,
+    )
+    resp = _client(history_dir).get("/pending", params={"ref": "20260110T000000000000Z"})
+    assert resp.status_code == 200
+    table = resp.text.split("<h2>Manual systems</h2>", 1)[1].split("</table>", 1)[0]
+    assert ">OPNsense<" in table  # opnsense_api resolves via the registry
+    assert ">TrueNAS SCALE<" in table  # truenas_scale resolves via the registry
+    assert "opnsense_api" not in table  # raw transport key never shown
+    assert ">some_old_adapter<" in table  # unknown legacy key falls back raw
 
 
 def test_host_drilldown_across_runs(history_dir):

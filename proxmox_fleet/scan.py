@@ -552,9 +552,26 @@ def run_fleet_scan(
     manual_hosts = inventory.load_manual_update_hosts(
         inventory_path, host_vars_dir=settings.host_vars_dir
     )
+
+    def _api_config(host: inventory.ManualUpdateHostSpec) -> manual_updates.ManualUpdateApiConfig:
+        """Per-host connection settings for the *_api manual-update adapters.
+
+        A blank ``api_url`` falls back to the SSH reachability address
+        (``ansible_host``) — the appliance's web UI usually lives on the same
+        interface; override with ``api_url`` when it does not.
+        """
+        return manual_updates.ManualUpdateApiConfig(
+            api_url=host.api_url or f"https://{host.ansible_host}",
+            api_key=host.api_key or "",
+            api_secret=host.api_secret or "",
+            verify_ssl=host.verify_ssl,
+            timeout=settings.manual_update_api_timeout,
+        )
+
     for host in manual_hosts:
         try:
-            manual_updates.MANUAL_UPDATE_REGISTRY.get(host.manual_adapter).validate()
+            adapter = manual_updates.MANUAL_UPDATE_REGISTRY.get(host.manual_adapter)
+            adapter.validate(_api_config(host) if adapter.transport == "api" else None)
         except manual_updates.ManualUpdateError as exc:
             raise SystemExit(
                 f"manual_update_hosts entry '{host.name}' is invalid: {exc}"
@@ -622,9 +639,17 @@ def run_fleet_scan(
             print(f"  [{name}] {result['pending_count']} OS package(s) pending{err}")
 
     def _scan_manual(host: inventory.ManualUpdateHostSpec) -> Dict[str, Any]:
-        ex = RunnerExecutor(host.name, inventory=inventory_path, check=False)
+        adapter = manual_updates.MANUAL_UPDATE_REGISTRY.get(host.manual_adapter)
+        config = _api_config(host) if adapter.transport == "api" else None
+        # API-transport adapters run manager-side HTTPS and never need an
+        # executor; SSH adapters still get one bound to the inventory.
+        ex = (
+            None
+            if config is not None
+            else RunnerExecutor(host.name, inventory=inventory_path, check=False)
+        )
         result = manual_updates.run_manual_update_check(
-            host.manual_adapter, ex, host.name
+            host.manual_adapter, ex, host.name, config=config
         )
         if host.display_name:
             result.display_name = host.display_name

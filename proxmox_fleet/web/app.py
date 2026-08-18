@@ -32,7 +32,7 @@ from fastapi.templating import Jinja2Templates
 from markupsafe import Markup, escape
 
 from proxmox_fleet import history as history_mod
-from proxmox_fleet import inventory_edit, ledger as ledger_mod, vars_edit
+from proxmox_fleet import inventory_edit, ledger as ledger_mod, manual_updates, vars_edit
 from proxmox_fleet import scan as scan_mod
 from proxmox_fleet.inventory_edit import InventoryEditError
 from proxmox_fleet.lock import probe_lock
@@ -515,6 +515,19 @@ def _pending_entry_matches(name: str, key: str, entry: Mapping[str, Any]) -> boo
     return str(entry.get("name", "")) == name or str(entry.get("id", "")) == name or key.rsplit("/", 1)[-1] == name
 
 
+def _manual_platform(adapter: str) -> str:
+    """Human platform label for a persisted manual-update adapter key.
+
+    Resolves through the adapter registry so transport variants (e.g.
+    ``opnsense_api``) read as the vendor name; legacy snapshots whose adapter
+    key is no longer registered fall back to the raw key.
+    """
+    try:
+        return manual_updates.MANUAL_UPDATE_REGISTRY.get(adapter).display_name
+    except manual_updates.UnknownManualUpdateAdapterError:
+        return adapter
+
+
 def _host_pending_entries(history_dir: str, name: str) -> List[Dict[str, Any]]:
     """This host's entry from each retained timestamped pending snapshot.
 
@@ -869,7 +882,14 @@ def create_app(
         # Manual systems are keyed by their stable inventory hostname — render
         # them sorted like the host section. Old snapshots without a ``manual``
         # mapping simply render an empty section.
-        manual = sorted((snapshot.get("manual") or {}).items()) if snapshot else []
+        # Render each entry with its registry-resolved platform label — the
+        # snapshot itself stays untouched so the raw adapter key survives for
+        # consumers that need it.
+        manual = (
+            [(name, {**entry, "platform": _manual_platform(str(entry.get("adapter") or ""))}) for name, entry in sorted((snapshot.get("manual") or {}).items())]
+            if snapshot
+            else []
+        )
         # The template renders (display_id, entry) pairs — derive the id here so
         # both node/id-keyed (new) and bare-id-keyed (legacy) snapshots work.
         lxc = (

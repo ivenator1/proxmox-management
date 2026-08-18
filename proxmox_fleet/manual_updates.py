@@ -2,21 +2,27 @@
 
 TrueNAS SCALE and OPNsense boxes apply updates through their own web UIs, so
 the fleet only *reports* what is available and never installs anything. Each
-adapter owns one fixed, sentinel-delimited, read-only SSH command and
-normalizes the result into a common :class:`ManualUpdateResult` shape:
+adapter owns one fixed, sentinel-delimited, read-only SSH command — or, for
+ the ``*_api`` adapters, two read-only REST API calls — and normalizes the
+result into a common :class:`ManualUpdateResult` shape:
 
-- no install/apply operation exists — commands only query version state;
-- adapters are validated *before* host contact: unknown adapter names and
-  command-invariant violations are caught without touching the network;
+- no install/apply operation exists — commands/endpoints only query version
+  state;
+- adapters are validated *before* host contact: unknown adapter names,
+  command-invariant violations, and missing API credentials are caught
+  without touching the network;
 - host unreachability — the ansible ``unreachable`` flag, a raised
-  :class:`UnreachableHostError`, or recognized SSH error text — is normalized
-  to ``unreachable=True`` with ``error`` populated and the output parser
-  skipped entirely;
-- genuine command/parser failures stay ``unreachable=False``.
+  :class:`UnreachableHostError`, recognized SSH error text, or an API
+  connection-level failure (``URLError``/``OSError``/``TimeoutError``) — is
+  normalized to ``unreachable=True`` with ``error`` populated and the output
+  parser skipped entirely;
+- genuine command/parser failures and HTTP error statuses (4xx/5xx) stay
+  ``unreachable=False``.
 
 Lookup goes through :data:`MANUAL_UPDATE_REGISTRY`. Call
 :func:`run_manual_update_check` with an adapter name, an :class:`Executor`
-bound to the target host, and the host string; the returned
+bound to the target host (SSH adapters only; API adapters take a
+:class:`ManualUpdateApiConfig` instead), and the host string; the returned
 :class:`ManualUpdateResult` is always full-shaped.
 """
 
@@ -24,9 +30,11 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.error
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Protocol, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
+from proxmox_fleet import http
 from proxmox_fleet.executor import Executor
 from proxmox_fleet.runner import PrimitiveResult, UnreachableHostError, is_unreachable_error
 
@@ -44,7 +52,7 @@ class ManualUpdateAdapterError(ManualUpdateError):
 
 
 class ManualUpdateParseError(ManualUpdateError):
-    """The remote command ran, but its output could not be normalized."""
+    """The remote command/API ran, but its output could not be normalized."""
 
 
 class UnknownManualUpdateAdapterError(ManualUpdateError, ValueError):
@@ -74,22 +82,47 @@ class ManualUpdateResult:
     error: str = ""
 
 
+@dataclass
+class ManualUpdateApiConfig:
+    """Per-host connection settings for the ``*_api`` manual-update adapters.
+
+    Built by the scan wiring from the host's inventory vars; a blank
+    ``api_url`` falls back to ``https://<host>`` inside the adapters.
+    ``timeout`` is the per-request timeout in seconds; ``verify_ssl`` mirrors
+    the per-host ``verify_ssl`` inventory var (default true).
+    """
+
+    api_url: str = ""
+    api_key: str = ""
+    api_secret: str = ""
+    verify_ssl: bool = True
+    timeout: float = 120.0
+
+
 class ManualUpdateAdapter(Protocol):
     """Contract every manual-update adapter satisfies.
 
     ``validate`` runs before any host contact and raises
     :class:`ManualUpdateAdapterError` when the adapter is misconfigured;
-    ``check`` runs the fixed read-only command and never raises.
+    ``check`` performs the read-only check and never raises. ``transport``
+    names the execution channel: ``"ssh"`` (uses *executor*) or ``"api"``
+    (uses *config* instead).
     """
 
     name: str
     display_name: str
     apply_hint: str
+    transport: str
 
-    def validate(self) -> None:
+    def validate(self, config: Optional[ManualUpdateApiConfig] = None) -> None:
         ...
 
-    def check(self, executor: Executor, host: str) -> ManualUpdateResult:
+    def check(
+        self,
+        executor: Optional[Executor],
+        host: str,
+        config: Optional[ManualUpdateApiConfig] = None,
+    ) -> ManualUpdateResult:
         ...
 
 
@@ -98,23 +131,21 @@ class BaseManualUpdateAdapter:
 
     Subclasses fix ``name``, ``display_name``, ``apply_hint``,
     ``check_command`` and ``forbidden_tokens``, and implement
-    ``_validate_required_commands`` plus ``parse``.
+    ``_validate_required_commands`` plus ``parse``. SSH-transport adapters
+    keep ``transport = "ssh"``; API-transport adapters subclass
+    :class:`BaseApiManualUpdateAdapter` instead.
     """
 
     name = ""
     display_name = ""
     apply_hint = ""
+    transport = "ssh"
     check_command = ""
     forbidden_tokens: Tuple[str, ...] = ()
 
-    def validate(self) -> None:
+    def validate(self, config: Optional[ManualUpdateApiConfig] = None) -> None:
         """Check registry/command invariants. Runs before any host contact."""
-        if not self.name:
-            raise ManualUpdateAdapterError("manual update adapter is missing a registry name")
-        if not self.display_name:
-            raise ManualUpdateAdapterError(
-                f"manual update adapter {self.name!r} is missing a display name"
-            )
+        self._validate_identity()
         if not self.check_command:
             raise ManualUpdateAdapterError(
                 f"manual update adapter {self.name!r} has no check command"
@@ -129,11 +160,29 @@ class BaseManualUpdateAdapter:
                     f"{self.name}: check command must be read-only, found forbidden token {token!r}"
                 )
         self._validate_required_commands()
+        self._validate_api_config(config)
+
+    def _validate_identity(self) -> None:
+        """Registry-name invariants shared by both transports."""
+        if not self.name:
+            raise ManualUpdateAdapterError("manual update adapter is missing a registry name")
+        if not self.display_name:
+            raise ManualUpdateAdapterError(
+                f"manual update adapter {self.name!r} is missing a display name"
+            )
 
     def _validate_required_commands(self) -> None:
         """Subclass hook: assert the exact expected invocations are present."""
 
-    def check(self, executor: Executor, host: str) -> ManualUpdateResult:
+    def _validate_api_config(self, config: Optional[ManualUpdateApiConfig]) -> None:
+        """Subclass hook: assert API credentials are present (API adapters only)."""
+
+    def check(
+        self,
+        executor: Optional[Executor],
+        host: str,
+        config: Optional[ManualUpdateApiConfig] = None,
+    ) -> ManualUpdateResult:
         """Run the read-only check and normalize the result. Never raises."""
         outcome = ManualUpdateResult(
             host=host,
@@ -141,6 +190,9 @@ class BaseManualUpdateAdapter:
             adapter=self.name,
             apply_hint=self.apply_hint,
         )
+        if executor is None:
+            outcome.error = f"{self.name}: SSH transport requires an executor"
+            return outcome
         try:
             res = executor.run_shell(self.check_command, changed_when=False, ignore_errors=True)
         except UnreachableHostError as exc:
@@ -172,6 +224,13 @@ class BaseManualUpdateAdapter:
         raise NotImplementedError(f"{self.name} adapter must implement parse()")
 
 
+# TrueNAS update.check_available status values — shared by the midclt (SSH)
+# and REST adapters so both transports normalize identically.
+_TRUENAS_STATUS_AVAILABLE = "AVAILABLE"
+_TRUENAS_STATUS_REBOOT = "REBOOT_REQUIRED"
+_TRUENAS_CLEAN_STATUSES = ("CURRENT", "UNAVAILABLE")
+
+
 class TrueNASScaleAdapter(BaseManualUpdateAdapter):
     """Read-only update check for TrueNAS SCALE via midclt.
 
@@ -193,10 +252,6 @@ class TrueNASScaleAdapter(BaseManualUpdateAdapter):
         " && midclt call update.check_available"
     )
     forbidden_tokens = ("apt", "jq", "updater", "apply", "upgrade")
-
-    _STATUS_AVAILABLE = "AVAILABLE"
-    _STATUS_REBOOT = "REBOOT_REQUIRED"
-    _CLEAN_STATUSES = ("CURRENT", "UNAVAILABLE")
 
     def _validate_required_commands(self) -> None:
         for required in ("midclt call system.version", "midclt call update.check_available"):
@@ -222,43 +277,195 @@ class TrueNASScaleAdapter(BaseManualUpdateAdapter):
             raise ManualUpdateParseError(
                 "TrueNAS update.check_available returned a non-object value"
             )
+        _apply_truenas_payload(outcome, version, payload)
+        return outcome
 
-        changes = payload.get("changes")
-        if not isinstance(changes, list):
-            changes = []
-        outcome.current = _component_version(version) or _first_component(changes, "old")
-        if payload.get("REBOOT_REQUIRED"):
-            outcome.reboot_required = True
 
-        status = payload.get("status")
-        train = str(payload.get("train") or "").strip()
+def _apply_truenas_payload(
+    outcome: ManualUpdateResult, version: str, payload: Dict[str, Any]
+) -> None:
+    """Normalize a TrueNAS ``update.check_available`` payload into *outcome*.
 
-        if status == self._STATUS_AVAILABLE:
-            outcome.update_available = True
-            latest = _component_version(payload.get("version")) or _first_component(changes, "new")
-            outcome.latest = latest
-            if outcome.current and latest:
-                outcome.summary = f"TrueNAS update available: {outcome.current} -> {latest}"
-            elif latest:
-                outcome.summary = f"TrueNAS update available: {latest}"
-            else:
-                outcome.summary = "TrueNAS update available"
-            if train:
-                outcome.summary += f" (train {train})"
-        elif status == self._STATUS_REBOOT:
-            outcome.reboot_required = True
-            outcome.summary = "TrueNAS reboot required to complete the pending update"
-            if train:
-                outcome.summary += f" (train {train})"
-        elif status in self._CLEAN_STATUSES:
-            outcome.summary = "TrueNAS is up to date"
-            if train:
-                outcome.summary += f" on train {train}"
+    Shared by the midclt (SSH) and REST adapters so both transports produce
+    identical current/latest/summary/detail fields. Raises
+    :class:`ManualUpdateParseError` on unknown status values (fail closed).
+    """
+    changes = payload.get("changes")
+    if not isinstance(changes, list):
+        changes = []
+    outcome.current = _component_version(version) or _first_component(changes, "old")
+    if payload.get("REBOOT_REQUIRED"):
+        outcome.reboot_required = True
+
+    status = payload.get("status")
+    train = str(payload.get("train") or "").strip()
+
+    if status == _TRUENAS_STATUS_AVAILABLE:
+        outcome.update_available = True
+        latest = _component_version(payload.get("version")) or _first_component(changes, "new")
+        outcome.latest = latest
+        if outcome.current and latest:
+            outcome.summary = f"TrueNAS update available: {outcome.current} -> {latest}"
+        elif latest:
+            outcome.summary = f"TrueNAS update available: {latest}"
         else:
-            raise ManualUpdateParseError(f"Unknown TrueNAS update status: {status!r}")
+            outcome.summary = "TrueNAS update available"
+        if train:
+            outcome.summary += f" (train {train})"
+    elif status == _TRUENAS_STATUS_REBOOT:
+        outcome.reboot_required = True
+        outcome.summary = "TrueNAS reboot required to complete the pending update"
+        if train:
+            outcome.summary += f" (train {train})"
+    elif status in _TRUENAS_CLEAN_STATUSES:
+        outcome.summary = "TrueNAS is up to date"
+        if train:
+            outcome.summary += f" on train {train}"
+    else:
+        raise ManualUpdateParseError(f"Unknown TrueNAS update status: {status!r}")
 
-        _append_changes(outcome, changes)
-        _append_notice(outcome, payload)
+    _append_changes(outcome, changes)
+    _append_notice(outcome, payload)
+
+
+def _body_excerpt(body: str) -> str:
+    """One-line excerpt of an API response body for error messages."""
+    return (body or "(empty)").strip().replace("\n", " ")[:300]
+
+
+class BaseApiManualUpdateAdapter(BaseManualUpdateAdapter):
+    """HTTP-API transport for a vendor's read-only update check.
+
+    Subclasses fix ``transport = "api"`` and implement ``_check_api``; this
+    class owns the never-raises contract and the failure classification:
+
+    - connection-level failures (``URLError``/``OSError``/``TimeoutError``)
+      normalize to ``unreachable=True`` — the host could not be reached;
+    - HTTP error statuses (4xx/5xx, including 401/403) are genuine errors
+      with ``unreachable=False`` — the host answered, the check failed;
+    - malformed/unknown payloads fail closed via :class:`ManualUpdateParseError`.
+    """
+
+    transport = "api"
+
+    def validate(self, config: Optional[ManualUpdateApiConfig] = None) -> None:
+        """API adapters carry no SSH command — registry + credential checks only."""
+        self._validate_identity()
+        self._validate_api_config(config)
+
+    def _validate_api_config(self, config: Optional[ManualUpdateApiConfig]) -> None:
+        if config is None or not config.api_key:
+            raise ManualUpdateAdapterError(
+                f"{self.name}: api_key is required for the API transport — "
+                "set it inline in hosts.ini or in host_vars/<host>.yml"
+            )
+
+    def check(
+        self,
+        executor: Optional[Executor],
+        host: str,
+        config: Optional[ManualUpdateApiConfig] = None,
+    ) -> ManualUpdateResult:
+        outcome = ManualUpdateResult(
+            host=host,
+            display_name=self.display_name,
+            adapter=self.name,
+            apply_hint=self.apply_hint,
+        )
+        try:
+            return self._check_api(outcome, host, config)
+        except ManualUpdateParseError as exc:
+            outcome.error = str(exc)
+            return outcome
+        except urllib.error.HTTPError as exc:
+            outcome.error = f"{self.name} API check failed ({exc})"
+            return outcome
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            outcome.unreachable = True
+            outcome.error = f"Host unreachable: {exc}"
+            return outcome
+        except Exception as exc:  # noqa: BLE001 - an API check never raises
+            outcome.error = f"Manual update check failed: {exc}"
+            return outcome
+
+    def _check_api(
+        self,
+        outcome: ManualUpdateResult,
+        host: str,
+        config: Optional[ManualUpdateApiConfig],
+    ) -> ManualUpdateResult:
+        """Run the vendor's read-only API calls and normalize *outcome*."""
+        raise NotImplementedError(f"{self.name} adapter must implement _check_api()")
+
+
+class TrueNASScaleApiAdapter(BaseApiManualUpdateAdapter):
+    """Read-only update check for TrueNAS SCALE via the REST API.
+
+    Two calls mirroring the SSH adapter's midclt commands:
+    ``GET /api/v2.0/system/version`` and ``POST /api/v2.0/update/check_available``
+    with ``Authorization: Bearer <api_key>``. The payload normalizes through
+    the same :func:`_apply_truenas_payload` as the SSH adapter. Read-only:
+    no update/apply endpoint is ever invoked.
+    """
+
+    name = "truenas_scale_api"
+    display_name = "TrueNAS SCALE"
+    apply_hint = "TrueNAS GUI → System Settings → Update"
+    transport = "api"
+
+    _VERSION_PATH = "/api/v2.0/system/version"
+    _CHECK_PATH = "/api/v2.0/update/check_available"
+    _API_RETRIES = 1
+    _API_RETRY_DELAY = 10.0
+
+    def _check_api(
+        self,
+        outcome: ManualUpdateResult,
+        host: str,
+        config: Optional[ManualUpdateApiConfig],
+    ) -> ManualUpdateResult:
+        if config is None:
+            raise ManualUpdateParseError(f"{self.name}: missing API config")
+        base_url = (config.api_url or f"https://{host}").rstrip("/")
+        headers = {"Authorization": f"Bearer {config.api_key}"}
+        timeout = config.timeout
+        verify = config.verify_ssl
+
+        version_resp = http.request(
+            f"{base_url}{self._VERSION_PATH}",
+            method="GET",
+            headers=headers,
+            timeout=timeout,
+            verify=verify,
+        )
+        check_resp = http.post_json(
+            f"{base_url}{self._CHECK_PATH}",
+            {},
+            headers=headers,
+            retries=self._API_RETRIES,
+            delay=self._API_RETRY_DELAY,
+            timeout=timeout,
+            verify=verify,
+        )
+        if check_resp.status not in (200, 201, 202):
+            raise ManualUpdateParseError(
+                f"TrueNAS update.check_available failed (HTTP {check_resp.status}): "
+                f"{_body_excerpt(check_resp.body)}"
+            )
+        try:
+            payload = check_resp.json()
+        except ValueError as exc:
+            raise ManualUpdateParseError(
+                f"Malformed TrueNAS update.check_available JSON: {exc}"
+            ) from exc
+        # Some middleware versions wrap the payload in a single-element list.
+        if isinstance(payload, list) and len(payload) == 1:
+            payload = payload[0]
+        if not isinstance(payload, dict):
+            raise ManualUpdateParseError(
+                "TrueNAS update.check_available returned a non-object value"
+            )
+        _apply_truenas_payload(outcome, version_resp.body, payload)
         return outcome
 
 
@@ -350,6 +557,118 @@ class OpnsenseAdapter(BaseManualUpdateAdapter):
         return outcome
 
 
+class OpnsenseApiAdapter(BaseApiManualUpdateAdapter):
+    """Read-only update check for OPNsense via the REST API.
+
+    ``GET /api/core/firmware/info`` (current version) then
+    ``GET /api/core/firmware/status`` (synchronous mirror check), authenticated
+    with ``X-API-Key``/``X-API-Secret`` headers. Machine status strings map:
+    ``update_available``/``update_available_major`` → update available (target
+    from ``upgrade_version``/``upgrade_major_version`` when present),
+    ``nothing_to_do`` → up to date, ``reboot_required`` → reboot flag,
+    ``connection_failure`` → error, anything else → fail closed. Read-only:
+    no update/apply endpoint is ever invoked.
+    """
+
+    name = "opnsense_api"
+    display_name = "OPNsense"
+    apply_hint = "OPNsense GUI → System → Firmware → Status"
+    transport = "api"
+
+    _INFO_PATH = "/api/core/firmware/info"
+    _STATUS_PATH = "/api/core/firmware/status"
+    _API_RETRIES = 1
+    _API_RETRY_DELAY = 10.0
+
+    _AVAILABLE_STATUSES = ("update_available", "update_available_major")
+    _NO_UPDATE_STATUSES = ("nothing_to_do",)
+    _REBOOT_STATUS = "reboot_required"
+    _CONNECTION_FAILURE_STATUS = "connection_failure"
+
+    def _validate_api_config(self, config: Optional[ManualUpdateApiConfig]) -> None:
+        super()._validate_api_config(config)
+        if config is None or not config.api_secret:
+            raise ManualUpdateAdapterError(
+                f"{self.name}: api_secret is required for the OPNsense API transport "
+                "(key/secret pair from System → Access → Users → API keys)"
+            )
+
+    def _check_api(
+        self,
+        outcome: ManualUpdateResult,
+        host: str,
+        config: Optional[ManualUpdateApiConfig],
+    ) -> ManualUpdateResult:
+        if config is None:
+            raise ManualUpdateParseError(f"{self.name}: missing API config")
+        base_url = (config.api_url or f"https://{host}").rstrip("/")
+        headers = {"X-API-Key": config.api_key, "X-API-Secret": config.api_secret}
+        timeout = config.timeout
+        verify = config.verify_ssl
+
+        info = http.get_json(
+            f"{base_url}{self._INFO_PATH}",
+            headers=headers,
+            retries=self._API_RETRIES,
+            delay=self._API_RETRY_DELAY,
+            timeout=timeout,
+            verify=verify,
+        )
+        current = _opnsense_version_from_info(info)
+        if not current:
+            raise ManualUpdateParseError(
+                f"Could not determine OPNsense release from firmware info: "
+                f"{_body_excerpt(str(info))}"
+            )
+        outcome.current = current
+        outcome.details.append(f"Installed: {current}")
+
+        status = http.get_json(
+            f"{base_url}{self._STATUS_PATH}",
+            headers=headers,
+            retries=self._API_RETRIES,
+            delay=self._API_RETRY_DELAY,
+            timeout=timeout,
+            verify=verify,
+        )
+        if not isinstance(status, dict):
+            raise ManualUpdateParseError(
+                f"Unrecognized OPNsense firmware status response: "
+                f"{_body_excerpt(str(status))}"
+            )
+        state = str(status.get("status") or "").strip()
+        if not state:
+            raise ManualUpdateParseError(
+                "OPNsense firmware status response has no 'status' field"
+            )
+
+        if state in self._AVAILABLE_STATUSES:
+            outcome.update_available = True
+            latest = _opnsense_upgrade_target(status)
+            outcome.latest = latest
+            if latest:
+                outcome.summary = f"OPNsense update available: {outcome.current} -> {latest}"
+                # OPNsense releases ship base system, kernel, and packages together.
+                outcome.details.append(f"Target release: {latest}")
+                outcome.details.append("Components: base system, kernel, packages")
+            else:
+                outcome.summary = f"OPNsense update available (current {outcome.current})"
+        elif state in self._NO_UPDATE_STATUSES:
+            outcome.summary = f"OPNsense is up to date ({outcome.current})"
+        elif state == self._REBOOT_STATUS:
+            outcome.reboot_required = True
+            outcome.summary = "OPNsense reboot required to complete the pending update"
+        elif state == self._CONNECTION_FAILURE_STATUS:
+            raise ManualUpdateParseError(
+                "OPNsense update check failed: connection_failure (update mirror unreachable)"
+            )
+        else:
+            raise ManualUpdateParseError(f"Unknown OPNsense update status: {state!r}")
+
+        outcome.details.append(f"Firmware check status: {state}")
+        return outcome
+
+
 def _split_sections(res: PrimitiveResult, label: str) -> Tuple[str, str]:
     """Split the sentinel-delimited stdout into (version_section, check_section)."""
     parts = res.stdout.split(_SEPARATOR)
@@ -437,6 +756,46 @@ def _extract_target_release(check_text: str) -> str:
     return match.group(1) if match else ""
 
 
+_RELEASE_TOKEN_RE = re.compile(r"^([0-9][0-9A-Za-z._-]*)")
+
+
+def _release_token(text: str) -> str:
+    """Leading release token of a bare version string ("24.1.10_3" → "24.1.10_3")."""
+    match = _RELEASE_TOKEN_RE.match(text.strip())
+    return match.group(1) if match else ""
+
+
+def _opnsense_version_from_info(info: Any) -> str:
+    """Extract the release token from the firmware/info response (defensive)."""
+    candidates: List[str] = []
+    if isinstance(info, dict):
+        version = info.get("version")
+        if isinstance(version, str) and version.strip():
+            candidates.append(version)
+        product = info.get("product")
+        if isinstance(product, dict):
+            for key in ("product_version", "version"):
+                value = product.get(key)
+                if isinstance(value, str) and value.strip():
+                    candidates.append(value)
+    for candidate in candidates:
+        token = _parse_opnsense_release(f"OPNsense {candidate}") or _release_token(candidate)
+        if token:
+            return token
+    return ""
+
+
+def _opnsense_upgrade_target(status: Dict[str, Any]) -> str:
+    """Target release from the firmware/status response, if advertised."""
+    for key in ("upgrade_version", "upgrade_major_version"):
+        value = status.get(key)
+        if isinstance(value, str) and value.strip():
+            token = _release_token(value)
+            if token:
+                return token
+    return ""
+
+
 class ManualUpdateRegistry:
     """Name → adapter registry; the only entry point for adapter lookup."""
 
@@ -466,26 +825,32 @@ class ManualUpdateRegistry:
         return len(self._adapters)
 
 
-# The default registry ships the two appliance adapters.
+# The default registry ships the two appliance adapters in both transports:
+# SSH (midclt / opnsense-update -c) and REST API (truenas_scale_api /
+# opnsense_api). Hosts pick one per entry via manual_adapter=.
 MANUAL_UPDATE_REGISTRY = ManualUpdateRegistry()
 MANUAL_UPDATE_REGISTRY.register(TrueNASScaleAdapter())
 MANUAL_UPDATE_REGISTRY.register(OpnsenseAdapter())
+MANUAL_UPDATE_REGISTRY.register(TrueNASScaleApiAdapter())
+MANUAL_UPDATE_REGISTRY.register(OpnsenseApiAdapter())
 
 
 def run_manual_update_check(
     adapter_name: str,
-    executor: Executor,
-    host: str,
+    executor: Optional[Executor] = None,
+    host: str = "",
     *,
+    config: Optional[ManualUpdateApiConfig] = None,
     registry: ManualUpdateRegistry = MANUAL_UPDATE_REGISTRY,
 ) -> ManualUpdateResult:
     """Run the named adapter's read-only update check against *host*.
 
-    Never raises and never returns a partial shape: unknown adapter names and
-    validation failures produce an error result *before* any host contact,
-    unreachable hosts are normalized to ``unreachable=True`` without invoking
-    the output parser, and genuine command/parser failures are reported with
-    ``unreachable=False``.
+    SSH-transport adapters use *executor*; API-transport adapters use *config*
+    instead and ignore the executor. Never raises and never returns a partial
+    shape: unknown adapter names and validation failures produce an error
+    result *before* any host contact, unreachable hosts are normalized to
+    ``unreachable=True`` without invoking the output parser, and genuine
+    command/parser failures are reported with ``unreachable=False``.
     """
     try:
         adapter = registry.get(adapter_name)
@@ -498,7 +863,7 @@ def run_manual_update_check(
         )
 
     try:
-        adapter.validate()
+        adapter.validate(config)
     except ManualUpdateAdapterError as exc:
         return ManualUpdateResult(
             host=host,
@@ -508,4 +873,4 @@ def run_manual_update_check(
             error=str(exc),
         )
 
-    return adapter.check(executor, host)
+    return adapter.check(executor, host, config=config)

@@ -95,6 +95,10 @@ class GlobalSettings(BaseModel):
     manual_update_notifications: bool = True
     manual_update_reminder_hours: int = 24
     manual_update_forks: int = 2
+    # Per-request timeout for the *_api manual-update adapters. OPNsense
+    # firmware/status performs its mirror check synchronously and can exceed
+    # the 30s http default; TrueNAS check_available is likewise slow.
+    manual_update_api_timeout: float = 120.0
 
     # node_update / manager phase settings (Phase 2 + Phase 3)
     node_dry_run: bool = False

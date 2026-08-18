@@ -269,6 +269,12 @@ class ManualUpdateHostSpec:
     (TrueNAS/OPNsense/...); supported names are validated by the manual_update
     phase, but the loader requires the value to be present and non-blank so a
     misconfigured host fails loudly at load time, before any host contact.
+
+    The ``api_url``/``api_key``/``api_secret``/``verify_ssl`` fields apply only
+    to the ``*_api`` adapters (``opnsense_api``, ``truenas_scale_api``): they
+    configure the appliance's web API transport. ``api_url`` blank → the
+    adapter defaults to ``https://<ansible_host>``; other adapters ignore these
+    fields entirely.
     """
 
     name: str                 # inventory hostname — must not overlap auto-update groups
@@ -276,6 +282,10 @@ class ManualUpdateHostSpec:
     manual_adapter: str       # required; supported names validated later (manual_updates.py)
     display_name: Optional[str] = None  # human-friendly label for reports/reminders
     apply_hint: Optional[str] = None    # free-form note for the reminder (when/how to apply)
+    api_url: Optional[str] = None       # web API base URL; blank → https://<ansible_host>
+    api_key: Optional[str] = None       # API credential token
+    api_secret: Optional[str] = None    # OPNsense key/secret pair second half
+    verify_ssl: bool = True             # TLS cert verification for the API call
 
 
 def _optional_str(value: Any) -> Optional[str]:
@@ -284,6 +294,30 @@ def _optional_str(value: Any) -> Optional[str]:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _optional_bool(value: Any, host: str) -> bool:
+    """Coerce an optional bool (inline string or host_vars YAML value).
+
+    Missing → True (the verify_ssl default). YAML booleans pass through;
+    strings are matched case-insensitively (true/yes/1/on, false/no/0/off).
+    Anything else fails loudly, naming the host, because a mistyped value
+    would silently flip TLS certificate verification.
+    """
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "yes", "1", "on"):
+            return True
+        if text in ("false", "no", "0", "off"):
+            return False
+    raise SystemExit(
+        f"manual_update_hosts entry '{host}' has invalid verify_ssl: {value!r} "
+        "— use true or false"
+    )
 
 
 def load_manual_update_hosts(
@@ -317,6 +351,10 @@ def load_manual_update_hosts(
             manual_adapter=adapter,
             display_name=_optional_str(inline.get("display_name", host_vars.get("display_name"))),
             apply_hint=_optional_str(inline.get("apply_hint", host_vars.get("apply_hint"))),
+            api_url=_optional_str(inline.get("api_url", host_vars.get("api_url"))),
+            api_key=_optional_str(inline.get("api_key", host_vars.get("api_key"))),
+            api_secret=_optional_str(inline.get("api_secret", host_vars.get("api_secret"))),
+            verify_ssl=_optional_bool(inline.get("verify_ssl", host_vars.get("verify_ssl")), name),
         ))
     return specs
 

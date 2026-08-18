@@ -10,6 +10,7 @@ no live host is ever contacted.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,10 +18,12 @@ from typing import Any, Dict, List, Optional
 import pytest
 
 from proxmox_fleet.executor import Executor
+from proxmox_fleet.http import HttpResponse
 from proxmox_fleet.manual_updates import (
     MANUAL_UPDATE_REGISTRY,
     BaseManualUpdateAdapter,
     ManualUpdateAdapterError,
+    ManualUpdateApiConfig,
     ManualUpdateRegistry,
     ManualUpdateResult,
     OpnsenseAdapter,
@@ -347,11 +350,23 @@ def test_opnsense_unknown_output_fails_closed() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_registry_ships_both_adapters() -> None:
-    assert sorted(MANUAL_UPDATE_REGISTRY.names()) == ["opnsense", "truenas_scale"]
+def test_registry_ships_both_adapters_in_both_transports() -> None:
+    assert sorted(MANUAL_UPDATE_REGISTRY.names()) == [
+        "opnsense",
+        "opnsense_api",
+        "truenas_scale",
+        "truenas_scale_api",
+    ]
     assert "truenas_scale" in MANUAL_UPDATE_REGISTRY
     assert "opnsense" in MANUAL_UPDATE_REGISTRY
-    assert len(MANUAL_UPDATE_REGISTRY) == 2
+    assert "truenas_scale_api" in MANUAL_UPDATE_REGISTRY
+    assert "opnsense_api" in MANUAL_UPDATE_REGISTRY
+    assert len(MANUAL_UPDATE_REGISTRY) == 4
+    # Transport split: the bare names stay SSH, the *_api names are API.
+    assert MANUAL_UPDATE_REGISTRY.get("opnsense").transport == "ssh"
+    assert MANUAL_UPDATE_REGISTRY.get("truenas_scale").transport == "ssh"
+    assert MANUAL_UPDATE_REGISTRY.get("opnsense_api").transport == "api"
+    assert MANUAL_UPDATE_REGISTRY.get("truenas_scale_api").transport == "api"
 
 
 def test_unknown_adapter_no_host_contact() -> None:
@@ -377,11 +392,12 @@ def test_registry_register_and_run_custom_adapter() -> None:
         name = "dummy"
         display_name = "Dummy Appliance"
         apply_hint = "Dummy GUI"
+        transport = "ssh"
 
-        def validate(self) -> None:
+        def validate(self, config: Any = None) -> None:
             return None
 
-        def check(self, executor: Any, host: str) -> ManualUpdateResult:
+        def check(self, executor: Any, host: str, config: Any = None) -> ManualUpdateResult:
             return ManualUpdateResult(
                 host=host,
                 display_name=self.display_name,
@@ -592,3 +608,451 @@ def test_result_full_shape_on_unreachable() -> None:
     assert result.unreachable is True
     assert result.error
     assert result.apply_hint == "TrueNAS GUI → System Settings → Update"
+
+
+# ---------------------------------------------------------------------------
+# API-transport adapters (truenas_scale_api / opnsense_api)
+# ---------------------------------------------------------------------------
+# The *_api adapters never touch an executor; they call proxmox_fleet.http
+# (manager-side). Tests monkeypatch the http module with scripted fakes — no
+# live host or network is ever contacted.
+
+
+class ScriptedHttp:
+    """Scripted fake for proxmox_fleet.http: URL substring → response/exception.
+
+    ``responses`` maps a URL substring to an HttpResponse; ``raises`` maps a
+    URL substring to an exception to raise instead. Every call is recorded so
+    tests can assert on method, URL, headers, timeout, and verify.
+    """
+
+    def __init__(
+        self,
+        responses: Optional[Dict[str, HttpResponse]] = None,
+        raises: Optional[Dict[str, Exception]] = None,
+    ) -> None:
+        self.responses = responses or {}
+        self.raises = raises or {}
+        self.calls: List[tuple] = []
+
+    def _match(self, url: str) -> HttpResponse:
+        for key, exc in self.raises.items():
+            if key in url:
+                raise exc
+        for key, resp in self.responses.items():
+            if key in url:
+                return resp
+        raise AssertionError(f"unscripted URL: {url}")
+
+    def request(self, url: str, *, method: str = "GET", headers: Any = None,
+                data: Any = None, timeout: float = 30.0, verify: bool = True) -> HttpResponse:
+        self.calls.append((method, url, headers, timeout, verify))
+        return self._match(url)
+
+    def get_json(self, url: str, *, headers: Any = None, retries: int = 0,
+                 delay: float = 10.0, timeout: float = 30.0, verify: bool = True) -> Any:
+        self.calls.append(("GET", url, headers, timeout, verify))
+        return self._match(url).json()
+
+    def post_json(self, url: str, payload: Any, *, headers: Any = None, retries: int = 0,
+                  delay: float = 10.0, ok_statuses: tuple = (200, 201, 202, 204),
+                  timeout: float = 30.0, verify: bool = True) -> HttpResponse:
+        self.calls.append(("POST", url, headers, timeout, verify))
+        return self._match(url)
+
+
+def _api_config(**kw: Any) -> ManualUpdateApiConfig:
+    values: Dict[str, Any] = {"api_key": "TEST-KEY", "timeout": 120.0, "verify_ssl": True}
+    values.update(kw)
+    return ManualUpdateApiConfig(**values)
+
+
+def _patch_http(monkeypatch: pytest.MonkeyPatch, fake: ScriptedHttp) -> None:
+    import proxmox_fleet.http as http_module
+
+    monkeypatch.setattr(http_module, "request", fake.request)
+    monkeypatch.setattr(http_module, "get_json", fake.get_json)
+    monkeypatch.setattr(http_module, "post_json", fake.post_json)
+
+
+# --- TrueNAS SCALE API ------------------------------------------------------
+
+
+def test_truenas_api_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    """check_available AVAILABLE → update available with current/latest/train."""
+    fake = ScriptedHttp(
+        responses={
+            "system/version": HttpResponse(status=200, body="TrueNAS-SCALE-24.10.0.1\n"),
+            "update/check_available": HttpResponse(
+                status=200,
+                body='{"status":"AVAILABLE","train":"STABLE","version":"24.04.0",'
+                '"changes":[{"operation":"upgrade","old":"23.10.0.1","new":"24.04.0"}]}',
+            ),
+        }
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_api", None, "nas-01", config=_api_config()
+    )
+
+    assert not result.error
+    assert result.unreachable is False
+    assert result.update_available is True
+    assert result.current == "24.10.0.1"
+    assert result.latest == "24.04.0"
+    assert "STABLE" in result.summary
+    assert "upgrade: 23.10.0.1 -> 24.04.0" in result.details
+    assert result.adapter == "truenas_scale_api"
+    assert result.display_name == "TrueNAS SCALE"
+    # Bearer auth on both calls, default https://<host> base URL.
+    assert len(fake.calls) == 2
+    assert fake.calls[0][0] == "GET" and "https://nas-01/api/v2.0/system/version" in fake.calls[0][1]
+    assert fake.calls[1][0] == "POST" and "check_available" in fake.calls[1][1]
+    for _, _, headers, _, _ in fake.calls:
+        assert headers.get("Authorization") == "Bearer TEST-KEY"
+
+
+def test_truenas_api_reboot_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = ScriptedHttp(
+        responses={
+            "system/version": HttpResponse(status=200, body="TrueNAS-SCALE-24.10.0.1"),
+            "update/check_available": HttpResponse(
+                status=200,
+                body='{"status":"REBOOT_REQUIRED","REBOOT_REQUIRED":true,'
+                '"changes":[{"operation":"upgrade","old":"24.04.0","new":"24.10.0.1"}]}',
+            ),
+        }
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_api", None, "nas-01", config=_api_config()
+    )
+
+    assert not result.error
+    assert result.update_available is False
+    assert result.reboot_required is True
+    assert "reboot" in result.summary.lower()
+
+
+def test_truenas_api_current_clean(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = ScriptedHttp(
+        responses={
+            "system/version": HttpResponse(status=200, body="TrueNAS-SCALE-24.10.0.1"),
+            "update/check_available": HttpResponse(
+                status=200, body='{"status":"CURRENT","changes":[]}'
+            ),
+        }
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_api", None, "nas-01", config=_api_config()
+    )
+
+    assert not result.error
+    assert result.update_available is False
+    assert result.reboot_required is False
+    assert "up to date" in result.summary
+
+
+def test_truenas_api_list_wrapped_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Some middleware versions wrap the payload in a single-element list."""
+    fake = ScriptedHttp(
+        responses={
+            "system/version": HttpResponse(status=200, body="TrueNAS-SCALE-24.10.0.1"),
+            "update/check_available": HttpResponse(
+                status=200, body='[{"status":"UNAVAILABLE","changes":[]}]'
+            ),
+        }
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_api", None, "nas-01", config=_api_config()
+    )
+
+    assert not result.error
+    assert result.update_available is False
+    assert "up to date" in result.summary
+
+
+def test_truenas_api_unknown_status_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = ScriptedHttp(
+        responses={
+            "system/version": HttpResponse(status=200, body="TrueNAS-SCALE-24.10.0.1"),
+            "update/check_available": HttpResponse(
+                status=200, body='{"status":"SOMETHING_ELSE","changes":[]}'
+            ),
+        }
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_api", None, "nas-01", config=_api_config()
+    )
+
+    assert result.error
+    assert "Unknown TrueNAS update status" in result.error
+    assert result.unreachable is False
+
+
+def test_truenas_api_http_error_not_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 401 from check_available is a real error, not an unreachable host."""
+    fake = ScriptedHttp(
+        responses={
+            "system/version": HttpResponse(status=200, body="TrueNAS-SCALE-24.10.0.1"),
+            "update/check_available": HttpResponse(status=401, body="Unauthorized"),
+        }
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_api", None, "nas-01", config=_api_config()
+    )
+
+    assert result.error
+    assert "HTTP 401" in result.error
+    assert result.unreachable is False
+    assert result.update_available is False
+
+
+def test_truenas_api_urlerror_is_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = ScriptedHttp(
+        raises={"system/version": __import__("urllib.error", fromlist=["URLError"]).URLError("no route")}
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_api", None, "nas-01", config=_api_config()
+    )
+
+    assert result.unreachable is True
+    assert result.error
+    assert result.update_available is False
+
+
+def test_truenas_api_verify_ssl_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = ScriptedHttp(
+        responses={
+            "system/version": HttpResponse(status=200, body="TrueNAS-SCALE-24.10.0.1"),
+            "update/check_available": HttpResponse(
+                status=200, body='{"status":"CURRENT","changes":[]}'
+            ),
+        }
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_api", None, "nas-01",
+        config=_api_config(verify_ssl=False, timeout=45.0),
+    )
+
+    assert not result.error
+    for _, _, _, timeout, verify in fake.calls:
+        assert verify is False
+        assert timeout == 45.0
+
+
+def test_truenas_api_missing_api_key_fails_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = ScriptedHttp(responses={})
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_api", None, "nas-01", config=_api_config(api_key="")
+    )
+
+    assert result.error
+    assert "api_key is required" in result.error
+    assert result.unreachable is False
+    assert fake.calls == []  # no host contact on a validation failure
+
+
+def test_truenas_api_never_calls_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The API adapter ignores the executor entirely (no run_shell)."""
+    ex = ScriptedManualExecutor()  # raises if any command runs
+    fake = ScriptedHttp(
+        responses={
+            "system/version": HttpResponse(status=200, body="TrueNAS-SCALE-24.10.0.1"),
+            "update/check_available": HttpResponse(status=200, body='{"status":"CURRENT"}'),
+        }
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "truenas_scale_api", ex, "nas-01", config=_api_config()
+    )
+
+    assert not result.error
+    assert ex.commands == []
+
+
+# --- OPNsense API -----------------------------------------------------------
+
+
+def _opnsense_api_http(monkeypatch: pytest.MonkeyPatch, status: Dict[str, Any]) -> ScriptedHttp:
+    fake = ScriptedHttp(
+        responses={
+            "firmware/info": HttpResponse(
+                status=200, body='{"product":{"product_name":"OPNsense","product_version":"24.1.10"},"version":"24.1.10"}'
+            ),
+            "firmware/status": HttpResponse(status=200, body=json.dumps(status)),
+        }
+    )
+    _patch_http(monkeypatch, fake)
+    return fake
+
+
+def test_opnsense_api_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    """update_available with an advertised upgrade version."""
+    fake = _opnsense_api_http(
+        monkeypatch,
+        {"status": "update_available", "upgrade_version": "24.7.11"},
+    )
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01",
+        config=_api_config(api_secret="SECRET"),
+    )
+
+    assert not result.error
+    assert result.unreachable is False
+    assert result.update_available is True
+    assert result.current == "24.1.10"
+    assert result.latest == "24.7.11"
+    assert "24.7.11" in result.summary
+    assert "Target release: 24.7.11" in result.details
+    assert "Components: base system, kernel, packages" in result.details
+    assert result.adapter == "opnsense_api"
+    assert result.display_name == "OPNsense"
+    # Key/secret headers on both calls, default https://<host> base URL.
+    assert len(fake.calls) == 2
+    for _, url, headers, _, _ in fake.calls:
+        assert url.startswith("https://fw-01/api/core/firmware/")
+        assert headers.get("X-API-Key") == "TEST-KEY"
+        assert headers.get("X-API-Secret") == "SECRET"
+
+
+def test_opnsense_api_available_major(monkeypatch: pytest.MonkeyPatch) -> None:
+    _opnsense_api_http(
+        monkeypatch,
+        {"status": "update_available_major", "upgrade_major_version": "25.1"},
+    )
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert not result.error
+    assert result.update_available is True
+    assert result.latest == "25.1"
+
+
+def test_opnsense_api_nothing_to_do(monkeypatch: pytest.MonkeyPatch) -> None:
+    _opnsense_api_http(monkeypatch, {"status": "nothing_to_do"})
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert not result.error
+    assert result.update_available is False
+    assert result.reboot_required is False
+    assert "up to date" in result.summary
+    assert result.current == "24.1.10"
+
+
+def test_opnsense_api_reboot_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    _opnsense_api_http(monkeypatch, {"status": "reboot_required"})
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert not result.error
+    assert result.update_available is False
+    assert result.reboot_required is True
+    assert "reboot" in result.summary.lower()
+
+
+def test_opnsense_api_connection_failure_is_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _opnsense_api_http(monkeypatch, {"status": "connection_failure"})
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert result.error
+    assert "connection_failure" in result.error
+    assert result.unreachable is False
+    assert result.update_available is False
+
+
+def test_opnsense_api_unknown_status_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    _opnsense_api_http(monkeypatch, {"status": "weird_state"})
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert result.error
+    assert "Unknown OPNsense update status" in result.error
+    assert result.unreachable is False
+
+
+def test_opnsense_api_missing_version_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = ScriptedHttp(
+        responses={
+            "firmware/info": HttpResponse(status=200, body='{"product":{}}'),
+            "firmware/status": HttpResponse(status=200, body='{"status":"nothing_to_do"}'),
+        }
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert result.error
+    assert "Could not determine OPNsense release" in result.error
+    assert result.unreachable is False
+
+
+def test_opnsense_api_missing_secret_fails_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = ScriptedHttp(responses={})
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="")
+    )
+
+    assert result.error
+    assert "api_secret is required" in result.error
+    assert result.unreachable is False
+    assert fake.calls == []
+
+
+def test_opnsense_api_urlerror_is_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    from urllib.error import URLError
+
+    fake = ScriptedHttp(
+        responses={
+            "firmware/info": HttpResponse(status=200, body='{"version":"24.1.10"}'),
+        },
+        raises={"firmware/status": URLError("timed out")},
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert result.unreachable is True
+    assert result.error
+    assert result.update_available is False
+
+
+def test_api_adapters_reject_http_error_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HTTPError from the GET path (e.g. 403) is an error, not unreachable."""
+    from email.message import Message
+    from urllib.error import HTTPError
+
+    hdrs = Message()
+    fake = ScriptedHttp(
+        responses={"firmware/info": HttpResponse(status=200, body='{"version":"24.1.10"}')},
+        raises={
+            "firmware/status": HTTPError(
+                "https://fw-01/api/core/firmware/status", 403, "Forbidden", hdrs, None
+            )
+        },
+    )
+    _patch_http(monkeypatch, fake)
+    result = run_manual_update_check(
+        "opnsense_api", None, "fw-01", config=_api_config(api_secret="SECRET")
+    )
+
+    assert result.error
+    assert "403" in result.error
+    assert result.unreachable is False

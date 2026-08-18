@@ -119,7 +119,7 @@
     {% for name, entry in manual %}
       <tr>
         <td><a href="/hosts/{{ name }}">{{ entry.get("display_name") or name }}</a></td>
-        <td><code>{{ entry.get("adapter", "") }}</code></td>
+        <td><code>{{ entry.get("platform") or entry.get("adapter", "") }}</code></td>
         <td class="num"><span class="mono">{{ entry.get("current") or "—" }}</span></td>
         <td class="num"><span class="mono">{{ entry.get("latest") or "—" }}</span></td>
         <td>

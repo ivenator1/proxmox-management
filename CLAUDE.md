@@ -107,8 +107,9 @@ proxmox_fleet/
   briefing.py              # render_briefing() byte-parity port of discord_briefing.j2
   history.py               # build_run_summary() + write_history(); history_summary()/read_run() readers
   notifiers.py             # resolve_notifiers(), dispatch() (discord/ntfy/webhook/telegram), ping_deadmans()
-  manual_updates.py        # read-only manual-update adapter checks (TrueNAS midclt / OPNsense
-                           # opnsense-update -c); registry + fail-closed parsers
+  manual_updates.py        # read-only manual-update adapter checks: SSH (TrueNAS midclt /
+                           # OPNsense opnsense-update -c) + REST-API (*_api) adapters;
+                           # registry + fail-closed parsers
   scan.py                  # --scan: read-only pending-updates walk → pending-*.json (next to history);
                            # runs manual_update adapter checks + reminder notifications
   scan_notifications.py    # manual-mapping scan notifications: fingerprint/state machine/render +
@@ -301,6 +302,17 @@ top-level `manual` mapping (keyed by the stable inventory hostname; fields: `ada
 `manual` bucket never enters `FleetState`, so a pending manual action cannot change
 `changed`/`failed` run totals, the run briefing, or run history.
 
+Each host's `manual_adapter` selects the transport: the default `opnsense`/`truenas_scale` names
+run the fixed SSH checks, while `opnsense_api`/`truenas_scale_api` switch that host to
+manager-side HTTPS checks against the appliance REST API — TrueNAS `/api/v2.0` with a bearer
+token, OPNsense `/api/core` with key/secret headers. Per-host vars (inline key=value in
+hosts.ini or `host_vars/<name>.yml`, inline wins): `api_url` (blank → defaults to
+`https://<ansible_host>`), `api_key`, `api_secret` (OPNsense only), `verify_ssl` (default true;
+set `false` for self-signed appliance certs). Both transports are strictly read-only —
+version/status endpoints only, never apply/update endpoints — and share the same result shape,
+dashboard/ledger/notification handling, and overlap guard; applying the update remains a manual
+GUI action in both.
+
 - **Inventory** (`inventory.py`): `[manual_update_hosts]` entries need a non-blank
   `manual_adapter` (inline or host_vars) — fails loud at load time, before host contact.
   `validate_manual_update_overlap()` rejects a hostname that also appears in `[remote_hosts]`,
@@ -323,7 +335,8 @@ top-level `manual` mapping (keyed by the stable inventory hostname; fields: `ada
   local check-only output and confirm the parser fixture
   (`tests/unit/data/manual_updates/opnsense_*.txt`) before relying on it.
 - **Settings** (`models/settings.py`): `manual_update_notifications` (default true),
-  `manual_update_reminder_hours` (24), `manual_update_forks` (2). Scan-only, read by
+  `manual_update_reminder_hours` (24), `manual_update_forks` (2), `manual_update_api_timeout`
+  (120 — per-request timeout for the `*_api` transport checks). Scan-only, read by
   `run_fleet_scan`; deliberately **not** accepted as `-e` extra vars (see the `-e` bullet below).
 - **Notifications** (`scan_notifications.py`): when enabled, `run_manual_notifications()`
   (load state → decide → dispatch → persist) runs after the pending snapshot is written. Per-host
@@ -527,6 +540,7 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
 - **Inventory parser avoids `configparser`** (it mis-splits `hostname key=val key=val …` lines on
   the first `=`) — `inventory._iter_section()` is a manual regex parser; merges `host_vars/<host>.yml`
   for every group, including `proxmox_nodes` (so a node's `ansible_host` can live in host_vars).
+  `host_vars/` is gitignored, so per-host API secrets (manual-update `api_key`/`api_secret`) are safe there.
 - **Package/locale commands pin `LC_ALL=C`** (`_pkg.upgrade_cmd`, `lxc._os_update_cmd`/`_dpkg_hash_cmd`)
   — change detection greps English summary lines. `window.in_window` likewise uses a fixed weekday list.
 - **Shared pkg helpers** (`detect_pkg_mgr`, `upgrade_cmd`, `kuma_healthy`) live in `flows/_pkg.py` —

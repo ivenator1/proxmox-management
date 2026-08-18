@@ -100,9 +100,22 @@ ansible_python_interpreter=/usr/bin/python3
 # tokens):
 #   # host_vars/truenas.yml →  display_name: "TrueNAS"
 #   #                          apply_hint: "TrueNAS GUI → System Settings → Update"
+#
+# Optional HTTP-API transport: set manual_adapter=opnsense_api or
+# truenas_scale_api to run the checks manager-side over the appliance REST API
+# instead of SSH; the plain opnsense/truenas_scale (SSH) names above remain
+# the default. Per-host vars (inline key=value or host_vars/<name>.yml, inline
+# wins): api_url (blank → defaults to https://<ansible_host>), api_key (TrueNAS
+# bearer token / OPNsense API key), api_secret (OPNsense only — key/secret
+# pair), verify_ssl (default true; set verify_ssl=false for self-signed
+# appliance certs). API credentials are secrets — keep them in hosts.ini
+# (gitignored) or host_vars/ (gitignored), never in a committed file.
 [manual_update_hosts]
 # truenas  ansible_host=10.10.10.30  manual_adapter=truenas_scale
 # firewall ansible_host=10.10.10.1   manual_adapter=opnsense
+# API transport variants:
+# firewall ansible_host=10.10.10.1   manual_adapter=opnsense_api  api_key=...  api_secret=...
+# truenas  ansible_host=10.10.10.30  manual_adapter=truenas_scale_api  api_key=...  verify_ssl=false
 
 [manual_update_hosts:vars]
 ansible_user=root

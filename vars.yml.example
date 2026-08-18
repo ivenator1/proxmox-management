@@ -99,6 +99,10 @@ scan_history_keep: 30
 manual_update_notifications: true
 manual_update_reminder_hours: 24
 manual_update_forks: 2
+# Per-request timeout for the HTTP-API manual checks (manual_adapter=*_api).
+# OPNsense's firmware/status check hits update mirrors synchronously and can
+# exceed the default 30s. Scan-only, not accepted as an -e extra var.
+manual_update_api_timeout: 120
 
 # --- LXC TAG DISCOVERY ---
 lxc_tags:

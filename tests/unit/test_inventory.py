@@ -492,6 +492,119 @@ def test_manual_update_hosts_blank_optional_fields_become_none(tmp_path):
     assert s.apply_hint is None
 
 
+# --- api transport fields (manual_adapter=*_api only) ---
+
+def test_manual_update_hosts_api_fields_inline(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[manual_update_hosts]\n"
+        "nas ansible_host=10.0.0.30 manual_adapter=truenas_scale_api "
+        "api_url=https://10.0.0.30 api_key=KEY api_secret=SEC verify_ssl=false\n",
+    )
+    s = load_manual_update_hosts(path)[0]
+    assert s.api_url == "https://10.0.0.30"
+    assert s.api_key == "KEY"
+    assert s.api_secret == "SEC"
+    assert s.verify_ssl is False
+
+
+def test_manual_update_hosts_api_fields_from_host_vars(tmp_path):
+    path = _write_ini(tmp_path, "[manual_update_hosts]\nopn manual_adapter=opnsense_api\n")
+    _write_host_vars(
+        tmp_path,
+        "opn",
+        "api_url: https://opn.lan\n"
+        "api_key: HVKEY\n"
+        "api_secret: HVSEC\n"
+        "verify_ssl: true\n",
+    )
+    s = load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))[0]
+    assert s.api_url == "https://opn.lan"
+    assert s.api_key == "HVKEY"
+    assert s.api_secret == "HVSEC"
+    assert s.verify_ssl is True
+
+
+def test_manual_update_hosts_inline_api_field_wins_over_host_vars(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[manual_update_hosts]\ntruenas-01 manual_adapter=truenas_scale_api verify_ssl=false\n",
+    )
+    _write_host_vars(
+        tmp_path,
+        "truenas-01",
+        "api_url: https://hv.lan\napi_key: HVKEY\nverify_ssl: true\n",
+    )
+    s = load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))[0]
+    assert s.api_url == "https://hv.lan"  # not overridden inline → host_vars wins
+    assert s.api_key == "HVKEY"
+    assert s.verify_ssl is False  # inline false beats host_vars true
+
+
+def test_manual_update_hosts_verify_ssl_true_forms(tmp_path):
+    cases = [
+        ("verify_ssl=true", True),
+        ("verify_ssl=yes", True),
+        ("verify_ssl=1", True),
+        ("verify_ssl=on", True),
+        ("verify_ssl=false", False),
+        ("verify_ssl=no", False),
+        ("verify_ssl=0", False),
+        ("verify_ssl=off", False),
+    ]
+    for i, (inline, expected) in enumerate(cases):
+        path = _write_ini(
+            tmp_path,
+            f"[manual_update_hosts]\nhost-{i} manual_adapter=opnsense_api {inline}\n",
+        )
+        s = load_manual_update_hosts(path)[0]
+        assert s.verify_ssl is expected, f"{inline} → {s.verify_ssl}"
+
+
+def test_manual_update_hosts_verify_ssl_yaml_bool_and_strings(tmp_path):
+    # YAML `false` parses to a real Python False; quoted strings stay strings.
+    path = _write_ini(tmp_path, "[manual_update_hosts]\nopn manual_adapter=opnsense_api\n")
+    _write_host_vars(
+        tmp_path,
+        "opn",
+        "verify_ssl: false\n",
+    )
+    s = load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))[0]
+    assert s.verify_ssl is False
+    _write_host_vars(
+        tmp_path,
+        "opn",
+        "verify_ssl: 'true'\n",
+    )
+    s = load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))[0]
+    assert s.verify_ssl is True
+
+
+def test_manual_update_hosts_invalid_verify_ssl_fails_loud(tmp_path):
+    path = _write_ini(
+        tmp_path,
+        "[manual_update_hosts]\ntruenas-01 manual_adapter=truenas_scale_api verify_ssl=maybe\n",
+    )
+    with pytest.raises(SystemExit, match="verify_ssl"):
+        load_manual_update_hosts(path)
+
+
+def test_manual_update_hosts_invalid_verify_ssl_from_host_vars_fails_loud(tmp_path):
+    path = _write_ini(tmp_path, "[manual_update_hosts]\ntruenas-01 manual_adapter=TrueNAS\n")
+    _write_host_vars(tmp_path, "truenas-01", "verify_ssl: maybe\n")
+    with pytest.raises(SystemExit, match="verify_ssl"):
+        load_manual_update_hosts(path, host_vars_dir=str(tmp_path / "host_vars"))
+
+
+def test_manual_update_hosts_api_fields_default_when_absent(tmp_path):
+    path = _write_ini(tmp_path, "[manual_update_hosts]\ntruenas-01 manual_adapter=TrueNAS\n")
+    s = load_manual_update_hosts(path)[0]
+    assert s.api_url is None
+    assert s.api_key is None
+    assert s.api_secret is None
+    assert s.verify_ssl is True
+
+
 # --- required manual_adapter (fails at load time, before host contact) ---
 
 def test_manual_update_hosts_missing_adapter_fails_before_contact(tmp_path):

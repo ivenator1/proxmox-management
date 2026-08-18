@@ -893,6 +893,81 @@ def test_run_fleet_scan_persists_manual_host_and_overrides(tmp_path, monkeypatch
     }
 
 
+def test_run_fleet_scan_manual_api_host_builds_no_executor(tmp_path, monkeypatch):
+    """API-transport manual hosts run manager-side HTTPS; no RunnerExecutor."""
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[manual_update_hosts]\n"
+        "firewall ansible_host=10.0.0.1 manual_adapter=opnsense_api "
+        "api_key=KEY api_secret=SECRET verify_ssl=false\n"
+        "[remote_hosts]\n[proxmox_nodes]\n[proxmox_vms]\n[custom_hosts]\n",
+        encoding="utf-8",
+    )
+    constructions = []
+    _patch_executors(
+        monkeypatch, lambda host, **kw: constructions.append(host) or ScriptedExecutor()
+    )
+    calls = []
+
+    def _get_json(url, **kw):
+        calls.append((url, kw))
+        if "firmware/status" in url:
+            return {"status": "nothing_to_do"}
+        return {"version": "24.1.10"}
+
+    monkeypatch.setattr(http_mod, "get_json", _get_json)
+    settings = GlobalSettings(
+        fleet_history_dir=str(tmp_path / "hist"),
+        manual_update_notifications=False,
+        manual_update_api_timeout=7.0,
+    )
+    rc = scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv))
+
+    assert rc == 0
+    assert constructions == []  # API transport never builds an SSH executor
+    assert len(calls) == 2
+    for url, kw in calls:
+        assert url.startswith("https://10.0.0.1/api/core/firmware/")
+        assert kw["timeout"] == 7.0  # settings.manual_update_api_timeout
+        assert kw["verify"] is False  # per-host verify_ssl=false
+        assert kw["headers"]["X-API-Key"] == "KEY"
+        assert kw["headers"]["X-API-Secret"] == "SECRET"
+    latest = json.loads((tmp_path / "hist" / "pending-latest.json").read_text())
+    assert latest["manual"]["firewall"] == {
+        "host": "firewall",
+        "display_name": "OPNsense",
+        "adapter": "opnsense_api",
+        "current": "24.1.10",
+        "latest": "",
+        "update_available": False,
+        "reboot_required": False,
+        "summary": "OPNsense is up to date (24.1.10)",
+        "details": ["Installed: 24.1.10", "Firmware check status: nothing_to_do"],
+        "apply_hint": "OPNsense GUI → System → Firmware → Status",
+        "unreachable": False,
+        "error": None,
+    }
+
+
+def test_run_fleet_scan_manual_api_missing_key_aborts_before_executor(tmp_path, monkeypatch):
+    """Missing api_key on an *_api host fails loudly before any host contact."""
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[manual_update_hosts]\n"
+        "nas manual_adapter=truenas_scale_api\n"
+        "[remote_hosts]\n[proxmox_nodes]\n[proxmox_vms]\n[custom_hosts]\n",
+        encoding="utf-8",
+    )
+    contacted = []
+    _patch_executors(monkeypatch, lambda host, **kw: contacted.append(host))
+    with pytest.raises(SystemExit, match="api_key is required"):
+        scan_mod.run_fleet_scan(
+            settings=GlobalSettings(fleet_history_enabled=False),
+            inventory_path=str(inv),
+        )
+    assert contacted == []
+
+
 def test_run_fleet_scan_manual_limit_selects_name(tmp_path, monkeypatch):
     inv = tmp_path / "hosts.ini"
     inv.write_text(
