@@ -110,6 +110,14 @@ ansible_python_interpreter=/usr/bin/python3
 # pair), verify_ssl (default true; set verify_ssl=false for self-signed
 # appliance certs). API credentials are secrets — keep them in hosts.ini
 # (gitignored) or host_vars/ (gitignored), never in a committed file.
+#
+# Where the API credentials come from:
+#   - OPNsense: System → Access → Users → add a dedicated user (e.g. fleet-ro)
+#     with the single privilege "System: Firmware" (there is no read-only ACL
+#     variant — never use the admin account's key), then open that user →
+#     API keys → + and copy the generated key + secret.
+#   - TrueNAS SCALE: web UI → user icon (top-right) → API Keys → Add, name it,
+#     and copy the token immediately (shown only once; sent as a Bearer token).
 [manual_update_hosts]
 # truenas  ansible_host=10.10.10.30  manual_adapter=truenas_scale
 # firewall ansible_host=10.10.10.1   manual_adapter=opnsense
