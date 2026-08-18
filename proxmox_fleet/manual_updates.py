@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import re
+import ssl
 import time
 import urllib.error
 from dataclasses import dataclass, field
@@ -334,6 +335,19 @@ def _body_excerpt(body: str) -> str:
     return (body or "(empty)").strip().replace("\n", " ")[:300]
 
 
+def _tls_verify_error(name: str, exc: ssl.SSLCertVerificationError) -> str:
+    """Actionable error for a certificate verification failure.
+
+    Classified as an error (not unreachable): a self-signed appliance cert is
+    a per-host config problem — set ``verify_ssl=false`` or install a trusted
+    certificate on the appliance.
+    """
+    return (
+        f"{name}: HTTPS certificate verification failed — set verify_ssl=false "
+        f"for this host (self-signed cert) or install a trusted certificate: {exc}"
+    )
+
+
 class BaseApiManualUpdateAdapter(BaseManualUpdateAdapter):
     """HTTP-API transport for a vendor's read-only update check.
 
@@ -342,6 +356,9 @@ class BaseApiManualUpdateAdapter(BaseManualUpdateAdapter):
 
     - connection-level failures (``URLError``/``OSError``/``TimeoutError``)
       normalize to ``unreachable=True`` — the host could not be reached;
+    - TLS certificate verification failures are **errors, not unreachable** —
+      a self-signed appliance cert is a config problem (``verify_ssl=false``
+      or a trusted cert), not a reachability one, so they fail loudly;
     - HTTP error statuses (4xx/5xx, including 401/403) are genuine errors
       with ``unreachable=False`` — the host answered, the check failed;
     - malformed/unknown payloads fail closed via :class:`ManualUpdateParseError`.
@@ -381,7 +398,18 @@ class BaseApiManualUpdateAdapter(BaseManualUpdateAdapter):
         except urllib.error.HTTPError as exc:
             outcome.error = f"{self.name} API check failed ({exc})"
             return outcome
-        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        except ssl.SSLCertVerificationError as exc:
+            outcome.error = _tls_verify_error(self.name, exc)
+            return outcome
+        except urllib.error.URLError as exc:
+            # urllib wraps TLS failures in URLError; surface them as errors too.
+            if isinstance(exc.reason, ssl.SSLCertVerificationError):
+                outcome.error = _tls_verify_error(self.name, exc.reason)
+                return outcome
+            outcome.unreachable = True
+            outcome.error = f"Host unreachable: {exc}"
+            return outcome
+        except (OSError, TimeoutError) as exc:
             outcome.unreachable = True
             outcome.error = f"Host unreachable: {exc}"
             return outcome
