@@ -216,10 +216,13 @@ def test_guest_only_run_groups_lxcs_and_vms_without_duplicate_node_headers():
 def test_titles_and_color():
     assert briefing_title(True) == "⚠️ Briefing: Failures Detected"
     assert briefing_title(False) == "✅ Briefing: All Systems Clear"
+    assert briefing_title(False, attention=True) == "⚠️ Briefing: Manual Attention Required"
     assert ntfy_title(True) == "Fleet Update: Failures Detected"
     assert ntfy_title(False) == "Fleet Update: All Systems Clear"
+    assert ntfy_title(False, attention=True) == "Fleet Update: Manual Attention Required"
     assert discord_color(True) == 15158332
     assert discord_color(False) == 3066993
+    assert discord_color(False, attention=True) == 16766720
 
 
 @pytest.mark.parametrize("force,dry,changed,failed,expected", [
@@ -238,6 +241,23 @@ def test_prepare_body_trims():
     body = prepare_body(_state(fleet_remote_data=[dict(host="h", status="OK")]))
     assert not body.startswith("\n")
     assert body.startswith("**Remote Hosts**")
+
+
+def test_manual_section_is_grouped_between_nodes_and_remote_hosts():
+    body = prepare_body(
+        _state(
+            fleet_node_data=[node()],
+            fleet_remote_data=[dict(host="remote", status="OK")],
+        ),
+        manual_section=(
+            "**Manual Systems: (ATTENTION REQUIRED)**\n"
+            "- Updates / reboots\n"
+            "  - **firewall** — 1.0 → 2.0"
+        ),
+    )
+
+    assert body.index("**pve-01: (OK)**") < body.index("**Manual Systems")
+    assert body.index("**Manual Systems") < body.index("**Remote Hosts**")
 
 
 def test_prepare_body_truncates_to_4000():

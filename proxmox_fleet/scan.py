@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Mapping, Optional, Set, Tuple, Union
 from proxmox_fleet import http as http_mod
 from proxmox_fleet import inventory
 from proxmox_fleet import ledger
-from proxmox_fleet import manual_updates, notifiers, scan_notifications
+from proxmox_fleet import manual_updates, scan_notifications
 from proxmox_fleet.cluster import DEFAULT_CLUSTER, limit_selects_id, token_is_id
 from proxmox_fleet.executor import Executor
 from proxmox_fleet.flows._pkg import detect_pkg_mgr
@@ -753,16 +753,11 @@ def run_fleet_scan(
         print(f"pending snapshot written to {path}")
 
     if settings.manual_update_notifications:
-        # This scan-only briefing is intentionally separate from Phase 4 and
-        # FleetState.changed. It reuses the configured notifier fan-out while
-        # its own state file enforces first/change/reminder selection.
-        scan_notifications.run_manual_notifications(
+        # Scans refresh dashboard and reminder state only. Due manual entries
+        # piggyback on the next ordinary fleet briefing in Phase 4.
+        scan_notifications.record_manual_results(
             list(scan["manual"].values()),
             history_dir=settings.fleet_history_dir,
-            notifiers_list=notifiers.resolve_notifiers(settings),
-            reminder_hours=settings.manual_update_reminder_hours,
-            retries=settings.notifier_retries,
-            dispatch_fn=notifiers.dispatch,
         )
 
     return 1 if failed else 0
