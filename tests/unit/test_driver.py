@@ -14,6 +14,7 @@ import pytest
 import yaml
 
 import proxmox_fleet.driver as driver_mod
+from proxmox_fleet import scan_notifications as scan_notif
 from proxmox_fleet.driver import (
     _deep_merge,
     _merge_state,
@@ -764,6 +765,107 @@ def test_notify_phase_dispatches_and_writes_history(tmp_path, monkeypatch):
     latest = json.loads((tmp_path / "latest.json").read_text())
     assert latest["briefing"] == body
     assert "sonarr" in latest["briefing"]
+
+
+def test_notify_phase_piggybacks_due_manual_attention(tmp_path, monkeypatch):
+    calls = _patch_notifiers(monkeypatch)
+    manual_entry = {
+        "host": "firewall",
+        "display_name": "Firewall",
+        "adapter": "opnsense",
+        "current": "24.1",
+        "latest": "24.7",
+        "update_available": True,
+        "reboot_required": False,
+        "details": "Checking upgrades...\nVersion 24.7 available",
+        "apply_hint": "System → Firmware → Status",
+        "unreachable": False,
+        "error": "",
+    }
+    scan_notif.record_manual_results([manual_entry], history_dir=tmp_path)
+    settings = GlobalSettings(
+        discord_webhook="https://d/hook",
+        fleet_history_dir=str(tmp_path),
+    )
+
+    body = run_notify_phase(settings=settings, state=_notify_state())
+
+    assert len(calls["dispatch"]) == 1
+    _, dispatched = calls["dispatch"][0]
+    assert dispatched["title"] == "⚠️ Briefing: Manual Attention Required"
+    assert dispatched["color"] == 16766720
+    assert dispatched["failed"] is False
+    assert "**Manual Systems: (ATTENTION REQUIRED)**" in body
+    assert "- Updates / reboots" in body
+    assert "  - **Firewall (firewall)** — 24.1 → 24.7" in body
+    assert "    - Checking upgrades..." in body
+    assert "    - Version 24.7 available" in body
+    assert "    - GUI apply: System → Firmware → Status" in body
+    assert calls["ping"][0][1]["failed"] is False
+
+    stored = scan_notif.load_state(tmp_path)["firewall"]
+    assert stored["notified_fingerprint"] == stored["fingerprint"]
+    assert "last_notified" in stored
+
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["changed"] is False
+    assert latest["failed"] is False
+    assert latest["briefing"] == body
+
+
+def test_notify_phase_manual_check_error_is_attention_not_fleet_failure(tmp_path, monkeypatch):
+    calls = _patch_notifiers(monkeypatch)
+    scan_notif.record_manual_results(
+        [
+            {
+                "host": "firewall",
+                "adapter": "opnsense",
+                "update_available": False,
+                "reboot_required": False,
+                "unreachable": False,
+                "error": "connection refused",
+            }
+        ],
+        history_dir=tmp_path,
+    )
+    settings = GlobalSettings(
+        discord_webhook="https://d/hook",
+        fleet_history_dir=str(tmp_path),
+    )
+
+    body = run_notify_phase(settings=settings, state=_notify_state())
+
+    _, dispatched = calls["dispatch"][0]
+    assert "- Check errors" in body
+    assert dispatched["failed"] is False
+    assert dispatched["title"] == "⚠️ Briefing: Manual Attention Required"
+    assert dispatched["color"] == 16766720
+    assert calls["ping"][0][1]["failed"] is False
+
+
+def test_notify_phase_does_not_repeat_manual_attention_before_reminder(tmp_path, monkeypatch):
+    calls = _patch_notifiers(monkeypatch)
+    entry = {
+        "host": "nas",
+        "adapter": "truenas_scale",
+        "current": "1.0",
+        "latest": "2.0",
+        "update_available": True,
+        "unreachable": False,
+        "error": "",
+    }
+    scan_notif.record_manual_results([entry], history_dir=tmp_path)
+    state = scan_notif.load_state(tmp_path)
+    decision = scan_notif.decide_stored_notifications(state)
+    scan_notif.save_state(tmp_path, decision.new_state)
+
+    settings = GlobalSettings(
+        discord_webhook="https://d/hook",
+        fleet_history_dir=str(tmp_path),
+    )
+    run_notify_phase(settings=settings, state=_notify_state())
+
+    assert calls["dispatch"] == []
 
 
 def test_notify_phase_suppressed_when_idle_but_history_still_written(tmp_path, monkeypatch):
@@ -2503,7 +2605,9 @@ _MC_NODE_CLUSTERS = {"alpha-01": "alpha", "alpha-02": "alpha", "beta-01": "beta"
 
 
 def _vm_spec(**kw):
-    defaults = dict(name="vm-x", ansible_host="10.0.1.1", vmid="101", pve_node="")
+    defaults: Dict[str, Any] = dict(
+        name="vm-x", ansible_host="10.0.1.1", vmid="101", pve_node=""
+    )
     defaults.update(kw)
     return VmSpec(**defaults)
 

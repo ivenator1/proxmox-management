@@ -24,7 +24,16 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 
 import yaml
 
-from proxmox_fleet import briefing, deps, history, http, inventory, notifiers, window
+from proxmox_fleet import (
+    briefing,
+    deps,
+    history,
+    http,
+    inventory,
+    notifiers,
+    scan_notifications,
+    window,
+)
 from proxmox_fleet.cluster import (
     DEFAULT_CLUSTER,
     api_creds,
@@ -956,34 +965,51 @@ def run_notify_phase(
 ) -> str:
     """Run Phase 4 (final briefing) via the Python driver.
 
-    Consumes the *merged* FleetState (all phases), renders the briefing body
-    once, then: dispatches it to the resolved notifiers when ``should_notify``
-    holds; records the run history (carrying the rendered body) when history is
-    enabled; and pings the dead-man's-switch. The body is rendered
-    unconditionally so the history file captures the message even when
-    notification is suppressed.
+    Consumes the merged FleetState plus due persisted manual-scan attention,
+    renders one combined briefing, and dispatches it when fleet or manual
+    conditions require. Manual entries never alter FleetState failure/change
+    status or the dead-man signal. History captures the rendered body even when
+    dispatch is suppressed.
 
     Returns the rendered briefing body (handy for tests / logging). Never raises
     — notification/history failures must not abort the run.
     """
-    body = briefing.prepare_body(state)
+    manual_decision: Optional[scan_notifications.ManualDecision] = None
+    if settings.manual_update_notifications:
+        manual_state = scan_notifications.load_state(settings.fleet_history_dir)
+        manual_decision = scan_notifications.decide_stored_notifications(
+            manual_state,
+            reminder_hours=settings.manual_update_reminder_hours,
+            force=settings.force_notify,
+        )
+
+    manual_attention = bool(manual_decision and manual_decision.notify)
+    manual_section = manual_decision.body if manual_decision is not None else ""
+    body = briefing.prepare_body(state, manual_section=manual_section)
     failed = state.failed
 
-    if briefing.should_notify(
+    notify = briefing.should_notify(
         force_notify=settings.force_notify,
         dry_run=settings.fleet_dry_run,
         changed=state.changed,
         failed=failed,
-    ):
+    ) or manual_attention
+    if notify:
         notifiers.dispatch(
             notifiers.resolve_notifiers(settings),
-            title=briefing.briefing_title(failed),
-            ntfy_title=briefing.ntfy_title(failed),
+            title=briefing.briefing_title(failed, attention=manual_attention),
+            ntfy_title=briefing.ntfy_title(failed, attention=manual_attention),
             body=body,
-            color=briefing.discord_color(failed),
+            color=briefing.discord_color(failed, attention=manual_attention),
             failed=failed,
             retries=settings.notifier_retries,
         )
+        if manual_attention and manual_decision is not None:
+            # Advance reminders only after the combined fleet dispatch attempt.
+            scan_notifications.save_state(
+                settings.fleet_history_dir,
+                manual_decision.new_state,
+            )
 
     if settings.fleet_history_enabled:
         history.write_history(

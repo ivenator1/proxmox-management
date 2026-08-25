@@ -79,7 +79,7 @@ proxmox_fleet/
     config.py              # CustomConfig pydantic schema (custom_update configs)
     state.py               # FleetState + per-type records; dump_for_ansible()
     settings.py            # GlobalSettings (vars.yml schema incl. timeouts/retries/kuma maps +
-                           # scan-only manual_update_* settings)
+                           # manual-update scan/briefing settings)
   flows/
     _pkg.py                # shared: detect_pkg_mgr, upgrade_cmd (LC_ALL=C), kuma_healthy
     custom.py              # run_custom_update(): detect→backup→update→health→report
@@ -112,9 +112,8 @@ proxmox_fleet/
                            # WebSocket JSON-RPC (truenas_scale_ws) adapters;
                            # registry + fail-closed parsers
   scan.py                  # --scan: read-only pending-updates walk → pending-*.json (next to history);
-                           # runs manual_update adapter checks + reminder notifications
-  scan_notifications.py    # manual-mapping scan notifications: fingerprint/state machine/render +
-                           # run_manual_notifications() one-call (load → decide → dispatch → persist)
+                           # runs manual_update checks + refreshes dashboard/reminder state
+  scan_notifications.py    # manual scan state + fleet-briefing first/change/reminder selection/render
   lock.py                  # fleet-wide run lock (flock in fleet_history_dir); acquire_run_lock()/probe_lock()
   cli.py                   # fleet-update CLI: parses flags, calls driver.run_fleet()
   web/                     # fleet-dashboard ('.[web]' extra): app.py (FastAPI pages + SSE), runs.py
@@ -207,11 +206,9 @@ merges purely in-memory.
   CTs/templates are skipped, never started. Writes `pending-<ts>.json` + `pending-latest.json`
   to `fleet_history_dir` (pruned to `scan_history_keep`); obeys `--limit`; exits 1 for genuine
   check/parser errors, while SSH-unreachable targets are recorded and skipped. Bypasses
-  `run_fleet()` entirely (no phases, no run briefing). It does dispatch
-  *manual-update* notifications (see "Manual-update monitoring" below): when
-  `manual_update_notifications` is enabled, pending/errored `[manual_update_hosts]` entries fan
-  out through the same `notifiers.dispatch` on a first/change/daily-reminder state machine — that
-  is the scan's only notify path.
+  `run_fleet()` entirely (no phases or dispatch): manual checks refresh dashboard snapshots and
+  `manual-notify-state.json`. Phase 4 of the next fleet run reads that persisted state and folds
+  due first/change/daily reminders into the normal fleet briefing.
 
 ### Web dashboard (`web/`, `fleet-dashboard`)
 
@@ -292,16 +289,17 @@ changeset; see `docs/observability-roadmap.md`).
   excluded) and ledger os-upgrade events — same timestamp shape, one lexical sort; pending
   items render counts / reboot pill / package `<details>`.
 
-### Manual-update monitoring (scan-only)
+### Manual-update monitoring (scan-only host checks)
 
 Appliances the fleet must never auto-update (TrueNAS SCALE, OPNsense, vendor-managed boxes) are
 **tracked, not updated**. The six-hour `--scan` runs read-only adapter checks per
 `[manual_update_hosts]` host and folds the normalized results into the pending snapshot's
 top-level `manual` mapping (keyed by the stable inventory hostname; fields: `adapter`, `current`,
 `latest`, `update_available`, `reboot_required`, `summary`, `details`, `apply_hint`,
-`unreachable`, `error`). This is scan-only — `run_fleet()` never touches these hosts, and the
-`manual` bucket never enters `FleetState`, so a pending manual action cannot change
-`changed`/`failed` run totals, the run briefing, or run history.
+`unreachable`, `error`). Host contact is scan-only — `run_fleet()` never touches these hosts, and
+manual records never enter `FleetState`, so a pending manual action cannot change
+`changed`/`failed`, package totals, the run exit code, or dead-man failure status. Due presentation
+content is included in the normal run briefing and its persisted briefing text.
 
 Each host's `manual_adapter` selects the transport: the default `opnsense`/`truenas_scale` names
 run the fixed SSH checks, while `opnsense_api`/`truenas_scale_api`/`truenas_scale_ws` switch that
@@ -346,21 +344,20 @@ bounded ~2 min budget) before reading status, so the monitor cannot go stale.
   If a future OPNsense release changes `opnsense-update -c` wording, the scan errors — capture the
   local check-only output and confirm the parser fixture
   (`tests/unit/data/manual_updates/opnsense_*.txt`) before relying on it.
-- **Settings** (`models/settings.py`): `manual_update_notifications` (default true),
-  `manual_update_reminder_hours` (24), `manual_update_forks` (2), `manual_update_api_timeout`
-  (120 — per-request timeout for the `*_api` transport checks). Scan-only, read by
-  `run_fleet_scan`; deliberately **not** accepted as `-e` extra vars (see the `-e` bullet below).
-- **Notifications** (`scan_notifications.py`): when enabled, `run_manual_notifications()`
-  (load state → decide → dispatch → persist) runs after the pending snapshot is written. Per-host
-  state is `manual-notify-state.json` (`{host: {fingerprint, last_notified}}`); a host notifies on
-  **first** (no entry), **change** (semantic `fingerprint` differs — whitespace-normalized, no
-  timestamps), or **reminder** (`now >= last_notified + reminder_hours`). Unreachable → skipped,
-  state untouched; clean → own entry cleared; hosts absent from a `--limit` scan keep their state.
-  Dispatch goes through the existing `notifiers.dispatch` fan-out (Discord/ntfy/webhook/Telegram,
-  same body, `notifier_retries`); genuine check errors drive failure severity (red,
-  `❌ Scan: Manual Check Errors`), pending drives warning (amber, `⚠️ Scan: Manual Updates
-  Available`). A dispatch attempt advances `last_notified` even with zero targets, so a failed
-  dispatch never re-spams the next scan. Body ≤4000 chars, no trailing newline.
+- **Settings** (`models/settings.py`): `manual_update_notifications` (default true) and
+  `manual_update_reminder_hours` (24) are read by scan state recording and Phase 4 selection;
+  `manual_update_forks` (2) and `manual_update_api_timeout` (120) remain scan-only. None are
+  accepted as `-e` extra vars (see the `-e` bullet below).
+- **Notifications** (`scan_notifications.py` + `driver.run_notify_phase()`): scans call
+  `record_manual_results()` after writing the pending snapshot and **never dispatch**. Actionable
+  entries in `manual-notify-state.json` retain the latest normalized result plus current and
+  last-notified fingerprints. Phase 4 calls `decide_stored_notifications()` and piggybacks due
+  **first**, **change**, or **reminder** entries onto the ordinary fleet briefing, then advances
+  `last_notified` after the combined dispatch attempt. Unreachable → state untouched; clean → own
+  entry cleared; hosts absent from a `--limit` scan keep their state. Manual attention uses an
+  amber node-like `Manual Systems` subsection with every detail indented. Genuine manual check
+  errors remain manual attention: they do not set `FleetState.failed`, the webhook `failed` flag,
+  dead-man failure, totals, or exit status.
 - **Dashboard/snapshot** (`web/app.py` + `pending.html`): the snapshot `manual` bucket renders as
   the "Manual systems" table on `/pending` (platform, current → available, action pills, details,
   apply hint, notes) with per-host `/hosts/<name>` links; `pending_summary()` counts
@@ -573,9 +570,9 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
   so `-e` cannot set a string setting at all — use `vars.yml` or `--vars-file`. The example
   previously advertised in the README and `--help` (`-e custom_allow_reboot=false`) was itself
   a no-op: `custom_allow_reboot` is only ever read from settings.
-- **`manual_update_*` settings are scan-only** — read by `run_fleet_scan` only, and deliberately
-  not part of the `-e` allowlist: like any other non-listed key, `-e manual_update_reminder_hours=…`
-  is parsed and silently ignored (set them in `vars.yml`).
+- **`manual_update_*` settings are not `-e` overrides** — scan checks use the adapter/fork/timeout
+  values, while Phase 4 also reads `manual_update_notifications` and
+  `manual_update_reminder_hours`. They remain outside the `-e` allowlist: set them in `vars.yml`.
 - **`run_shell.yml`/`reboot_host.yml` have `check_mode: false`** — commands always execute; Python
   controls dry-run by choosing a simulate vs. real command. The node flow additionally guards
   reboot with `not dry_run` in Python.

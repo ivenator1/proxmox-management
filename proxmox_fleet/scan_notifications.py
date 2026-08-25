@@ -1,26 +1,21 @@
-"""Manual-mapping scan notifications — reminder-gated alerting for the pending
-scan's *manual* entries (hosts whose updates must be applied by hand through
-the GUI, plus genuine check errors).
+"""Manual-update scan state and fleet-briefing notification selection.
 
-``scan.py`` assembles the normalized manual mappings (one dict per host with
-``adapter``/``current``/``latest``/``update_available``/``reboot_required``/
-``summary``/``details``/``apply_hint``/``unreachable``/``error``), then calls
-:func:`run_manual_notifications` once — that helper loads the persisted
-per-host state, decides what needs notifying, dispatches through the existing
-``notifiers.dispatch`` fan-out, and persists the post-attempt state. The pure
-primitives (:func:`decide_manual_notifications`, :func:`fingerprint`,
-:func:`render_body`, :func:`load_state`/:func:`save_state`) are exported for
-tests and for integrations that want to control dispatch themselves.
+``scan.py`` refreshes the normalized manual mappings and records actionable
+results here without dispatching anything. The dashboard continues to read the
+pending snapshot. During the next fleet run, Phase 4 selects first/change/daily
+reminder entries from this state and includes them in the ordinary fleet
+briefing. Manual systems therefore remain scan-only and never affect
+``FleetState`` totals, failure status, or the process exit code.
 
 Selection contract
 ------------------
 Each entry is classified exactly once:
 
 - **unreachable** → skipped entirely; its persisted state is left untouched.
-- **genuine check error** (``error`` set, not unreachable) → notifies on
-  first / change / reminder with failure severity.
-- **pending** (``update_available`` or ``reboot_required``) → notifies on
-  first / change / reminder with warning severity.
+- **genuine check error** (``error`` set, not unreachable) → records attention
+  for first / change / reminder selection.
+- **pending** (``update_available`` or ``reboot_required``) → records attention
+  for first / change / reminder selection.
 - **current** (nothing to report) → clears that host's own state entry.
 
 A host not observed in this scan keeps its state (limited/``--limit`` scans
@@ -29,22 +24,13 @@ failed write never fails the scan.
 
 Reminder semantics
 ------------------
-Per host, the state entry is ``{"fingerprint": ..., "last_notified": ...}``.
-A host notifies when it has no entry (first), when its
-:func:`fingerprint` differs from the stored one (change), or when
+Per actionable host, state retains the latest result and fingerprint plus the
+last-notified fingerprint/timestamp. A fleet run selects a host when it has
+never been notified (first), its current fingerprint differs (change), or
 ``now >= last_notified + reminder_hours`` (reminder, exact boundary included).
-``last_notified`` advances to *now* after a dispatch attempt — the scan
-integration persists :attr:`ManualDecision.new_state` after it dispatches (or
-:func:`run_manual_notifications` does so itself), so a failed dispatch never
-spams the next scan.
-
-Severity metadata
------------------
-:attr:`ManualDecision.failed` is True exactly when at least one genuine check
-error is selected for this notification, so ``scan.py`` can choose
-:func:`scan_title`/:func:`scan_color` (failure red vs warning amber) and its
-own failure bookkeeping from one flag. The body never carries a trailing
-newline and is capped at 4000 chars.
+``last_notified`` advances only after the combined fleet dispatch attempt.
+Manual check errors remain presentation-only attention and never become a fleet
+failure. The subsection has no trailing newline and is capped at 4000 chars.
 """
 
 from __future__ import annotations
@@ -54,35 +40,28 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
-
-from proxmox_fleet import notifiers
-
-# Discord embed colours — failure red matches the update briefing; amber
-# signals "manual updates available, no check errors".
-_COLOR_FAILED = 15158332
-_COLOR_WARNING = 16766720
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 _BODY_LIMIT = 4000
 _STATE_FILE = "manual-notify-state.json"
-_STATE_VERSION = 1
+_STATE_VERSION = 2
 # Default gap between notifications for an unchanged host.
 _REMINDER_HOURS_DEFAULT = 24.0
 
 
 @dataclass
 class ManualDecision:
-    """Pure selection outcome for one scan — no side effects, no I/O.
+    """Pure manual-attention selection outcome — no side effects or I/O.
 
-    ``new_state`` is the state to persist *after* a dispatch attempt: selected
-    hosts get ``last_notified`` advanced to *now*, currently-observed clean
-    hosts are removed, and absent/unreachable hosts are left untouched.
+    ``new_state`` is the state to persist *after* the combined fleet dispatch
+    attempt: selected hosts get ``last_notified`` advanced to *now* and all
+    other recorded hosts remain untouched.
     """
 
     notify: bool
     """Whether anything was selected and a dispatch attempt is warranted."""
     failed: bool
-    """True iff at least one genuine check error is selected (failure severity)."""
+    """True iff a check error is selected; classification only, not fleet failure."""
     body: str
     """Rendered notification body (<=4000 chars, no trailing newline)."""
     selected: List[str]
@@ -95,26 +74,6 @@ class ManualDecision:
     """Selected hosts with a genuine check error (failure section)."""
     new_state: Dict[str, Dict[str, Any]]
     """State to persist after the dispatch attempt (see class docstring)."""
-
-
-@dataclass
-class ManualNotifyReport:
-    """Outcome of the one-call :func:`run_manual_notifications` integration."""
-
-    notify: bool
-    failed: bool
-    body: str
-    title: str
-    ntfy_title: str
-    color: int
-    selected: List[str]
-    reasons: Dict[str, str]
-    dispatched: bool
-    """Whether a dispatch attempt was made (True iff ``notify``)."""
-    state_saved: bool
-    """Whether the persisted state on disk reflects ``new_state`` after the run."""
-    state_path: Path
-    """Where ``manual-notify-state.json`` lives (or would live)."""
 
 
 # --------------------------------------------------------------------------
@@ -133,6 +92,18 @@ def _entry_details(entry: Mapping[str, Any]) -> List[str]:
         return [detail for item in value if (detail := _norm(item))]
     detail = _norm(value)
     return [detail] if detail else []
+
+
+def _entry_detail_lines(entry: Mapping[str, Any]) -> List[str]:
+    """Return physical detail lines so every line can be nested in Markdown."""
+    value = entry.get("details")
+    values = value if isinstance(value, (list, tuple)) else [value]
+    lines: List[str] = []
+    for item in values:
+        for raw_line in str(item if item is not None else "").splitlines():
+            if line := _norm(raw_line):
+                lines.append(line)
+    return lines
 
 
 def fingerprint(entry: Mapping[str, Any]) -> str:
@@ -200,26 +171,6 @@ def _entry_category(entry: Mapping[str, Any]) -> str:
     return "clean"
 
 
-def _notify_reason(
-    stored: Optional[Mapping[str, Any]],
-    fp: str,
-    now: datetime,
-    reminder_hours: float,
-    force: bool,
-) -> Optional[str]:
-    """Why this host should notify now, or None to stay silent."""
-    if force:
-        return "force"
-    if stored is None:
-        return "first"
-    if stored.get("fingerprint") != fp:
-        return "change"
-    last = _parse_ts(stored.get("last_notified"))
-    if last is None or now >= last + timedelta(hours=reminder_hours):
-        return "reminder"
-    return None
-
-
 # --------------------------------------------------------------------------
 # Time helpers
 # --------------------------------------------------------------------------
@@ -271,123 +222,34 @@ def render_body(
     *,
     limit: int = _BODY_LIMIT,
 ) -> str:
-    """Render the notification body: ``Manual updates required`` then, only
-    when present, a separate ``Manual check errors`` section.
+    """Render due manual entries as one node-like fleet subsection.
 
-    Per pending host: ``host — current → latest`` (``(reboot required)`` when
-    a reboot is pending), the details line, and the GUI apply hint. Per error
-    host: ``host — <error>``. Returns <= *limit* chars with no trailing
-    newline (truncation is at a word/whitespace boundary and ends with ``...``).
+    Category, host, detail, and apply-hint lines are nested at successively
+    deeper indentation levels. Returns <= *limit* chars with no trailing
+    newline.
     """
-    sections: List[str] = []
+    if not pending and not errors:
+        return ""
+    lines = ["**Manual Systems: (ATTENTION REQUIRED)**"]
     if pending:
-        lines = ["**Manual updates required**"]
+        lines.append("- Updates / reboots")
         for entry in pending:
             current = _norm(entry.get("current"))
             latest = _norm(entry.get("latest"))
             arrow = f"{current} → {latest}" if (current or latest) else "update available"
             reboot = " (reboot required)" if entry.get("reboot_required") else ""
-            lines.append(f"- **{_label(entry)}** — {arrow}{reboot}")
-            for detail in _entry_details(entry):
-                lines.append(f"  - {detail}")
+            lines.append(f"  - **{_label(entry)}** — {arrow}{reboot}")
+            for detail in _entry_detail_lines(entry):
+                lines.append(f"    - {detail}")
             hint = _norm(entry.get("apply_hint"))
             if hint:
-                lines.append(f"  GUI apply: {hint}")
-        sections.append("\n".join(lines))
+                lines.append(f"    - GUI apply: {hint}")
     if errors:
-        lines = ["**Manual check errors**"]
+        lines.append("- Check errors")
         for entry in errors:
             err = _norm(entry.get("error")) or "check failed"
-            lines.append(f"- **{_label(entry)}** — {err}")
-        sections.append("\n".join(lines))
-    return _trim_body("\n\n".join(sections), limit)
-
-
-# --------------------------------------------------------------------------
-# Selection
-# --------------------------------------------------------------------------
-
-def decide_manual_notifications(
-    entries: Sequence[Mapping[str, Any]],
-    state: Mapping[str, Mapping[str, Any]],
-    *,
-    now: Optional[datetime] = None,
-    reminder_hours: float = _REMINDER_HOURS_DEFAULT,
-    force: bool = False,
-) -> ManualDecision:
-    """Pure selection: which hosts notify now, and the state to persist after.
-
-    *entries* are the normalized manual mappings from this scan; *state* is the
-    persisted per-host ``{fingerprint, last_notified}`` map (see
-    :func:`load_state`). Unreachable hosts are skipped untouched; error hosts
-    notify on first/change/reminder with failure severity; pending
-    update/reboot hosts notify on first/change/reminder; clean hosts clear
-    their own entry. Hosts absent from *entries* keep their state (limited
-    scans never wipe unobserved hosts).
-
-    *now* defaults to the current UTC time and is injected for deterministic
-    tests. ``force=True`` notifies every error/pending host regardless of the
-    reminder window (mirrors ``settings.force_notify``).
-    """
-    now_utc = _as_utc(now)
-    new_state: Dict[str, Dict[str, Any]] = {k: dict(v) for k, v in state.items()}
-    selected: List[str] = []
-    reasons: Dict[str, str] = {}
-    pending_selected: List[Mapping[str, Any]] = []
-    error_selected: List[Mapping[str, Any]] = []
-
-    for entry in entries:
-        host = _key(entry)
-        category = _entry_category(entry)
-        if category == "unreachable":
-            # Could not look — never a notification, and never a state change.
-            continue
-        if category == "clean":
-            # Currently clean — this host's own state entry is cleared.
-            new_state.pop(host, None)
-            continue
-
-        fp = fingerprint(entry)
-        reason = _notify_reason(new_state.get(host), fp, now_utc, reminder_hours, force)
-        if reason is None:
-            continue
-        selected.append(host)
-        reasons[host] = reason
-        if category == "error":
-            error_selected.append(entry)
-        else:
-            pending_selected.append(entry)
-        new_state[host] = {"fingerprint": fp, "last_notified": _to_iso(now_utc)}
-
-    return ManualDecision(
-        notify=bool(selected),
-        failed=bool(error_selected),
-        body=render_body(pending_selected, error_selected),
-        selected=selected,
-        reasons=reasons,
-        pending_count=len(pending_selected),
-        error_count=len(error_selected),
-        new_state=new_state,
-    )
-
-
-# --------------------------------------------------------------------------
-# Title/colour metadata for scan.py
-# --------------------------------------------------------------------------
-
-def scan_title(failed: bool) -> str:
-    """Discord embed title — failure red when check errors were selected."""
-    return "❌ Scan: Manual Check Errors" if failed else "⚠️ Scan: Manual Updates Available"
-
-
-def scan_ntfy_title(failed: bool) -> str:
-    """ASCII-safe ntfy 'Title' header — mirrors :func:`scan_title`."""
-    return "Fleet Scan: Manual Check Errors" if failed else "Fleet Scan: Manual Updates Available"
-
-
-def scan_color(failed: bool) -> int:
-    """Discord embed colour — red on check errors, amber for updates only."""
-    return _COLOR_FAILED if failed else _COLOR_WARNING
+            lines.append(f"  - **{_label(entry)}** — {err}")
+    return _trim_body("\n".join(lines), limit)
 
 
 # --------------------------------------------------------------------------
@@ -433,80 +295,127 @@ def save_state(
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"version": _STATE_VERSION, "hosts": dict(state)}
-        path.write_text(
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(
             json.dumps(payload, indent=4, sort_keys=True, ensure_ascii=False),
             encoding="utf-8",
         )
+        temporary.replace(path)
         return True
     except (OSError, ValueError):
         return False
 
 
 # --------------------------------------------------------------------------
-# One-call integration
+# Scan recording and fleet-run selection
 # --------------------------------------------------------------------------
 
-def run_manual_notifications(
+def record_manual_results(
     entries: Sequence[Mapping[str, Any]],
     *,
     history_dir: Union[str, Path],
-    notifiers_list: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> bool:
+    """Refresh actionable manual state without sending a notification.
+
+    Pending/error entries replace their latest observed payload while retaining
+    the last fleet-notification markers. Clean entries are removed. Unreachable
+    and absent hosts remain untouched so transient or limited scans cannot wipe
+    known state. Returns whether the resulting state is safely persisted.
+    """
+    state = load_state(history_dir)
+    new_state: Dict[str, Dict[str, Any]] = {key: dict(value) for key, value in state.items()}
+    for entry in entries:
+        host = _key(entry)
+        category = _entry_category(entry)
+        if category == "unreachable":
+            continue
+        if category == "clean":
+            new_state.pop(host, None)
+            continue
+
+        fp = fingerprint(entry)
+        previous = new_state.get(host, {})
+        record: Dict[str, Any] = {
+            "fingerprint": fp,
+            "entry": dict(entry),
+        }
+        last_notified = previous.get("last_notified")
+        if last_notified:
+            record["last_notified"] = last_notified
+        notified_fingerprint = previous.get("notified_fingerprint")
+        if notified_fingerprint is None and last_notified:
+            # Version-1 state stored the last-notified fingerprint directly.
+            notified_fingerprint = previous.get("fingerprint")
+        if notified_fingerprint:
+            record["notified_fingerprint"] = notified_fingerprint
+        new_state[host] = record
+
+    return (new_state == state) or save_state(history_dir, new_state)
+
+
+def decide_stored_notifications(
+    state: Mapping[str, Mapping[str, Any]],
+    *,
     now: Optional[datetime] = None,
     reminder_hours: float = _REMINDER_HOURS_DEFAULT,
     force: bool = False,
-    retries: int = 15,
-    dispatch_fn: Callable[..., None] = notifiers.dispatch,
-) -> ManualNotifyReport:
-    """One-call integration for ``scan.py``: load → decide → dispatch → persist.
+) -> ManualDecision:
+    """Select due recorded entries for the next fleet-run briefing.
 
-    Loads the persisted state from *history_dir*, runs
-    :func:`decide_manual_notifications`, and when anything was selected makes a
-    dispatch attempt through *dispatch_fn* (default ``notifiers.dispatch``,
-    which swallows per-notifier failures — a failed dispatch never aborts the
-    scan). Immediately after the attempt the post-attempt state is persisted:
-    selected hosts' ``last_notified`` is advanced, currently-observed clean
-    hosts are cleared, and absent/unreachable hosts are untouched (limited
-    scans never wipe unobserved hosts). State writes are best-effort and
-    reported via :attr:`ManualNotifyReport.state_saved`.
-
-    *notifiers_list* is the resolved notifier list (``notifiers.resolve_notifiers``
-    output); ``None``/empty still counts as an attempt (zero targets) so the
-    reminder window still advances. *now* defaults to the current UTC time and
-    is injectable for deterministic tests; *force* mirrors
-    ``settings.force_notify``.
+    The returned ``new_state`` is the post-dispatch-attempt state. Callers must
+    persist it only after the ordinary fleet notification has been attempted.
     """
-    state = load_state(history_dir)
-    decision = decide_manual_notifications(
-        entries,
-        state,
-        now=now,
-        reminder_hours=reminder_hours,
-        force=force,
-    )
-    if decision.notify:
-        # Dispatch attempt — advance last_notified right after, so a failure
-        # here does not cause a re-notification on the next scan.
-        dispatch_fn(
-            list(notifiers_list) if notifiers_list is not None else [],
-            title=scan_title(decision.failed),
-            ntfy_title=scan_ntfy_title(decision.failed),
-            body=decision.body,
-            color=scan_color(decision.failed),
-            failed=decision.failed,
-            retries=retries,
-        )
-    changed = decision.new_state != state
-    state_saved = (not changed) or save_state(history_dir, decision.new_state)
-    return ManualNotifyReport(
-        notify=decision.notify,
-        failed=decision.failed,
-        body=decision.body,
-        title=scan_title(decision.failed),
-        ntfy_title=scan_ntfy_title(decision.failed),
-        color=scan_color(decision.failed),
-        selected=decision.selected,
-        reasons=decision.reasons,
-        dispatched=decision.notify,
-        state_saved=state_saved,
-        state_path=_state_path(history_dir),
+    now_utc = _as_utc(now)
+    new_state: Dict[str, Dict[str, Any]] = {key: dict(value) for key, value in state.items()}
+    selected: List[str] = []
+    reasons: Dict[str, str] = {}
+    pending_selected: List[Mapping[str, Any]] = []
+    error_selected: List[Mapping[str, Any]] = []
+
+    for host in sorted(state):
+        stored = state[host]
+        entry = stored.get("entry")
+        if not isinstance(entry, Mapping):
+            continue
+        category = _entry_category(entry)
+        if category not in {"pending", "error"}:
+            continue
+
+        fp = str(stored.get("fingerprint") or fingerprint(entry))
+        notified_fp = stored.get("notified_fingerprint")
+        last_notified = _parse_ts(stored.get("last_notified"))
+        if force:
+            reason: Optional[str] = "force"
+        elif not notified_fp or last_notified is None:
+            reason = "first"
+        elif notified_fp != fp:
+            reason = "change"
+        elif now_utc >= last_notified + timedelta(hours=reminder_hours):
+            reason = "reminder"
+        else:
+            reason = None
+        if reason is None:
+            continue
+
+        selected.append(host)
+        reasons[host] = reason
+        if category == "error":
+            error_selected.append(entry)
+        else:
+            pending_selected.append(entry)
+        updated = dict(stored)
+        updated["fingerprint"] = fp
+        updated["notified_fingerprint"] = fp
+        updated["last_notified"] = _to_iso(now_utc)
+        new_state[host] = updated
+
+    return ManualDecision(
+        notify=bool(selected),
+        failed=bool(error_selected),
+        body=render_body(pending_selected, error_selected),
+        selected=selected,
+        reasons=reasons,
+        pending_count=len(pending_selected),
+        error_count=len(error_selected),
+        new_state=new_state,
     )

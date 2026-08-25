@@ -91,10 +91,10 @@ dashboard_port: 8421
 # pending-latest.json to fleet_history_dir. Keep the newest N scan snapshots.
 scan_history_keep: 30
 
-# --- MANUAL UPDATE TRACKING (scan-only) ---
-# Hosts listed in [manual_update_hosts] are never auto-updated. The six-hour
-# scan checks them read-only and notifies on first/change, then at this reminder
-# interval while action remains pending. These settings are scan-only and are
+# --- MANUAL UPDATE TRACKING ---
+# Hosts listed in [manual_update_hosts] are never auto-updated. Scans check them
+# read-only and refresh state/dashboard data without notifying. Due first/change
+# notices and reminders piggyback on the next fleet briefing. These settings are
 # NOT accepted as -e extra vars.
 manual_update_notifications: true
 manual_update_reminder_hours: 24

@@ -13,7 +13,9 @@ from typing import Any, Dict, List
 import pytest
 
 from proxmox_fleet import http as http_mod
+from proxmox_fleet import notifiers
 from proxmox_fleet import scan as scan_mod
+from proxmox_fleet import scan_notifications
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.runner import PrimitiveResult, UnreachableHostError
 
@@ -45,8 +47,41 @@ class ScriptedExecutor:
         self.commands.append(command)
         return self._resp(command)
 
+    def run_local(self, command):
+        return self._resp(command)
+
+    def reboot(self, *, timeout=600):
+        return self.default
+
+    def node_post_upgrade(self, *, nvidia_host=False):
+        return self.default
+
+    def snapshot(self, vmid, **kwargs):
+        return self.default
+
     def introspect(self, lxc_id):
         return PrimitiveResult(rc=0, changed=False, facts=dict(self.introspect_facts))
+
+    def vzdump(self, lxc_id, *, backup_storage, lxc_name):
+        return self.default
+
+    def lxc_os_update(self, lxc_id, *, os_update_cmd):
+        return self.default
+
+    def lxc_app_update(self, lxc_id, **kwargs):
+        return self.default
+
+    def post_update(self, lxc_id, **kwargs):
+        return self.default
+
+    def pct_rollback(self, lxc_id):
+        return self.default
+
+    def pct_start(self, lxc_id):
+        return self.default
+
+    def pct_stop(self, lxc_id):
+        return self.default
 
 
 APT_SIM = """\
@@ -1080,7 +1115,7 @@ def test_run_fleet_scan_rejects_unknown_adapter_before_executor(tmp_path, monkey
     assert contacted == []
 
 
-def test_run_fleet_scan_manual_notification_reuses_all_notifiers(tmp_path, monkeypatch):
+def test_run_fleet_scan_records_manual_attention_without_dispatch(tmp_path, monkeypatch):
     inv = tmp_path / "hosts.ini"
     inv.write_text(
         "[manual_update_hosts]\nnas manual_adapter=truenas_scale\n"
@@ -1093,32 +1128,28 @@ def test_run_fleet_scan_manual_notification_reuses_all_notifiers(tmp_path, monke
             script={"midclt": [_ok(_TRUENAS_AVAILABLE)]}
         ),
     )
-    destinations = [
-        {"type": "discord", "webhook": "https://discord.test"},
-        {"type": "ntfy", "url": "https://ntfy.test"},
-        {"type": "webhook", "url": "https://webhook.test"},
-        {"type": "telegram", "bot_token": "x", "chat_id": "1"},
-    ]
     calls = []
     monkeypatch.setattr(
-        scan_mod.notifiers,
+        notifiers,
         "dispatch",
         lambda resolved, **kw: calls.append((resolved, kw)),
     )
+    history_dir = tmp_path / "hist"
     settings = GlobalSettings(
-        fleet_history_dir=str(tmp_path / "hist"),
+        fleet_history_dir=str(history_dir),
         fleet_history_enabled=False,
-        notifiers=destinations,
+        notifiers=[{"type": "discord", "webhook": "https://discord.test"}],
     )
     assert scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv)) == 0
-    assert len(calls) == 1
-    assert calls[0][0] == destinations
-    assert calls[0][1]["failed"] is False
-    assert "Manual updates required" in calls[0][1]["body"]
+    assert calls == []
 
-    # The unchanged state is below the 24-hour reminder boundary.
+    stored = scan_notifications.load_state(history_dir)["nas"]
+    assert stored["entry"]["update_available"] is True
+    assert "last_notified" not in stored
+
+    # Repeated scans refresh state but still never dispatch directly.
     assert scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv)) == 0
-    assert len(calls) == 1
+    assert calls == []
 
 
 # --- pending_summary / read_pending (readers) ------------------------------------
@@ -1407,7 +1438,7 @@ _UNREACHABLE_ERR = (
 
 
 def test_scan_host_flags_unreachable_rather_than_a_plain_error():
-    class Dead:
+    class Dead(ScriptedExecutor):
         host = "ONeill"
 
         def run_shell(self, command, **opts):
@@ -1427,7 +1458,7 @@ def test_scan_host_genuine_failure_is_not_flagged_unreachable():
 
 
 def test_scan_lxc_typed_unreachable_is_flagged():
-    class Dead:
+    class Dead(ScriptedExecutor):
         host = "ONeill"
 
         def introspect(self, lxc_id):

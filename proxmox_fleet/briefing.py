@@ -19,10 +19,11 @@ from proxmox_fleet.models.state import FleetState
 
 # Discord embed colours — kept identical to fleet-update.yml Phase 4.
 _COLOR_FAILED = 15158332
+_COLOR_WARNING = 16766720
 _COLOR_OK = 3066993
 
 
-def render_briefing(state: FleetState) -> str:
+def render_briefing(state: FleetState, *, manual_section: str = "") -> str:
     """Render the briefing body exactly as ``discord_briefing.j2`` would.
 
     Returns the *raw* template output (no trim/truncate) so the golden parity
@@ -80,6 +81,11 @@ def render_briefing(state: FleetState) -> str:
         parts.append(f"**{node_name}: (GUEST RESULTS)**")
         append_guest_results(node_name)
 
+    if manual_section:
+        if parts:
+            parts.append("\n\n")
+        parts.append(manual_section.strip())
+
     if state.remote:
         parts.append("\n\n**Remote Hosts**")
         for r in state.remote:
@@ -116,24 +122,39 @@ def _truncate(s: str, length: int = 255, killwords: bool = False,
     return result + end
 
 
-def prepare_body(state: FleetState) -> str:
-    """The notifier/history body: ``render_briefing(state) | trim | truncate(4000, ...)``."""
-    return _truncate(render_briefing(state).strip(), 4000, False, "\n...")
+def prepare_body(state: FleetState, *, manual_section: str = "") -> str:
+    """Return the trimmed, notifier-safe fleet and manual briefing body."""
+    return _truncate(
+        render_briefing(state, manual_section=manual_section).strip(),
+        4000,
+        False,
+        "\n...",
+    )
 
 
-def briefing_title(failed: bool) -> str:
-    """Discord embed title (with emoji) — mirrors ``_briefing_title``."""
-    return "⚠️ Briefing: Failures Detected" if failed else "✅ Briefing: All Systems Clear"
+def briefing_title(failed: bool, *, attention: bool = False) -> str:
+    """Discord embed title, with manual attention kept distinct from failure."""
+    if failed:
+        return "⚠️ Briefing: Failures Detected"
+    if attention:
+        return "⚠️ Briefing: Manual Attention Required"
+    return "✅ Briefing: All Systems Clear"
 
 
-def ntfy_title(failed: bool) -> str:
-    """ASCII-safe ntfy 'Title' header — mirrors ``_ntfy_title``."""
-    return "Fleet Update: Failures Detected" if failed else "Fleet Update: All Systems Clear"
+def ntfy_title(failed: bool, *, attention: bool = False) -> str:
+    """ASCII-safe ntfy title, with manual attention kept distinct from failure."""
+    if failed:
+        return "Fleet Update: Failures Detected"
+    if attention:
+        return "Fleet Update: Manual Attention Required"
+    return "Fleet Update: All Systems Clear"
 
 
-def discord_color(failed: bool) -> int:
-    """Discord embed colour — mirrors ``_discord_color``."""
-    return _COLOR_FAILED if failed else _COLOR_OK
+def discord_color(failed: bool, *, attention: bool = False) -> int:
+    """Discord embed colour: red failure, amber attention, green success."""
+    if failed:
+        return _COLOR_FAILED
+    return _COLOR_WARNING if attention else _COLOR_OK
 
 
 def should_notify(*, force_notify: bool, dry_run: bool, changed: bool, failed: bool) -> bool:
