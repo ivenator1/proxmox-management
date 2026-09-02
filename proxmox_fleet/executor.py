@@ -71,8 +71,9 @@ class Executor(Protocol):
         """Read pct config, pct status, and update-script content in one subprocess.
 
         Returns facts: config_stdout, config_rc, status_stdout, pull_rc,
-        script_stdout, df_stdout, os_release_stdout. The last two are empty for a
-        container that was not running (introspect precedes the flow's pct_start).
+        script_stdout, df_stdout, boot_df_stdout, os_release_stdout. The disk and
+        OS facts are empty for a container that was not running (introspect
+        precedes the flow's pct_start).
         """
         ...
 
@@ -95,10 +96,12 @@ class Executor(Protocol):
         lxc_build_ram: str = "",
         lxc_run_cpu: str = "",
         lxc_run_ram: str = "",
+        lxc_bypass_storage_guard: bool = False,
     ) -> PrimitiveResult:
         """Run the community-scripts /usr/bin/update via the lxc_app_update primitive.
 
-        Handles resource scaling (up before, down after) internally when lxc_needs_scale=True.
+        Handles resource scaling and a Python-approved high-utilization storage
+        guard bypass internally.
         """
         ...
 
@@ -258,6 +261,7 @@ class RunnerExecutor:
         lxc_build_ram: str = "",
         lxc_run_cpu: str = "",
         lxc_run_ram: str = "",
+        lxc_bypass_storage_guard: bool = False,
     ) -> PrimitiveResult:
         return _merge_facts(invoke_primitive(
             "lxc_app_update",
@@ -272,6 +276,7 @@ class RunnerExecutor:
                 "lxc_build_ram": lxc_build_ram,
                 "lxc_run_cpu": lxc_run_cpu,
                 "lxc_run_ram": lxc_run_ram,
+                "lxc_bypass_storage_guard": lxc_bypass_storage_guard,
             },
             check=self.check,
         ))

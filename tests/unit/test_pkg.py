@@ -1,4 +1,6 @@
 """Tests for proxmox_fleet.flows._pkg — shared package-manager helpers."""
+from typing import Any, cast
+
 import pytest
 
 from proxmox_fleet.flows._pkg import detect_pkg_mgr, kuma_healthy, upgrade_cmd
@@ -29,12 +31,12 @@ class _FakeExec:
     ("", "apt"),            # no output → fallback
 ])
 def test_detect_pkg_mgr(stdout, expected):
-    assert detect_pkg_mgr(_FakeExec(stdout)) == expected
+    assert detect_pkg_mgr(cast(Any, _FakeExec(stdout))) == expected
 
 
 def test_detect_pkg_mgr_is_read_only():
     ex = _FakeExec("apt\n")
-    detect_pkg_mgr(ex)
+    detect_pkg_mgr(cast(Any, ex))
     # exactly one detection shell, issued with changed_when=False / ignore_errors
     assert len(ex.commands) == 1
 
@@ -49,9 +51,16 @@ def test_upgrade_cmd_pins_locale(pkg_mgr, dry_run):
     assert "LC_ALL=C" in cmd
 
 
-def test_upgrade_cmd_apt_real_vs_dry():
-    assert "-s dist-upgrade" in upgrade_cmd("apt", dry_run=True)
-    assert "dist-upgrade -y --autoremove" in upgrade_cmd("apt", dry_run=False)
+def test_upgrade_cmd_apt_real_cleans_archives_only_after_success():
+    cmd = upgrade_cmd("apt", dry_run=False)
+    assert "dist-upgrade -y --autoremove" in cmd
+    assert cmd.endswith("&& LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get clean")
+
+
+def test_upgrade_cmd_apt_dry_run_never_cleans_archives():
+    cmd = upgrade_cmd("apt", dry_run=True)
+    assert "-s dist-upgrade" in cmd
+    assert "apt-get clean" not in cmd
 
 
 def test_upgrade_cmd_dnf_real_vs_dry():

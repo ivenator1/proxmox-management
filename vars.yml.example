@@ -115,12 +115,16 @@ lxc_dry_run: false         # compare versions only; no actual updates
 lxc_auto_reboot: true      # reboot container when reboot-required is present
 lxc_continue_on_error: false
 
-# --- HEALTH WARNINGS (pre-emptive; never skip or fail a container) ---
-# Warn when a container's rootfs is at/above this percentage. Kept below the
-# community scripts' own >80% abort (check_container_storage) so a container is
-# flagged a run or two before its app updates start failing with exit 114.
+# --- DISK SAFETY (percentage AND absolute free space) ---
+# A rootfs is low only when it is at/above this percentage AND has less than
+# lxc_disk_min_free_gb available. This avoids false alarms on large roots (for
+# example, 90% of 200 GiB still leaves 20 GiB free). When /boot exceeds the
+# community scripts' hard 80% guard but meets the absolute minimum, the fleet
+# updater filters only that guard call from the fetched ct script stream; the
+# installed /usr/bin/update wrapper and upstream source are never modified.
 # Reported in the briefing's Warnings section, on --dry-run, and in --scan.
 lxc_disk_warn_percent: 75
+lxc_disk_min_free_gb: 10
 
 # --- RESOURCE SCALING (opt-in) ---
 # Temporarily raise a container's cores/memory to its ct script's var_cpu/var_ram

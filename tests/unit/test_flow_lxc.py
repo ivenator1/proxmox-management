@@ -5,10 +5,10 @@ GitHub/Kuma calls. Asserts control flow: rescue/rollback, snapshot gating,
 health check, dry-run, was_stopped handling, resource scaling, and status strings.
 """
 import time
-
+from typing import Any, cast
 
 from proxmox_fleet import http as http_mod
-from proxmox_fleet.flows.lxc import _discover_lxcs, run_lxc_update
+from proxmox_fleet.flows.lxc import _discover_lxcs, _os_update_cmd, run_lxc_update
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.runner import PrimitiveResult
 
@@ -101,12 +101,25 @@ class ScriptedLxcExecutor:
     def reboot(self, *, timeout=600):
         return _ok()
 
-    def snapshot(self, lxc_id, *, snap_state, **api_params):
-        self.snapshot_api_params.append(dict(api_params))
+    def node_post_upgrade(self, *, nvidia_host=False):
+        return _ok()
+
+    def snapshot(
+        self, vmid, *, snap_state, api_host, api_user, api_token_id,
+        api_token_secret, timeout=600, api_timeout=30,
+    ):
+        self.snapshot_api_params.append({
+            "api_host": api_host,
+            "api_user": api_user,
+            "api_token_id": api_token_id,
+            "api_token_secret": api_token_secret,
+            "timeout": timeout,
+            "api_timeout": api_timeout,
+        })
         if snap_state == "present":
-            self.snapshots_created.append(lxc_id)
+            self.snapshots_created.append(vmid)
         else:
-            self.snapshots_deleted.append(lxc_id)
+            self.snapshots_deleted.append(vmid)
         return _ok(changed=self.snap_changed)
 
     def introspect(self, lxc_id):
@@ -129,13 +142,14 @@ class ScriptedLxcExecutor:
     def lxc_app_update(
         self, lxc_id, *, lxc_shell="bash", lxc_unattended=True,
         lxc_needs_scale=False, lxc_build_cpu="", lxc_build_ram="",
-        lxc_run_cpu="", lxc_run_ram="",
+        lxc_run_cpu="", lxc_run_ram="", lxc_bypass_storage_guard=False,
     ):
         self.commands.append(f"lxc_app_update:{lxc_id}")
         self.app_update_kwargs = {
             "lxc_needs_scale": lxc_needs_scale,
             "lxc_build_cpu": lxc_build_cpu, "lxc_build_ram": lxc_build_ram,
             "lxc_run_cpu": lxc_run_cpu, "lxc_run_ram": lxc_run_ram,
+            "lxc_bypass_storage_guard": lxc_bypass_storage_guard,
         }
         return self._lxc_app_result
 
@@ -491,6 +505,7 @@ def test_snapshot_rollback_on_failure(monkeypatch):
 
     out = run_lxc_update("pve-01", "101", ex, _settings(), api_host="192.168.1.10")
     assert out.failed is True
+    assert out.record is not None
     assert out.record.app == "FAILED + ROLLED BACK"
     assert ex.rollback_called is True
     assert ex.snapshots_created == ["101"]
@@ -515,6 +530,7 @@ def test_no_rollback_without_snapshot(monkeypatch):
     out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10")
     assert out.failed is True
     # strategy=none → no snapshot attempted → plain "FAILED"
+    assert out.record is not None
     assert out.record.app == "FAILED"
     assert ex.rollback_called is False
     assert ex.snapshots_created == []
@@ -526,7 +542,10 @@ def test_snapshot_failure_warning(monkeypatch):
     monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
 
     class TimedOutSnapshotExecutor(ScriptedLxcExecutor):
-        def snapshot(self, lxc_id, *, snap_state, **api_params):
+        def snapshot(
+            self, vmid, *, snap_state, api_host, api_user, api_token_id,
+            api_token_secret, timeout=600, api_timeout=30,
+        ):
             if snap_state == "present":
                 return _fail(stderr="Reached timeout while waiting for creating VM snapshot")
             return _ok()
@@ -564,6 +583,7 @@ def test_vzdump_failure_triggers_rescue(monkeypatch):
     assert out.failed is True
     # vzdump runs BEFORE snapshot; no snapshot taken (snap_taken=False,
     # snapshot_failed=False) → plain "FAILED"
+    assert out.record is not None
     assert out.record.app == "FAILED"
 
 
@@ -589,6 +609,7 @@ def test_health_check_failure_triggers_rescue(monkeypatch):
     )
     out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10")
     assert out.failed is True
+    assert out.record is not None
     assert "FAILED" in out.record.app
 
 
@@ -781,7 +802,12 @@ def test_reboot_suffix_in_os_status(monkeypatch):
 # snapshot_with_retry
 # ---------------------------------------------------------------------------
 
-_API = {"api_host": "1.2.3.4", "api_user": "root@pam", "api_token_id": "tok", "api_token_secret": "sec"}
+_API: dict[str, Any] = {
+    "api_host": "1.2.3.4",
+    "api_user": "root@pam",
+    "api_token_id": "tok",
+    "api_token_secret": "sec",
+}
 
 
 class _QueueSnapshotEx:
@@ -804,7 +830,7 @@ def test_snapshot_with_retry_succeeds_after_two_failures():
         PrimitiveResult(rc=1, failed=True, changed=False, stdout="CT is locked"),
         _ok(changed=True),
     ])
-    result = snapshot_with_retry(ex, "101", snap_state="present", **_API,
+    result = snapshot_with_retry(cast(Any, ex), "101", snap_state="present", **_API,
                                  retries=3, _sleep=lambda s: None)
     assert result.changed is True
     assert len(ex.calls) == 3
@@ -817,7 +843,7 @@ def test_snapshot_with_retry_returns_failed_after_exhaustion():
         PrimitiveResult(rc=1, failed=True, changed=False, stdout="CT is locked"),
         PrimitiveResult(rc=1, failed=True, changed=False, stdout="CT is locked"),
     ])
-    result = snapshot_with_retry(ex, "101", snap_state="present", **_API,
+    result = snapshot_with_retry(cast(Any, ex), "101", snap_state="present", **_API,
                                  retries=2, _sleep=lambda s: None)
     assert result.failed is True
     assert result.changed is False
@@ -835,7 +861,7 @@ def test_snapshot_with_retry_returns_failed_when_snapshot_raises():
         def snapshot(self, vmid, *, snap_state, **kw):
             raise OSError("ansible-runner exploded")
 
-    result = snapshot_with_retry(_RaisingEx(), "101", snap_state="present", **_API,
+    result = snapshot_with_retry(cast(Any, _RaisingEx()), "101", snap_state="present", **_API,
                                  retries=2, _sleep=lambda s: None)
     assert result.failed is True
     assert result.changed is False
@@ -1003,6 +1029,19 @@ def test_failure_detail_prefers_stderr_over_banner_stdout():
 
 
 # ---------------------------------------------------------------------------
+# Package cleanup and pre-emptive health warnings
+# ---------------------------------------------------------------------------
+
+
+def test_lxc_real_apt_upgrade_cleans_archives_only_after_success():
+    cmd = _os_update_cmd("101", "debian")
+    assert "dist-upgrade" in cmd
+    assert cmd.endswith(
+        "&& LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get clean'"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pre-emptive health warnings (low disk / OS behind the ct script's target)
 # ---------------------------------------------------------------------------
 
@@ -1014,6 +1053,10 @@ DF_90_PERCENT = (
 DF_52_PERCENT = (
     "Filesystem     1024-blocks    Used Available Capacity Mounted on\n"
     "/dev/rbd7         17369872 8440172   8022028      52% /\n"
+)
+DF_90_PERCENT_20_GIB_FREE = (
+    "Filesystem     1024-blocks      Used Available Capacity Mounted on\n"
+    "/dev/rbd20        209715200 188743680  20971520      90% /\n"
 )
 # Verbatim /etc/os-release from CT 123 (nginxproxymanager).
 OS_RELEASE_BOOKWORM = (
@@ -1061,6 +1104,48 @@ def test_disk_warning_fires_at_threshold(monkeypatch):
     assert len(disk) == 1
     assert disk[0].host == "pve-01/130"
     assert "90% full" in disk[0].warning
+
+
+def test_large_rootfs_uses_absolute_free_space_and_bypasses_upstream_guard(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(
+                            200, CT_SCRIPT_TRIXIE + "check_container_storage\n"))
+    ex = _exec_with_health(df=DF_90_PERCENT_20_GIB_FREE, os_release=OS_RELEASE_TRIXIE)
+    ex._introspect_facts["boot_df_stdout"] = DF_90_PERCENT_20_GIB_FREE
+    settings = _settings(lxc_disk_min_free_gb=10)
+
+    out = run_lxc_update("pve-01", "130", ex, settings, api_host="192.168.1.10")
+
+    assert [w for w in out.warnings if w.task == "disk space"] == []
+    assert ex.app_update_kwargs["lxc_bypass_storage_guard"] is True
+
+
+def test_high_percentage_with_little_free_space_keeps_guard(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(
+                            200, CT_SCRIPT_TRIXIE + "check_container_storage\n"))
+    ex = _exec_with_health(df=DF_90_PERCENT, os_release=OS_RELEASE_TRIXIE)
+    ex._introspect_facts["boot_df_stdout"] = DF_90_PERCENT
+    settings = _settings(lxc_disk_min_free_gb=10)
+
+    out = run_lxc_update("pve-01", "130", ex, settings, api_host="192.168.1.10")
+
+    assert [w.task for w in out.warnings if w.task == "disk space"] == ["disk space"]
+    assert ex.app_update_kwargs["lxc_bypass_storage_guard"] is False
+
+
+def test_large_rootfs_without_upstream_guard_needs_no_bypass(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DF_90_PERCENT_20_GIB_FREE, os_release=OS_RELEASE_TRIXIE)
+    ex._introspect_facts["boot_df_stdout"] = DF_90_PERCENT_20_GIB_FREE
+
+    run_lxc_update("pve-01", "130", ex, _settings(), api_host="192.168.1.10")
+
+    assert ex.app_update_kwargs["lxc_bypass_storage_guard"] is False
 
 
 def test_disk_warning_silent_below_threshold(monkeypatch):
@@ -1242,6 +1327,7 @@ def test_run_lxc_update_qualified_app_exclude_only_its_cluster(monkeypatch):
     )
     out_alpha = run_lxc_update("pve-01", "101", ex_alpha, settings,
                                api_host="192.168.1.10", cluster="alpha")
+    assert out_alpha.record is not None
     assert out_alpha.record.app == "SKIPPED"
     assert not any(c.startswith("lxc_app_update:") for c in ex_alpha.commands)
 
@@ -1252,6 +1338,7 @@ def test_run_lxc_update_qualified_app_exclude_only_its_cluster(monkeypatch):
     )
     out_beta = run_lxc_update("pve-01", "101", ex_beta, settings,
                               api_host="192.168.1.10", cluster="beta")
+    assert out_beta.record is not None
     assert out_beta.record.app != "SKIPPED"
     assert any(c.startswith("lxc_app_update:") for c in ex_beta.commands)
 
@@ -1269,6 +1356,7 @@ def test_run_lxc_update_bare_app_exclude_applies_to_every_cluster(monkeypatch):
         )
         out = run_lxc_update("pve-01", "101", ex, settings,
                              api_host="192.168.1.10", cluster=cluster)
+        assert out.record is not None
         assert out.record.app == "SKIPPED"
 
 

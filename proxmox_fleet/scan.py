@@ -39,6 +39,7 @@ from proxmox_fleet.flows.lxc import (
 )
 from proxmox_fleet.lxc_parse import (
     parse_ct_script,
+    parse_df_available_kb,
     parse_df_percent,
     # The LXC helper returns {id, version_id}; the scan-local parse_os_release
     # below extends it with pretty_name. Aliased so the two never shadow each
@@ -73,6 +74,19 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def disk_is_low(entry: Mapping[str, Any], threshold: int, minimum_free_gb: float) -> bool:
+    """Apply the dual threshold while treating legacy/invalid free space as unknown."""
+    if _as_int(entry.get("disk_percent")) < threshold:
+        return False
+    free_gb = entry.get("disk_free_gb")
+    if free_gb is None:
+        return True
+    try:
+        return float(free_gb) < minimum_free_gb
+    except (TypeError, ValueError):
+        return True
 
 
 def scan_cmd(pkg_mgr: str) -> str:
@@ -344,6 +358,7 @@ def _empty_lxc_entry(node: str, lxc_id: str) -> Dict[str, Any]:
         "reboot_required": False,
         "os_release": {"id": "", "version_id": "", "pretty_name": ""},
         "disk_percent": None,
+        "disk_free_gb": None,
         "os": "",
         "os_mismatch": None,
         "unreachable": False,
@@ -390,7 +405,12 @@ def scan_lxc(executor: Executor, lxc_id: str, node: str) -> Dict[str, Any]:
         out["app"] = app
 
         # Health signals — read from the same introspect pass, no extra commands.
-        out["disk_percent"] = parse_df_percent(str(intro.facts.get("df_stdout", "")))
+        df_stdout = str(intro.facts.get("df_stdout", ""))
+        out["disk_percent"] = parse_df_percent(df_stdout)
+        available_kb = parse_df_available_kb(df_stdout)
+        out["disk_free_gb"] = (
+            available_kb / (1024 * 1024) if available_kb is not None else None
+        )
         cur_os = _lxc_parse_os_release(str(intro.facts.get("os_release_stdout", "")))
         out["os"] = f"{cur_os['id']} {cur_os['version_id']}".strip()
         out["os_release"] = parsed["os_release"]
@@ -437,6 +457,7 @@ def pending_summary(
     *,
     limit: int = 10,
     disk_threshold: int = 75,
+    disk_min_free_gb: float = 10.0,
 ) -> List[Dict[str, Any]]:
     """Read back the newest *limit* pending-scan summaries, newest first.
 
@@ -445,9 +466,9 @@ def pending_summary(
     ``limit <= 0`` meaning "all scans". ``pending-latest.json`` is excluded
     (it duplicates the newest timestamped file).
 
-    *disk_threshold* counts containers at or above that rootfs percentage; pass
-    ``settings.lxc_disk_warn_percent`` to keep the scan page and the briefing
-    warnings agreeing on what "low" means.
+    A container counts as low disk only when it is at/above *disk_threshold*
+    and has less than *disk_min_free_gb* available. Legacy snapshots without
+    absolute free-space data retain the percentage-only classification.
     """
     directory = Path(history_dir)
     scans = sorted(
@@ -492,7 +513,9 @@ def pending_summary(
                 "reboot_hosts": sum(1 for entry in (*hosts, *lxc) if entry.get("reboot_required")),
                 # Health signals — containers that need attention before they fail.
                 # Read defensively: scans written before these keys existed lack them.
-                "low_disk": sum(1 for c in lxc if (c.get("disk_percent") or 0) >= disk_threshold),
+                "low_disk": sum(
+                    1 for c in lxc if disk_is_low(c, disk_threshold, disk_min_free_gb)
+                ),
                 "os_mismatch": sum(1 for c in lxc if c.get("os_mismatch")),
                 # Unreachable hosts are reported separately: they are "could not
                 # look", not a broken scan, and they do not fail the run either.

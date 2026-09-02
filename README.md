@@ -134,12 +134,13 @@ The `vars.yml` file is the central intelligence of the orchestrator.
 * `lxc_tags`: List of PVE tags that mark community-scripts containers (default: `community-script`, `proxmox-helper-scripts`). Set tags in PVE UI → Container → Options → Tags.
 * `lxc_dry_run`: Set to `true` to compare installed vs. latest GitHub release versions without making any changes.
 * `lxc_unattended`: Sets `PHS_SILENT=1` inside containers to suppress interactive prompts.
+* `lxc_disk_warn_percent` / `lxc_disk_min_free_gb`: Disk safety uses both utilization and absolute free space (defaults: 75% and 10 GiB). Large roots with ample free space may pass the community-script 80% guard; genuinely constrained roots remain blocked.
 * `lxc_backup_strategy` / `lxc_auto_reboot` / `lxc_continue_on_error`: See `vars.yml.example` for defaults.
 
 ### 🛡️ Management & Exclusions
 * `manager_lxc_id`: The VMID of the Manager LXC itself. The node hosting this container is never rebooted automatically.
 * `exclude_list`: LXC IDs completely skipped (no updates, no snapshots).
-* `os_update_exclude_list`: Skip `apt dist-upgrade` / `apk upgrade` for these IDs (app update still runs).
+* `os_update_exclude_list`: Skip `apt dist-upgrade` / `apk upgrade` for these IDs (app update still runs). Successful real APT upgrades finish with `apt-get clean`; dry runs and failed upgrades do not remove cached archives.
 * `app_update_exclude_list`: Skip the community-script app update for these tagged LXC IDs (the OS update still runs).
 * `os_only_lxc_list`: Pull these *untagged* LXC IDs into discovery for OS-only management — they have no `/usr/bin/update`, so the app line reports `NO SCRIPT`.
 * `snapshot_exclude_list`: Updates run but no snapshot is taken (use for LXCs with bind mounts).

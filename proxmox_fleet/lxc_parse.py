@@ -40,16 +40,30 @@ def parse_pct_status(stdout: str) -> dict:
 
 
 def parse_df_percent(stdout: str) -> Optional[int]:
-    """Extract the used-capacity percentage from ``df -P /`` stdout.
+    """Extract the used-capacity percentage from POSIX ``df -P`` output."""
+    for line in stdout.splitlines():
+        columns = line.split()
+        if len(columns) >= 6 and re.fullmatch(r"\d{1,3}%", columns[4]):
+            try:
+                return int(columns[4][:-1])
+            except ValueError:
+                return None
+    return None
 
-    ``-P`` pins POSIX output so the capacity column stays 5th even when a long
-    device name would otherwise wrap the line. Returns None when the output is
-    empty or unparseable (e.g. the container was not running).
+
+def parse_df_available_kb(stdout: str) -> Optional[int]:
+    """Extract available 1-KiB blocks from POSIX ``df -Pk`` output.
+
+    ``df -P`` also uses 1024-byte blocks on the GNU and BusyBox implementations
+    used by supported containers. Missing or malformed output fails closed.
     """
     for line in stdout.splitlines():
-        m = re.search(r"\s(\d{1,3})%\s", line)
-        if m:
-            return int(m.group(1))
+        columns = line.split()
+        if len(columns) >= 6 and re.fullmatch(r"\d{1,3}%", columns[4]):
+            try:
+                return int(columns[3])
+            except ValueError:
+                return None
     return None
 
 

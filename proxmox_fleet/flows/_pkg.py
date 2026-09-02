@@ -46,7 +46,11 @@ def upgrade_cmd(pkg_mgr: str, *, dry_run: bool) -> str:
         prefix = "LC_ALL=C DEBIAN_FRONTEND=noninteractive"
         if dry_run:
             return f"{prefix} apt-get update -qq && {prefix} apt-get -s dist-upgrade"
-        return f"{prefix} apt-get update -qq && {prefix} apt-get dist-upgrade -y --autoremove"
+        return (
+            f"{prefix} apt-get update -qq && "
+            f"{prefix} apt-get dist-upgrade -y --autoremove && "
+            f"{prefix} apt-get clean"
+        )
     if pkg_mgr == "dnf":
         return "LC_ALL=C dnf upgrade --assumeno" if dry_run else "LC_ALL=C dnf upgrade -y"
     if pkg_mgr == "apk":

@@ -1319,6 +1319,7 @@ def test_scan_lxc_reports_disk_and_os(monkeypatch):
     )
     result = scan_mod.scan_lxc(ex, "130", "pve-01")
     assert result["disk_percent"] == 90
+    assert result["disk_free_gb"] == pytest.approx(403668 / (1024 * 1024))
     assert result["os"] == "debian 13"
     assert result["os_mismatch"] is None
 
@@ -1360,13 +1361,20 @@ def test_pending_summary_counts_health_signals(tmp_path):
                 "os_mismatch": "container runs debian 12 but ...",
                 "error": None,
             },
-            "130": {"os_pending_count": 4, "app": None, "disk_percent": 90, "os_mismatch": None, "error": None},
+            "130": {
+                "os_pending_count": 4, "app": None, "disk_percent": 90,
+                "disk_free_gb": 0.4, "os_mismatch": None, "error": None,
+            },
+            "131": {
+                "os_pending_count": 0, "app": None, "disk_percent": 90,
+                "disk_free_gb": 20.0, "os_mismatch": None, "error": None,
+            },
             "105": {"os_pending_count": 0, "app": None, "disk_percent": 52, "os_mismatch": None, "error": None},
         },
     }
     (tmp_path / "pending-2026-07-23T04-00-00Z.json").write_text(json.dumps(scan))
     rows = scan_mod.pending_summary(tmp_path, disk_threshold=75)
-    assert rows[0]["low_disk"] == 1  # only 130 at 90%
+    assert rows[0]["low_disk"] == 1  # 130 is constrained; 131 has 20 GiB free
     assert rows[0]["os_mismatch"] == 1  # only 123
 
 
