@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator  # pyright: ignore[reportMissingImports]
 
 
 class PveClusterCreds(BaseModel):
@@ -62,8 +62,11 @@ class GlobalSettings(BaseModel):
     lxc_forks: int = 20
     lxc_continue_on_error: bool = False
     # Warn below the community scripts' own >80% abort (check_container_storage)
-    # so a container is flagged a run or two before its updates start failing.
+    # only when BOTH utilization is high and absolute free space is constrained.
     lxc_disk_warn_percent: int = 75
+    # A high-utilization root remains safe enough to update when it has at least
+    # this much free space (for example, 20 GiB free on a 200 GiB rootfs).
+    lxc_disk_min_free_gb: float = Field(default=10.0, gt=0)
     # Temporarily raise cores/memory to the ct script's var_cpu/var_ram for the
     # update, then restore. Defaults off: upstream dropped build-time scaling, so
     # turning this on adds `pct set` calls the scripts themselves no longer make.

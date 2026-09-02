@@ -19,6 +19,7 @@ from proxmox_fleet.changes import dpkg_hash_differs, lxc_os_changed, lxc_os_pkg_
 from proxmox_fleet.lxc_parse import (
     os_version_matches,
     parse_ct_script,
+    parse_df_available_kb,
     parse_df_percent,
     parse_os_release,
     parse_pct_config,
@@ -647,6 +648,15 @@ def test_parse_df_percent_none_when_empty():
     """A container that was not running when introspect ran yields no output."""
     assert parse_df_percent("") is None
     assert parse_df_percent("df: /: No such file or directory") is None
+
+
+def test_parse_df_available_kb_reads_available_column():
+    stdout = (
+        "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+        "/dev/rbd0 209715200 188743680 20971520 90% /\n"
+    )
+    assert parse_df_available_kb(stdout) == 20971520
+    assert parse_df_available_kb("") is None
 
 
 def test_parse_os_release_handles_quoted_and_bare_values():

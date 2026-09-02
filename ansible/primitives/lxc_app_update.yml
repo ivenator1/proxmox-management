@@ -25,6 +25,9 @@
 #   lxc_build_ram     RAM MB for build
 #   lxc_run_cpu       CPU cores for runtime
 #   lxc_run_ram       RAM MB for runtime
+#   lxc_bypass_storage_guard  true → intercept the fetched ct/*.sh stream and
+#                             disable only check_container_storage; Python sets
+#                             this only after its dual disk check
 - name: "lxc_app_update primitive"
   hosts: "{{ target_hosts | default('all') }}"
   gather_facts: false
@@ -40,10 +43,58 @@
           mkdir -p /tmp/.nc
           printf "#!/bin/sh\n:\n" > /tmp/.nc/clear
           chmod +x /tmp/.nc/clear
+          {% if lxc_bypass_storage_guard | default(false) | bool %}
+          real_curl=$(command -v curl || true)
+          real_wget=$(command -v wget || true)
+          fetch_dir=$(mktemp -d /tmp/fleet-fetch.XXXXXX) || exit 115
+          cat > "$fetch_dir/fleet-fetch" <<EOF
+        #!/usr/bin/env bash
+        fetcher=\$(basename "\$0")
+        case "\$fetcher" in
+          curl) real_fetcher="$real_curl" ;;
+          wget) real_fetcher="$real_wget" ;;
+          *) exit 115 ;;
+        esac
+        if [ -z "\$real_fetcher" ]; then exit 115; fi
+        case " \$* " in
+          *community-scripts/ProxmoxVE*/ct/*.sh*)
+            tmp=\$(mktemp /tmp/fleet-ct-script.XXXXXX) || exit 115
+            "\$real_fetcher" "\$@" > "\$tmp"
+            fetch_rc=\$?
+            if [ "\$fetch_rc" -ne 0 ]; then rm -f "\$tmp"; exit "\$fetch_rc"; fi
+            if ! grep -Eq "^[[:space:]]*check_container_storage[[:space:]]*\$" "\$tmp"; then
+              echo "fleet updater could not locate check_container_storage in fetched ct script" >&2
+              rm -f "\$tmp"
+              exit 115
+            fi
+            sed -E "s/^[[:space:]]*check_container_storage[[:space:]]*\$/  : # fleet dual-threshold storage check passed/" "\$tmp"
+            filter_rc=\$?
+            if [ "\$filter_rc" -eq 0 ]; then touch "$fetch_dir/storage-guard-patched"; fi
+            rm -f "\$tmp"
+            exit "\$filter_rc"
+            ;;
+          *) exec "\$real_fetcher" "\$@" ;;
+        esac
+        EOF
+          chmod +x "$fetch_dir/fleet-fetch"
+          if [ -n "$real_curl" ]; then ln -s "$fetch_dir/fleet-fetch" "$fetch_dir/curl"; fi
+          if [ -n "$real_wget" ]; then ln -s "$fetch_dir/fleet-fetch" "$fetch_dir/wget"; fi
+          export PATH="$fetch_dir:/tmp/.nc:$PATH"
+          {% else %}
           export PATH=/tmp/.nc:$PATH
+          {% endif %}
           export TERM=dumb
           {{ "export PHS_SILENT=1" if (lxc_unattended | default(true) | bool) else "" }}
-          /usr/bin/update'
+          /usr/bin/update
+          app_rc=$?
+          {% if lxc_bypass_storage_guard | default(false) | bool %}
+          if [ ! -f "$fetch_dir/storage-guard-patched" ]; then
+            echo "fleet updater storage-guard bypass did not intercept a ct script" >&2
+            app_rc=115
+          fi
+          rm -rf "$fetch_dir"
+          {% endif %}
+          exit "$app_rc"'
       register: _app
       changed_when: true
       ignore_errors: true

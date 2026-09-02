@@ -24,11 +24,11 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Mapping, Optional, 
 
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
-from fastapi.exception_handlers import http_exception_handler
-from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request  # pyright: ignore[reportMissingImports]
+from fastapi.exception_handlers import http_exception_handler  # pyright: ignore[reportMissingImports]
+from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse  # pyright: ignore[reportMissingImports]
+from fastapi.staticfiles import StaticFiles  # pyright: ignore[reportMissingImports]
+from fastapi.templating import Jinja2Templates  # pyright: ignore[reportMissingImports]
 from markupsafe import Markup, escape
 
 from proxmox_fleet import history as history_mod
@@ -151,8 +151,11 @@ def spark_points(
         return ""
     if len(vals) == 1:
         vals = vals * 2
-    top = float(hi) if hi is not None else max(vals)
-    bot = float(lo) if lo is not None else min(vals)
+    try:
+        top = float(hi) if hi is not None else max(vals)
+        bot = float(lo) if lo is not None else min(vals)
+    except (TypeError, ValueError):
+        return ""
     span = (top - bot) or 1.0
     step = (w - 2 * pad) / (len(vals) - 1)
     return " ".join(f"{pad + i * step:.1f},{pad + (top - v) / span * (h - 2 * pad):.1f}" for i, v in enumerate(vals))
@@ -825,7 +828,12 @@ def create_app(
         latest_pending = _read_pending_or_none("latest")
         # Same threshold as /pending, so a customised lxc_disk_warn_percent can
         # never make the overview's counts disagree with the pending page's.
-        pending_rows = scan_mod.pending_summary(history_dir, limit=1, disk_threshold=settings.lxc_disk_warn_percent)
+        pending_rows = scan_mod.pending_summary(
+            history_dir,
+            limit=1,
+            disk_threshold=settings.lxc_disk_warn_percent,
+            disk_min_free_gb=settings.lxc_disk_min_free_gb,
+        )
         pending_row = pending_rows[0] if pending_rows else None
         # newest first from history_summary; reversed → oldest first for the
         # pulse strip / sparkline (time flows left → right)
@@ -892,14 +900,28 @@ def create_app(
         )
         # The template renders (display_id, entry) pairs — derive the id here so
         # both node/id-keyed (new) and bare-id-keyed (legacy) snapshots work.
+        # Compute disk severity in Python so scan totals and row styling share
+        # one dual-threshold policy (and the template remains presentation-only).
+        disk_threshold = settings.lxc_disk_warn_percent
+        disk_min_free_gb = settings.lxc_disk_min_free_gb
         lxc = (
-            [(_lxc_entry_id(k, e), e) for k, e in sorted((snapshot.get("lxc") or {}).items(), key=_lxc_sort_key)]
+            [
+                (
+                    _lxc_entry_id(key, entry),
+                    {
+                        **entry,
+                        "disk_low": scan_mod.disk_is_low(
+                            entry, disk_threshold, disk_min_free_gb
+                        ),
+                    },
+                )
+                for key, entry in sorted(
+                    (snapshot.get("lxc") or {}).items(), key=_lxc_sort_key
+                )
+            ]
             if snapshot
             else []
         )
-        # Pass the configured threshold through so the page and the briefing
-        # warnings agree on what counts as "low disk".
-        disk_threshold = settings.lxc_disk_warn_percent
         return templates.TemplateResponse(
             request,
             "pending.html",
@@ -910,7 +932,13 @@ def create_app(
                 "manual": manual,
                 "lxc": lxc,
                 "disk_threshold": disk_threshold,
-                "scans": scan_mod.pending_summary(history_dir, limit=0, disk_threshold=disk_threshold),
+                "disk_min_free_gb": disk_min_free_gb,
+                "scans": scan_mod.pending_summary(
+                    history_dir,
+                    limit=0,
+                    disk_threshold=disk_threshold,
+                    disk_min_free_gb=disk_min_free_gb,
+                ),
             },
         )
 

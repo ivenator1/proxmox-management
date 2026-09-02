@@ -506,17 +506,22 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
   These failures do **not** enter rescue, so **they do not roll back** — the container is left
   half-updated by design.
 - **Pre-emptive health warnings** (`flows/lxc.py`: `disk_warning()` / `os_mismatch_warning()`):
-  the `lxc_introspect` primitive also returns `df_stdout` + `os_release_stdout` (batched — no
-  extra subprocess), and the flow emits a `WarningEntry` when the rootfs is at/over
-  `lxc_disk_warn_percent` (default 75, below the community scripts' own >80% `exit 114`) or the
+  the `lxc_introspect` primitive also returns `df_stdout` + `boot_df_stdout` +
+  `os_release_stdout` (batched — no extra Ansible subprocess), and the flow emits a `WarningEntry`
+  when the rootfs is at/over `lxc_disk_warn_percent` (default 75) **and** below
+  `lxc_disk_min_free_gb` (default 10 GiB), or the
   container OS is behind the ct script's `var_os`/`var_version` (the `exit 203` trap). Disk is
   checked for **every** container (plain apt runs out of space too); OS only when a ct script
   exists. Both fire **outside** `try` / before the dry-run return, so `--dry-run` reports them
   ahead of a window — that is the point. `scan.py` surfaces the same two signals as
   `disk_percent`/`os`/`os_mismatch` per container, counted by `pending_summary(disk_threshold=)`
   as `low_disk`/`os_mismatch`, and the dashboard's `/pending` page renders both (Disk + OS
-  columns, plus per-scan counters) — `web/app.py` passes `settings.lxc_disk_warn_percent` so the
-  page and the briefing agree on "low". Warnings only: nothing is skipped or failed.
+  columns, plus per-scan counters) — `web/app.py` passes both disk settings so the page and the
+  briefing agree on "low". When upstream's `/boot` check is >80% but absolute free space meets
+  the minimum, Python authorizes `lxc_app_update` to place temporary curl/wget shims first in
+  `PATH`; only the fetched `ct/*.sh` stream has its exact `check_container_storage` call disabled.
+  `/usr/bin/update` and upstream source are never modified, and a missing interception fails closed.
+  Missing/unparseable `/boot` data fails closed. Warnings only: nothing is skipped or failed.
 - **Introspect precedes `pct_start`**, so `df_stdout`/`os_release_stdout` are empty for a
   container that was stopped (a failed `pct exec` gives rc≠0 + empty stdout, absorbed by
   `failed_when: false`). The parsers return `None`/`""` there and no warning fires — an accepted
@@ -551,7 +556,9 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
   for every group, including `proxmox_nodes` (so a node's `ansible_host` can live in host_vars).
   `host_vars/` is gitignored, so per-host API secrets (manual-update `api_key`/`api_secret`) are safe there.
 - **Package/locale commands pin `LC_ALL=C`** (`_pkg.upgrade_cmd`, `lxc._os_update_cmd`/`_dpkg_hash_cmd`)
-  — change detection greps English summary lines. `window.in_window` likewise uses a fixed weekday list.
+  — change detection greps English summary lines. Successful real APT upgrades append
+  `&& apt-get clean`; dry-run commands never clean and failed upgrades retain archives for retry/diagnosis.
+  `window.in_window` likewise uses a fixed weekday list.
 - **Shared pkg helpers** (`detect_pkg_mgr`, `upgrade_cmd`, `kuma_healthy`) live in `flows/_pkg.py` —
   used by vm/remote/lxc/custom/node flows; don't re-copy them.
 - **Alpine uses `ash`**: `lxc._read_version` and the OS-update command pick `ash` for `ostype: alpine`, else `bash`.

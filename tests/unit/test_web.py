@@ -17,7 +17,7 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from fastapi.testclient import TestClient  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402  # pyright: ignore[reportMissingImports]
 
 from proxmox_fleet import briefing  # noqa: E402
 from proxmox_fleet import manual_updates  # noqa: E402
@@ -1616,6 +1616,37 @@ def test_pending_page_renders_health_signals(history_dir):
     assert "63%" in resp.text
     assert "debian 12 — outdated" in resp.text  # the mismatch pill
     assert "targets debian 13" in resp.text  # full reason in the tooltip
+
+
+def test_pending_page_does_not_flag_large_root_with_ample_free_space(history_dir):
+    scan_mod.write_pending(
+        {
+            "timestamp": "20260104T010000000000Z",
+            "hosts": {},
+            "lxc": {
+                "131": {
+                    "node": "Hammond",
+                    "name": "large-root",
+                    "skipped": None,
+                    "os_pending_count": 0,
+                    "os_pending": [],
+                    "app": None,
+                    "disk_percent": 90,
+                    "disk_free_gb": 20.0,
+                    "os": "debian 13",
+                    "os_mismatch": None,
+                    "error": None,
+                },
+            },
+        },
+        history_dir=history_dir,
+        keep=0,
+    )
+
+    resp = _client(history_dir).get("/pending", params={"ref": "20260104T010000000000Z"})
+    assert resp.status_code == 200
+    assert "20.0 GiB free" in resp.text
+    assert '<span class="fail">90%</span>' not in resp.text
 
 
 def test_pending_page_tolerates_scans_without_health_keys(history_dir):

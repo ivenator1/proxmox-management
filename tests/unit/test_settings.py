@@ -12,6 +12,8 @@ def test_all_defaults():
     assert s.fleet_dry_run is False
     assert s.custom_allow_reboot is True
     assert s.force_window is False
+    assert s.lxc_disk_warn_percent == 75
+    assert s.lxc_disk_min_free_gb == 10.0
     assert s.configs_dir == "configs"
     assert s.host_vars_dir == "host_vars"
 

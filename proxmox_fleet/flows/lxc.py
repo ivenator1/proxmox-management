@@ -25,6 +25,7 @@ from proxmox_fleet.flows._pkg import kuma_healthy
 from proxmox_fleet.lxc_parse import (
     os_version_matches,
     parse_ct_script,
+    parse_df_available_kb,
     parse_df_percent,
     parse_os_release,
     parse_pct_config,
@@ -107,19 +108,53 @@ def _failure_detail(res: Any) -> str:
     return flat
 
 
-def disk_warning(introspect_facts: Dict[str, Any], threshold: int) -> Optional[str]:
-    """Warning text when the container's rootfs is at/over *threshold* percent.
+_KIB_PER_GIB = 1024 * 1024
+_COMMUNITY_STORAGE_ABORT_PERCENT = 80
 
-    Returns None when there is nothing to say, including when df produced no
-    parseable output (a container that was not running when introspect ran).
-    Applies to every container, with or without an update script: apt itself runs
-    out of space, which is how CT 130's OS update failed.
+
+def _has_minimum_free_space(df_stdout: str, minimum_gb: float) -> bool:
+    available_kb = parse_df_available_kb(df_stdout)
+    return available_kb is not None and available_kb >= minimum_gb * _KIB_PER_GIB
+
+
+def disk_warning(
+    introspect_facts: Dict[str, Any], threshold: int, minimum_free_gb: float,
+) -> Optional[str]:
+    """Warn only when rootfs utilization is high *and* free space is scarce.
+
+    Unknown free-space output fails safe: the existing percentage warning is
+    retained. This applies to every container because apt can also run out of
+    space, regardless of whether a community update script exists.
     """
-    used = parse_df_percent(str(introspect_facts.get("df_stdout", "")))
-    if used is None or used < threshold:
+    df_stdout = str(introspect_facts.get("df_stdout", ""))
+    used = parse_df_percent(df_stdout)
+    if used is None or used < threshold or _has_minimum_free_space(df_stdout, minimum_free_gb):
         return None
-    return (f"rootfs {used}% full — apt can fail to unpack, and the community-scripts "
-            f"storage guard aborts app updates above 80%")
+    available_kb = parse_df_available_kb(df_stdout)
+    free = f", {available_kb / _KIB_PER_GIB:.1f} GiB free" if available_kb is not None else ""
+    return (
+        f"rootfs {used}% full{free} — apt can fail to unpack; keep at least "
+        f"{minimum_free_gb:g} GiB free"
+    )
+
+
+def _ct_script_uses_storage_guard(content: str) -> bool:
+    return bool(re.search(r"^[ \t]*check_container_storage[ \t]*$", content, re.MULTILINE))
+
+
+def bypass_community_storage_guard(introspect_facts: Dict[str, Any], minimum_free_gb: float) -> bool:
+    """Allow a >80% community-script update when absolute free space is ample.
+
+    The upstream guard checks ``/boot``. The introspect primitive captures that
+    exact path; missing data fails closed and leaves the upstream guard intact.
+    """
+    df_stdout = str(introspect_facts.get("boot_df_stdout", ""))
+    used = parse_df_percent(df_stdout)
+    return bool(
+        used is not None
+        and used > _COMMUNITY_STORAGE_ABORT_PERCENT
+        and _has_minimum_free_space(df_stdout, minimum_free_gb)
+    )
 
 
 def os_mismatch_warning(introspect_facts: Dict[str, Any], ct_info: Dict[str, Any],
@@ -156,7 +191,8 @@ def _os_update_cmd(lxc_id: str, lxc_os: str) -> str:
         apt_env = "LC_ALL=C DEBIAN_FRONTEND=noninteractive"
         return (
             f"pct exec {lxc_id} -- bash -c "
-            f"'{apt_env} apt-get update && {apt_env} apt-get -y dist-upgrade'"
+            f"'{apt_env} apt-get update && {apt_env} apt-get -y dist-upgrade && "
+            f"{apt_env} apt-get clean'"
         )
     if lxc_os == "alpine":
         return f"pct exec {lxc_id} -- ash -c 'LC_ALL=C apk -U upgrade'"
@@ -302,7 +338,11 @@ def run_lxc_update(
     # they survive a later failure and are emitted on the dry-run path too, which
     # is the point: they are meant to arrive before the maintenance window, not
     # in the same briefing as the failure they predict.
-    disk_msg = disk_warning(introspect_res.facts, settings.lxc_disk_warn_percent)
+    disk_msg = disk_warning(
+        introspect_res.facts,
+        settings.lxc_disk_warn_percent,
+        settings.lxc_disk_min_free_gb,
+    )
     if disk_msg:
         outcome.warnings.append(WarningEntry(host=f"{node}/{lxc_id}", task="disk space", warning=disk_msg))
 
@@ -318,6 +358,7 @@ def run_lxc_update(
         # Detect — parse the update script pulled by introspect
         # ------------------------------------------------------------------
         ct_script_name: Optional[str] = None
+        ct_script_content = ""
         ct_info: Dict[str, Any] = {}
 
         pull_rc_val = introspect_res.facts.get("pull_rc", 1)
@@ -342,8 +383,8 @@ def run_lxc_update(
                     f"/main/ct/{ct_script_name}.sh"
                 )
                 try:
-                    content = http_mod.request(gh_url).body
-                    ct_info = parse_ct_script(content)
+                    ct_script_content = http_mod.request(gh_url).body
+                    ct_info = parse_ct_script(ct_script_content)
                 except Exception:  # noqa: BLE001 - fail-open like detect.yml failed_when: false
                     ct_info = parse_ct_script("")
             else:
@@ -474,6 +515,12 @@ def run_lxc_update(
                 lxc_build_ram=scale["build_ram"],
                 lxc_run_cpu=scale["run_cpu"],
                 lxc_run_ram=scale["run_ram"],
+                lxc_bypass_storage_guard=(
+                    _ct_script_uses_storage_guard(ct_script_content)
+                    and bypass_community_storage_guard(
+                        introspect_res.facts, settings.lxc_disk_min_free_gb
+                    )
+                ),
             )
             app_failed = app_res.failed
             app_changed = not app_res.failed  # tentative; overridden below by version/hash

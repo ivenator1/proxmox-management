@@ -142,6 +142,21 @@ def test_run_local_targets_localhost(monkeypatch):
     assert captured["host_pattern"] == "localhost"
 
 
+def test_lxc_app_update_passes_storage_guard_decision(monkeypatch):
+    captured = {}
+
+    def fake_invoke(primitive, *, inventory, host_pattern, extravars, check, **kw):
+        captured.update(primitive=primitive, extravars=extravars)
+        return _pr()
+
+    monkeypatch.setattr(executor_mod, "invoke_primitive", fake_invoke)
+    ex = RunnerExecutor("pve-01")
+    ex.lxc_app_update("101", lxc_bypass_storage_guard=True)
+
+    assert captured["primitive"] == "lxc_app_update"
+    assert captured["extravars"]["lxc_bypass_storage_guard"] is True
+
+
 def test_node_post_upgrade_invokes_bound_primitive_and_preserves_facts(monkeypatch):
     captured = {}
     facts = {"diagnostics_version": 1, "running_kernel": "6.8.12-8-pve"}
