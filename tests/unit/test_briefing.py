@@ -30,8 +30,16 @@ def _state(**kw) -> FleetState:
     return FleetState.from_raw(kw)
 
 
-def lxc(node="pve-01", name="sonarr", id="101", app="Updated: v4.0 → v4.1", os="OK", snap=True):
-    return dict(node=node, name=name, id=id, app=app, os=os, snap=snap)
+def lxc(
+    node="pve-01",
+    name="sonarr",
+    id="101",
+    app="Updated: v4.0 → v4.1",
+    os="OK",
+    snap=True,
+    **extra,
+):
+    return dict(node=node, name=name, id=id, app=app, os=os, snap=snap, **extra)
 
 
 def node(node="pve-01", status="OK"):
@@ -127,6 +135,25 @@ def test_vm_pkg_count_absent_when_none():
     assert "upgraded" not in out
 
 
+def test_alloy_status_renders_alongside_guest_status():
+    out = render_briefing(_state(
+        fleet_lxc_data=[lxc(app="OK", os="", alloy="Configured")],
+        fleet_vm_data=[vm(status="UPDATED", alloy="Service repaired")],
+    ))
+    assert "sonarr (101) — OK | Alloy: Configured" in out
+    assert "my-vm (200) — UPDATED | Alloy: Service repaired" in out
+
+
+def test_alloy_only_status_renders_without_blank_update_status():
+    out = render_briefing(_state(
+        fleet_lxc_data=[lxc(app="", os="", snap=False, alloy="Installed")],
+        fleet_vm_data=[vm(status="", alloy="Configured")],
+    ))
+    assert "sonarr (101) — Alloy: Installed" in out
+    assert "my-vm (200) — Alloy: Configured" in out
+    assert "*(no snap)*" not in out
+
+
 def test_vm_pkg_count_absent_when_zero():
     out = render_briefing(_state(fleet_node_data=[node()], fleet_vm_data=[vm(pkg_count=0)]))
     assert "upgraded" not in out
@@ -197,7 +224,7 @@ def test_guest_only_run_groups_lxcs_and_vms_without_duplicate_node_headers():
     out = render_briefing(_state(
         fleet_lxc_data=[
             lxc(node="pve01", name="firecrawl", id="128"),
-            lxc(node="pve02", name="loki", id="129"),
+            lxc(node="pve02", name="logs", id="102"),
         ],
         fleet_vm_data=[vm(node="pve01", vmid="110", name="eve-ng")],
     ))

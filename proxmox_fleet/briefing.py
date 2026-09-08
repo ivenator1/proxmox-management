@@ -38,18 +38,28 @@ def render_briefing(state: FleetState, *, manual_section: str = "") -> str:
         if node_lxcs:
             parts.append("\n- LXC")
             for lx in node_lxcs:
-                seg = f"\n  - {lx.name} ({lx.id}) — {lx.app}"
+                seg = f"\n  - {lx.name} ({lx.id})"
+                if lx.app:
+                    seg += f" — {lx.app}"
                 if lx.os and lx.os != "None":
                     seg += f" | OS: {lx.os}"
-                if not lx.snap:
+                if lx.alloy:
+                    seg += f"{' |' if lx.app or lx.os else ' —'} Alloy: {lx.alloy}"
+                # Alloy-only runs intentionally skip snapshots; reserve the
+                # marker for update records where a snapshot was applicable.
+                if not lx.snap and (lx.app or lx.os):
                     seg += " *(no snap)*"
                 parts.append(seg)
         if node_vms:
             parts.append("\n- VM")
             for vm in node_vms:
-                seg = f"\n  - {vm.name} ({vm.vmid}) — {vm.status}"
+                seg = f"\n  - {vm.name} ({vm.vmid})"
+                if vm.status:
+                    seg += f" — {vm.status}"
                 if vm.pkg_count:
                     seg += f" ({vm.pkg_count} upgraded)"
+                if vm.alloy:
+                    seg += f"{' |' if vm.status else ' —'} Alloy: {vm.alloy}"
                 parts.append(seg)
         return bool(node_lxcs or node_vms)
 

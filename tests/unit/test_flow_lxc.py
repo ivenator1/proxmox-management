@@ -4,6 +4,7 @@ Uses a ScriptedLxcExecutor (no real Ansible) and monkeypatches http for
 GitHub/Kuma calls. Asserts control flow: rescue/rollback, snapshot gating,
 health check, dry-run, was_stopped handling, resource scaling, and status strings.
 """
+import importlib
 import time
 from typing import Any, cast
 
@@ -173,6 +174,14 @@ class ScriptedLxcExecutor:
         self.commands.append(f"pct stop {lxc_id}")
         return _ok()
 
+    def alloy_probe(self, *, lxc_id=None):
+        self.commands.append(f"alloy_probe:{lxc_id}")
+        return self.default
+
+    def alloy_reconcile(self, **kwargs):
+        self.commands.append(f"alloy_reconcile:{kwargs.get('lxc_id')}")
+        return self.default
+
 
 def _settings(**overrides):
     """Build a minimal GlobalSettings for tests."""
@@ -212,6 +221,83 @@ def _exec_normal(ver_before="1.0", ver_after="1.1", os_stdout="2 upgraded, 0 new
 # ---------------------------------------------------------------------------
 # Happy paths
 # ---------------------------------------------------------------------------
+
+
+def test_alloy_reconciliation_runs_after_snapshot_before_packages(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+    desired = alloy_mod.DesiredAlloyConfig(content="config\n", sha256="hash")
+    ex = _exec_normal()
+
+    def reconcile(executor, config, **kwargs):
+        assert ex.snapshots_created == ["101"]
+        assert not any("dist-upgrade" in command for command in ex.commands)
+        ex.commands.append("alloy-reconcile")
+        return alloy_mod.AlloyResult(status="Configured", changed=True)
+
+    monkeypatch.setattr(alloy_mod, "reconcile_alloy", reconcile)
+    out = run_lxc_update(
+        "pve-01", "101", ex, _settings(), api_host="192.168.1.10", alloy_config=desired
+    )
+    assert out.record is not None
+    assert out.record.alloy == "Configured"
+    alloy_index = ex.commands.index("alloy-reconcile")
+    os_index = next(i for i, command in enumerate(ex.commands) if "dist-upgrade" in command)
+    assert alloy_index < os_index
+
+
+def test_alloy_only_skips_snapshot_package_reboot_and_app_work(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+    desired = alloy_mod.DesiredAlloyConfig(content="config\n", sha256="hash")
+    monkeypatch.setattr(
+        alloy_mod,
+        "reconcile_alloy",
+        lambda *args, **kwargs: alloy_mod.AlloyResult(status="Installed", changed=True),
+    )
+    ex = ScriptedLxcExecutor(introspect_facts=_INTROSPECT_NO_SCRIPT)
+    out = run_lxc_update(
+        "pve-01",
+        "101",
+        ex,
+        _settings(),
+        api_host="192.168.1.10",
+        alloy_config=desired,
+        alloy_only=True,
+    )
+    assert out.changed is True
+    assert out.record is not None and out.record.alloy == "Installed"
+    assert ex.snapshots_created == []
+    assert not any(
+        marker in command
+        for command in ex.commands
+        for marker in ("dist-upgrade", "lxc_app_update", "post_update", "reboot-required")
+    )
+
+
+def test_alloy_status_is_cleared_after_later_snapshot_rollback(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+    desired = alloy_mod.DesiredAlloyConfig(content="config\n", sha256="hash")
+    monkeypatch.setattr(
+        alloy_mod,
+        "reconcile_alloy",
+        lambda *args, **kwargs: alloy_mod.AlloyResult(status="Configured", changed=True),
+    )
+    ex = _exec_normal()
+
+    def fail_os(*args, **kwargs):
+        raise RuntimeError("hard package failure")
+
+    ex.lxc_os_update = fail_os
+    out = run_lxc_update(
+        "pve-01", "101", ex, _settings(), api_host="192.168.1.10", alloy_config=desired
+    )
+    assert out.failed is True
+    assert ex.rollback_called is True
+    assert out.record is not None and out.record.alloy is None
 
 
 def test_version_updated(monkeypatch):

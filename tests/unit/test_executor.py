@@ -185,6 +185,47 @@ def test_node_post_upgrade_invokes_bound_primitive_and_preserves_facts(monkeypat
     assert result.facts == facts
 
 
+def test_alloy_probe_selects_direct_and_lxc_primitives(monkeypatch):
+    calls = []
+
+    def fake_invoke(primitive, **kwargs):
+        calls.append((primitive, kwargs))
+        return _pr(facts={"binary_present": True})
+
+    monkeypatch.setattr(executor_mod, "invoke_primitive", fake_invoke)
+    ex = RunnerExecutor("guest", inventory="fleet.ini", check=True)
+    assert ex.alloy_probe().facts["binary_present"] is True
+    ex.alloy_probe(lxc_id="101")
+    assert calls[0][0] == "alloy_vm_probe"
+    assert calls[0][1]["host_pattern"] == "guest"
+    assert calls[1][0] == "alloy_lxc_probe"
+    assert calls[1][1]["extravars"] == {"lxc_id": "101"}
+
+
+def test_alloy_reconcile_passes_content_as_ansible_data(monkeypatch):
+    captured = {}
+
+    def fake_invoke(primitive, **kwargs):
+        captured.update(primitive=primitive, **kwargs)
+        return _pr(changed=True)
+
+    monkeypatch.setattr(executor_mod, "invoke_primitive", fake_invoke)
+    ex = RunnerExecutor("pve-01")
+    result = ex.alloy_reconcile(
+        lxc_id="101",
+        desired_content="loki.write {}\n",
+        install=False,
+        configure=True,
+        add_journal_group=False,
+        repair_service=True,
+    )
+    assert result.changed is True
+    assert captured["primitive"] == "alloy_lxc_reconcile"
+    assert captured["extravars"]["alloy_config_content"] == "loki.write {}\n"
+    assert captured["extravars"]["alloy_configure"] is True
+    assert captured["extravars"]["alloy_repair_service"] is True
+
+
 # ---------------------------------------------------------------------------
 # RunnerExecutor.snapshot — fact merge
 # ---------------------------------------------------------------------------

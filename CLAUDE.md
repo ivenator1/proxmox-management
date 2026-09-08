@@ -22,6 +22,8 @@ flags. `fleet-update` (pip console command) is the programmatic/cron interface.
 ./fleet-update.py --phases lxc,vm              # run only these phases (pre-flight+notify always run)
 ./fleet-update.py --scan                       # read-only pending-updates scan → pending-*.json
                                               # (also runs manual_update checks + reminders)
+./fleet-update.py --dry-run --alloy-only       # audit Alloy on managed LXC/VM guests
+./fleet-update.py --alloy-only --limit 101,vm  # repair Alloy only; no snapshots/regular updates
 fleet-update --check -e force_notify=true      # console command (needs active venv)
 
 pip install -e '.[web]'              # fastapi + uvicorn for the dashboard
@@ -90,7 +92,8 @@ proxmox_fleet/
   cluster.py               # multi-cluster helpers: DEFAULT_CLUSTER, split_qualified("alpha/101")
   deps.py                  # validate_depends_order() + dependency_failed()
   driver.py                # run_fleet() orchestrator + per-phase run_*_phase() helpers
-  executor.py              # Executor protocol + RunnerExecutor; snapshot()/snapshot_with_retry(); 8 primitive methods
+  executor.py              # Executor protocol + RunnerExecutor; snapshot and Alloy transport primitives
+  alloy.py                 # desired-config load/hash, probe parsing, installer registry, drift reconciliation
   http.py                  # get_json, poll_until, request, post_json
   inventory.py             # manual hosts.ini parsers + host_vars merge; MaintenanceWindow typing;
                            # [manual_update_hosts] loader + manual/auto overlap guard
@@ -148,6 +151,8 @@ returned state in):
 | Phase 2 | `proxmox_nodes` | `run_node_phase()` — serial OS update + reboot (abort-on-first-failure) |
 | Phase 3 | manager | manager self-update (runs even after a node failure) |
 | Phase 4 | manager | `run_notify_phase()` — render briefing → dispatch notifiers → write history → dead-man ping |
+
+`--alloy-only` still runs pre-flight, lock, LXC/VM targeting, Phase 4, and history, but skips remote/custom/node/manager and all regular guest update work. It rejects explicit `--phases` and `--scan`. The mode honors limits, Alloy exclusions, VM maintenance windows, and `--force-window`; it takes no snapshots and performs no package-upgrade reboot or Kuma workload check.
 
 Returns exit code 1 if any phase recorded a failure. Each phase's dry-run flag is
 `check or fleet_dry_run or <phase>_dry_run`; `fleet_dry_run` also forces a notification.
@@ -459,6 +464,7 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
 
 ### Key non-obvious details
 
+- **Alloy desired state (opt-in)**: `alloy_enabled` applies shared compliance during ordinary LXC/VM phases; `--alloy-only` overrides it. `driver.run_fleet()` reads and SHA-256 hashes `alloy_config_path` once. Missing/unreadable/empty/placeholder input creates one notifying manager warning and skips Alloy mutation while ordinary updates continue. LXC exclusions use bare or `cluster/ID` tokens; VM exclusions use inventory names. Reconciliation probes binary/config hash/journal group/enabled/active, installs missing Alloy only on apt guests from Grafana's stable repository, validates a staged config before replacement, repairs group/service drift, then re-probes. It runs after snapshot attempt and before package work; a later successful rollback removes the reported Alloy status. Alloy failures are notifying warnings, never fleet failures. Dry runs probe only. Dedicated `alloy_{vm,lxc}_{probe,reconcile}.yml` primitives pass config as Ansible copy data, never shell interpolation. Exclude log receivers and any guest with a purpose-specific Alloy config.
 - **Tag-based LXC discovery**: LXCs tagged `community-script` or `proxmox-helper-scripts`
   in PVE are processed (set in PVE UI → Container → Options → Tags), **plus** any IDs in
   `os_only_lxc_list` (pulled in for OS updates only — they lack `/usr/bin/update`, so the
@@ -562,6 +568,7 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
 - **Shared pkg helpers** (`detect_pkg_mgr`, `upgrade_cmd`, `kuma_healthy`) live in `flows/_pkg.py` —
   used by vm/remote/lxc/custom/node flows; don't re-copy them.
 - **Alpine uses `ash`**: `lxc._read_version` and the OS-update command pick `ash` for `ostype: alpine`, else `bash`.
+- **Notifying warnings**: `WarningEntry.notifying=true` forces an amber attention dispatch on an otherwise idle successful run. Red fleet failure still wins; exit code remains 0 and dead-man receives success. Existing warnings without the marker retain their old non-dispatch behavior.
 - **Briefing byte-parity — no trailing newline**: `render_briefing()` must not emit one (golden
   fixture has none). `prepare_body()` is `.strip()` + a port of Jinja's
   `truncate(4000, killwords=False, end='\n...', leeway=5)` — match the algorithm exactly

@@ -13,6 +13,7 @@ Status strings come from proxmox_fleet.status (byte-parity with the old Jinja).
 
 from __future__ import annotations
 
+import importlib
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -21,7 +22,7 @@ from proxmox_fleet import http as http_mod
 from proxmox_fleet.changes import pkg_changed as _pkg_changed
 from proxmox_fleet.cluster import DEFAULT_CLUSTER, api_creds
 from proxmox_fleet.changes import vm_pkg_count as _vm_pkg_count
-from proxmox_fleet.executor import Executor, snapshot_failure_warning, snapshot_with_retry
+from proxmox_fleet.executor import snapshot_failure_warning, snapshot_with_retry
 from proxmox_fleet.flows._pkg import detect_pkg_mgr, kuma_healthy, upgrade_cmd
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import ErrorEntry, VmRecord, WarningEntry
@@ -44,13 +45,15 @@ def run_vm_update(
     node: str,
     vmid: str,
     inventory_hostname: str,
-    executor: Executor,
-    node_executor: Executor,
+    executor: Any,
+    node_executor: Any,
     settings: GlobalSettings,
     *,
     dry_run: bool = False,
     api_host: str = "",
     cluster: str = DEFAULT_CLUSTER,
+    alloy_config: Optional[Any] = None,
+    alloy_only: bool = False,
 ) -> VmFlowOutcome:
     """Run the full vm_update flow for one VM. Never raises — failures are
     captured into the outcome (FAILED record + error entry), mirroring rescue.
@@ -76,6 +79,24 @@ def run_vm_update(
     snapshot_failed = False
     rollback_done = False
     outcome = VmFlowOutcome()
+    alloy_status: Optional[str] = None
+    alloy_changed = False
+
+    def _enforce_alloy() -> None:
+        nonlocal alloy_status, alloy_changed
+        if alloy_config is None:
+            return
+        alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+        result = alloy_mod.reconcile_alloy(executor, alloy_config, dry_run=dry_run)
+        alloy_status = result.status
+        alloy_changed = result.changed
+        if result.warning:
+            outcome.warnings.append(WarningEntry(
+                host=inventory_hostname,
+                task="Alloy compliance",
+                warning=result.warning,
+                notifying=True,
+            ))
 
     api_params: Dict[str, Any] = {
         "api_host": api_host,
@@ -85,6 +106,19 @@ def run_vm_update(
     }
 
     try:
+        if alloy_only:
+            _enforce_alloy()
+            outcome.changed = alloy_changed
+            if alloy_status is not None:
+                outcome.record = VmRecord(
+                    node=node,
+                    vmid=vmid,
+                    name=inventory_hostname,
+                    status="",
+                    alloy=alloy_status,
+                )
+            return outcome
+
         # ------------------------------------------------------------------
         # Backup (skip in dry-run — no state mutations)
         # ------------------------------------------------------------------
@@ -116,6 +150,10 @@ def run_vm_update(
                         )
                     )
                     snapshot_failed = True
+
+        # Normal runs reconcile after the snapshot attempt and before package
+        # upgrades.  Dry runs call the same policy in probe-only mode.
+        _enforce_alloy()
 
         # ------------------------------------------------------------------
         # Detect package manager (Python decides, Ansible executes)
@@ -170,8 +208,11 @@ def run_vm_update(
         # Report
         # ------------------------------------------------------------------
         status_str = vm_status(pkg_changed=changed, rebooted=rebooted, dry_run=dry_run, failed=False)
-        outcome.changed = changed or rebooted
-        if vm_should_report(pkg_changed=changed, rebooted=rebooted, failed=False):
+        outcome.changed = changed or rebooted or alloy_changed
+        if (
+            vm_should_report(pkg_changed=changed, rebooted=rebooted, failed=False)
+            or alloy_status is not None
+        ):
             outcome.record = VmRecord(
                 node=node,
                 vmid=vmid,
@@ -179,6 +220,7 @@ def run_vm_update(
                 status=status_str,
                 pkg_count=pkg_count,
                 packages=packages,
+                alloy=alloy_status,
             )
         return outcome
 
@@ -206,11 +248,17 @@ def run_vm_update(
                             rollback_done = True
                             break
             except Exception:  # noqa: BLE001
-                pass
+                rollback_done = False
 
         rescue_str = vm_rescue_status(rollback_done=rollback_done, snapshot_failed=snapshot_failed)
         outcome.failed = True
-        outcome.record = VmRecord(node=node, vmid=vmid, name=inventory_hostname, status=rescue_str)
+        outcome.record = VmRecord(
+            node=node,
+            vmid=vmid,
+            name=inventory_hostname,
+            status=rescue_str,
+            alloy=None if rollback_done else alloy_status,
+        )
         outcome.error = ErrorEntry(host=f"{node}/vm-{vmid}", task=str(failed_task), error=str(exc)[:300])
         outcome.warnings = list(outcome.warnings)
         return outcome

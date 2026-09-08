@@ -8,6 +8,7 @@ from proxmox_fleet.models.state import (
     NodeRecord,
     RemoteRecord,
     VmRecord,
+    WarningEntry,
 )
 
 
@@ -26,6 +27,26 @@ def test_packages_omitted_when_none():
     r = LxcRecord.model_validate({"node": "pve-01", "name": "sonarr", "id": "101", "app": "OK"})
     assert r.packages is None
     assert "packages" not in r.model_dump()
+
+
+def test_alloy_status_is_optional_and_legacy_safe():
+    legacy_lxc = LxcRecord(node="pve-01", name="sonarr", id="101", app="OK")
+    legacy_vm = VmRecord(node="pve-01", vmid="200", name="vm", status="OK")
+    assert "alloy" not in legacy_lxc.model_dump()
+    assert "alloy" not in legacy_vm.model_dump()
+    assert LxcRecord(
+        node="pve-01", name="sonarr", id="101", app="OK", alloy="Configured"
+    ).model_dump()["alloy"] == "Configured"
+    assert VmRecord(
+        node="pve-01", vmid="200", name="vm", status="", alloy="Installed"
+    ).model_dump()["alloy"] == "Installed"
+
+
+def test_warning_notification_marker_is_optional():
+    old = WarningEntry(host="h", task="t", warning="w")
+    alloy = WarningEntry(host="h", task="Alloy compliance", warning="drift", notifying=True)
+    assert "notifying" not in old.model_dump()
+    assert alloy.model_dump()["notifying"] is True
 
 
 def test_packages_present_when_set():

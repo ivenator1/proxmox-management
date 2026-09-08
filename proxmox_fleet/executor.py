@@ -14,6 +14,26 @@ from typing import Any, Callable, Dict, Optional, Protocol
 from proxmox_fleet.runner import PrimitiveResult, invoke_primitive
 
 
+class SnapshotExecutor(Protocol):
+    """Narrow capability used by snapshot retry policy."""
+
+    host: str
+
+    def snapshot(
+        self,
+        vmid: str,
+        *,
+        snap_state: str,
+        api_host: str,
+        api_user: str,
+        api_token_id: str,
+        api_token_secret: str,
+        timeout: int = 600,
+        api_timeout: int = 30,
+    ) -> PrimitiveResult:
+        ...
+
+
 class Executor(Protocol):
     host: str
 
@@ -329,6 +349,47 @@ class RunnerExecutor:
             check=self.check,
         ))
 
+    def alloy_probe(self, *, lxc_id: Optional[str] = None) -> PrimitiveResult:
+        primitive = "alloy_lxc_probe" if lxc_id is not None else "alloy_vm_probe"
+        extravars = {"lxc_id": lxc_id} if lxc_id is not None else {}
+        return _merge_facts(invoke_primitive(
+            primitive,
+            inventory=self.inventory,
+            host_pattern=self.host,
+            extravars=extravars,
+            # Probe tasks explicitly use check_mode: false; they are read-only and
+            # must run during --check so Python can classify drift.
+            check=self.check,
+        ))
+
+    def alloy_reconcile(
+        self,
+        *,
+        lxc_id: Optional[str] = None,
+        desired_content: str,
+        install: bool,
+        configure: bool,
+        add_journal_group: bool,
+        repair_service: bool,
+    ) -> PrimitiveResult:
+        primitive = "alloy_lxc_reconcile" if lxc_id is not None else "alloy_vm_reconcile"
+        extravars: Dict[str, Any] = {
+            "alloy_config_content": desired_content,
+            "alloy_install": install,
+            "alloy_configure": configure,
+            "alloy_add_journal_group": add_journal_group,
+            "alloy_repair_service": repair_service,
+        }
+        if lxc_id is not None:
+            extravars["lxc_id"] = lxc_id
+        return _merge_facts(invoke_primitive(
+            primitive,
+            inventory=self.inventory,
+            host_pattern=self.host,
+            extravars=extravars,
+            check=self.check,
+        ))
+
 
 def _merge_facts(result: PrimitiveResult) -> PrimitiveResult:
     """Prefer the explicit set_stats facts the run_shell primitive returns."""
@@ -337,7 +398,9 @@ def _merge_facts(result: PrimitiveResult) -> PrimitiveResult:
         try:
             result.rc = int(facts["rc"])
         except (TypeError, ValueError):
-            pass
+            # Preserve PrimitiveResult.rc when a malformed optional fact is
+            # returned; the runner-level status remains authoritative.
+            result.rc = int(result.rc)
     if "stdout" in facts:
         result.stdout = str(facts["stdout"])
     if "stderr" in facts:
@@ -358,7 +421,7 @@ def snapshot_failure_warning(result: PrimitiveResult) -> str:
 
 
 def snapshot_with_retry(
-    executor: Executor,
+    executor: SnapshotExecutor,
     vmid: str,
     *,
     snap_state: str,

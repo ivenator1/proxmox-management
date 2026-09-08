@@ -405,6 +405,36 @@ def test_scan_flag_runs_scan_not_fleet(tmp_path):
     assert captured["limit"] == {"web-01"}
 
 
+def test_alloy_only_forwarded_to_driver():
+    captured = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    with (
+        patch("proxmox_fleet.driver.run_fleet", side_effect=fake_run),
+        patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
+    ):
+        assert cli.main(["--alloy-only", "--check", "--limit", "101,vm-01"]) == 0
+    assert captured["alloy_only"] is True
+    assert captured["check"] is True
+    assert captured["limit"] == {"101", "vm-01"}
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--alloy-only", "--scan"],
+        ["--alloy-only", "--phases", "lxc"],
+    ],
+)
+def test_alloy_only_rejects_ambiguous_modes(argv):
+    with pytest.raises(SystemExit):
+        cli.main(argv)
+
+
 def test_scan_exit_code_forwarded():
     with (
         patch("proxmox_fleet.scan.run_fleet_scan", return_value=1),

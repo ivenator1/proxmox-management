@@ -29,6 +29,13 @@
     </span>
   </label>
   <label class="option-row">
+    <span class="switch"><input type="checkbox" name="alloy_only" value="true"><span class="track"></span></span>
+    <span class="option-text">
+      <span class="option-title">Alloy compliance only</span>
+      <span class="option-desc"><code>--alloy-only</code> — audit/repair managed guests; no regular updates or snapshots</span>
+    </span>
+  </label>
+  <label class="option-row">
     <span class="switch"><input type="checkbox" name="force_notify" value="true"><span class="track"></span></span>
     <span class="option-text">
       <span class="option-title">Force notification</span>
@@ -53,7 +60,7 @@
     <label>Phases
       <input type="text" name="phases" placeholder="lxc,vm">
     </label>
-    <p class="hint">optional: {{ phase_names | join(", ") }}</p>
+    <p class="hint">optional: {{ phase_names | join(", ") }}; leave blank for Alloy-only runs</p>
   </div>
   {% if token_required %}
   <div class="field">

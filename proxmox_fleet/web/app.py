@@ -82,8 +82,8 @@ _LIMIT_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$")
 # ``packages`` (PR1 exact OS package detail) is rendered as a `<details>`
 # disclosure by both templates instead of a plain cell.
 BUCKET_COLUMNS: Dict[str, Tuple[str, ...]] = {
-    "lxc": ("node", "id", "name", "os", "app", "packages"),
-    "vm": ("node", "vmid", "name", "status", "pkg_count", "packages"),
+    "lxc": ("node", "id", "name", "os", "app", "alloy", "packages"),
+    "vm": ("node", "vmid", "name", "status", "alloy", "pkg_count", "packages"),
     "remote": ("host", "status", "pkg_count", "packages"),
     "node": ("node", "status", "pkg_count", "packages"),
     "custom": ("host", "name", "app"),
@@ -393,16 +393,23 @@ def build_run_args(form: Mapping[str, Any]) -> List[str]:
     """
     args: List[str] = []
     scan = _truthy(form.get("scan"))
+    alloy_only = _truthy(form.get("alloy_only"))
+    phases = _csv_tokens(str(form.get("phases") or ""))
+    if scan and alloy_only:
+        raise ValueError("--alloy-only cannot be combined with --scan")
+    if alloy_only and phases:
+        raise ValueError("--alloy-only cannot be combined with --phases")
     if scan:
         args.append("--scan")
     else:
+        if alloy_only:
+            args.append("--alloy-only")
         if _truthy(form.get("dry_run")):
             args.append("--check")
         if _truthy(form.get("force_notify")):
             args += ["-e", "force_notify=true"]
         if _truthy(form.get("force_window")):
             args += ["-e", "force_window=true"]
-        phases = _csv_tokens(str(form.get("phases") or ""))
         unknown = [p for p in phases if p not in PHASE_NAMES]
         if unknown:
             raise ValueError(f"unknown phase(s): {', '.join(unknown)}")
@@ -1198,6 +1205,8 @@ def create_app(
                             "os_update_exclude_list",
                             "app_update_exclude_list",
                             "snapshot_exclude_list",
+                            "lxc_alloy_exclude_list",
+                            "vm_alloy_exclude_list",
                         )
                     },
                     map_remove={key: ids for key in ("lxc_kuma_map", "vm_kuma_map", "remote_kuma_map")},
