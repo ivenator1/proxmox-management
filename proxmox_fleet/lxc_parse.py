@@ -181,9 +181,31 @@ def resource_scale_plan(ct_info: dict, pct_info: dict) -> dict:
 
 
 def script_name_from_update(content: str) -> Optional[str]:
-    """Extract the community-scripts name from /usr/bin/update content.
+    """Extract the community-scripts name from ``/usr/bin/update`` content.
 
-    Returns the name (e.g. 'sonarr') or None if no ct/*.sh reference found.
+    Supports legacy literal references (``ct/sonarr.sh``) and the current
+    wrapper format, which declares ``UPDATE_SCRIPT_NAME=sonarr`` and references
+    ``ct/${UPDATE_SCRIPT_NAME}.sh``. An unresolved variable fails closed instead
+    of becoming part of a bogus GitHub URL.
     """
-    m = re.search(r"ct/([^.]+)\.sh", content)
-    return m.group(1) if m else None
+    reference = re.search(
+        r"ct/(?:(?:\$\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\})|"
+        r"(?:\$(?P<plain>[A-Za-z_][A-Za-z0-9_]*))|"
+        r"(?P<literal>[A-Za-z0-9][A-Za-z0-9_-]*))\.sh",
+        content,
+    )
+    if reference is None:
+        return None
+
+    literal = reference.group("literal")
+    if literal:
+        return literal
+
+    variable = reference.group("braced") or reference.group("plain")
+    assignment = re.search(
+        rf"^\s*(?:export\s+)?{re.escape(variable)}\s*=\s*"
+        r"([\"']?)([A-Za-z0-9][A-Za-z0-9_-]*)\1\s*$",
+        content,
+        re.MULTILINE,
+    )
+    return assignment.group(2) if assignment else None

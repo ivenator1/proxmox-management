@@ -1121,6 +1121,34 @@ def test_large_rootfs_uses_absolute_free_space_and_bypasses_upstream_guard(monke
     assert ex.app_update_kwargs["lxc_bypass_storage_guard"] is True
 
 
+def test_current_update_wrapper_resolves_script_before_storage_bypass(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    requested_urls = []
+
+    def request(url, **kwargs):
+        requested_urls.append(url)
+        return http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE + "check_container_storage\n")
+
+    monkeypatch.setattr(http_mod, "request", request)
+    ex = _exec_with_health(df=DF_90_PERCENT_20_GIB_FREE, os_release=OS_RELEASE_TRIXIE)
+    ex._introspect_facts["boot_df_stdout"] = DF_90_PERCENT_20_GIB_FREE
+    ex._introspect_facts["script_stdout"] = """\
+export UPDATE_SCRIPT_NAME="debian"
+export COMMUNITY_SCRIPTS_URL="https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main"
+bash -c "$(curl -fsSL "${COMMUNITY_SCRIPTS_URL}/ct/${UPDATE_SCRIPT_NAME}.sh")"
+"""
+
+    run_lxc_update(
+        "pve-01", "101", ex, _settings(lxc_disk_min_free_gb=10),
+        api_host="192.168.1.10",
+    )
+
+    assert requested_urls == [
+        "https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/debian.sh"
+    ]
+    assert ex.app_update_kwargs["lxc_bypass_storage_guard"] is True
+
+
 def test_high_percentage_with_little_free_space_keeps_guard(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda s: None)
     monkeypatch.setattr(http_mod, "request",

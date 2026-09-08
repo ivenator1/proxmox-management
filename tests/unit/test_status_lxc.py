@@ -25,6 +25,7 @@ from proxmox_fleet.lxc_parse import (
     parse_pct_config,
     parse_pct_status,
     resource_scale_plan,
+    script_name_from_update,
 )
 from proxmox_fleet.status import (
     lxc_app_did_update,
@@ -326,6 +327,30 @@ def test_dry_update_available_with_whitespace_in_installed():
         lxc_dry_run_status(gh_repo="owner/repo", fetch_ok=True, installed_ver=" v1.9 ", latest_tag="v2.0")
         == "v1.9 → v2.0"
     )
+
+
+# ---------------------------------------------------------------------------
+# script_name_from_update — resolve legacy literal and current variable URLs
+# ---------------------------------------------------------------------------
+
+
+def test_script_name_from_update_reads_literal_reference():
+    content = 'source <(curl -fsSL "https://example.test/ct/sonarr.sh")\n'
+    assert script_name_from_update(content) == "sonarr"
+
+
+def test_script_name_from_update_resolves_current_variable_reference():
+    content = """\
+export UPDATE_SCRIPT_NAME="debian"
+export COMMUNITY_SCRIPTS_URL="https://example.test"
+bash -c "$(curl -fsSL "${COMMUNITY_SCRIPTS_URL}/ct/${UPDATE_SCRIPT_NAME}.sh")"
+"""
+    assert script_name_from_update(content) == "debian"
+
+
+def test_script_name_from_update_rejects_unresolved_variable_reference():
+    content = 'bash -c "$(curl -fsSL "${BASE_URL}/ct/${UPDATE_SCRIPT_NAME}.sh")"\n'
+    assert script_name_from_update(content) is None
 
 
 # ---------------------------------------------------------------------------
