@@ -26,7 +26,7 @@ from proxmox_fleet.driver import (
 from proxmox_fleet.flows.vm import VmFlowOutcome
 from proxmox_fleet.inventory import VmSpec
 from proxmox_fleet.models.settings import GlobalSettings
-from proxmox_fleet.models.state import FleetState
+from proxmox_fleet.models.state import FleetState, WarningEntry
 from proxmox_fleet.runner import PrimitiveResult
 
 
@@ -868,6 +868,39 @@ def test_notify_phase_does_not_repeat_manual_attention_before_reminder(tmp_path,
     assert calls["dispatch"] == []
 
 
+def test_notify_phase_notifying_warning_dispatches_amber_success(tmp_path, monkeypatch):
+    calls = _patch_notifiers(monkeypatch)
+    state = _notify_state(fleet_warning_log=[{
+        "host": "vm-01",
+        "task": "Alloy compliance",
+        "warning": "service is not active",
+        "notifying": True,
+    }])
+    settings = GlobalSettings(discord_webhook="https://d/hook", fleet_history_dir=str(tmp_path))
+    run_notify_phase(settings=settings, state=state)
+    assert len(calls["dispatch"]) == 1
+    _, dispatched = calls["dispatch"][0]
+    assert dispatched["failed"] is False
+    assert dispatched["color"] == 16766720
+    assert "Attention Required" in dispatched["title"]
+    assert calls["ping"][0][1]["failed"] is False
+
+
+def test_notify_phase_legacy_warning_does_not_dispatch_idle_run(tmp_path, monkeypatch):
+    calls = _patch_notifiers(monkeypatch)
+    state = _notify_state(fleet_warning_log=[{
+        "host": "pve-01",
+        "task": "disk space",
+        "warning": "low",
+    }])
+    run_notify_phase(
+        settings=GlobalSettings(discord_webhook="https://d/hook", fleet_history_dir=str(tmp_path)),
+        state=state,
+    )
+    assert calls["dispatch"] == []
+    assert calls["ping"][0][1]["failed"] is False
+
+
 def test_notify_phase_suppressed_when_idle_but_history_still_written(tmp_path, monkeypatch):
     calls = _patch_notifiers(monkeypatch)
     state = _notify_state()  # nothing changed/failed
@@ -898,7 +931,15 @@ def test_notify_phase_history_disabled(tmp_path, monkeypatch):
 def test_notify_phase_failed_state_titles(tmp_path, monkeypatch):
     calls = _patch_notifiers(monkeypatch)
     settings = GlobalSettings(discord_webhook="https://d/hook", fleet_history_dir=str(tmp_path))
-    run_notify_phase(settings=settings, state=_notify_state(fleet_failed=True))
+    run_notify_phase(settings=settings, state=_notify_state(
+        fleet_failed=True,
+        fleet_warning_log=[{
+            "host": "vm-01",
+            "task": "Alloy compliance",
+            "warning": "inactive",
+            "notifying": True,
+        }],
+    ))
     _, kw = calls["dispatch"][0]
     assert kw["title"] == "⚠️ Briefing: Failures Detected"
     assert kw["ntfy_title"] == "Fleet Update: Failures Detected"
@@ -1032,7 +1073,20 @@ def _record_phases(monkeypatch):
     def mk(name):
         def _fn(**kwargs):
             calls.append(
-                (name, {k: kwargs.get(k) for k in ("limit", "include_nodes", "include_manager") if k in kwargs})
+                (
+                    name,
+                    {
+                        k: kwargs.get(k)
+                        for k in (
+                            "limit",
+                            "include_nodes",
+                            "include_manager",
+                            "alloy_only",
+                            "alloy_config",
+                        )
+                        if k in kwargs
+                    },
+                )
             )
             return FleetState()
 
@@ -1076,6 +1130,59 @@ def test_run_fleet_phases_manager_only(monkeypatch):
     assert [c[0] for c in calls] == ["node"]
     assert calls[0][1]["include_nodes"] is False
     assert calls[0][1]["include_manager"] is True
+
+
+def test_run_fleet_alloy_only_selects_guest_phases(monkeypatch):
+    calls = _record_phases(monkeypatch)
+    desired = object()
+    monkeypatch.setattr(driver_mod, "_load_alloy_config", lambda settings: (desired, None))
+    rc = run_fleet(
+        settings=GlobalSettings(apt_proxy_ip=""),
+        inventory_path="x",
+        alloy_only=True,
+        limit={"101", "vm-01"},
+    )
+    assert rc == 0
+    assert [c[0] for c in calls] == ["lxc", "vm"]
+    assert all(c[1]["alloy_only"] is True for c in calls)
+    assert all(c[1]["alloy_config"] is desired for c in calls)
+    assert all(c[1]["limit"] == {"101", "vm-01"} for c in calls)
+
+
+def test_run_fleet_rejects_alloy_only_with_explicit_phases(monkeypatch):
+    _record_phases(monkeypatch)
+    with pytest.raises(SystemExit, match="cannot be combined"):
+        run_fleet(
+            settings=GlobalSettings(apt_proxy_ip=""),
+            inventory_path="x",
+            alloy_only=True,
+            phases={"lxc"},
+        )
+
+
+def test_run_fleet_invalid_alloy_config_warns_once(monkeypatch):
+    captured = {}
+    _stub_phases(monkeypatch)
+    monkeypatch.setattr(
+        driver_mod,
+        "run_notify_phase",
+        lambda **kwargs: captured.setdefault("state", kwargs["state"]),
+    )
+    missing = WarningEntry(
+        host="Ansible-Manager",
+        task="Alloy desired config",
+        warning="missing",
+        notifying=True,
+    )
+    monkeypatch.setattr(driver_mod, "_load_alloy_config", lambda settings: (None, missing))
+    rc = run_fleet(
+        settings=GlobalSettings(apt_proxy_ip="", alloy_enabled=True),
+        inventory_path="x",
+    )
+    assert rc == 0
+    warnings = captured["state"].warnings
+    assert len(warnings) == 1
+    assert warnings[0].notifying is True
 
 
 def test_run_fleet_unknown_phase_exits(monkeypatch):
@@ -1258,6 +1365,113 @@ def test_vm_phase_limit_matches_name_or_vmid(tmp_path, monkeypatch):
         settings=GlobalSettings(), inventory_path=str(p), state_output_path=None, limit={"media-vm", "201"}
     )
     assert sorted(ran) == ["db-vm", "media-vm"]
+
+
+def test_vm_phase_alloy_only_honors_name_exclusions(tmp_path, monkeypatch):
+    path = tmp_path / "hosts.ini"
+    path.write_text(
+        "[proxmox_nodes]\npve-01 ansible_host=10.0.0.1\n"
+        "[proxmox_vms]\n"
+        "media-vm ansible_host=10.0.1.1 vmid=200 pve_node=pve-01\n"
+        "loki-vm ansible_host=10.0.1.2 vmid=201 pve_node=pve-01\n",
+        encoding="utf-8",
+    )
+    ran: List[str] = []
+
+    def fake_update(node_name, vmid, name, vm_ex, node_ex, settings, **kwargs):
+        ran.append(name)
+        assert kwargs["alloy_only"] is True
+        assert kwargs["alloy_config"] is desired
+        return VmFlowOutcome()
+
+    desired = object()
+    monkeypatch.setattr(driver_mod, "run_vm_update", fake_update)
+    monkeypatch.setattr(driver_mod, "_discover_vm_locations", lambda *args, **kwargs: {})
+    monkeypatch.setattr(driver_mod, "RunnerExecutor", lambda *args, **kwargs: ScriptedExecutor())
+    driver_mod.run_vm_phase(
+        settings=GlobalSettings(vm_alloy_exclude_list=["loki-vm"]),
+        inventory_path=str(path),
+        state_output_path=None,
+        alloy_only=True,
+        alloy_config=desired,
+    )
+    assert ran == ["media-vm"]
+
+
+def test_vm_phase_alloy_only_honors_maintenance_window_and_force(tmp_path, monkeypatch):
+    path = tmp_path / "hosts.ini"
+    path.write_text(
+        "[proxmox_nodes]\npve-01 ansible_host=10.0.0.1\n"
+        "[proxmox_vms]\nmedia-vm ansible_host=10.0.1.1 vmid=200 pve_node=pve-01\n",
+        encoding="utf-8",
+    )
+    host_vars = tmp_path / "host_vars"
+    host_vars.mkdir()
+    (host_vars / "media-vm.yml").write_text(
+        "maintenance_window:\n  days: [Sat]\n  start: '02:00'\n  end: '04:00'\n  tz: UTC\n",
+        encoding="utf-8",
+    )
+    ran: List[str] = []
+
+    def fake_update(node_name, vmid, name, vm_ex, node_ex, settings, **kwargs):
+        ran.append(name)
+        return VmFlowOutcome()
+
+    monkeypatch.setattr(driver_mod, "run_vm_update", fake_update)
+    monkeypatch.setattr(driver_mod, "_discover_vm_locations", lambda *args, **kwargs: {})
+    monkeypatch.setattr(driver_mod, "RunnerExecutor", lambda *args, **kwargs: ScriptedExecutor())
+    monkeypatch.setattr(driver_mod.window, "in_window", lambda spec, *, force=False: force)
+
+    settings = GlobalSettings(host_vars_dir=str(host_vars))
+    driver_mod.run_vm_phase(
+        settings=settings,
+        inventory_path=str(path),
+        state_output_path=None,
+        alloy_only=True,
+        alloy_config=object(),
+    )
+    assert ran == []
+    driver_mod.run_vm_phase(
+        settings=settings.model_copy(update={"force_window": True}),
+        inventory_path=str(path),
+        state_output_path=None,
+        alloy_only=True,
+        alloy_config=object(),
+    )
+    assert ran == ["media-vm"]
+
+
+def test_lxc_phase_alloy_only_honors_qualified_and_bare_exclusions(tmp_path, monkeypatch):
+    path = tmp_path / "hosts.ini"
+    path.write_text(
+        "[proxmox_nodes]\n"
+        "alpha-node ansible_host=10.0.0.1 cluster=alpha\n"
+        "beta-node ansible_host=10.0.0.2 cluster=beta\n",
+        encoding="utf-8",
+    )
+    ran: List[str] = []
+
+    def fake_executor(host, **kwargs):
+        executor = ScriptedExecutor()
+        executor.host = host
+        return executor
+
+    def fake_update(node_name, lxc_id, executor, settings, **kwargs):
+        ran.append(f"{node_name}/{lxc_id}")
+        assert kwargs["alloy_only"] is True
+        return driver_mod.LxcFlowOutcome()
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", lambda *args, **kwargs: ["101", "102"])
+    monkeypatch.setattr(driver_mod, "run_lxc_update", fake_update)
+    monkeypatch.setattr(driver_mod, "RunnerExecutor", fake_executor)
+    driver_mod.run_lxc_phase(
+        settings=GlobalSettings(lxc_alloy_exclude_list=["alpha/101", "102"]),
+        inventory_path=str(path),
+        state_output_path=None,
+        alloy_only=True,
+        alloy_config=object(),
+    )
+    assert ran == ["beta-node/101"]
 
 
 def test_lxc_phase_limit_node_name_keeps_all_ids(tmp_path, monkeypatch):

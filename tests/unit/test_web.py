@@ -164,6 +164,35 @@ def test_build_args_flags():
     assert args == ["--check", "-e", "force_notify=true", "-e", "force_window=true"]
 
 
+def test_build_args_alloy_only_with_safe_flags():
+    args = build_run_args({
+        "alloy_only": "on",
+        "dry_run": "on",
+        "force_window": "on",
+        "limit": "101,vm-01",
+    })
+    assert args == [
+        "--alloy-only",
+        "--check",
+        "-e",
+        "force_window=true",
+        "--limit",
+        "101,vm-01",
+    ]
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        {"alloy_only": "on", "scan": "on"},
+        {"alloy_only": "on", "phases": "lxc"},
+    ],
+)
+def test_build_args_rejects_ambiguous_alloy_modes(form):
+    with pytest.raises(ValueError, match="alloy-only"):
+        build_run_args(form)
+
+
 def test_build_args_limit_and_phases():
     args = build_run_args({"limit": "pve-01, 105", "phases": "lxc,vm"})
     assert args == ["--phases", "lxc,vm", "--limit", "pve-01,105"]
@@ -1241,6 +1270,19 @@ def test_settings_page_invalid_yaml_renders_raw_editor(project):
     assert resp.status_code == 200
     assert "duplicate key" in resp.text.lower()
     assert invalid_yaml in unescape(resp.text)
+
+
+def test_settings_form_supports_alloy_fields():
+    rows = {row["name"]: row for row in settings_form_fields({
+        "alloy_enabled": True,
+        "alloy_config_path": "configs/private.alloy",
+        "lxc_alloy_exclude_list": [501, "beta/502"],
+        "vm_alloy_exclude_list": ["loki-vm"],
+    })}
+    assert rows["alloy_enabled"]["kind"] == "bool"
+    assert rows["alloy_config_path"]["kind"] == "str"
+    assert rows["lxc_alloy_exclude_list"]["text"] == "501\nbeta/502"
+    assert rows["vm_alloy_exclude_list"]["kind"] == "list"
 
 
 def test_settings_page_keeps_nested_cluster_credentials_raw_only(project):

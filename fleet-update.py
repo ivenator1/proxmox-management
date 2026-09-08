@@ -76,6 +76,10 @@ EXAMPLES
   ./fleet-update.py --history 5
   ./fleet-update.py --history-show latest
 
+  # Audit Alloy, then repair it without running package-update phases:
+  ./fleet-update.py --dry-run --alloy-only
+  ./fleet-update.py --alloy-only --limit 105,media-vm
+
   # Re-run a single failed LXC (dry-run first), or only the VM phase:
   ./fleet-update.py --dry-run --phases lxc --limit 105
   ./fleet-update.py --phases vm --limit media-vm
@@ -177,12 +181,25 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
             "Writes pending-*.json next to the run history; no changes are made."
         ),
     )
+    parser.add_argument(
+        "--alloy-only",
+        action="store_true",
+        help=(
+            "Audit and repair Grafana Alloy on managed LXCs and VMs while "
+            "skipping snapshots and all regular update work."
+        ),
+    )
 
 
 def main() -> int:
     parser = _build_parser()
     _add_arguments(parser)
     args = parser.parse_args()
+
+    if args.alloy_only and args.scan:
+        parser.error("--alloy-only cannot be combined with --scan")
+    if args.alloy_only and args.phases is not None:
+        parser.error("--alloy-only cannot be combined with --phases")
 
     try:
         from proxmox_fleet import driver
@@ -228,6 +245,7 @@ def main() -> int:
         settings = settings.model_copy(update={"lxc_verbose": True})
     if args.force_window:
         settings = settings.model_copy(update={"force_window": True})
+    alloy_options = {"alloy_only": True} if args.alloy_only else {}
 
     return run_locked(settings, lambda: driver.run_fleet(
         settings=settings,
@@ -236,6 +254,7 @@ def main() -> int:
         extra_vars=extravars,
         limit=_parse_csv_set(args.limit),
         phases=_parse_csv_set(args.phases),
+        **alloy_options,
     ))
 
 

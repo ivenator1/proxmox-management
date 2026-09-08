@@ -1,0 +1,111 @@
+---
+# Apply only the Alloy repairs selected by Python to one LXC through pct.
+- name: "Alloy LXC reconcile primitive"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars:
+    _alloy_node_stage: "/tmp/fleet-alloy-{{ lxc_id }}.alloy"
+    _alloy_guest_stage: /tmp/fleet-alloy-config.alloy
+  tasks:
+    - name: "Install Alloy from Grafana stable apt repository in container"
+      ansible.builtin.command:
+        argv:
+          - pct
+          - exec
+          - "{{ lxc_id }}"
+          - --
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            export LC_ALL=C DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y wget gpg
+            install -d -m 0755 /etc/apt/keyrings
+            wget -q -O - https://apt.grafana.com/gpg.key \
+              | gpg --dearmor --batch --yes -o /etc/apt/keyrings/grafana.gpg
+            printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main' \
+              > /etc/apt/sources.list.d/grafana.list
+            apt-get update
+            apt-get install -y alloy
+      environment:
+        LC_ALL: C
+      when: alloy_install | bool
+
+    - name: "Validate and install desired Alloy configuration in container"
+      when: alloy_configure | bool
+      block:
+        - name: "Stage desired Alloy configuration on Proxmox node"
+          ansible.builtin.copy:
+            content: "{{ alloy_config_content }}"
+            dest: "{{ _alloy_node_stage }}"
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+        - name: "Push staged Alloy configuration into container"
+          ansible.builtin.command:
+            argv:
+              - pct
+              - push
+              - "{{ lxc_id }}"
+              - "{{ _alloy_node_stage }}"
+              - "{{ _alloy_guest_stage }}"
+          changed_when: false
+
+        - name: "Protect staged Alloy configuration in container"
+          ansible.builtin.command:
+            argv: [pct, exec, "{{ lxc_id }}", --, chmod, "0600", "{{ _alloy_guest_stage }}"]
+          changed_when: false
+
+        - name: "Validate staged Alloy configuration in container"
+          ansible.builtin.command:
+            argv: [pct, exec, "{{ lxc_id }}", --, /usr/bin/alloy, validate, "{{ _alloy_guest_stage }}"]
+          changed_when: false
+
+        - name: "Replace Alloy configuration after validation"
+          ansible.builtin.command:
+            argv:
+              - pct
+              - exec
+              - "{{ lxc_id }}"
+              - --
+              - install
+              - -D
+              - -o
+              - root
+              - -g
+              - alloy
+              - -m
+              - "0640"
+              - "{{ _alloy_guest_stage }}"
+              - /etc/alloy/config.alloy
+          changed_when: true
+      always:
+        - name: "Remove staged Alloy configuration from container"
+          ansible.builtin.command:
+            argv: [pct, exec, "{{ lxc_id }}", --, rm, -f, "{{ _alloy_guest_stage }}"]
+          changed_when: false
+          failed_when: false
+
+        - name: "Remove staged Alloy configuration from Proxmox node"
+          ansible.builtin.file:
+            path: "{{ _alloy_node_stage }}"
+            state: absent
+          changed_when: false
+
+    - name: "Add Alloy service user to systemd-journal in container"
+      ansible.builtin.command:
+        argv: [pct, exec, "{{ lxc_id }}", --, usermod, -aG, systemd-journal, alloy]
+      when: alloy_add_journal_group | bool
+
+    - name: "Enable Alloy service in container"
+      ansible.builtin.command:
+        argv: [pct, exec, "{{ lxc_id }}", --, systemctl, enable, alloy]
+      when: alloy_repair_service | bool
+
+    - name: "Restart Alloy service in container"
+      ansible.builtin.command:
+        argv: [pct, exec, "{{ lxc_id }}", --, systemctl, restart, alloy]
+      when: alloy_repair_service | bool

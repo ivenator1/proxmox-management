@@ -104,6 +104,23 @@ manual_update_forks: 2
 # exceed the default 30s. Scan-only, not accepted as an -e extra var.
 manual_update_api_timeout: 120
 
+# --- GRAFANA ALLOY GUEST COMPLIANCE (opt-in) ---
+# Copy configs/guest.alloy.example to configs/guest.alloy, replace the
+# REPLACE_WITH_LOKI_ENDPOINT placeholder, then enable enforcement. The real
+# *.alloy file is gitignored because it may contain private network details.
+alloy_enabled: false
+alloy_config_path: "configs/guest.alloy"
+# Bare LXC ids apply fleet-wide; qualify cluster/ID for one cluster. Exclude
+# log receivers and any guest with a purpose-specific Alloy config.
+lxc_alloy_exclude_list: []
+# VM exclusions are stable [proxmox_vms] inventory names, not collision-prone vmids.
+vm_alloy_exclude_list: []
+
+# Safe rollout after enabling/configuring:
+#   ./fleet-update.py --dry-run --alloy-only
+#   ./fleet-update.py --alloy-only --limit 101,media-vm
+#   ./fleet-update.py --alloy-only
+
 # --- LXC TAG DISCOVERY ---
 lxc_tags:
   - "community-script"

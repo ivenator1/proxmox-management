@@ -1,0 +1,85 @@
+---
+# Apply only the Alloy repairs selected by the Python control plane to a VM.
+- name: "Alloy VM reconcile primitive"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  become: true
+  tasks:
+    - name: "Install Alloy from Grafana stable apt repository"
+      when: alloy_install | bool
+      block:
+        - name: "Install Alloy repository prerequisites"
+          ansible.builtin.apt:
+            name: [wget, gpg]
+            state: present
+            update_cache: true
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+
+        - name: "Configure Grafana stable repository and install Alloy"
+          ansible.builtin.shell: |
+            set -euo pipefail
+            install -d -m 0755 /etc/apt/keyrings
+            wget -q -O - https://apt.grafana.com/gpg.key \
+              | gpg --dearmor --batch --yes -o /etc/apt/keyrings/grafana.gpg
+            printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main' \
+              > /etc/apt/sources.list.d/grafana.list
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y alloy
+          args:
+            executable: /bin/bash
+          environment:
+            LC_ALL: C
+
+    - name: "Validate and install desired Alloy configuration"
+      when: alloy_configure | bool
+      block:
+        - name: "Stage desired Alloy configuration"
+          ansible.builtin.copy:
+            content: "{{ alloy_config_content }}"
+            dest: /tmp/fleet-alloy-config.alloy
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+        - name: "Validate staged Alloy configuration"
+          ansible.builtin.command:
+            argv: [/usr/bin/alloy, validate, /tmp/fleet-alloy-config.alloy]
+          changed_when: false
+
+        - name: "Replace Alloy configuration after validation"
+          ansible.builtin.command:
+            argv:
+              - install
+              - -D
+              - -o
+              - root
+              - -g
+              - alloy
+              - -m
+              - "0640"
+              - /tmp/fleet-alloy-config.alloy
+              - /etc/alloy/config.alloy
+          changed_when: true
+      always:
+        - name: "Remove staged Alloy configuration"
+          ansible.builtin.file:
+            path: /tmp/fleet-alloy-config.alloy
+            state: absent
+          changed_when: false
+
+    - name: "Add Alloy service user to systemd-journal"
+      ansible.builtin.user:
+        name: alloy
+        groups: systemd-journal
+        append: true
+      when: alloy_add_journal_group | bool
+
+    - name: "Enable and restart Alloy service"
+      ansible.builtin.systemd_service:
+        name: alloy
+        enabled: true
+        state: restarted
+        daemon_reload: true
+      when: alloy_repair_service | bool

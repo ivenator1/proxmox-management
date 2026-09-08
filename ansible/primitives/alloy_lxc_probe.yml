@@ -1,0 +1,76 @@
+---
+# Read-only Alloy compliance probe for one LXC via its Proxmox node.
+- name: "Alloy LXC probe primitive"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  tasks:
+    - name: "Check Alloy binary in container"
+      ansible.builtin.command:
+        argv: [pct, exec, "{{ lxc_id }}", --, test, -x, /usr/bin/alloy]
+      register: _alloy_binary
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Hash Alloy configuration in container"
+      ansible.builtin.command:
+        argv: [pct, exec, "{{ lxc_id }}", --, sha256sum, /etc/alloy/config.alloy]
+      register: _alloy_config
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Read Alloy supplementary groups in container"
+      ansible.builtin.command:
+        argv: [pct, exec, "{{ lxc_id }}", --, id, -nG, alloy]
+      register: _alloy_groups
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Check Alloy service enabled state in container"
+      ansible.builtin.command:
+        argv: [pct, exec, "{{ lxc_id }}", --, systemctl, is-enabled, alloy]
+      register: _alloy_enabled
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Check Alloy service active state in container"
+      ansible.builtin.command:
+        argv: [pct, exec, "{{ lxc_id }}", --, systemctl, is-active, alloy]
+      register: _alloy_active
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Detect package manager in container"
+      ansible.builtin.command:
+        argv:
+          - pct
+          - exec
+          - "{{ lxc_id }}"
+          - --
+          - sh
+          - -c
+          - >-
+            if command -v apt-get >/dev/null 2>&1; then printf apt;
+            elif command -v dnf >/dev/null 2>&1; then printf dnf;
+            elif command -v apk >/dev/null 2>&1; then printf apk;
+            else printf unknown; fi
+      register: _alloy_pkg
+      changed_when: false
+      check_mode: false
+
+    - name: "Return Alloy probe facts"
+      ansible.builtin.set_stats:
+        data:
+          binary_present: "{{ _alloy_binary.rc | default(1) == 0 }}"
+          package_manager: "{{ _alloy_pkg.stdout | default('unknown') | trim }}"
+          config_sha256: "{{ (_alloy_config.stdout | default('')).split(' ') | first }}"
+          journal_member: "{{ 'systemd-journal' in (_alloy_groups.stdout | default('')).split() }}"
+          service_enabled: "{{ _alloy_enabled.rc | default(1) == 0 }}"
+          service_active: "{{ _alloy_active.rc | default(1) == 0 }}"
+        aggregate: false
+      changed_when: false
+      check_mode: false

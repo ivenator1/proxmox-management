@@ -7,7 +7,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 configs/*.yml
+configs/*.alloy
 !configs/*.yml.example
+!configs/*.alloy.example
 !configs/.gitkeep
 
 # Python packaging / build artifacts

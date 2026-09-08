@@ -12,6 +12,7 @@ Status strings come from proxmox_fleet.status (byte-parity with the old Jinja).
 
 from __future__ import annotations
 
+import importlib
 import re
 import time
 from dataclasses import dataclass, field
@@ -283,6 +284,8 @@ def run_lxc_update(
     dry_run: bool = False,
     api_host: str = "",
     cluster: str = DEFAULT_CLUSTER,
+    alloy_config: Optional[Any] = None,
+    alloy_only: bool = False,
 ) -> LxcFlowOutcome:
     """Run the whole lxc_update flow for one container. Never raises — failures
     are captured into the outcome (FAILED record + error entry), mirroring rescue.
@@ -333,6 +336,29 @@ def run_lxc_update(
     snapshot_failed = False
     rollback_done = False
     outcome = LxcFlowOutcome()
+    alloy_status: Optional[str] = None
+    alloy_changed = False
+
+    def _enforce_alloy() -> None:
+        nonlocal alloy_status, alloy_changed
+        if alloy_config is None:
+            return
+        alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+        result = alloy_mod.reconcile_alloy(
+            executor,
+            alloy_config,
+            dry_run=dry_run,
+            lxc_id=lxc_id,
+        )
+        alloy_status = result.status
+        alloy_changed = result.changed
+        if result.warning:
+            outcome.warnings.append(WarningEntry(
+                host=f"{node}/{lxc_id}",
+                task="Alloy compliance",
+                warning=result.warning,
+                notifying=True,
+            ))
 
     # Health warnings are raised before any update runs — and outside the try, so
     # they survive a later failure and are emitted on the dry-run path too, which
@@ -354,6 +380,24 @@ def run_lxc_update(
     }
 
     try:
+        # Alloy-only deliberately skips snapshots and all package/application
+        # work.  The surrounding introspection/start/finally logic still makes
+        # stopped managed containers safely reachable for the audit.
+        if alloy_only:
+            _enforce_alloy()
+            outcome.changed = alloy_changed
+            if alloy_status is not None:
+                outcome.record = LxcRecord(
+                    node=node,
+                    name=name,
+                    id=lxc_id,
+                    app="",
+                    os="",
+                    snap=False,
+                    alloy=alloy_status,
+                )
+            return outcome
+
         # ------------------------------------------------------------------
         # Detect — parse the update script pulled by introspect
         # ------------------------------------------------------------------
@@ -402,6 +446,9 @@ def run_lxc_update(
         # Dry-check — version compare only, no mutations
         # ------------------------------------------------------------------
         if dry_run:
+            # Normal dry runs audit Alloy too, but reconciliation itself is
+            # probe-only and returns notifying drift warnings.
+            _enforce_alloy()
             if app_excluded:
                 dry_status = "SKIPPED"
             else:
@@ -429,7 +476,7 @@ def run_lxc_update(
                 )
             outcome.record = LxcRecord(
                 node=node, name=name, id=lxc_id,
-                app=dry_status, os="", snap=False,
+                app=dry_status, os="", snap=False, alloy=alloy_status,
             )
             return outcome
 
@@ -456,6 +503,10 @@ def run_lxc_update(
                     warning=snapshot_failure_warning(snap_res),
                 ))
                 snapshot_failed = True
+
+        # Alloy changes happen after the snapshot attempt and before package
+        # work, so a later successful rollback reverts them with the guest.
+        _enforce_alloy()
 
         # ------------------------------------------------------------------
         # Update
@@ -624,15 +675,22 @@ def run_lxc_update(
             reboot_done=reboot_done,
         )
 
-        outcome.changed = something_changed
+        outcome.changed = something_changed or alloy_changed
         # A non-zero OS or app update does not raise (the flow carries on so the
         # other line still gets reported), but it is still a failed run: without
         # this the record says FAILED while state.failed stays false, so the exit
         # code, the history entry and the dashboard all report success.
         outcome.failed = bool(outcome.errors)
         script_expected = not matches_any(settings.os_only_lxc_list, cluster, lxc_id)
-        if lxc_should_report(app_status_str, os_status_str, dry_run=False,
-                             script_expected=script_expected):
+        if (
+            lxc_should_report(
+                app_status_str,
+                os_status_str,
+                dry_run=False,
+                script_expected=script_expected,
+            )
+            or alloy_status is not None
+        ):
             # Exact OS packages (PR1) — success records only: skip when the OS
             # step failed (partial output), and store None for an empty parse
             # (non-apt OS, dnf drift) so idle-style records stay key-free.
@@ -644,6 +702,7 @@ def run_lxc_update(
                 node=node, name=name, id=lxc_id,
                 app=app_status_str, os=os_status_str, snap=snap_taken,
                 packages=os_packages,
+                alloy=alloy_status,
             )
         return outcome
 
@@ -664,7 +723,7 @@ def run_lxc_update(
                         break
                 rollback_done = True
             except Exception:  # noqa: BLE001 - rollback errors are ignored
-                pass
+                rollback_done = False
 
         rescue_app = lxc_rescue_app_status(
             rollback_done=rollback_done, snapshot_failed=snapshot_failed
@@ -673,6 +732,9 @@ def run_lxc_update(
         outcome.record = LxcRecord(
             node=node, name=name, id=lxc_id,
             app=rescue_app, os="FAILED", snap=False,
+            # A completed rollback reverted the Alloy mutation too.  Without a
+            # rollback (no snapshot or rollback failure), report what remains.
+            alloy=None if rollback_done else alloy_status,
         )
         outcome.error = ErrorEntry(
             host=f"{node}/{lxc_id}", task=str(failed_task), error=str(exc)[:300]
@@ -693,5 +755,6 @@ def run_lxc_update(
         if was_stopped and not rollback_done and not is_template:
             try:
                 executor.pct_stop(lxc_id)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as cleanup_exc:  # noqa: BLE001
+                if settings.lxc_verbose:
+                    _vprint(node, lxc_id, name, f"stop cleanup failed: {cleanup_exc}")

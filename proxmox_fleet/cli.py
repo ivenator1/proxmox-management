@@ -187,7 +187,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--scan", action="store_true",
                         help="read-only pending-updates scan (no changes); writes "
                              "pending-*.json to fleet_history_dir and exits.")
+    parser.add_argument(
+        "--alloy-only",
+        action="store_true",
+        help="audit/repair Alloy on managed LXCs and VMs; skip all regular update work.",
+    )
     args = parser.parse_args(argv)
+
+    if args.alloy_only and args.scan:
+        parser.error("--alloy-only cannot be combined with --scan")
+    if args.alloy_only and args.phases is not None:
+        parser.error("--alloy-only cannot be combined with --phases")
 
     if args.history is not None or args.history_show is not None:
         return history_main(history=args.history, history_show=args.history_show,
@@ -216,6 +226,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Propagate CLI extravars that affect driver behaviour into settings.
     settings = apply_extravar_overrides(settings, extravars)
+    alloy_options = {"alloy_only": True} if args.alloy_only else {}
 
     return run_locked(settings, lambda: driver.run_fleet(
         settings=settings,
@@ -224,6 +235,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         extra_vars=extravars,
         limit=_parse_csv_set(args.limit),
         phases=_parse_csv_set(args.phases),
+        **alloy_options,
     ))
 
 

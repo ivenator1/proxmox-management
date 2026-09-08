@@ -16,6 +16,10 @@ def test_all_defaults():
     assert s.lxc_disk_min_free_gb == 10.0
     assert s.configs_dir == "configs"
     assert s.host_vars_dir == "host_vars"
+    assert s.alloy_enabled is False
+    assert s.alloy_config_path == "configs/guest.alloy"
+    assert s.lxc_alloy_exclude_list == []
+    assert s.vm_alloy_exclude_list == []
 
 
 def test_load_missing_file_returns_defaults(tmp_path):
@@ -97,6 +101,22 @@ def test_integer_kuma_map_keys_are_coerced_to_str():
     assert s.lxc_kuma_map.get("101") == 5
     assert s.vm_kuma_map == {"200": 9}
     assert s.remote_kuma_map == {"web": 3}
+
+
+def test_alloy_settings_load_and_lxc_ids_are_coerced(tmp_path):
+    path = tmp_path / "vars.yml"
+    path.write_text(
+        "alloy_enabled: true\n"
+        "alloy_config_path: /etc/fleet/guest.alloy\n"
+        "lxc_alloy_exclude_list: [501, 'beta/502']\n"
+        "vm_alloy_exclude_list: [loki-vm]\n",
+        encoding="utf-8",
+    )
+    settings = GlobalSettings.load(path)
+    assert settings.alloy_enabled is True
+    assert settings.alloy_config_path == "/etc/fleet/guest.alloy"
+    assert settings.lxc_alloy_exclude_list == ["501", "beta/502"]
+    assert settings.vm_alloy_exclude_list == ["loki-vm"]
 
 
 def test_integer_kuma_map_keys_load_from_yaml(tmp_path):

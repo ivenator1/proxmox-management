@@ -245,6 +245,37 @@ def test_custom_vars_file(tmp_path):
 # Tests: exit code forwarded from driver
 # ---------------------------------------------------------------------------
 
+def test_alloy_only_forwarded_to_driver():
+    captured: Dict[str, Any] = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    with (
+        patch.object(sys, "argv", ["./fleet-update.py", "--alloy-only", "--limit", "101"]),
+        patch("proxmox_fleet.driver.run_fleet", side_effect=fake_run),
+        patch("proxmox_fleet.models.settings.GlobalSettings.load", return_value=GlobalSettings()),
+        patch("proxmox_fleet.cli.run_locked", side_effect=lambda settings, fn: fn()),
+    ):
+        assert _wrapper.main() == 0
+    assert captured["alloy_only"] is True
+    assert captured["limit"] == {"101"}
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--alloy-only", "--scan"],
+        ["--alloy-only", "--phases", "vm"],
+    ],
+)
+def test_alloy_only_rejects_scan_or_phases(argv):
+    with patch.object(sys, "argv", ["./fleet-update.py", *argv]):
+        with pytest.raises(SystemExit):
+            _wrapper.main()
+
+
 def test_exit_code_forwarded():
     rc, _, _ = _run([], run_fleet_return=1)
     assert rc == 1

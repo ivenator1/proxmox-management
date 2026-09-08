@@ -17,7 +17,8 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 * **NVIDIA Post-Upgrade Checks:** Nodes flagged `nvidia_host=true` get read-only GPU-driver diagnostics after their node update — installed vs. loaded module versions, DKMS state, and an `nvidia-smi` probe. A module mismatch flags a reboot; missing DKMS is a hard failure.
 * **Controlled Parallelism:** Updates LXCs across multiple nodes simultaneously to save time, while rebooting physical nodes sequentially to maintain Cluster Quorum and HA stability.
 * **Apt-Proxy Awareness:** Optimized for environments using `apt-cacher-ng`; automatically waits for the proxy service to be online before allowing subsequent nodes to start updates.
-* **Tag-Based Discovery:** Only processes LXCs tagged `community-script` or `proxmox-helper-scripts` in PVE — untagged containers are never touched.
+* **Tag-Based Discovery:** Processes LXCs tagged `community-script` or `proxmox-helper-scripts`, plus explicitly configured OS-only containers.
+* **Automatic Alloy Compliance:** Optional desired-state enforcement installs Grafana Alloy from its official apt repository, validates/deploys the guest config, grants journal access, and repairs the service on every managed LXC/VM. `--alloy-only` audits or migrates guests without regular updates or snapshots.
 * **Multi-Host Support:** Handles LXC containers, QEMU VMs, non-Proxmox remote hosts, and config-driven custom systems in a single run.
 * **Flexible Backup Strategy:** Choose per-run between lightweight snapshots, full `vzdump` backups (including PBS), both, or none.
 * **Snapshot-Lock Retry:** Transient Proxmox task locks (`CT is locked`) are retried automatically (up to 3 times, 15 s apart by default) before a snapshot failure is recorded as a non-fatal warning.
@@ -90,7 +91,7 @@ lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
 ├── proxmox_fleet/                   # Python control plane (the "brain")
 │   ├── cli.py / driver.py           # Entrypoint + run_fleet() orchestrator
 │   ├── flows/                       # Per-host control flows (custom/lxc/vm/remote/node)
-│   ├── executor.py                  # Executor protocol + RunnerExecutor + snapshot_with_retry()
+│   ├── executor.py / alloy.py       # Execution adapters + shared Alloy compliance policy
 │   ├── status.py / changes.py       # Decision trees + change detection
 │   ├── briefing.py / notifiers.py / history.py   # Phase 4 (briefing/notify/history)
 │   ├── scan.py / lock.py            # Read-only pending-updates scan (incl. manual-update state refresh) + fleet-wide run lock
@@ -125,6 +126,26 @@ The `vars.yml` file is the central intelligence of the orchestrator.
 ### 🚥 Uptime Kuma Integration
 * `kuma_url` / `kuma_slug`: Points to your Kuma instance and the specific Status Page slug.
 * `lxc_kuma_map` / `vm_kuma_map` / `remote_kuma_map`: Map an inventory hostname or LXC ID to an Uptime Kuma Monitor ID. The orchestrator waits up to `kuma_health_check_retries` × `kuma_health_check_delay` seconds (default 5×30 s) for Kuma to report `status: 1`.
+
+### 📈 Grafana Alloy Guest Compliance
+Alloy enforcement is opt-in and applies only to guests already managed by the LXC/VM phases.
+
+```bash
+cp configs/guest.alloy.example configs/guest.alloy
+# Edit configs/guest.alloy and replace REPLACE_WITH_LOKI_ENDPOINT.
+```
+
+Then set `alloy_enabled: true` in `vars.yml`. Add any log receiver or guest with a purpose-specific Alloy config to `lxc_alloy_exclude_list`; use bare IDs fleet-wide or `cluster/ID` for one cluster. `vm_alloy_exclude_list` uses VM inventory names.
+
+Audit first, then migrate:
+
+```bash
+./fleet-update.py --dry-run --alloy-only
+./fleet-update.py --alloy-only --limit 101,media-vm
+./fleet-update.py --alloy-only
+```
+
+Alloy-only mode honors limits, exclusions, VM maintenance windows, and `--force-window`, but takes no snapshots and skips package/app updates, reboots, and Kuma workload checks. A missing/placeholder desired config or unresolved guest drift produces an amber attention notification while the run remains successful (`rc=0`, successful dead-man ping). Once every guest reports compliant, retire the separate `install-alloy-guests.yml` rollout.
 
 ### 🔄 Backup Strategy
 * `lxc_backup_strategy`: `snapshot` (default) | `vzdump` | `both` | `none`
@@ -349,8 +370,9 @@ Copy the example files to create your own configuration:
 ```bash
 cp vars.yml.example vars.yml
 cp hosts.ini.example hosts.ini
+cp configs/guest.alloy.example configs/guest.alloy  # only when enabling Alloy
 ```
-Populate `hosts.ini` and `vars.yml` with your cluster-specific configuration.
+Populate `hosts.ini` and `vars.yml` with your cluster-specific configuration. Before enabling Alloy, replace the endpoint placeholder in the ignored `configs/guest.alloy` file and exclude any log receiver or guest with a purpose-specific config.
 
 ### 5. Configure Ansible Hosts
 Ensure `hosts.ini` sets the correct interpreter for each group so Ansible's executor primitives use the right Python:
@@ -404,6 +426,14 @@ flags, and a built-in `--help`. Run it from the project root.
 ./fleet-update.py --phases vm --limit media-vm         # only the VM phase, one VM
 ```
 
+### Alloy Audit / Migration Only
+```bash
+./fleet-update.py --dry-run --alloy-only             # probe only
+./fleet-update.py --alloy-only --limit 101,media-vm  # limited repair
+./fleet-update.py --alloy-only                       # all managed LXC/VM guests
+```
+`--alloy-only` cannot be combined with `--scan` or `--phases`.
+
 ### Pending-Updates Scan & Run History
 ```bash
 ./fleet-update.py --scan                 # read-only: what *would* update, fleet-wide
@@ -420,6 +450,7 @@ flags, and a built-in `--help`. Run it from the project root.
 --limit HOST,ID,...        Restrict the run to these host names and/or LXC/VM ids
 --phases P1,P2             Run only these phases (remote,custom,lxc,vm,node,manager)
 --scan                     Read-only pending-updates scan → pending-*.json (no fleet run; refreshes manual-update state)
+--alloy-only               Audit/repair Alloy on managed LXC/VM guests; skip regular updates and snapshots
 --history [N]              Show the last N persisted runs and exit (default: 10)
 --history-show TS|latest   Print one persisted run's briefing and exit
 -e KEY=VALUE               Raw extra var (repeatable). Only fleet_dry_run, lxc_verbose,
@@ -472,6 +503,7 @@ The orchestrator sends one consolidated embed per run:
 * **Per-Node sections:** Node status (`OK` / `UPDATED & REBOOTED` / `UPDATED (MANUAL REBOOT REQ)` / `FAILED`), followed by each changed LXC and VM.
 * **App status per container:** `Updated: X → Y` (version changed), `UPDATED` (packages changed, no version file), `OK` (nothing changed), `NO SCRIPT` (no community-script update binary), `FAILED`.
 * **OS status per container:** `Updated (N upgraded)` (with package count), `OK`, `SKIPPED` (in `os_update_exclude_list`), `FAILED`.
+* **Alloy status per guest:** `Installed`, `Configured`, or `Service repaired` appears only when remediation changed the guest; compliant guests stay silent.
 * **Remote Hosts section:** Listed separately (not tied to a PVE node).
 * **Error Log:** Structured entries showing which host failed, which task failed, and the first 300 characters of stderr.
 * Containers where nothing changed produce no embed entry — they are absorbed into `*No container changes.*` for that node.

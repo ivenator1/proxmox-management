@@ -6,6 +6,9 @@ rescue without snapshot, dry-run, idle (nothing to upgrade), correct executor
 binding (qm commands must go to node_executor, not the VM executor).
 """
 
+import importlib
+import time
+
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.flows.vm import run_vm_update
 from proxmox_fleet.models.settings import GlobalSettings
@@ -138,6 +141,104 @@ def _call(node_ex, vm_ex=None, settings=None, **kwargs):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_alloy_reconciliation_runs_after_snapshot_before_packages(monkeypatch):
+    alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+    desired = alloy_mod.DesiredAlloyConfig(content="config\n", sha256="hash")
+    vm_ex = _vm_ex(
+        **{
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "dist-upgrade": [_ok(stdout=APT_NOOP)],
+        }
+    )
+
+    def reconcile(executor, config, **kwargs):
+        assert vm_ex.snapshots_created == ["200"]
+        assert not any("dist-upgrade" in command for command in vm_ex.commands)
+        vm_ex.commands.append("alloy-reconcile")
+        return alloy_mod.AlloyResult(status="Configured", changed=True)
+
+    monkeypatch.setattr(alloy_mod, "reconcile_alloy", reconcile)
+    outcome = run_vm_update(
+        "pve-01",
+        "200",
+        "my-vm",
+        vm_ex,
+        _node_ex(),
+        _settings(),
+        api_host="1.2.3.4",
+        alloy_config=desired,
+    )
+    assert outcome.record is not None and outcome.record.alloy == "Configured"
+    assert outcome.changed is True
+    assert vm_ex.commands.index("alloy-reconcile") < next(
+        i for i, command in enumerate(vm_ex.commands) if "dist-upgrade" in command
+    )
+
+
+def test_alloy_only_skips_snapshot_packages_reboot_and_kuma(monkeypatch):
+    alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+    desired = alloy_mod.DesiredAlloyConfig(content="config\n", sha256="hash")
+    monkeypatch.setattr(
+        alloy_mod,
+        "reconcile_alloy",
+        lambda *args, **kwargs: alloy_mod.AlloyResult(status="Installed", changed=True),
+    )
+    kuma_called = []
+    monkeypatch.setattr(http_mod, "poll_until", lambda *args, **kwargs: kuma_called.append(True))
+    vm_ex = _vm_ex()
+    outcome = run_vm_update(
+        "pve-01",
+        "200",
+        "my-vm",
+        vm_ex,
+        _node_ex(),
+        _settings(vm_kuma_map={"my-vm": "9"}, kuma_url="http://kuma"),
+        api_host="1.2.3.4",
+        alloy_config=desired,
+        alloy_only=True,
+    )
+    assert outcome.record is not None and outcome.record.alloy == "Installed"
+    assert vm_ex.snapshots_created == []
+    assert vm_ex.commands == []
+    assert vm_ex.reboots == 0
+    assert kuma_called == []
+
+
+def test_alloy_status_is_cleared_after_vm_snapshot_rollback(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+    desired = alloy_mod.DesiredAlloyConfig(content="config\n", sha256="hash")
+    monkeypatch.setattr(
+        alloy_mod,
+        "reconcile_alloy",
+        lambda *args, **kwargs: alloy_mod.AlloyResult(status="Configured", changed=True),
+    )
+    vm_ex = _vm_ex(
+        **{
+            "which apt-get": [_ok(stdout=PKG_DETECT_APT)],
+            "dist-upgrade": [_fail(stderr="upgrade failed")],
+        }
+    )
+    node_ex = _node_ex(
+        **{
+            "qm rollback": [_ok()],
+            "qm status": [_ok(stdout="status: running")],
+        }
+    )
+    outcome = run_vm_update(
+        "pve-01",
+        "200",
+        "my-vm",
+        vm_ex,
+        node_ex,
+        _settings(),
+        api_host="1.2.3.4",
+        alloy_config=desired,
+    )
+    assert outcome.failed is True
+    assert outcome.record is not None and outcome.record.alloy is None
 
 
 def test_normal_update_apt():
@@ -393,6 +494,7 @@ def test_rescue_no_snapshot_strategy_none():
     outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), settings, dry_run=False, api_host="1.2.3.4")
 
     assert outcome.failed is True
+    assert outcome.record is not None
     assert outcome.record.status == "FAILED"
     assert vm_ex.snapshots_created == []
     assert vm_ex.snapshots_deleted == []
@@ -413,6 +515,7 @@ def test_rescue_snapshot_failed_no_rollback():
     outcome = run_vm_update("pve-01", "200", "my-vm", vm_ex, _node_ex(), _settings(), dry_run=False, api_host="1.2.3.4")
 
     assert outcome.failed is True
+    assert outcome.record is not None
     assert outcome.record.status == "FAILED (NO SNAPSHOT)"
 
 

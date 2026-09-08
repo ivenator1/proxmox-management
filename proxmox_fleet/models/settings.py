@@ -21,8 +21,8 @@ class PveClusterCreds(BaseModel):
     """
 
     pve_api_user: str = ""
-    pve_api_token_id: str = ""
-    pve_api_token_secret: str = ""
+    pve_api_token_id: str = Field(default_factory=str)
+    pve_api_token_secret: str = Field(default_factory=str)
 
 
 class GlobalSettings(BaseModel):
@@ -50,6 +50,13 @@ class GlobalSettings(BaseModel):
     custom_allow_reboot: bool = True
     configs_dir: str = "configs"
     host_vars_dir: str = "host_vars"
+
+    # Alloy desired-state enforcement for managed LXC/VM guests.  Ordinary
+    # runs opt in with alloy_enabled; --alloy-only overrides that switch.
+    alloy_enabled: bool = False
+    alloy_config_path: str = "configs/guest.alloy"
+    lxc_alloy_exclude_list: List[str] = Field(default_factory=list)
+    vm_alloy_exclude_list: List[str] = Field(default_factory=list)
 
     # lxc_update phase settings
     lxc_dry_run: bool = False
@@ -112,8 +119,8 @@ class GlobalSettings(BaseModel):
 
     # Proxmox API credentials (for snapshot operations)
     pve_api_user: str = ""
-    pve_api_token_id: str = ""
-    pve_api_token_secret: str = ""
+    pve_api_token_id: str = Field(default_factory=str)
+    pve_api_token_secret: str = Field(default_factory=str)
     # Optional per-cluster overrides, keyed by cluster name — see
     # proxmox_fleet.cluster.api_creds() for the per-field fallback rules.
     pve_clusters: Dict[str, PveClusterCreds] = Field(default_factory=dict)
@@ -167,6 +174,7 @@ class GlobalSettings(BaseModel):
         "app_update_exclude_list",
         "snapshot_exclude_list",
         "os_only_lxc_list",
+        "lxc_alloy_exclude_list",
         mode="before",
     )
     @classmethod

@@ -1,0 +1,32 @@
+// Grafana Alloy config for managed LXC/VM guests.
+// Copy to configs/guest.alloy and replace REPLACE_WITH_LOKI_ENDPOINT.
+
+loki.relabel "journal" {
+  forward_to = []
+
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+  rule {
+    source_labels = ["__journal__hostname"]
+    target_label  = "host"
+  }
+  rule {
+    source_labels = ["__journal_priority_keyword"]
+    target_label  = "level"
+  }
+}
+
+loki.source.journal "journal" {
+  forward_to    = [loki.write.default.receiver]
+  relabel_rules = loki.relabel.journal.rules
+  labels        = { job = "systemd-journal", role = "guest" }
+  max_age       = "12h"
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://REPLACE_WITH_LOKI_ENDPOINT:3100/loki/api/v1/push"
+  }
+}

@@ -16,6 +16,7 @@ Conventions:
 """
 from __future__ import annotations
 
+import importlib
 import json
 import sys
 import time
@@ -110,6 +111,23 @@ _MANAGER_LIMIT_TOKENS = frozenset({"manager", "localhost", "Ansible-Manager"})
 
 # Status recorded for hosts whose wave was aborted by a canary failure.
 CANARY_SKIP_STATUS = "SKIPPED (canary failed)"
+
+# Distinguishes "phase called directly; load once here" from "run_fleet already
+# tried to load and intentionally passed None after a manager-level warning".
+_ALLOY_CONFIG_UNSET = object()
+
+
+def _load_alloy_config(settings: GlobalSettings) -> Tuple[Optional[Any], Optional[WarningEntry]]:
+    alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+    try:
+        return alloy_mod.load_desired_config(settings.alloy_config_path), None
+    except (OSError, ValueError) as exc:
+        return None, WarningEntry(
+            host="Ansible-Manager",
+            task="Alloy desired config",
+            warning=str(exc),
+            notifying=True,
+        )
 
 
 def _soak_canaries(
@@ -365,6 +383,8 @@ def run_lxc_phase(
     check: bool = False,
     state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_lxc_state.json",  # nosec B108 - tooling output path
     limit: Optional[Set[str]] = None,
+    alloy_only: bool = False,
+    alloy_config: Any = _ALLOY_CONFIG_UNSET,
 ) -> FleetState:
     """Run Phase 1 (LXC container updates) via the Python driver.
 
@@ -391,6 +411,13 @@ def run_lxc_phase(
     nodes = inventory.load_proxmox_nodes(inventory_path, host_vars_dir=settings.host_vars_dir)
     dry_run = check or settings.fleet_dry_run or settings.lxc_dry_run
     state = FleetState()
+    alloy_requested = alloy_only or settings.alloy_enabled
+    if alloy_requested and alloy_config is _ALLOY_CONFIG_UNSET:
+        alloy_config, config_warning = _load_alloy_config(settings)
+        if config_warning is not None:
+            state.warnings.append(config_warning)
+    elif alloy_config is _ALLOY_CONFIG_UNSET:
+        alloy_config = None
 
     limit_has_ids = limit is not None and any(token_is_id(token) for token in limit)
 
@@ -432,6 +459,11 @@ def run_lxc_phase(
 
         if limit is not None and node_name not in limit:
             lxc_ids = [i for i in lxc_ids if limit_selects_id(limit, node_cluster, i)]
+        if alloy_only:
+            lxc_ids = [
+                i for i in lxc_ids
+                if not matches_any(settings.lxc_alloy_exclude_list, node_cluster, i)
+            ]
 
         print(f"[{node_name}] found {len(lxc_ids)} managed LXC(s): {', '.join(lxc_ids) or 'none'}")
         discovered.append((node_name, api_host, node_cluster, lxc_ids))
@@ -479,9 +511,16 @@ def run_lxc_phase(
         # Concurrent per-container updates (lxc_continue_on_error is the default)
         def _run_one(lxc_id: str) -> LxcFlowOutcome:
             ex = RunnerExecutor(node_name, inventory=inventory_path, check=check)
+            guest_alloy_config = alloy_config
+            if (
+                not alloy_requested
+                or matches_any(settings.lxc_alloy_exclude_list, cluster, lxc_id)
+            ):
+                guest_alloy_config = None
             return run_lxc_update(
                 node_name, lxc_id, ex, settings,
                 dry_run=dry_run, api_host=api_host, cluster=cluster,
+                alloy_config=guest_alloy_config, alloy_only=alloy_only,
             )
 
         results = run_concurrent(
@@ -499,7 +538,8 @@ def run_lxc_phase(
                     # Always print both lines: the record encodes the failure in
                     # app/os already ("FAILED + ROLLED BACK", "FAILED"), and a bare
                     # "FAILED" hides which of the two actually broke.
-                    print(f"  [{node_name}/{lxc_id}] {rec.name}: app={rec.app}  os={rec.os}")
+                    alloy_text = f"  alloy={rec.alloy}" if rec.alloy else ""
+                    print(f"  [{node_name}/{lxc_id}] {rec.name}: app={rec.app}  os={rec.os}{alloy_text}")
                 else:
                     print(f"  [{node_name}/{lxc_id}] idle (no changes)")
             elif run_err is not None:
@@ -514,7 +554,11 @@ def run_lxc_phase(
         return wave_failed
 
     all_pairs = [(cluster, i) for _, _, cluster, ids in discovered for i in ids]
-    canary_pairs = [(c, i) for c, i in all_pairs if matches_any(settings.canary_hosts, c, i)]
+    canary_pairs = (
+        []
+        if alloy_only
+        else [(c, i) for c, i in all_pairs if matches_any(settings.canary_hosts, c, i)]
+    )
     rest_pairs = [(c, i) for c, i in all_pairs if not matches_any(settings.canary_hosts, c, i)]
 
     if not canary_pairs or not rest_pairs:
@@ -651,6 +695,8 @@ def run_vm_phase(
     check: bool = False,
     state_output_path: Optional[Union[str, Path]] = "/tmp/fleet_vm_state.json",  # nosec B108 - tooling output path
     limit: Optional[Set[str]] = None,
+    alloy_only: bool = False,
+    alloy_config: Any = _ALLOY_CONFIG_UNSET,
 ) -> FleetState:
     """Run Phase 1b (QEMU VM updates) via the Python driver.
 
@@ -683,9 +729,18 @@ def run_vm_phase(
     if limit is not None:
         vms = [v for v in vms
                if v.name in limit or limit_selects_id(limit, _vm_cluster_hint(v), v.vmid)]
+    if alloy_only:
+        vms = [v for v in vms if v.name not in settings.vm_alloy_exclude_list]
 
     dry_run = check or settings.fleet_dry_run or settings.vm_dry_run
     state = FleetState()
+    alloy_requested = alloy_only or settings.alloy_enabled
+    if alloy_requested and alloy_config is _ALLOY_CONFIG_UNSET:
+        alloy_config, config_warning = _load_alloy_config(settings)
+        if config_warning is not None:
+            state.warnings.append(config_warning)
+    elif alloy_config is _ALLOY_CONFIG_UNSET:
+        alloy_config = None
 
     # Discover VM locations once up-front via pvesh. Live cluster state always
     # wins over static pve_node inventory hints — pve_node is only a fallback
@@ -722,9 +777,13 @@ def run_vm_phase(
 
         vm_ex = RunnerExecutor(vm_spec.name, inventory=inventory_path, check=check)
         node_ex = RunnerExecutor(node_name, inventory=inventory_path, check=check)
+        guest_alloy_config = alloy_config
+        if not alloy_requested or vm_spec.name in settings.vm_alloy_exclude_list:
+            guest_alloy_config = None
         return run_vm_update(
             node_name, vm_spec.vmid, vm_spec.name, vm_ex, node_ex, settings,
             dry_run=dry_run, api_host=api_host, cluster=vm_cluster,
+            alloy_config=guest_alloy_config, alloy_only=alloy_only,
         )
 
     def _run_wave(wave: List[VmSpec]) -> None:
@@ -736,7 +795,8 @@ def run_vm_phase(
                 rec = outcome.record
                 if rec is not None:
                     status = "FAILED" if outcome.failed else rec.status
-                    print(f"  [{vm_name}] {status}")
+                    alloy_text = f" Alloy={rec.alloy}" if rec.alloy else ""
+                    print(f"  [{vm_name}] {status}{alloy_text}")
                 else:
                     print(f"  [{vm_name}] idle (no changes)")
             elif run_err is not None:
@@ -746,9 +806,11 @@ def run_vm_phase(
                 ))
                 print(f"  [{vm_name}] ERROR: {run_err}")
 
-    canary = [v for v in vms
-              if v.canary or v.name in settings.canary_hosts
-              or matches_any(settings.canary_hosts, _vm_cluster_hint(v), v.vmid)]
+    canary = [] if alloy_only else [
+        v for v in vms
+        if v.canary or v.name in settings.canary_hosts
+        or matches_any(settings.canary_hosts, _vm_cluster_hint(v), v.vmid)
+    ]
     rest = [v for v in vms if v not in canary]
 
     if not canary or not rest:
@@ -984,6 +1046,8 @@ def run_notify_phase(
         )
 
     manual_attention = bool(manual_decision and manual_decision.notify)
+    warning_attention = any(bool(w.notifying) for w in state.warnings)
+    attention = manual_attention or warning_attention
     manual_section = manual_decision.body if manual_decision is not None else ""
     body = briefing.prepare_body(state, manual_section=manual_section)
     failed = state.failed
@@ -993,14 +1057,14 @@ def run_notify_phase(
         dry_run=settings.fleet_dry_run,
         changed=state.changed,
         failed=failed,
-    ) or manual_attention
+    ) or attention
     if notify:
         notifiers.dispatch(
             notifiers.resolve_notifiers(settings),
-            title=briefing.briefing_title(failed, attention=manual_attention),
-            ntfy_title=briefing.ntfy_title(failed, attention=manual_attention),
+            title=briefing.briefing_title(failed, attention=attention),
+            ntfy_title=briefing.ntfy_title(failed, attention=attention),
             body=body,
-            color=briefing.discord_color(failed, attention=manual_attention),
+            color=briefing.discord_color(failed, attention=attention),
             failed=failed,
             retries=settings.notifier_retries,
         )
@@ -1051,6 +1115,7 @@ def run_fleet(
     extra_vars: Optional[Dict[str, Any]] = None,
     limit: Optional[Set[str]] = None,
     phases: Optional[Set[str]] = None,
+    alloy_only: bool = False,
 ) -> int:
     """End-to-end fleet update — the Python orchestrator (the sole entrypoint).
 
@@ -1070,6 +1135,9 @@ def run_fleet(
     name.
     """
     ev = extra_vars or {}
+
+    if alloy_only and phases is not None:
+        raise SystemExit("--alloy-only cannot be combined with --phases")
 
     if phases is not None:
         unknown = sorted(set(phases) - set(PHASE_NAMES))
@@ -1107,23 +1175,32 @@ def run_fleet(
             raise SystemExit(1)
 
     state = FleetState()
-    if _phase_on("remote"):
+    desired_alloy: Optional[Any] = None
+    alloy_phase_selected = alloy_only or _phase_on("lxc") or _phase_on("vm")
+    if (alloy_only or settings.alloy_enabled) and alloy_phase_selected:
+        desired_alloy, alloy_warning = _load_alloy_config(settings)
+        if alloy_warning is not None:
+            state.warnings.append(alloy_warning)
+
+    if not alloy_only and _phase_on("remote"):
         _merge_state(state, run_remote_phase(
             settings=settings, inventory_path=inventory_path, check=check,
             state_output_path=None, limit=limit))
-    if _phase_on("custom"):
+    if not alloy_only and _phase_on("custom"):
         _merge_state(state, run_custom_phase(
             settings=settings, inventory_path=inventory_path, extra_vars=ev, check=check,
             state_output_path=None, limit=limit))
-    if _phase_on("lxc"):
+    if alloy_only or _phase_on("lxc"):
         _merge_state(state, run_lxc_phase(
             settings=settings, inventory_path=inventory_path, check=check,
-            state_output_path=None, limit=limit))
-    if _phase_on("vm"):
+            state_output_path=None, limit=limit, alloy_only=alloy_only,
+            alloy_config=desired_alloy))
+    if alloy_only or _phase_on("vm"):
         _merge_state(state, run_vm_phase(
             settings=settings, inventory_path=inventory_path, check=check,
-            state_output_path=None, limit=limit))
-    if _phase_on("node") or _phase_on("manager"):
+            state_output_path=None, limit=limit, alloy_only=alloy_only,
+            alloy_config=desired_alloy))
+    if not alloy_only and (_phase_on("node") or _phase_on("manager")):
         _merge_state(state, run_node_phase(
             settings=settings, inventory_path=inventory_path, check=check,
             state_output_path=None, limit=limit,

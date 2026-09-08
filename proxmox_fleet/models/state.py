@@ -26,6 +26,7 @@ class LxcRecord(BaseModel):
     # None keeps idle/dry-run/old records key-free; only real-run success
     # records carry detail (see flows.lxc).
     packages: Optional[List[Dict[str, str]]] = Field(default=None, exclude_if=lambda value: value is None)
+    alloy: Optional[str] = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class VmRecord(BaseModel):
@@ -36,6 +37,7 @@ class VmRecord(BaseModel):
     status: str
     pkg_count: Optional[int] = None
     packages: Optional[List[Dict[str, str]]] = Field(default=None, exclude_if=lambda value: value is None)
+    alloy: Optional[str] = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class RemoteRecord(BaseModel):
@@ -86,6 +88,7 @@ class WarningEntry(BaseModel):
     host: str
     task: str
     warning: str
+    notifying: Optional[bool] = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class FleetState(BaseModel):
@@ -123,13 +126,21 @@ class FleetState(BaseModel):
 
     @classmethod
     def load(cls, path: Union[str, Path]) -> "FleetState":
-        with open(path, "r", encoding="utf-8") as fh:
-            return cls.from_raw(json.load(fh))
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return cls.from_raw(json.load(fh))
+        except (OSError, ValueError):
+            # State files are authoritative inputs here; callers need the
+            # original failure rather than a silently fabricated empty state.
+            raise
 
     def dump(self, path: Union[str, Path]) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(self.model_dump(), fh, indent=2, ensure_ascii=False)
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(self.model_dump(), fh, indent=2, ensure_ascii=False)
+        except OSError:
+            raise
 
     def dump_for_ansible(self, path: Union[str, Path]) -> None:
         """Write with fleet_* key names so an Ansible play can include_vars the
@@ -148,5 +159,8 @@ class FleetState(BaseModel):
         }
         data = {alias[k]: v for k, v in self.model_dump().items() if k in alias}
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, ensure_ascii=False)
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, ensure_ascii=False)
+        except OSError:
+            raise
