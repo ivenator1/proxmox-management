@@ -94,3 +94,65 @@ def test_storage_guard_bypass_filters_fetched_ct_script(
     assert app_ran.read_text(encoding="utf-8") == "ok"
     assert update.read_text(encoding="utf-8") == original_update
     assert not list(tmp_path.glob("fleet-fetch.*"))
+
+
+def test_storage_guard_bypass_ignores_script_existence_probe(tmp_path: Path) -> None:
+    """The current shared helper probes with curl -o /dev/null before fetching."""
+    nc_dir = tmp_path / ".nc"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    app_ran = tmp_path / "app-ran"
+
+    update = tmp_path / "update"
+    update.write_text(
+        "#!/usr/bin/env bash\n"
+        "helper=\"$(curl -fsSL https://raw.githubusercontent.com/community-scripts/core/main/misc/update.sh)\"\n"
+        "bash -c \"$helper\"\n",
+        encoding="utf-8",
+    )
+    update.chmod(0o755)
+
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
+        "#!/usr/bin/env bash\n"
+        "case \"$*\" in\n"
+        "  *core/main/misc/update.sh*)\n"
+        "    cat <<'HELPER'\n"
+        "curl -fsSL -o /dev/null https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/test.sh || exit 1\n"
+        "bash -c \"$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/test.sh)\"\n"
+        "HELPER\n"
+        "    ;;\n"
+        "  *ProxmoxVE/main/ct/test.sh*)\n"
+        "    case \" $* \" in *\" -o /dev/null \"*) exit 0 ;; esac\n"
+        "    cat <<'SCRIPT'\n"
+        "update_script() {\n"
+        "  check_container_storage\n"
+        f'  printf ok > "{app_ran}"\n'
+        "}\n"
+        "update_script\n"
+        "SCRIPT\n"
+        "    ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o755)
+
+    inner = _render_inner_shell(bypass=True)
+    harness = (
+        inner.replace("/tmp/.nc", str(nc_dir))
+        .replace("/tmp/fleet-fetch.", str(tmp_path / "fleet-fetch."))
+        .replace("/usr/bin/update", str(update))
+    )
+    run_env: Dict[str, Any] = dict(os.environ)
+    run_env["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        env=run_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert app_ran.read_text(encoding="utf-8") == "ok"
+    assert not list(tmp_path.glob("fleet-fetch.*"))
