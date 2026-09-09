@@ -14,7 +14,7 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 
 ## ✨ Key Features
 * **Location-Aware Updates:** Dynamically detects which physical node is hosting the Manager LXC and skips that node's reboot.
-* **NVIDIA Post-Upgrade Checks:** Nodes flagged `nvidia_host=true` get read-only GPU-driver diagnostics after their node update — installed vs. loaded module versions, DKMS state, and an `nvidia-smi` probe. A module mismatch flags a reboot; missing DKMS is a hard failure.
+* **NVIDIA Post-Upgrade Checks:** Nodes flagged `nvidia_host=true` get read-only GPU-driver diagnostics after their node update — loaded vs. next-boot module versions, target-kernel DKMS state, and an `nvidia-smi` probe. A module mismatch flags a reboot; an unprepared target kernel is a hard failure.
 * **Controlled Parallelism:** Updates LXCs across multiple nodes simultaneously to save time, while rebooting physical nodes sequentially to maintain Cluster Quorum and HA stability.
 * **Apt-Proxy Awareness:** Optimized for environments using `apt-cacher-ng`; automatically waits for the proxy service to be online before allowing subsequent nodes to start updates.
 * **Tag-Based Discovery:** Processes LXCs tagged `community-script` or `proxmox-helper-scripts`, plus explicitly configured OS-only containers.
@@ -251,9 +251,10 @@ nvidia_host: true
 
 Keep the flag absent or `false` on non-NVIDIA nodes. After an opted-in node's OS update it gets read-only driver diagnostics, executed from the Manager LXC via Ansible SSH on the Proxmox node itself (never inside a workload LXC). The control plane classifies the results:
 
-* **Installed vs. loaded module mismatch** — a newer driver is installed than the one the running kernel has loaded: the node is flagged as requiring a reboot.
-* **Missing DKMS build for the running kernel** — a hard failure; the node reports `FAILED` rather than being rebooted.
-* **`nvidia-smi` faults** (non-zero exit) — surfaced in the node report and briefing.
+* **Running vs. target kernel** — the configured Proxmox next-boot pin, boot-loader override, or automatic kernel selection determines the kernel that will be validated; the newest `/boot` image alone does not override an explicit selection.
+* **Target vs. loaded module mismatch** — a newer target-kernel driver than the running kernel has loaded flags the node as requiring a reboot.
+* **Missing target modules or installed DKMS state** — a hard failure; the node reports `FAILED` rather than being rebooted. The old running kernel's on-disk module may be absent while its module remains loaded; a transient userspace mismatch is cleared by the pending reboot.
+* **`nvidia-smi` faults** — non-fatal before a pending reboot caused by a driver mismatch, but fatal during the strict post-reboot validation.
 
 Reboot policy is unchanged and covers all nodes: `node_auto_reboot` defaults to `true`. Set it to `false` for controlled/manual maintenance — nodes that need a reboot report `UPDATED (MANUAL REBOOT REQ)` and are never rebooted automatically. Manager-host protection remains: the node hosting the Manager LXC is never rebooted automatically.
 

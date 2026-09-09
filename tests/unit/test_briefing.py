@@ -106,6 +106,21 @@ def test_node_reboot_reasons_are_rendered():
     )
 
 
+def test_nvidia_target_readiness_is_rendered_for_pending_reboot():
+    record = dict(
+        node(status="UPDATED (MANUAL REBOOT REQ)"),
+        reboot_reasons=["kernel update: 7.0.14-14-pve → 7.0.14-15-pve"],
+        checks={
+            "target_kernel": "7.0.14-15-pve",
+            "nvidia_post_reboot_ready": True,
+        },
+    )
+
+    out = render_briefing(_state(fleet_node_data=[record]))
+
+    assert "NVIDIA target 7.0.14-15-pve: DKMS/modules ready for reboot" in out
+
+
 def test_node_without_reboot_reasons_keeps_legacy_rendering():
     assert (
         render_briefing(_state(fleet_node_data=[node()]))

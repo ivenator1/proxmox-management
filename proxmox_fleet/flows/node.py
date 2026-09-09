@@ -74,11 +74,11 @@ def _fact_text(facts: Mapping[str, Any], key: str) -> str:
     return str(facts[key] or "").strip()
 
 
-def _nvidia_dkms_ready(status: str, running_kernel: str) -> bool:
+def _nvidia_dkms_ready(status: str, kernel: str) -> bool:
     """Match an NVIDIA-family DKMS entry for this exact kernel in installed state."""
     pattern = re.compile(
         r"^\s*nvidia(?:[-_][A-Za-z0-9_.-]+)?/[^,]+,\s*"
-        + re.escape(running_kernel)
+        + re.escape(kernel)
         + r"(?:,\s*[^:]+)?:\s*installed\s*$",
         re.IGNORECASE,
     )
@@ -94,31 +94,45 @@ def classify_post_upgrade(
     """Validate primitive facts and classify reboot reasons and NVIDIA health."""
     result = PostUpgradeAssessment()
     try:
-        if _fact_int(facts, "diagnostics_version") != 1:
+        if _fact_int(facts, "diagnostics_version") != 2:
             raise ValueError("unsupported node diagnostic response version")
 
         running_rc = _fact_int(facts, "running_kernel_rc")
         latest_rc = _fact_int(facts, "latest_kernel_rc")
+        target_rc = _fact_int(facts, "target_kernel_rc")
         running = _fact_text(facts, "running_kernel")
         latest = _fact_text(facts, "latest_kernel")
+        target = _fact_text(facts, "target_kernel")
+        target_source = _fact_text(facts, "target_kernel_source")
         if running_rc != 0 or not running:
             result.errors.append("could not determine running kernel")
         if latest_rc != 0 or not latest:
             result.errors.append("could not determine latest installed kernel")
+        if target_rc != 0 or not target or not target_source:
+            result.errors.append("could not determine configured next-boot kernel")
 
         if _fact_bool(facts, "reboot_required_exists"):
             packages = str(facts.get("reboot_required_packages", "") or "").splitlines()
             packages = [package.strip() for package in packages if package.strip()]
             suffix = f" ({', '.join(packages)})" if packages else ""
             result.reboot_reasons.append(f"reboot-required marker present{suffix}")
-        if running and latest and running != latest:
-            result.reboot_reasons.append(f"kernel update: {running} → {latest}")
+        if running and target and running != target:
+            result.reboot_reasons.append(f"kernel update: {running} → {target}")
 
         if not nvidia_host:
             return result
         if not _fact_bool(facts, "nvidia_checked"):
             result.errors.append("NVIDIA diagnostics were skipped on an NVIDIA host")
             return result
+
+        nvidia_kernel = _fact_text(facts, "nvidia_kernel")
+        expected_kernel = running if after_reboot else target
+        kernel_ok = bool(expected_kernel) and nvidia_kernel == expected_kernel
+        if not kernel_ok:
+            result.errors.append(
+                "NVIDIA diagnostics checked kernel "
+                f"{nvidia_kernel or '?'}, expected {expected_kernel or '?'}"
+            )
 
         installed_rc = _fact_int(facts, "nvidia_installed_rc")
         loaded_rc = _fact_int(facts, "nvidia_loaded_rc")
@@ -129,29 +143,46 @@ def classify_post_upgrade(
         dkms_status = _fact_text(facts, "nvidia_dkms_status")
         installed_ok = installed_rc == 0 and bool(installed)
         loaded_ok = loaded_rc == 0 and bool(loaded)
-        dkms_ready = dkms_rc == 0 and bool(running) and _nvidia_dkms_ready(dkms_status, running)
+        dkms_ready = (
+            dkms_rc == 0
+            and bool(nvidia_kernel)
+            and _nvidia_dkms_ready(dkms_status, nvidia_kernel)
+        )
         smi_ok = smi_rc == 0
         mismatch = installed_ok and loaded_ok and installed != loaded
+        post_reboot_ready = kernel_ok and installed_ok and dkms_ready
 
         result.checks = {
             "running_kernel": running,
+            "target_kernel": target,
+            "target_kernel_source": target_source,
+            "nvidia_kernel": nvidia_kernel,
             "nvidia_loaded": loaded or None,
             "nvidia_installed": installed or None,
             "nvidia_dkms_ready": dkms_ready,
             "nvidia_smi_ok": smi_ok,
+            "nvidia_post_reboot_ready": post_reboot_ready,
         }
         if not installed_ok:
-            result.errors.append("NVIDIA driver module not found (modinfo failed)")
+            result.errors.append(
+                f"NVIDIA driver modules not found for kernel {nvidia_kernel or '?'} "
+                "(modinfo failed)"
+            )
         if not loaded_ok:
             result.errors.append("NVIDIA module is not loaded")
         if not dkms_ready:
-            result.errors.append(f"NVIDIA DKMS module is not installed for kernel {running or '?'}")
+            result.errors.append(
+                f"NVIDIA DKMS module is not installed for kernel {nvidia_kernel or '?'}"
+            )
         if mismatch:
-            message = f"NVIDIA module mismatch: loaded {loaded}, installed {installed}"
             if after_reboot:
-                result.errors.append(f"{message} after reboot")
+                result.errors.append(
+                    f"NVIDIA module mismatch after reboot: loaded {loaded}, installed {installed}"
+                )
             else:
-                result.reboot_reasons.append(message)
+                result.reboot_reasons.append(
+                    f"NVIDIA module mismatch: loaded {loaded}, target {installed}"
+                )
         if not smi_ok:
             if after_reboot:
                 result.errors.append("nvidia-smi failed after reboot")
@@ -279,7 +310,10 @@ def run_node_update(
             _sleep(15)
 
             if nvidia_host:
-                post_reboot = executor.node_post_upgrade(nvidia_host=True)
+                post_reboot = executor.node_post_upgrade(
+                    nvidia_host=True,
+                    after_reboot=True,
+                )
                 if post_reboot.failed or post_reboot.rc != 0:
                     raise RuntimeError(
                         f"NVIDIA post-reboot check failed: {post_reboot.stderr or post_reboot.stdout}"
@@ -289,6 +323,16 @@ def run_node_update(
                     nvidia_host=True,
                     after_reboot=True,
                 )
+                expected_kernel = str(
+                    (assessment.checks or {}).get("target_kernel") or ""
+                )
+                booted_kernel = str((after.checks or {}).get("running_kernel") or "")
+                if expected_kernel and booted_kernel != expected_kernel:
+                    after.errors.insert(
+                        0,
+                        f"node booted kernel {booted_kernel or '?'} instead of "
+                        f"target {expected_kernel}",
+                    )
                 hard_errors.extend(after.errors)
                 checks = {
                     "pre_reboot": assessment.checks or {},

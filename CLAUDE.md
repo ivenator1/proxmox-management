@@ -483,6 +483,7 @@ rescue (and rolls back if snapshotted). Retries/delay: `kuma_health_check_retrie
   (header only) — Ansible raises "no hosts matched" otherwise.
 - **`custom_config` is required per-host** for `[custom_hosts]` — fails loud (include_vars) if missing.
 - **Node reboot is skipped** when `manager_lxc_id` runs on that node (would kill the manager mid-run).
+- **NVIDIA checks target the configured next-boot kernel before reboot**: `node_post_upgrade.yml` resolves systemd-boot/GRUB one-shot entries and official Proxmox next/persistent pins before falling back to automatic kernel selection, then runs `modinfo -k` and `dkms status -k` for that target. A missing old running-kernel module file is non-fatal when its module remains loaded and the target is ready. The second, post-reboot probe validates the running kernel and treats module, DKMS, version, or `nvidia-smi` failures as fatal.
 - **Unreachable nodes are tolerated while the cluster is quorate**: LXC discovery
   (`UnreachableHostError`, from `PrimitiveResult.unreachable` / `runner_on_unreachable`) and
   the Phase-2 node loop (`_error_is_unreachable()` text match) convert an SSH-unreachable node

@@ -102,7 +102,7 @@ class ScriptedLxcExecutor:
     def reboot(self, *, timeout=600):
         return _ok()
 
-    def node_post_upgrade(self, *, nvidia_host=False):
+    def node_post_upgrade(self, *, nvidia_host=False, after_reboot=False):
         return _ok()
 
     def snapshot(

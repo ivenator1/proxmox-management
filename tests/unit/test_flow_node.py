@@ -47,6 +47,8 @@ def _post_result(
     reboot_required=False,
     running="6.8.12-8-pve",
     latest="6.8.12-8-pve",
+    target=None,
+    target_source="automatic",
     nvidia=False,
     installed="550.90.07",
     loaded="550.90.07",
@@ -55,18 +57,23 @@ def _post_result(
     installed_rc=0,
     loaded_rc=0,
 ):
-    dkms = f"nvidia-current/{installed}, {running}, x86_64: installed" if dkms_ready else ""
+    target = latest if target is None else target
+    dkms = f"nvidia-current/{installed}, {target}, x86_64: installed" if dkms_ready else ""
     return _ok(
         changed=False,
         facts={
-            "diagnostics_version": 1,
+            "diagnostics_version": 2,
             "running_kernel_rc": 0,
             "running_kernel": running,
             "latest_kernel_rc": 0,
             "latest_kernel": latest,
+            "target_kernel_rc": 0,
+            "target_kernel": target,
+            "target_kernel_source": target_source,
             "reboot_required_exists": reboot_required,
             "reboot_required_packages": "pve-kernel" if reboot_required else "",
             "nvidia_checked": nvidia,
+            "nvidia_kernel": target,
             "nvidia_installed_rc": installed_rc if nvidia else 1,
             "nvidia_installed": installed if nvidia and installed_rc == 0 else "",
             "nvidia_loaded_rc": loaded_rc if nvidia else 1,
@@ -127,8 +134,10 @@ class ScriptedNodeExecutor(Executor):
         self.reboots += 1
         return _ok()
 
-    def node_post_upgrade(self, *, nvidia_host=False):
-        self.commands.append(f"node_post_upgrade nvidia_host={nvidia_host}")
+    def node_post_upgrade(self, *, nvidia_host=False, after_reboot=False):
+        self.commands.append(
+            f"node_post_upgrade nvidia_host={nvidia_host} after_reboot={after_reboot}"
+        )
         return self._resp("vmlinuz")
 
     def snapshot(self, vmid, *, snap_state, **kwargs):
@@ -263,6 +272,7 @@ def test_reboot_no_proxy_when_ip_empty(monkeypatch):
     outcome = run_node_update("pve-01", ex, _settings(apt_proxy_ip=""), dry_run=False, _sleep=_no_sleep)
 
     assert not outcome.failed
+    assert outcome.record is not None
     assert outcome.record.status == "UPDATED & REBOOTED"
     assert port_calls == []
 
@@ -354,6 +364,7 @@ def test_apt_retry_succeeds_on_third_attempt():
     )
 
     assert not outcome.failed
+    assert outcome.record is not None
     assert outcome.record.status == "UPDATED"
     assert call_count[0] == 3
 
@@ -437,6 +448,7 @@ def test_dry_run_ok():
     outcome = run_node_update("pve-01", ex, _settings(), dry_run=True, _sleep=_no_sleep)
 
     assert not outcome.failed
+    assert outcome.record is not None
     assert outcome.record.status == "OK"
     assert ex.reboots == 0
 
@@ -458,6 +470,7 @@ def test_manager_lxc_id_empty_skips_check():
     )
 
     assert not outcome.failed
+    assert outcome.record is not None
     assert outcome.record.status == "UPDATED"
     assert not any("pct list" in cmd for cmd in ex.commands)
 
@@ -488,6 +501,7 @@ def test_qualified_manager_id_skips_probe_on_other_cluster():
     assert not outcome.failed
     assert not any("pct list" in cmd for cmd in ex.commands)
     # not treated as manager — reboot proceeds normally
+    assert outcome.record is not None
     assert outcome.record.status == "UPDATED & REBOOTED"
     assert ex.reboots == 1
 
@@ -512,6 +526,7 @@ def test_qualified_manager_id_runs_probe_on_matching_cluster():
 
     assert not outcome.failed
     assert any("pct list" in cmd for cmd in ex.commands)
+    assert outcome.record is not None
     assert outcome.record.status == "UPDATED (MANUAL REBOOT REQ)"
     assert ex.reboots == 0
 
@@ -536,6 +551,7 @@ def test_bare_manager_id_runs_probe_regardless_of_cluster():
 
     assert not outcome.failed
     assert any("pct list" in cmd for cmd in ex.commands)
+    assert outcome.record is not None
     assert outcome.record.status == "UPDATED"
 
 
@@ -584,10 +600,14 @@ def test_nvidia_matching_versions_are_healthy():
     assert outcome.record.status == "UPDATED"
     assert outcome.record.checks == {
         "running_kernel": "6.8.12-8-pve",
+        "target_kernel": "6.8.12-8-pve",
+        "target_kernel_source": "automatic",
+        "nvidia_kernel": "6.8.12-8-pve",
         "nvidia_loaded": "550.90.07",
         "nvidia_installed": "550.90.07",
         "nvidia_dkms_ready": True,
         "nvidia_smi_ok": True,
+        "nvidia_post_reboot_ready": True,
     }
     assert ex.reboots == 0
 
@@ -610,7 +630,7 @@ def test_nvidia_mismatch_triggers_normal_auto_reboot():
     assert outcome.record is not None
     assert outcome.record.status == "UPDATED & REBOOTED"
     assert outcome.record.reboot_reasons == [
-        "NVIDIA module mismatch: loaded 550.54.14, installed 550.90.07"
+        "NVIDIA module mismatch: loaded 550.54.14, target 550.90.07"
     ]
     assert outcome.record.checks is not None
     assert outcome.record.checks["pre_reboot"]["nvidia_loaded"] == "550.54.14"
@@ -656,6 +676,64 @@ def test_nvidia_mismatch_on_manager_host_remains_manual():
     assert not outcome.failed
     assert outcome.record is not None
     assert outcome.record.status == "UPDATED (MANUAL REBOOT REQ)"
+    assert ex.reboots == 0
+
+
+def test_nvidia_pending_kernel_validates_target_module_before_reboot():
+    post = _post_result(
+        running="7.0.14-14-pve",
+        latest="7.0.14-15-pve",
+        nvidia=True,
+        installed="615.71.09",
+        loaded="610.57.04",
+        smi_rc=18,
+    )
+    post.facts.update(
+        {
+            "diagnostics_version": 2,
+            "target_kernel_rc": 0,
+            "target_kernel": "7.0.14-15-pve",
+            "target_kernel_source": "automatic",
+            "nvidia_kernel": "7.0.14-15-pve",
+            "nvidia_dkms_status": (
+                "nvidia/615.71.09, 7.0.14-15-pve, x86_64: installed"
+            ),
+        }
+    )
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "vmlinuz": [post],
+        }
+    )
+
+    outcome = run_node_update(
+        "pve01",
+        ex,
+        _settings(node_auto_reboot=False),
+        nvidia_host=True,
+        _sleep=_no_sleep,
+    )
+
+    assert not outcome.failed
+    assert outcome.record is not None
+    assert outcome.record.status == "UPDATED (MANUAL REBOOT REQ)"
+    assert outcome.record.reboot_reasons == [
+        "kernel update: 7.0.14-14-pve → 7.0.14-15-pve",
+        "NVIDIA module mismatch: loaded 610.57.04, target 615.71.09",
+    ]
+    assert outcome.record.checks == {
+        "running_kernel": "7.0.14-14-pve",
+        "target_kernel": "7.0.14-15-pve",
+        "target_kernel_source": "automatic",
+        "nvidia_kernel": "7.0.14-15-pve",
+        "nvidia_loaded": "610.57.04",
+        "nvidia_installed": "615.71.09",
+        "nvidia_dkms_ready": True,
+        "nvidia_smi_ok": False,
+        "nvidia_post_reboot_ready": True,
+    }
     assert ex.reboots == 0
 
 
@@ -755,6 +833,51 @@ def test_standalone_nvidia_smi_failure_is_warning():
     assert ex.reboots == 0
 
 
+def test_nvidia_post_reboot_wrong_kernel_marks_node_failed():
+    before = _post_result(
+        running="7.0.14-14-pve",
+        latest="7.0.14-15-pve",
+        nvidia=True,
+        installed="615.71.09",
+        loaded="610.57.04",
+    )
+    after = _post_result(
+        running="7.0.14-14-pve",
+        latest="7.0.14-15-pve",
+        nvidia=True,
+        installed="610.57.04",
+        loaded="610.57.04",
+    )
+    after.facts.update(
+        {
+            "nvidia_kernel": "7.0.14-14-pve",
+            "nvidia_dkms_status": (
+                "nvidia/610.57.04, 7.0.14-14-pve, x86_64: installed"
+            ),
+        }
+    )
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_UPGRADED)],
+            "vmlinuz": [before, after],
+        }
+    )
+
+    outcome = run_node_update(
+        "pve01",
+        ex,
+        _settings(),
+        nvidia_host=True,
+        _sleep=_no_sleep,
+    )
+
+    assert outcome.failed
+    assert outcome.error is not None
+    assert outcome.error.task == "NVIDIA post-reboot check"
+    assert "instead of target 7.0.14-15-pve" in outcome.error.error
+
+
 @pytest.mark.parametrize(
     "after",
     [
@@ -804,6 +927,55 @@ def test_failed_reboot_is_not_reported_as_success():
     assert "reboot failed" in outcome.error.error
 
 
+def test_pinned_running_kernel_ignores_newer_installed_kernel():
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_NOOP)],
+            "vmlinuz": [
+                _post_result(
+                    latest="6.8.12-9-pve",
+                    target="6.8.12-8-pve",
+                    target_source="proxmox-persistent-pin",
+                )
+            ],
+        }
+    )
+
+    outcome = run_node_update("pve-01", ex, _settings(), _sleep=_no_sleep)
+
+    assert not outcome.failed
+    assert outcome.record is not None
+    assert outcome.record.status == "OK"
+    assert outcome.record.reboot_reasons is None
+    assert ex.reboots == 0
+
+
+def test_unresolved_target_kernel_fails_closed():
+    post = _post_result()
+    post.facts.update(
+        {
+            "target_kernel_rc": 1,
+            "target_kernel": "",
+            "target_kernel_source": "unknown",
+        }
+    )
+    ex = ScriptedNodeExecutor(
+        script={
+            "pct list": [NOT_MANAGER],
+            "dist-upgrade": [_ok(stdout=APT_NOOP)],
+            "vmlinuz": [post],
+        }
+    )
+
+    outcome = run_node_update("pve-01", ex, _settings(), _sleep=_no_sleep)
+
+    assert outcome.failed
+    assert outcome.error is not None
+    assert "next-boot kernel" in outcome.error.error
+    assert ex.reboots == 0
+
+
 def test_kernel_mismatch_still_triggers_reboot():
     ex = ScriptedNodeExecutor(
         script={
@@ -816,6 +988,7 @@ def test_kernel_mismatch_still_triggers_reboot():
 
     assert not outcome.failed
     assert outcome.record is not None
+    assert outcome.record.reboot_reasons is not None
     assert "kernel update" in outcome.record.reboot_reasons[0]
     assert ex.reboots == 1
 
@@ -895,6 +1068,7 @@ def test_manager_update_reboot_required():
     outcome = run_manager_update(ex, _settings())
 
     assert not outcome.failed
+    assert outcome.record is not None
     assert outcome.record.status == "UPDATED (MANUAL REBOOT REQ)"
     assert ex.reboots == 0
 
@@ -912,6 +1086,7 @@ def test_manager_update_ok():
 
     assert not outcome.failed
     assert outcome.changed is False
+    assert outcome.record is not None
     assert outcome.record.status == "OK"
 
 

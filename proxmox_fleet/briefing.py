@@ -72,6 +72,12 @@ def render_briefing(state: FleetState, *, manual_section: str = "") -> str:
         # when the record carries them — legacy key-free records stay identical.
         for reason in (n.reboot_reasons or []):
             parts.append(f"\n- reboot required: {reason}")
+        checks = n.checks or {}
+        target_kernel = checks.get("target_kernel")
+        if n.reboot_reasons and checks.get("nvidia_post_reboot_ready") and target_kernel:
+            parts.append(
+                f"\n- NVIDIA target {target_kernel}: DKMS/modules ready for reboot"
+            )
         if n.node != "Ansible-Manager" and not append_guest_results(n.node):
             parts.append("\n- *No container changes.*")
 
