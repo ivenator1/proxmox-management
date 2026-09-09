@@ -60,10 +60,10 @@ class NodeRecord(BaseModel):
     # persist this marker so the ledger never treats simulation as applied.
     dry_run: Optional[bool] = Field(default=None, exclude_if=lambda value: value is None)
     # Why this node needs (or needed) a reboot — ordinary marker/kernel reasons
-    # plus NVIDIA installed/loaded mismatch reasons. Omitted entirely when the
+    # plus NVIDIA target/loaded mismatch reasons. Omitted entirely when the
     # node does not need a reboot, preserving the legacy record byte shape.
     reboot_reasons: Optional[List[str]] = Field(default=None, exclude_if=lambda value: value is None)
-    # Structured post-upgrade check results (NVIDIA diagnostics + classification
+    # Structured post-upgrade results (target-kernel NVIDIA readiness + classification
     # for nvidia_host nodes). Omitted entirely when no checks ran, so legacy
     # records and non-nvidia hosts stay byte-identical.
     checks: Optional[Dict[str, Any]] = Field(default=None, exclude_if=lambda value: value is None)

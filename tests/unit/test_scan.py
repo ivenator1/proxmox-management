@@ -53,7 +53,12 @@ class ScriptedExecutor:
     def reboot(self, *, timeout=600):
         return self.default
 
-    def node_post_upgrade(self, *, nvidia_host=False):
+    def node_post_upgrade(
+        self,
+        *,
+        nvidia_host=False,
+        after_reboot=False,
+    ) -> PrimitiveResult:
         return self.default
 
     def snapshot(self, vmid, **kwargs):

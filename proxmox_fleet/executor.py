@@ -55,15 +55,19 @@ class Executor(Protocol):
     def reboot(self, *, timeout: int = 600) -> PrimitiveResult:
         ...
 
-    def node_post_upgrade(self, *, nvidia_host: bool = False) -> PrimitiveResult:
+    def node_post_upgrade(
+        self,
+        *,
+        nvidia_host: bool = False,
+        after_reboot: bool = False,
+    ) -> PrimitiveResult:
         """Run the read-only node post-upgrade diagnostics in one subprocess.
 
-        Returns facts: running_kernel, latest_kernel, reboot_required_exists,
-        reboot_required_packages, and (when ``nvidia_host``) the NVIDIA probes:
-        nvidia_checked, nvidia_installed(_rc), nvidia_loaded(_rc),
-        nvidia_dkms(_rc/status), and nvidia_smi_rc. All tasks are
-        check_mode: false, so the probes run even under ``--check`` — Python
-        owns every classification and reboot decision.
+        Returns running, latest-installed and configured target kernel facts,
+        reboot-required metadata, and optional NVIDIA loaded/target-module,
+        DKMS and device-health probes. ``after_reboot`` makes NVIDIA validation
+        target the running kernel. All tasks run under check mode; Python owns
+        classification and reboot policy.
         """
         ...
 
@@ -196,12 +200,20 @@ class RunnerExecutor:
             check=self.check,
         )
 
-    def node_post_upgrade(self, *, nvidia_host: bool = False) -> PrimitiveResult:
+    def node_post_upgrade(
+        self,
+        *,
+        nvidia_host: bool = False,
+        after_reboot: bool = False,
+    ) -> PrimitiveResult:
         return _merge_facts(invoke_primitive(
             "node_post_upgrade",
             inventory=self.inventory,
             host_pattern=self.host,
-            extravars={"nvidia_host": bool(nvidia_host)},
+            extravars={
+                "nvidia_host": bool(nvidia_host),
+                "after_reboot": bool(after_reboot),
+            },
             check=self.check,
         ))
 

@@ -234,9 +234,9 @@ snapshot_exclude_list:
 # host_vars/<node>.yml) get read-only GPU-driver diagnostics after their node
 # OS update. The checks run from the Manager LXC over Ansible SSH on the node
 # itself — never inside a workload LXC:
-#   * installed vs. loaded NVIDIA module mismatch  → node reboot required
-#   * missing DKMS build for the running kernel    → hard failure (node FAILED)
-#   * nvidia-smi faults (non-zero return code)     → surfaced in the node report
+#   * target vs. loaded NVIDIA module mismatch     → node reboot required
+#   * missing modules/DKMS for next-boot kernel    → hard failure (node FAILED)
+#   * nvidia-smi fails after the reboot             → hard failure (node FAILED)
 # node_auto_reboot governs ALL node reboots. Default true = auto-reboot when
 # needed; false = controlled/manual maintenance: nodes needing a reboot report
 # "UPDATED (MANUAL REBOOT REQ)" and are never rebooted automatically. The node

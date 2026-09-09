@@ -69,8 +69,15 @@ class ScriptedExecutor:
         self.reboots += 1
         return _ok()
 
-    def node_post_upgrade(self, *, nvidia_host: bool = False) -> PrimitiveResult:
-        self.commands.append(f"node_post_upgrade nvidia_host={nvidia_host}")
+    def node_post_upgrade(
+        self,
+        *,
+        nvidia_host: bool = False,
+        after_reboot: bool = False,
+    ) -> PrimitiveResult:
+        self.commands.append(
+            f"node_post_upgrade nvidia_host={nvidia_host} after_reboot={after_reboot}"
+        )
         return self._resp("vmlinuz")
 
 
@@ -382,11 +389,14 @@ NOT_MANAGER = _ok(stdout="1\n", changed=False)  # pct list grep → not manager
 NO_REBOOT = _ok(
     changed=False,
     facts={
-        "diagnostics_version": 1,
+        "diagnostics_version": 2,
         "running_kernel_rc": 0,
         "running_kernel": "6.8.12-8-pve",
         "latest_kernel_rc": 0,
         "latest_kernel": "6.8.12-8-pve",
+        "target_kernel_rc": 0,
+        "target_kernel": "6.8.12-8-pve",
+        "target_kernel_source": "automatic",
         "reboot_required_exists": False,
         "reboot_required_packages": "",
         "nvidia_checked": False,

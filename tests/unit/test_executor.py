@@ -179,7 +179,7 @@ def test_node_post_upgrade_invokes_bound_primitive_and_preserves_facts(monkeypat
         "primitive": "node_post_upgrade",
         "inventory": "fleet.ini",
         "host_pattern": "pve-01",
-        "extravars": {"nvidia_host": True},
+        "extravars": {"nvidia_host": True, "after_reboot": False},
         "check": True,
     }
     assert result.facts == facts

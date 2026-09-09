@@ -100,7 +100,13 @@ class ScriptedManualExecutor(Executor):
     def reboot(self, *, timeout: int = 600) -> PrimitiveResult:
         raise AssertionError("reboot should never be called for manual update checks")
 
-    def node_post_upgrade(self, *, nvidia_host: bool = False) -> PrimitiveResult:
+    def node_post_upgrade(
+        self,
+        *,
+        nvidia_host: bool = False,
+        after_reboot: bool = False,
+    ) -> PrimitiveResult:
+        del nvidia_host, after_reboot
         raise AssertionError("node_post_upgrade should never be called for manual update checks")
 
     def snapshot(self, vmid: str, *, snap_state: str, **api_params: Any) -> PrimitiveResult:
