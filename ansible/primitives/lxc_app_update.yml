@@ -56,6 +56,20 @@
           *) exit 115 ;;
         esac
         if [ -z "\$real_fetcher" ]; then exit 115; fi
+        # The shared update helper probes script existence before downloading it.
+        # Those requests intentionally discard the body, so they must reach the
+        # real fetcher unchanged; only the later stdout script stream is filtered.
+        case "\$fetcher: \$* " in
+          curl:*" -o /dev/null "*|curl:*" -o/dev/null "*|curl:*" --output /dev/null "*|curl:*" --output=/dev/null "*)
+            exec "\$real_fetcher" "\$@"
+            ;;
+          wget:*" --spider "*|wget:*" -O /dev/null "*|wget:*" -O/dev/null "*)
+            exec "\$real_fetcher" "\$@"
+            ;;
+          wget:*" --output-document /dev/null "*|wget:*" --output-document=/dev/null "*)
+            exec "\$real_fetcher" "\$@"
+            ;;
+        esac
         case " \$* " in
           *community-scripts/ProxmoxVE*/ct/*.sh*)
             tmp=\$(mktemp /tmp/fleet-ct-script.XXXXXX) || exit 115
