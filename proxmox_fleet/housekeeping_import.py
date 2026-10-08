@@ -73,6 +73,8 @@ PUSH_MAX_ATTEMPTS = 3
 _BACKOFF_BASE = 2.0
 _BACKOFF_MAX = 30.0
 _MAX_RETRY_AFTER = 60.0
+# Keep the complete node-shell command below Linux's per-argument limit.
+_MAX_RELEASE_BLOBS = 128
 
 DELIVERY_ARCHIVE = "archive"
 JOB_LABEL = "lxc-file"
@@ -1522,7 +1524,7 @@ def _maybe_release(executor: Executor, state: _ImportState) -> None:
     intent = state.store.capture_intent(state.key)
     if intent is None or intent.state != "complete":
         return
-    if state.pending or state.store.pending_batch(state.key) is not None:
+    if state.store.pending_batch(state.key) is not None:
         return
     blobs = state.store.captured_blobs(state.key, intent.capture_id)
     records = {record.source_id: record for record in state.store.sources(state.key)}
@@ -1538,20 +1540,22 @@ def _maybe_release(executor: Executor, state: _ImportState) -> None:
             candidates.append(blob.blob_path)
     if not candidates:
         return
-    command = build_capture_release_command(intent.capture_id, candidates)
-    try:
-        result = executor.run_shell(command)
-    except Exception as exc:  # noqa: BLE001 - transport boundary
-        state.warnings.append(f"housekeeping import: spool release transport error ({_bounded(type(exc).__name__)})")
-        return
-    if result.failed:
-        state.warnings.append("housekeeping import: spool release failed; acknowledged blobs retained")
-        return
-    for blob_path in candidates:
+    for start in range(0, len(candidates), _MAX_RELEASE_BLOBS):
+        batch = candidates[start:start + _MAX_RELEASE_BLOBS]
+        command = build_capture_release_command(intent.capture_id, batch)
         try:
-            state.store.release_blob(state.key, intent.capture_id, blob_path)
-        except CheckpointError:
-            break
+            result = executor.run_shell(command)
+        except Exception as exc:  # noqa: BLE001 - transport boundary
+            state.warnings.append(f"housekeeping import: spool release transport error ({_bounded(type(exc).__name__)})")
+            return
+        if result.failed:
+            state.warnings.append("housekeeping import: spool release failed; acknowledged blobs retained")
+            return
+        for blob_path in batch:
+            try:
+                state.store.release_blob(state.key, intent.capture_id, blob_path)
+            except CheckpointError:
+                return
 
 
 # --------------------------------------------------------------------------- #

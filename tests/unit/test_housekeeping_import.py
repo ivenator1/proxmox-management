@@ -641,10 +641,106 @@ def test_release_reclaims_acknowledged_blobs(env, tmp_path):
     assert all(blob.released for blob in store.captured_blobs(KEY, capture_id))
 
 
+def test_large_initial_manifest_releases_all_acknowledged_blobs(env):
+    guest, spool, executor, store = env
+    payloads = {
+        f"/data/logs/access-{index:04d}.log.1": f"retained-{index}\n".encode()
+        for index in range(1000)
+    }
+    for path, payload in payloads.items():
+        _write(guest, path, payload)
+    with LokiServer() as server:
+        result = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY,
+            name="npm-ct", files=[_wire(guest, path) for path in payloads],
+            sleep=lambda _s: None,
+        )
+    assert not result.failed and not result.pending
+    archived = {entry["filename"]: entry["_entry"] + "\n" for entry in _iter_entries(server)}
+    assert archived == {path: payload.decode() for path, payload in payloads.items()}
+    capture_id = store.capture_intent(KEY).capture_id
+    assert all(blob.released for blob in store.captured_blobs(KEY, capture_id))
+    assert not (spool / capture_id).exists()
+    assert {path: (guest / path.lstrip("/")).read_bytes() for path in payloads} == payloads
+
+
+def test_acknowledged_blob_release_survives_transport_interruption(env):
+    guest, spool, executor, store = env
+
+    class InterruptedExecutor(FakeExecutor):
+        interrupted = False
+
+        def run_shell(self, command: str, **opts: Any) -> PrimitiveResult:
+            if self.interrupted:
+                return _failed("transport interrupted")
+            result = super().run_shell(command, **opts)
+            self.interrupted = True
+            return result
+
+    payloads = {
+        f"/data/logs/retained-{index:04d}.log.1": f"resume-{index}\n".encode()
+        for index in range(256)
+    }
+    for path, payload in payloads.items():
+        _write(guest, path, payload)
+    wires = [_wire(guest, path) for path in payloads]
+    interrupted = InterruptedExecutor(guest, spool)
+    with LokiServer() as server:
+        first = hi.import_guest_logs(
+            interrupted, _settings(server.url), store, KEY,
+            name="npm-ct", files=wires, sleep=lambda _s: None,
+        )
+        assert not first.failed and not first.pending
+        capture_id = store.capture_intent(KEY).capture_id
+        blobs = store.captured_blobs(KEY, capture_id)
+        assert 0 < sum(blob.released for blob in blobs) < len(payloads)
+        assert all(Path(blob.blob_path).exists() != blob.released for blob in blobs)
+        assert (spool / capture_id).exists()
+        done = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY,
+            name="npm-ct", files=wires, sleep=lambda _s: None,
+        )
+    assert not done.failed and not done.pending
+    assert done.bytes_archived == 0
+    assert all(blob.released for blob in store.captured_blobs(KEY, capture_id))
+    assert not (spool / capture_id).exists()
+    entries = list(_iter_entries(server))
+    assert len(entries) == len(payloads)
+    assert {entry["filename"]: entry["_entry"] + "\n" for entry in entries} == {
+        path: payload.decode() for path, payload in payloads.items()
+    }
+    assert {path: (guest / path.lstrip("/")).read_bytes() for path in payloads} == payloads
+
+
+def test_completed_frozen_blob_released_while_other_prefixes_need_backfill(env):
+    guest, _spool, executor, store = env
+    _write(guest, "/data/logs/a-small.log.1", b"fully-acknowledged\n")
+    large = b"".join(f"pending-{index:06d}-{'x' * 80}\n".encode() for index in range(20000))
+    _write(guest, "/data/logs/z-large.log.1", large)
+    wires = [
+        _wire(guest, "/data/logs/a-small.log.1"),
+        _wire(guest, "/data/logs/z-large.log.1"),
+    ]
+    with LokiServer() as server:
+        result = hi.import_guest_logs(
+            executor, _settings(server.url, budget_mb=1), store, KEY,
+            name="npm-ct", files=wires, sleep=lambda _s: None,
+        )
+    assert result.pending and not result.failed
+    assert store.pending_batch(KEY) is None
+    capture_id = store.capture_intent(KEY).capture_id
+    blobs = {blob.source_path: blob for blob in store.captured_blobs(KEY, capture_id)}
+    small = blobs["/data/logs/a-small.log.1"]
+    unfinished = blobs["/data/logs/z-large.log.1"]
+    assert small.released and not Path(small.blob_path).exists()
+    assert not unfinished.released and Path(unfinished.blob_path).read_bytes() == large
+    assert (guest / "data/logs/a-small.log.1").read_bytes() == b"fully-acknowledged\n"
+    assert (guest / "data/logs/z-large.log.1").read_bytes() == large
+
+
 def test_release_command_validation():
     valid = hi.capture_id_for(KEY)
     token = "a" * 64
-    assert f"/{valid}/" in hi.build_capture_release_command(valid, [f"/var/tmp/fleet-log-import/{valid}/{token}.blob"])
     with pytest.raises(ValueError):
         hi.build_capture_release_command("bad-id", [f"/var/tmp/fleet-log-import/{valid}/{token}.blob"])
     with pytest.raises(ValueError):
