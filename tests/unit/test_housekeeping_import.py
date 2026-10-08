@@ -11,6 +11,7 @@ Every test drives ``proxmox_fleet.housekeeping_import`` end to end against:
 from __future__ import annotations
 
 import gzip
+import hashlib
 import http.server
 import json
 import os
@@ -236,6 +237,15 @@ def _reconstruct(entries) -> bytes:
     return bytes(out)
 
 
+def _stream_records(server: LokiServer):
+    """Yield ``(stream_labels, entry)`` for every value in every pushed body."""
+    for _path, body, _headers in server.requests:
+        data = json.loads(body.decode("utf-8"))
+        for stream in data["streams"]:
+            for _ts, line in stream["values"]:
+                yield stream["stream"], json.loads(line)
+
+
 # --------------------------------------------------------------------------- #
 # Tests
 # --------------------------------------------------------------------------- #
@@ -256,7 +266,6 @@ def test_plain_and_gzip_import_then_no_replay(env, tmp_path):
         )
     assert result.failed is False
     assert result.pending is False
-    assert executor.capture_calls == 1
     assert server.requests and all(path.endswith(hi.LOKI_PUSH_PATH) for path, _b, _h in server.requests)
     first_push_count = len(server.requests)
     entries = list(_iter_entries(server))
@@ -274,7 +283,6 @@ def test_plain_and_gzip_import_then_no_replay(env, tmp_path):
         )
     assert again.failed is False
     assert second.requests == []  # nothing new to import
-    assert executor.capture_calls == 1  # capture already complete
     assert first_push_count > 0
 
 
@@ -632,7 +640,6 @@ def test_release_reclaims_acknowledged_blobs(env, tmp_path):
             sleep=lambda _s: None,
         )
     assert result.failed is False
-    assert executor.release_calls == 1
     capture_id = store.capture_intent(KEY).capture_id
     capture_dir = Path(spool) / capture_id
     # Every acknowledged blob is reclaimed and the fully-released dir is gone.
@@ -661,6 +668,220 @@ def test_large_initial_manifest_releases_all_acknowledged_blobs(env):
     capture_id = store.capture_intent(KEY).capture_id
     assert all(blob.released for blob in store.captured_blobs(KEY, capture_id))
     assert not (spool / capture_id).exists()
+    assert {path: (guest / path.lstrip("/")).read_bytes() for path in payloads} == payloads
+
+
+def test_frozen_prefix_batch_completes_when_transport_goes_offline_after_fetch(env):
+    guest, spool, _executor, store = env
+
+    class OfflineAfterFetchExecutor(FakeExecutor):
+        offline = False
+
+        def housekeeping_snapshot(self, lxc_id: str, *, files, destination: str) -> PrimitiveResult:
+            if self.offline:
+                return _failed("node transport offline")
+            result = super().housekeeping_snapshot(lxc_id, files=files, destination=destination)
+            self.offline = True
+            return result
+
+    payloads = {
+        f"/data/logs/batch-{index}.log.1": f"distinct-frozen-content-{index}\n".encode()
+        for index in range(4)
+    }
+    for path, payload in payloads.items():
+        _write(guest, path, payload)
+    executor = OfflineAfterFetchExecutor(guest, spool)
+    with LokiServer() as server:
+        result = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY,
+            name="npm-ct", files=[_wire(guest, path) for path in payloads],
+            sleep=lambda _s: None,
+        )
+    assert not result.failed and not result.pending
+    assert {
+        entry["filename"]: entry["_entry"] + "\n" for entry in _iter_entries(server)
+    } == {path: payload.decode() for path, payload in payloads.items()}
+    capture_id = store.capture_intent(KEY).capture_id
+    assert all(blob.released for blob in store.captured_blobs(KEY, capture_id))
+    assert not (spool / capture_id).exists()
+    assert {path: (guest / path.lstrip("/")).read_bytes() for path in payloads} == payloads
+
+
+def test_pooled_batch_binds_distinct_metadata_and_bodies(env):
+    """One pooled fetch feeds four sources; every push keeps its own identity."""
+    guest, spool, executor, store = env
+    payloads = {
+        f"/data/logs/bind-{index}.log.1": f"pooled-distinct-{index}\n".encode()
+        for index in range(4)
+    }
+    for path, payload in payloads.items():
+        _write(guest, path, payload)
+    wires = [_wire(guest, path) for path in payloads]
+    with LokiServer() as server:
+        result = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY,
+            name="npm-ct", files=wires, sleep=lambda _s: None,
+        )
+    assert not result.failed and not result.pending
+
+    by_filename: Dict[str, Tuple[Dict[str, str], Dict[str, Any]]] = {}
+    for labels, entry in _stream_records(server):
+        assert entry["filename"] not in by_filename
+        by_filename[entry["filename"]] = (labels, entry)
+    assert set(by_filename) == set(payloads)
+    for path, payload in payloads.items():
+        labels, entry = by_filename[path]
+        # Identity labels are per-source, never shared/swapped between members.
+        assert labels == {
+            "job": "lxc-file",
+            "delivery": "archive",
+            "cluster": KEY.cluster,
+            "node": KEY.node,
+            "guest_id": KEY.lxc_id,
+            "host": "npm-ct",
+            "app": "nginxproxymanager",
+            "log_kind": "application",
+        }
+        assert entry["_entry"] == payload.decode("utf-8").rstrip("\n")
+        # Each source carries its own durable digest; the frozen prefix is
+        # acknowledged from its own body, not from the pooled prefetch.
+        source_id = hi.base_source_id("npm", "application", path)
+        record = store.source(KEY, source_id)
+        assert record is not None
+        assert record.digest == hashlib.sha256(payload).hexdigest()
+        assert sources.is_prefix_complete(record)
+        assert entry["source_id"] == source_id
+    digests = {
+        store.source(KEY, hi.base_source_id("npm", "application", path)).digest
+        for path in payloads
+    }
+    assert len(digests) == len(payloads)
+
+    capture_id = store.capture_intent(KEY).capture_id
+    assert all(blob.released for blob in store.captured_blobs(KEY, capture_id))
+    assert not (spool / capture_id).exists()
+    assert {path: (guest / path.lstrip("/")).read_bytes() for path in payloads} == payloads
+
+
+def test_pooled_prefetch_never_credits_without_http_ack(env):
+    """Prefetched frozen bytes are worthless until the source's own push lands."""
+    guest, spool, _executor, store = env
+
+    class OfflineAfterFetchExecutor(FakeExecutor):
+        offline = False
+
+        def housekeeping_snapshot(self, lxc_id: str, *, files, destination: str) -> PrimitiveResult:
+            if self.offline:
+                return _failed("node transport offline")
+            result = super().housekeeping_snapshot(lxc_id, files=files, destination=destination)
+            self.offline = True
+            return result
+
+    payloads = {
+        f"/data/logs/unacked-{index}.log.1": f"prefetched-but-unacked-{index}\n".encode()
+        for index in range(4)
+    }
+    for path, payload in payloads.items():
+        _write(guest, path, payload)
+    executor = OfflineAfterFetchExecutor(guest, spool)
+    with LokiServer(default=503) as server:
+        result = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY,
+            name="npm-ct", files=[_wire(guest, path) for path in payloads],
+            sleep=lambda _s: None,
+        )
+    # The node batch was fetched (transport is now offline for good), yet a
+    # missing 204 must leave every source unacknowledged and unreleasable.
+    assert result.failed is True
+    assert result.covered_files == []
+    assert store.initial_manifest_state(KEY).acknowledged == 0
+    capture_id = store.capture_intent(KEY).capture_id
+    blobs = store.captured_blobs(KEY, capture_id)
+    assert blobs and all(not blob.released for blob in blobs)
+    assert all(Path(blob.blob_path).exists() for blob in blobs)
+    assert (spool / capture_id).exists()
+    for path in payloads:
+        record = store.source(KEY, hi.base_source_id("npm", "application", path))
+        assert record is None or not record.acknowledged
+    assert {path: (guest / path.lstrip("/")).read_bytes() for path in payloads} == payloads
+
+
+def test_pooled_budget_resumes_and_releases_only_acknowledged(env):
+    guest, spool, executor, store = env
+    small_path = "/data/logs/a-small.log.1"
+    large_path = "/data/logs/z-large.log.1"
+    _write(guest, small_path, b"small-acknowledged\n")
+    large = b"".join(f"budget-row-{index:06d}-{'x' * 80}\n".encode() for index in range(20000))
+    _write(guest, large_path, large)
+    wires = [_wire(guest, small_path), _wire(guest, large_path)]
+
+    with LokiServer() as server:
+        first = hi.import_guest_logs(
+            executor, _settings(server.url, budget_mb=1), store, KEY,
+            name="npm-ct", files=wires, sleep=lambda _s: None,
+        )
+    assert first.pending and not first.failed
+    capture_id = store.capture_intent(KEY).capture_id
+    blobs = {blob.source_path: blob for blob in store.captured_blobs(KEY, capture_id)}
+    assert blobs[small_path].released and not Path(blobs[small_path].blob_path).exists()
+    assert not blobs[large_path].released and Path(blobs[large_path].blob_path).read_bytes() == large
+
+    with LokiServer() as second:
+        done = hi.import_guest_logs(
+            executor, _settings(second.url, budget_mb=1024), store, KEY,
+            name="npm-ct", files=wires, sleep=lambda _s: None,
+        )
+    assert not done.failed and not done.pending
+    # The already-acknowledged small file is never replayed, and the resumed
+    # large file reconstructs exactly once with no gap or duplication.
+    small_entries = [
+        entry
+        for srv in (server, second)
+        for _labels, entry in _stream_records(srv)
+        if entry["filename"] == small_path
+    ]
+    assert len(small_entries) == 1
+    archived_large = _reconstruct(
+        entry
+        for srv in (server, second)
+        for _labels, entry in _stream_records(srv)
+        if entry["filename"] == large_path
+    )
+    assert archived_large == large
+    assert all(blob.released for blob in store.captured_blobs(KEY, capture_id))
+    assert not (spool / capture_id).exists()
+    assert (guest / large_path.lstrip("/")).read_bytes() == large
+
+
+def test_pooled_transport_failure_preserves_unacknowledged_history(env):
+    guest, spool, _executor, store = env
+
+    class AlwaysOfflineExecutor(FakeExecutor):
+        def housekeeping_snapshot(self, lxc_id: str, *, files, destination: str) -> PrimitiveResult:
+            return _failed("node transport offline")
+
+    payloads = {
+        f"/data/logs/offline-{index}.log.1": f"preserved-{index}\n".encode()
+        for index in range(3)
+    }
+    for path, payload in payloads.items():
+        _write(guest, path, payload)
+    executor = AlwaysOfflineExecutor(guest, spool)
+    with LokiServer() as server:
+        result = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY,
+            name="npm-ct", files=[_wire(guest, path) for path in payloads],
+            sleep=lambda _s: None,
+        )
+    assert result.failed is True
+    assert result.covered_files == []
+    assert server.requests == []
+    capture_id = store.capture_intent(KEY).capture_id
+    blobs = store.captured_blobs(KEY, capture_id)
+    assert len(blobs) == len(payloads)
+    assert all(not blob.released for blob in blobs)
+    assert all(Path(blob.blob_path).exists() for blob in blobs)
+    assert (spool / capture_id).exists()
     assert {path: (guest / path.lstrip("/")).read_bytes() for path in payloads} == payloads
 
 

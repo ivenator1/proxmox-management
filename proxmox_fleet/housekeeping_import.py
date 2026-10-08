@@ -5,7 +5,9 @@ This module owns the *import* slice of the log-housekeeping feature:
 * freeze the initial manifest in SQLite and on the PVE node **before** the first
   byte is copied (``CheckpointStore.begin_capture`` + ``housekeeping_capture``);
 * read frozen node-spool blobs or live closed prefixes through
-  :mod:`proxmox_fleet.housekeeping_stream`, reconstructing original raw bytes
+  :mod:`proxmox_fleet.housekeeping_stream` (pooling the frozen initial-capture
+  ranges into as few validated node transfers as possible, without ever
+  crediting a source from prefetched bytes), reconstructing original raw bytes
   (including delimiters and non-UTF-8) as bounded archive fragments;
 * build bounded Loki ``/loki/api/v1/push`` bodies, persist the exact body as a
   pending batch **before** upload, and advance progress **only** on HTTP 204;
@@ -22,6 +24,7 @@ notifications.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
@@ -31,7 +34,7 @@ import urllib.error
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 from proxmox_fleet import http as _http
 from proxmox_fleet import housekeeping_sources as sources
@@ -51,6 +54,7 @@ from proxmox_fleet.housekeeping_stream import (
     DecodedLogReader,
     HousekeepingStreamError,
     RemoteLogReader,
+    RemoteSnapshotPool,
     RemoteSourceError,
     encode_entry,
     iter_log_fragments,
@@ -284,6 +288,48 @@ def _build_body(labels_json: bytes, values: Sequence[bytes]) -> bytes:
 
 def _bounded(text: str, limit: int = 240) -> str:
     return " ".join(str(text).split())[:limit]
+
+
+# --------------------------------------------------------------------------- #
+# Bounded snapshot pool
+# --------------------------------------------------------------------------- #
+
+
+def _pool_eligible(read_wire: Optional[Dict[str, Any]]) -> bool:
+    """A read wire may be pooled only when it is a frozen captured-blob range.
+
+    Live/current sources are never pooled: the pool serves a range only on an
+    exact ``(capture_id, blob_path, offset, length)`` hint match and falls back
+    to the strict singleton reader otherwise, so passing the pool to a live read
+    is a no-op.  Only the frozen initial-capture ranges are advertised as hints.
+    """
+    return (
+        read_wire is not None
+        and "blob_path" in read_wire
+        and "capture_id" in read_wire
+        and "offset" in read_wire
+        and "length" in read_wire
+    )
+
+
+@contextlib.contextmanager
+def _snapshot_pool(
+    executor: Executor, lxc_id: str, wires: Sequence[Dict[str, Any]]
+) -> "Iterator[Optional[RemoteSnapshotPool]]":
+    """Open one lazily-fetched pool for the plan's eligible frozen ranges.
+
+    The pool batches the advertised hints (up to its own 64-range / 32 MiB
+    bounds) so one validated node transfer can feed several sources; a
+    subsequent transport outage therefore cannot strand already-fetched bytes.
+    The pool never acknowledges anything: each source still advances only on
+    its own HTTP 204.  With no eligible wires the loop runs on the strict
+    singleton reader (``pool=None``).
+    """
+    if not wires:
+        yield None
+        return
+    with RemoteSnapshotPool(executor, lxc_id, list(wires)) as pool:
+        yield pool
 
 
 # --------------------------------------------------------------------------- #
@@ -1037,7 +1083,13 @@ def _prepare_live_input(executor: Executor, state: _ImportState, plan: _FilePlan
         return False
 
 
-def _try_lineage_reuse(executor: Executor, state: _ImportState, plan: _FilePlan) -> bool:
+def _try_lineage_reuse(
+    executor: Executor,
+    state: _ImportState,
+    plan: _FilePlan,
+    *,
+    pool: Optional[RemoteSnapshotPool] = None,
+) -> bool:
     """Reuse a proved predecessor's acknowledged coverage for a compression successor.
 
     We decode the successor fully and require matching full decoded SHA-256 and
@@ -1055,7 +1107,7 @@ def _try_lineage_reuse(executor: Executor, state: _ImportState, plan: _FilePlan)
     if record is None or sources.is_prefix_complete(record):
         return False
     try:
-        with RemoteLogReader(executor, state.lxc_id, plan.read_wire) as raw:
+        with RemoteLogReader(executor, state.lxc_id, plan.read_wire, pool=pool) as raw:
             with DecodedLogReader(raw, plan.read_wire["compression"]) as decoded:
                 while decoded.read(1 << 16):
                     pass
@@ -1138,10 +1190,16 @@ def _flush_values(
     return False
 
 
-def _import_source(executor: Executor, state: _ImportState, plan: _FilePlan) -> None:
+def _import_source(
+    executor: Executor,
+    state: _ImportState,
+    plan: _FilePlan,
+    *,
+    pool: Optional[RemoteSnapshotPool] = None,
+) -> None:
     if plan.read_wire is None:
         return
-    if plan.lineage_predecessor is not None and _try_lineage_reuse(executor, state, plan):
+    if plan.lineage_predecessor is not None and _try_lineage_reuse(executor, state, plan, pool=pool):
         return
     record = state.store.source(state.key, plan.source_id)
     if record is None:
@@ -1157,7 +1215,7 @@ def _import_source(executor: Executor, state: _ImportState, plan: _FilePlan) -> 
     decoded_sha: Optional[str] = None
     decoded_bytes = 0
     try:
-        with RemoteLogReader(executor, state.lxc_id, plan.read_wire) as raw:
+        with RemoteLogReader(executor, state.lxc_id, plan.read_wire, pool=pool) as raw:
             with DecodedLogReader(raw, plan.read_wire["compression"]) as decoded:
                 fragments = iter_log_fragments(
                     decoded,
@@ -1665,18 +1723,29 @@ def import_guest_logs(
     if existing_pending is not None:
         return existing_pending
 
-    for plan in _plan_sources(state, wires):
-        if state.stopped:
-            break
-        if not _prepare_live_input(executor, state, plan):
-            break
-        if plan.complete_for_current:
-            if plan.wire is not None:
-                record = store.source(key, plan.source_id)
-                if record is not None:
-                    state.add_covered(plan.wire, record)
-            continue
-        _import_source(executor, state, plan)
+    plans = _plan_sources(state, wires)
+    pool_wires = [
+        plan.read_wire for plan in plans
+        if plan.read_wire is not None and _pool_eligible(plan.read_wire)
+    ]
+    # One lazily-fetched pool serves every eligible frozen range in plan order.
+    # The live current-prefix proof that gates current-file deletion still reads
+    # through the strict singleton reader, so no deletion is ever credited from
+    # prefetched bytes; each source advances only on its own HTTP 204 (the pool
+    # never acknowledges anything).
+    with _snapshot_pool(executor, state.lxc_id, pool_wires) as pool:
+        for plan in plans:
+            if state.stopped:
+                break
+            if not _prepare_live_input(executor, state, plan):
+                break
+            if plan.complete_for_current:
+                if plan.wire is not None:
+                    record = store.source(key, plan.source_id)
+                    if record is not None:
+                        state.add_covered(plan.wire, record)
+                continue
+            _import_source(executor, state, plan, pool=pool)
 
     if state.stopped and not state.failed:
         state.pending = True

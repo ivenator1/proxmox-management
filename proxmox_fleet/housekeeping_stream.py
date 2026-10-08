@@ -62,6 +62,21 @@ line_number=1, fragment_index=0, active_prefix=False, max_raw=16384)``
     reader shrinks a fragment's payload rather than drop log bytes, and raises
     :class:`FragmentEncodingError` only when the shared metadata alone cannot
     fit.
+
+``RemoteSnapshotPool(executor, lxc_id, file_wires, *, scratch_dir=None)``
+    Context-managed batcher for **frozen captured-blob** range reads only.  It
+    keeps the eligible read wires as metadata hints in import-plan order and,
+    on the first range it is asked for, fetches one bounded tar covering the
+    following hints that fit (at most :data:`MAX_POOL_RANGES` ranges,
+    :data:`MAX_FETCH_BYTES` raw bytes and the shared 64 KiB manifest bound).
+    That single tar is validated in full through the very same framing checks as
+    the singleton reader *before* any payload is handed out, then each range is
+    served straight from its ``extractfile`` member; nothing is extracted into
+    memory and only one tar is ever kept.  Live wires and any unpooled or missed
+    range fall back to the strict singleton :class:`RemoteLogReader` fetch.
+    Scratch (and the kept tar) is removed on close, including the error and
+    budget-stop paths.  Pooling changes no source coverage, checkpoint, HTTP
+    budget or retention policy; it never authorises an acknowledgement.
 """
 
 from __future__ import annotations
@@ -77,7 +92,7 @@ import tempfile
 import uuid
 import zlib
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Tuple, Type
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Type
 
 import zstandard
 
@@ -85,6 +100,7 @@ from proxmox_fleet.executor import Executor
 
 __all__ = [
     "MAX_FETCH_BYTES",
+    "MAX_POOL_RANGES",
     "MIN_SCRATCH_FREE",
     "MAX_ENTRY_BYTES",
     "MAX_RAW_FRAGMENT",
@@ -97,6 +113,7 @@ __all__ = [
     "FragmentEncodingError",
     "LogFragment",
     "RemoteLogReader",
+    "RemoteSnapshotPool",
     "DecodedLogReader",
     "iter_log_fragments",
     "encode_entry",
@@ -104,6 +121,8 @@ __all__ = [
 
 #: Largest raw byte budget requested from the node in one snapshot fetch.
 MAX_FETCH_BYTES = 32 * 1024 * 1024
+#: Largest number of frozen ranges batched into one pooled snapshot request.
+MAX_POOL_RANGES = 64
 #: Manager scratch must keep this much free before a bounded fetch.
 MIN_SCRATCH_FREE = 64 * 1024 * 1024
 #: Hard ceiling for one encoder-produced inner log entry.
@@ -117,6 +136,8 @@ RANGE_MEMBER = "ranges/000000.bin"
 _READ_CHUNK = 1024 * 1024
 _MANIFEST_LIMIT = 64 * 1024
 _TAR_OVERHEAD = 1024 * 1024
+#: Conservative slack for the node-added fields of one pooled manifest record.
+_POOL_RECORD_ALLOWANCE = 512
 _COMPRESSIONS = ("plain", "gzip", "zstd")
 #: gzip members keep the gzip header/trailer window (zlib wbits 16 + MAX_WBITS).
 _GZIP_WBITS = 16 + zlib.MAX_WBITS
@@ -236,6 +257,284 @@ def _absolute_safe_path(path: Any) -> bool:
     return ".." not in path.split("/")
 
 
+def _range_member(index: int) -> str:
+    """Canonical bounded-range member name for one tar position."""
+    return f"ranges/{index:06d}.bin"
+
+
+def _range_request(wire: Mapping[str, Any], offset: int, length: int) -> Dict[str, Any]:
+    """Build one exact node snapshot request spec from a read wire."""
+    request = dict(wire)
+    request["offset"] = offset
+    request["length"] = length
+    return request
+
+
+def _snapshot_request_key(request: Mapping[str, Any]) -> str:
+    """Bind cached bytes to the entire request, including source provenance."""
+    return json.dumps(request, sort_keys=True, separators=(",", ":"))
+
+
+def _resolve_scratch(scratch_dir: Optional[str]) -> "Tuple[str, bool]":
+    """Return ``(scratch_path, owned)``; ``owned`` dirs are removed on close."""
+    if scratch_dir is None:
+        return tempfile.mkdtemp(prefix="fleet-log-import-"), True
+    path = os.path.abspath(str(scratch_dir))
+    if not os.path.isdir(path):
+        raise StreamScratchError(
+            "scratch directory does not exist",
+            code="scratch",
+            detail={"scratch_dir": path},
+        )
+    return path, False
+
+
+def _check_scratch(path: str) -> None:
+    """Refuse a bounded fetch when manager scratch is below the reserve."""
+    try:
+        statvfs = os.statvfs(path)
+    except OSError as exc:
+        raise StreamScratchError(
+            "cannot inspect the scratch filesystem",
+            code="scratch",
+            detail={"scratch_dir": path, "reason": str(exc)},
+        ) from exc
+    free = statvfs.f_bavail * statvfs.f_frsize
+    if free < MIN_SCRATCH_FREE:
+        raise StreamScratchError(
+            "insufficient manager scratch space for a bounded fetch",
+            code="scratch",
+            detail={"scratch_dir": path, "free_bytes": free},
+        )
+
+
+def _safe_unlink(path: Optional[str]) -> None:
+    """Best-effort removal of a transient fetch artifact."""
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _validate_snapshot_members(
+    members: "list[tarfile.TarInfo]",
+    *,
+    label: Any,
+    requests: Sequence[Mapping[str, Any]],
+) -> None:
+    """Validate the exact member set, order, types and sizes of one tar.
+
+    Shared by the singleton reader and the pool so their framing can never
+    diverge: exactly ``manifest.json`` followed by one ``ranges/NNNNNN.bin`` per
+    request, regular files only, no links, traversal or duplicates.
+    """
+    names = [member.name for member in members]
+    if len(set(names)) != len(names):
+        raise RemoteSourceError(
+            "snapshot tar holds duplicate members",
+            code="unexpected_member",
+            detail={"path": label, "members": names},
+        )
+    for member in members:
+        if member.name.startswith("/") or ".." in member.name.split("/"):
+            raise RemoteSourceError(
+                "snapshot tar member escapes the archive root",
+                code="traversal",
+                detail={"path": label, "member": member.name},
+            )
+        if member.issym() or member.islnk():
+            raise RemoteSourceError(
+                "snapshot tar must not hold links",
+                code="symlink",
+                detail={"path": label, "member": member.name},
+            )
+        if not member.isreg():
+            raise RemoteSourceError(
+                "snapshot tar must hold regular file members only",
+                code="unsupported",
+                detail={"path": label, "member": member.name},
+            )
+    expected = [MANIFEST_MEMBER] + [_range_member(i) for i in range(len(requests))]
+    if set(names) != set(expected):
+        missing = set(expected) - set(names)
+        if missing:
+            raise RemoteSourceError(
+                "snapshot tar is missing expected members",
+                code="missing_member",
+                detail={"path": label, "missing": sorted(missing)},
+            )
+        raise RemoteSourceError(
+            "snapshot tar holds unexpected members",
+            code="unexpected_member",
+            detail={"path": label, "members": sorted(names)},
+        )
+    if names != expected:
+        raise RemoteSourceError(
+            "snapshot tar member order is not the documented order",
+            code="unexpected_member",
+            detail={"path": label, "members": names},
+        )
+    if members[0].size > _MANIFEST_LIMIT:
+        raise RemoteSourceError(
+            "snapshot manifest member is oversized",
+            code="oversized",
+            detail={"path": label, "size": members[0].size},
+        )
+    for index, request in enumerate(requests):
+        length = int(request["length"])
+        size = members[index + 1].size
+        if size > length:
+            raise RemoteSourceError(
+                "snapshot range member is oversized",
+                code="oversized",
+                detail={"path": label, "size": size, "length": length},
+            )
+        if size < length:
+            raise RemoteSourceError(
+                "snapshot range member is shorter than requested",
+                code="truncated",
+                detail={"path": label, "size": size, "length": length},
+            )
+
+
+def _read_manifest_member(tar: tarfile.TarFile, *, label: Any) -> bytes:
+    member = tar.getmember(MANIFEST_MEMBER)
+    extracted = tar.extractfile(member)
+    if extracted is None:
+        raise RemoteSourceError(
+            "snapshot manifest member is not readable",
+            code="missing_member",
+            detail={"path": label},
+        )
+    with extracted:
+        return extracted.read()
+
+
+def _validate_snapshot_manifest(
+    raw: bytes,
+    *,
+    label: Any,
+    requests: Sequence[Mapping[str, Any]],
+) -> "list[Dict[str, Any]]":
+    """Bind every manifest entry to its expected request identity and size."""
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RemoteSourceError(
+            "snapshot manifest is not valid JSON",
+            code="conflict",
+            detail={"path": label, "reason": str(exc)},
+        ) from exc
+    files = manifest.get("files") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(files, list)
+        or len(files) != len(requests)
+        or not all(isinstance(entry, dict) for entry in files)
+    ):
+        raise RemoteSourceError(
+            "snapshot manifest must describe exactly the requested ranges",
+            code="conflict",
+            detail={"path": label, "requested": len(requests)},
+        )
+    for index, request in enumerate(requests):
+        entry = files[index]
+        member = _range_member(index)
+        expected = {
+            "member": member,
+            "offset": request["offset"],
+            "length": request["length"],
+            "path": request.get("path"),
+        }
+        for key, value in expected.items():
+            if entry.get(key) != value:
+                raise RemoteSourceError(
+                    "snapshot manifest entry does not match the request",
+                    code="conflict",
+                    detail={"path": label, "key": key, "member": member},
+                )
+        if request.get("blob_path"):
+            checks = {
+                "source": "capture",
+                "capture_id": request.get("capture_id"),
+                "blob_path": request.get("blob_path"),
+            }
+        else:
+            checks = {
+                "source": "live",
+                "device": request.get("device"),
+                "inode": request.get("inode"),
+            }
+        for key, value in checks.items():
+            if entry.get(key) != value:
+                raise RemoteSourceError(
+                    "snapshot manifest identity does not match the wire",
+                    code="conflict",
+                    detail={"path": label, "key": key, "member": member},
+                )
+        source_size = entry.get("size")
+        if (
+            isinstance(source_size, bool)
+            or not isinstance(source_size, int)
+            or source_size < int(request["offset"]) + int(request["length"])
+        ):
+            raise RemoteSourceError(
+                "snapshot manifest source is shorter than the requested range",
+                code="truncated",
+                detail={"path": label, "member": member},
+            )
+    return files
+
+
+def _open_validated_snapshot(
+    destination: str,
+    *,
+    label: Any,
+    requests: Sequence[Mapping[str, Any]],
+) -> "Tuple[tarfile.TarFile, List[Dict[str, Any]]]":
+    """Open one bounded snapshot tar and validate it *before* any payload use.
+
+    The whole member set, order, per-range length and every manifest binding is
+    checked once here; pooled and singleton fetches share this single
+    implementation.  The caller owns the returned :class:`tarfile.TarFile` and
+    must close it.
+    """
+    expected_bytes = sum(int(request["length"]) for request in requests)
+    if not os.path.isfile(destination):
+        raise RemoteSourceError(
+            "snapshot fetch did not produce the expected tar",
+            code="transport",
+            detail={"path": label},
+        )
+    if os.path.getsize(destination) > expected_bytes + _TAR_OVERHEAD:
+        raise RemoteSourceError(
+            "snapshot tar is larger than the bounded request",
+            code="oversized",
+            detail={"path": label},
+        )
+    try:
+        tar = tarfile.open(destination, "r:")
+    except (OSError, tarfile.TarError) as exc:
+        raise RemoteSourceError(
+            "snapshot tar is unreadable",
+            code="conflict",
+            detail={"path": label, "reason": str(exc)},
+        ) from exc
+    try:
+        members = tar.getmembers()
+        _validate_snapshot_members(members, label=label, requests=requests)
+        raw = _read_manifest_member(tar, label=label)
+        entries = _validate_snapshot_manifest(raw, label=label, requests=requests)
+    except BaseException:
+        try:
+            tar.close()
+        except (OSError, tarfile.TarError):
+            pass
+        raise
+    return tar, entries
+
+
 class RemoteLogReader(io.RawIOBase):
     """Bounded raw byte stream for one guest log source (see module docstring)."""
 
@@ -246,6 +545,7 @@ class RemoteLogReader(io.RawIOBase):
         file_wire: Mapping[str, Any],
         *,
         scratch_dir: Optional[str] = None,
+        pool: "Optional[RemoteSnapshotPool]" = None,
     ) -> None:
         super().__init__()
         # Cleanup state is initialised first so a construction failure cannot
@@ -262,7 +562,8 @@ class RemoteLogReader(io.RawIOBase):
         self._executor = executor
         self._lxc_id = str(lxc_id)
         self._wire: Dict[str, Any] = dict(file_wire)
-        self._scratch, self._owned_scratch = self._resolve_scratch(scratch_dir)
+        self._pool = pool
+        self._scratch, self._owned_scratch = _resolve_scratch(scratch_dir)
 
         compression = self._wire.get("compression")
         if compression not in _COMPRESSIONS:
@@ -314,18 +615,6 @@ class RemoteLogReader(io.RawIOBase):
         self._at_eof = False
 
     # -- construction helpers ------------------------------------------------ #
-
-    def _resolve_scratch(self, scratch_dir: Optional[str]) -> "tuple[str, bool]":
-        if scratch_dir is None:
-            return tempfile.mkdtemp(prefix="fleet-log-import-"), True
-        path = os.path.abspath(str(scratch_dir))
-        if not os.path.isdir(path):
-            raise StreamScratchError(
-                "scratch directory does not exist",
-                code="scratch",
-                detail={"scratch_dir": path},
-            )
-        return path, False
 
     def _validate_live_wire(self) -> None:
         _required_int(self._wire, "device")
@@ -399,29 +688,6 @@ class RemoteLogReader(io.RawIOBase):
 
     # -- fetching ------------------------------------------------------------ #
 
-    def _check_scratch(self) -> None:
-        try:
-            statvfs = os.statvfs(self._scratch)
-        except OSError as exc:
-            raise StreamScratchError(
-                "cannot inspect the scratch filesystem",
-                code="scratch",
-                detail={"scratch_dir": self._scratch, "reason": str(exc)},
-            ) from exc
-        free = statvfs.f_bavail * statvfs.f_frsize
-        if free < MIN_SCRATCH_FREE:
-            raise StreamScratchError(
-                "insufficient manager scratch space for a bounded fetch",
-                code="scratch",
-                detail={"scratch_dir": self._scratch, "free_bytes": free},
-            )
-
-    def _safe_unlink(self, path: str) -> None:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-
     def _finish_fetch(self) -> None:
         member, tar, dest = self._member, self._tar, self._dest
         self._member = None
@@ -439,7 +705,7 @@ class RemoteLogReader(io.RawIOBase):
             except (OSError, tarfile.TarError):
                 pass
         if dest is not None:
-            self._safe_unlink(dest)
+            _safe_unlink(dest)
 
     def _open_fetch(self) -> None:
         self._finish_fetch()
@@ -449,16 +715,26 @@ class RemoteLogReader(io.RawIOBase):
             return
         current = self._offset + self._delivered
         size = min(MAX_FETCH_BYTES, remaining)
-        self._check_scratch()
+        if self._pool is not None and self._blob:
+            pooled = self._pool.take(self._wire, offset=current, length=size)
+            if pooled is not None:
+                # The pooled member is bounded to exactly ``size`` bytes and
+                # validated as part of the whole batch; no local tar is kept.
+                self._member = pooled
+                self._fetch_remaining = size
+                return
+        self._fetch_singleton(current, size)
+
+    def _fetch_singleton(self, current: int, size: int) -> None:
+        """Strict single-range fetch used for live and unpooled sources."""
+        _check_scratch(self._scratch)
         destination = os.path.join(self._scratch, f"fleet-log-{uuid.uuid4().hex}.tar")
-        request = dict(self._wire)
-        request["offset"] = current
-        request["length"] = size
+        request = _range_request(self._wire, current, size)
         result = self._executor.housekeeping_snapshot(
             self._lxc_id, files=[request], destination=destination
         )
         if result is None or not result.ok:
-            self._safe_unlink(destination)
+            _safe_unlink(destination)
             raise RemoteSourceError(
                 "housekeeping snapshot transport failed",
                 code="transport",
@@ -469,206 +745,23 @@ class RemoteLogReader(io.RawIOBase):
                 },
             )
         try:
-            tar, member = self._open_tar(destination, request, size)
-        except BaseException:
-            self._safe_unlink(destination)
-            raise
-        self._tar = tar
-        self._member = member
-        self._dest = destination
-        self._fetch_remaining = size
-
-    def _open_tar(
-        self, destination: str, request: Mapping[str, Any], expected_length: int
-    ) -> "tuple[tarfile.TarFile, Any]":
-        if not os.path.isfile(destination):
-            raise RemoteSourceError(
-                "snapshot fetch did not produce the expected tar",
-                code="transport",
-                detail={"path": self._wire.get("path")},
+            tar, _entries = _open_validated_snapshot(
+                destination, label=self._wire.get("path"), requests=[request]
             )
-        if os.path.getsize(destination) > expected_length + _TAR_OVERHEAD:
-            raise RemoteSourceError(
-                "snapshot tar is larger than the bounded request",
-                code="oversized",
-                detail={"path": self._wire.get("path")},
-            )
-        try:
-            tar = tarfile.open(destination, "r:")
-        except (OSError, tarfile.TarError) as exc:
-            raise RemoteSourceError(
-                "snapshot tar is unreadable",
-                code="conflict",
-                detail={"path": self._wire.get("path"), "reason": str(exc)},
-            ) from exc
-        try:
-            members = tar.getmembers()
-            self._validate_members(members, request, expected_length)
-            manifest_member = tar.getmember(MANIFEST_MEMBER)
-            extracted = tar.extractfile(manifest_member)
-            if extracted is None:
-                raise RemoteSourceError(
-                    "snapshot manifest member is not readable",
-                    code="missing_member",
-                    detail={"path": self._wire.get("path")},
-                )
-            with extracted:
-                raw = extracted.read()
-            self._validate_manifest(raw, request, expected_length)
-            range_member = tar.getmember(RANGE_MEMBER)
-            member_file = tar.extractfile(range_member)
-            if member_file is None:
+            member = tar.extractfile(RANGE_MEMBER)
+            if member is None:
                 raise RemoteSourceError(
                     "snapshot range member is not readable",
                     code="missing_member",
                     detail={"path": self._wire.get("path")},
                 )
         except BaseException:
-            try:
-                tar.close()
-            except (OSError, tarfile.TarError):
-                pass
+            _safe_unlink(destination)
             raise
-        return tar, member_file
-
-    def _validate_members(
-        self,
-        members: "list[tarfile.TarInfo]",
-        request: Mapping[str, Any],
-        expected_length: int,
-    ) -> None:
-        names = [member.name for member in members]
-        for member in members:
-            if member.name.startswith("/") or ".." in member.name.split("/"):
-                raise RemoteSourceError(
-                    "snapshot tar member escapes the archive root",
-                    code="traversal",
-                    detail={"path": self._wire.get("path"), "member": member.name},
-                )
-            if member.issym() or member.islnk():
-                raise RemoteSourceError(
-                    "snapshot tar must not hold links",
-                    code="symlink",
-                    detail={"path": self._wire.get("path"), "member": member.name},
-                )
-            if not member.isreg():
-                raise RemoteSourceError(
-                    "snapshot tar must hold regular file members only",
-                    code="unsupported",
-                    detail={"path": self._wire.get("path"), "member": member.name},
-                )
-        if len(members) != 2 or set(names) != {MANIFEST_MEMBER, RANGE_MEMBER}:
-            missing = {MANIFEST_MEMBER, RANGE_MEMBER} - set(names)
-            if missing:
-                raise RemoteSourceError(
-                    "snapshot tar is missing expected members",
-                    code="missing_member",
-                    detail={"path": self._wire.get("path"), "missing": sorted(missing)},
-                )
-            raise RemoteSourceError(
-                "snapshot tar holds unexpected members",
-                code="unexpected_member",
-                detail={"path": self._wire.get("path"), "members": sorted(names)},
-            )
-        if names[0] != MANIFEST_MEMBER:
-            raise RemoteSourceError(
-                "snapshot tar member order is not the documented order",
-                code="unexpected_member",
-                detail={"path": self._wire.get("path"), "members": names},
-            )
-        manifest_member = members[0]
-        if manifest_member.size > _MANIFEST_LIMIT:
-            raise RemoteSourceError(
-                "snapshot manifest member is oversized",
-                code="oversized",
-                detail={"path": self._wire.get("path"), "size": manifest_member.size},
-            )
-        range_member = members[1]
-        if range_member.size > expected_length:
-            raise RemoteSourceError(
-                "snapshot range member is oversized",
-                code="oversized",
-                detail={
-                    "path": self._wire.get("path"),
-                    "size": range_member.size,
-                    "length": expected_length,
-                },
-            )
-        if range_member.size < expected_length:
-            raise RemoteSourceError(
-                "snapshot range member is shorter than requested",
-                code="truncated",
-                detail={
-                    "path": self._wire.get("path"),
-                    "size": range_member.size,
-                    "length": expected_length,
-                },
-            )
-
-    def _validate_manifest(
-        self, raw: bytes, request: Mapping[str, Any], expected_length: int
-    ) -> None:
-        try:
-            manifest = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RemoteSourceError(
-                "snapshot manifest is not valid JSON",
-                code="conflict",
-                detail={"path": self._wire.get("path"), "reason": str(exc)},
-            ) from exc
-        files = manifest.get("files") if isinstance(manifest, dict) else None
-        if not isinstance(files, list) or len(files) != 1 or not isinstance(files[0], dict):
-            raise RemoteSourceError(
-                "snapshot manifest must describe exactly one range",
-                code="conflict",
-                detail={"path": self._wire.get("path")},
-            )
-        entry = files[0]
-        expected = {
-            "member": RANGE_MEMBER,
-            "offset": request["offset"],
-            "length": expected_length,
-            "path": self._wire.get("path"),
-        }
-        for key, value in expected.items():
-            if entry.get(key) != value:
-                raise RemoteSourceError(
-                    "snapshot manifest entry does not match the request",
-                    code="conflict",
-                    detail={"path": self._wire.get("path"), "key": key},
-                )
-        if self._blob:
-            checks = {
-                "source": "capture",
-                "capture_id": self._wire.get("capture_id"),
-                "blob_path": self._wire.get("blob_path"),
-            }
-        else:
-            checks = {
-                "source": "live",
-                "device": self._wire.get("device"),
-                "inode": self._wire.get("inode"),
-            }
-        for key, value in checks.items():
-            if entry.get(key) != value:
-                raise RemoteSourceError(
-                    "snapshot manifest identity does not match the wire",
-                    code="conflict",
-                    detail={"path": self._wire.get("path"), "key": key},
-                )
-        # For captured blobs the manifest reports the node blob's identity, not
-        # the original source inode; only the blob's own length may be compared.
-        blob_size = entry.get("size")
-        if (
-            isinstance(blob_size, bool)
-            or not isinstance(blob_size, int)
-            or blob_size < request["offset"] + expected_length
-        ):
-            raise RemoteSourceError(
-                "snapshot manifest source is shorter than the requested range",
-                code="truncated",
-                detail={"path": self._wire.get("path")},
-            )
+        self._tar = tar
+        self._member = member
+        self._dest = destination
+        self._fetch_remaining = size
 
     # -- BinaryIO surface ---------------------------------------------------- #
 
@@ -754,6 +847,256 @@ class RemoteLogReader(io.RawIOBase):
             if self._owned_scratch:
                 shutil.rmtree(self._scratch, ignore_errors=True)
             super().close()
+
+
+@dataclass(frozen=True)
+class _PoolHint:
+    """One eligible frozen range kept in import-plan order."""
+
+    key: str
+    wire: Dict[str, Any]
+    offset: int
+    length: int
+    estimate: int
+
+
+def _pool_hint(wire: Mapping[str, Any]) -> Optional[_PoolHint]:
+    """Build a pool hint from a read wire, or ``None`` when it is not poolable.
+
+    Only frozen captured-blob wires are poolable; live wires and malformed
+    ranges are ignored and fall back to the strict singleton reader.
+    """
+    blob_path = wire.get("blob_path")
+    capture_id = wire.get("capture_id")
+    if not isinstance(blob_path, str) or not blob_path:
+        return None
+    if not isinstance(capture_id, str) or not capture_id:
+        return None
+    offset = wire.get("offset")
+    length = wire.get("length")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return None
+    if isinstance(length, bool) or not isinstance(length, int) or length <= 0:
+        return None
+    window = min(length, MAX_FETCH_BYTES)
+    spec_wire = dict(wire)
+    request = _range_request(spec_wire, offset, window)
+    key = _snapshot_request_key(request)
+    return _PoolHint(
+        key=key,
+        wire=spec_wire,
+        offset=offset,
+        length=window,
+        estimate=len(key) + _POOL_RECORD_ALLOWANCE,
+    )
+
+
+class _PooledRange:
+    """Read-only cursor over one pooled range member owned by the pool."""
+
+    def __init__(self, member: Any, release: Callable[[], None]) -> None:
+        self._member = member
+        self._release = release
+        self._closed = False
+
+    def read(self, size: int = -1) -> bytes:
+        if self._closed:
+            raise ValueError("I/O operation on closed pooled range")
+        return self._member.read(size)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._member.close()
+        finally:
+            self._release()
+
+
+class RemoteSnapshotPool:
+    """Batch many frozen captured-blob range reads into one validated tar.
+
+    See the module docstring for the contract.  The pool keeps **exactly one**
+    bounded tar at a time; requests are served directly from its
+    ``extractfile`` members so no payload is copied into memory.  A batch is
+    fetched lazily on the first range it must serve, covering the eligible
+    metadata hints that follow in import-plan order within the 64-range,
+    :data:`MAX_FETCH_BYTES` and 64 KiB manifest bounds.  Anything the pool
+    cannot serve (live wires, out-of-plan ranges, later windows of an oversized
+    blob, or a range requested while another pooled handle is open) returns
+    ``None`` so the caller uses the strict singleton fetch instead.
+    """
+
+    def __init__(
+        self,
+        executor: Executor,
+        lxc_id: str,
+        file_wires: Sequence[Mapping[str, Any]],
+        *,
+        scratch_dir: Optional[str] = None,
+    ) -> None:
+        self._executor = executor
+        self._lxc_id = str(lxc_id)
+        self._closed = False
+        self._tar: Optional[tarfile.TarFile] = None
+        self._dest: Optional[str] = None
+        self._served: Dict[str, str] = {}
+        self._handles = 0
+        self._batches = 0
+        self._ranges = 0
+        self._bytes = 0
+        hints: "list[_PoolHint]" = []
+        order: Dict[str, int] = {}
+        for wire in file_wires:
+            hint = _pool_hint(wire)
+            if hint is None or hint.key in order:
+                continue
+            order[hint.key] = len(hints)
+            hints.append(hint)
+        self._hints = hints
+        self._order = order
+        self._cursor = 0
+        self._scratch, self._owned_scratch = _resolve_scratch(scratch_dir)
+
+    # -- context management -------------------------------------------------- #
+
+    def __enter__(self) -> "RemoteSnapshotPool":
+        if self._closed:
+            raise HousekeepingStreamError("snapshot pool is closed", code="unsupported")
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Drop any kept tar and remove owned scratch, whatever happened."""
+        if self._closed:
+            return
+        self._closed = True
+        self._drop_tar()
+        if self._owned_scratch:
+            shutil.rmtree(self._scratch, ignore_errors=True)
+
+    # -- statistics ---------------------------------------------------------- #
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "hints": len(self._hints),
+            "batches": self._batches,
+            "ranges": self._ranges,
+            "raw_bytes": self._bytes,
+        }
+
+    # -- serving ------------------------------------------------------------- #
+
+    def take(
+        self, wire: Mapping[str, Any], *, offset: int, length: int
+    ) -> "Optional[_PooledRange]":
+        """Return a bounded reader for one pooled range, or ``None`` on a miss."""
+        if self._closed:
+            raise HousekeepingStreamError("snapshot pool is closed", code="unsupported")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            return None
+        if isinstance(length, bool) or not isinstance(length, int) or length <= 0:
+            return None
+        key = _snapshot_request_key(_range_request(wire, offset, length))
+        name = self._served.get(key)
+        if name is not None:
+            return self._serve(key, name)
+        index = self._order.get(key)
+        if index is None or index < self._cursor or self._handles:
+            return None
+        self._load_batch(index)
+        name = self._served.get(key)
+        if name is None:
+            return None
+        return self._serve(key, name)
+
+    def _serve(self, key: str, name: str) -> Optional[_PooledRange]:
+        tar = self._tar
+        if tar is None:
+            return None
+        member = tar.extractfile(name)
+        if member is None:
+            raise RemoteSourceError(
+                "pooled snapshot range is not readable",
+                code="missing_member",
+                detail={"member": name},
+            )
+        del self._served[key]
+        self._handles += 1
+        return _PooledRange(member, self._release)
+
+    def _release(self) -> None:
+        if self._handles > 0:
+            self._handles -= 1
+
+    # -- fetching ------------------------------------------------------------ #
+
+    def _drop_tar(self) -> None:
+        tar, dest = self._tar, self._dest
+        self._tar = None
+        self._dest = None
+        self._served = {}
+        if tar is not None:
+            try:
+                tar.close()
+            except (OSError, tarfile.TarError):
+                pass
+        _safe_unlink(dest)
+
+    def _load_batch(self, start_index: int) -> None:
+        """Fetch and validate one bounded tar covering hints from *start_index*."""
+        hints: "list[_PoolHint]" = []
+        total = 0
+        estimate = 0
+        index = start_index
+        while index < len(self._hints):
+            hint = self._hints[index]
+            if len(hints) >= MAX_POOL_RANGES:
+                break
+            if hints and total + hint.length > MAX_FETCH_BYTES:
+                break
+            if hints and estimate + hint.estimate > _MANIFEST_LIMIT:
+                break
+            hints.append(hint)
+            total += hint.length
+            estimate += hint.estimate
+            index += 1
+        self._cursor = index
+        if not hints:
+            return
+        self._drop_tar()
+        _check_scratch(self._scratch)
+        destination = os.path.join(
+            self._scratch, f"fleet-log-pool-{uuid.uuid4().hex}.tar"
+        )
+        requests = [_range_request(h.wire, h.offset, h.length) for h in hints]
+        result = self._executor.housekeeping_snapshot(
+            self._lxc_id, files=requests, destination=destination
+        )
+        if result is None or not result.ok:
+            _safe_unlink(destination)
+            raise RemoteSourceError(
+                "housekeeping snapshot transport failed",
+                code="transport",
+                detail={"lxc_id": self._lxc_id, "ranges": len(hints)},
+            )
+        try:
+            tar, _entries = _open_validated_snapshot(
+                destination, label=f"pool:{self._lxc_id}", requests=requests
+            )
+        except BaseException:
+            _safe_unlink(destination)
+            raise
+        self._tar = tar
+        self._dest = destination
+        self._served = {hint.key: _range_member(i) for i, hint in enumerate(hints)}
+        self._batches += 1
+        self._ranges += len(hints)
+        self._bytes += total
 
 
 class DecodedLogReader:

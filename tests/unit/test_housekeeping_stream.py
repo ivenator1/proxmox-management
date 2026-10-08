@@ -509,6 +509,415 @@ def test_remote_reader_blob_wire_validation(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# RemoteSnapshotPool: batched frozen reads share the strict framing checks
+# --------------------------------------------------------------------------- #
+
+
+class _NodeExecutor:
+    """Node transport backed by the real housekeeping_io helper on temp paths."""
+
+    def __init__(self, guest: Path, spool: Path, *, offline_after_first: bool = False) -> None:
+        self.guest = str(guest)
+        self.spool = str(spool)
+        self.calls: "list[dict]" = []
+        self.offline = False
+        self._offline_after_first = offline_after_first
+
+    def housekeeping_snapshot(self, lxc_id, *, files, destination: str) -> PrimitiveResult:
+        self.calls.append(
+            {
+                "lxc_id": lxc_id,
+                "files": [dict(entry) for entry in files],
+                "destination": destination,
+            }
+        )
+        if self.offline:
+            return PrimitiveResult(rc=1, failed=True, stderr="node transport offline")
+        try:
+            facts = hio.snapshot(
+                {"files": files},
+                destination=destination,
+                sysroot=self.guest,
+                spool_root=self.spool,
+            )
+        except hio.HelperError as exc:
+            return PrimitiveResult(rc=1, failed=True, stderr=str(exc))
+        if self._offline_after_first:
+            self.offline = True
+        return PrimitiveResult(rc=0, changed=True, facts=facts)
+
+
+class _WriterExecutor:
+    """Node transport whose tar is produced by a test-supplied writer."""
+
+    def __init__(self, writer) -> None:
+        self.writer = writer
+        self.calls: "list[list[dict]]" = []
+
+    def housekeeping_snapshot(self, lxc_id, *, files, destination: str) -> PrimitiveResult:
+        self.calls.append([dict(entry) for entry in files])
+        self.writer(destination, [dict(entry) for entry in files])
+        return PrimitiveResult(rc=0)
+
+
+def _scratch_dir(tmp_path: Path) -> Path:
+    scratch = tmp_path / "pool-scratch"
+    scratch.mkdir()
+    return scratch
+
+
+def _blob_name(index: int) -> str:
+    return hashlib.sha256(f"pool-blob-{index}".encode()).hexdigest() + ".blob"
+
+
+def _blob_read_wire(path: str, st: os.stat_result, entry: dict) -> dict:
+    return {
+        "path": path,
+        "device": int(st.st_dev),
+        "inode": int(st.st_ino),
+        "size": int(entry["size"]),
+        "mtime_ns": int(st.st_mtime_ns),
+        "allocated_bytes": int(st.st_blocks * 512),
+        "compression": entry.get("compression", "plain"),
+        "profile": entry.get("profile", "npm"),
+        "log_kind": entry.get("log_kind", "application"),
+        "is_active": False,
+        "capture_id": CAPTURE_ID,
+        "blob_path": entry["blob_path"],
+        "sha256": entry["sha256"],
+        "offset": 0,
+        "length": int(entry["size"]),
+    }
+
+
+def _freeze_many(guest: Path, spool: Path, payloads: "dict[str, bytes]") -> "dict[str, dict]":
+    """Freeze every payload under one capture and return blob read wires."""
+    requests = []
+    stats = {}
+    for index, (path, payload) in enumerate(payloads.items()):
+        target = _write(guest, path, payload)
+        st = target.stat()
+        wire = _live_wire(path, st)
+        wire.update(
+            capture_id=CAPTURE_ID,
+            blob_path=f"{spool}/{CAPTURE_ID}/{_blob_name(index)}",
+        )
+        requests.append(wire)
+        stats[path] = st
+    facts = hio.capture(
+        {"capture_id": CAPTURE_ID, "files": requests},
+        sysroot=str(guest),
+        spool_root=str(spool),
+    )
+    entries = {entry["path"]: entry for entry in facts["files"]}
+    return {
+        path: _blob_read_wire(path, stats[path], entries[path]) for path in payloads
+    }
+
+
+def _read_through_pool(pool, executor, wires, payloads, *, lxc_id="123", scratch=None):
+    for path, payload in payloads.items():
+        with hs.RemoteLogReader(
+            executor, lxc_id, wires[path], scratch_dir=scratch, pool=pool
+        ) as raw:
+            assert raw.read() == payload
+            assert raw.sha256 == hashlib.sha256(payload).hexdigest()
+            assert raw.finalized is True
+
+
+def _pool_manifest(requests, over=None) -> dict:
+    entries = []
+    for index, request in enumerate(requests):
+        entry = dict(request)
+        entry["member"] = f"ranges/{index:06d}.bin"
+        entry["source"] = "capture" if request.get("blob_path") else "live"
+        entry["offset"] = int(request["offset"])
+        entry["length"] = int(request["length"])
+        entries.append(entry)
+    if over is not None:
+        over(entries)
+    return {"files": entries}
+
+
+def _pool_corruption(kind: str):
+    def writer(destination, requests):
+        doc = _pool_manifest(requests)
+        specs = [
+            {
+                "name": MANIFEST,
+                "data": json.dumps(doc, separators=(",", ":")).encode("utf-8"),
+            }
+        ]
+        for index, request in enumerate(requests):
+            size = int(request["length"])
+            if kind == "later_truncated" and index == len(requests) - 1:
+                size = max(size - 1, 0)
+            specs.append({"name": f"ranges/{index:06d}.bin", "data": b"\x00" * size})
+        if kind == "later_duplicate":
+            specs.append({"name": f"ranges/{len(requests) - 1:06d}.bin", "data": b"x"})
+        _tar_write(destination, specs)
+
+    return writer
+
+
+def _valid_writer(fill: bytes = b"X"):
+    """Emit a structurally valid batched tar with substitute range bytes."""
+
+    def writer(destination, requests):
+        doc = _pool_manifest(requests)
+        specs = [
+            {
+                "name": MANIFEST,
+                "data": json.dumps(doc, separators=(",", ":")).encode("utf-8"),
+            }
+        ]
+        for index, request in enumerate(requests):
+            specs.append(
+                {
+                    "name": f"ranges/{index:06d}.bin",
+                    "data": fill * int(request["length"]),
+                }
+            )
+        _tar_write(destination, specs)
+
+    return writer
+
+
+def _over_writer(over):
+    def writer(destination, requests):
+        doc = _pool_manifest(requests, over=over)
+        specs = [
+            {
+                "name": MANIFEST,
+                "data": json.dumps(doc, separators=(",", ":")).encode("utf-8"),
+            }
+        ]
+        for index, request in enumerate(requests):
+            specs.append(
+                {
+                    "name": f"ranges/{index:06d}.bin",
+                    "data": b"\x00" * int(request["length"]),
+                }
+            )
+        _tar_write(destination, specs)
+
+    return writer
+
+
+def test_pool_serves_distinct_frozen_contents_after_transport_offline(tmp_path: Path) -> None:
+    guest = tmp_path / "guest"
+    spool = tmp_path / "spool"
+    payloads = {
+        f"/data/logs/frozen-{index}.log.1": f"batch-content-{index}\n".encode()
+        for index in range(4)
+    }
+    wires = _freeze_many(guest, spool, payloads)
+    executor = _NodeExecutor(guest, spool, offline_after_first=True)
+    scratch = _scratch_dir(tmp_path)
+    with hs.RemoteSnapshotPool(
+        executor, "123", list(wires.values()), scratch_dir=str(scratch)
+    ) as pool:
+        _read_through_pool(pool, executor, wires, payloads, scratch=str(scratch))
+    # The first range triggered one batched fetch; every later range was served
+    # from the kept tar, so the (now offline) transport was never called again.
+    assert executor.offline is True
+    assert list(scratch.iterdir()) == []
+
+
+def test_pool_never_relabels_prefetched_bytes_as_an_unplanned_source(tmp_path: Path) -> None:
+    guest, spool = tmp_path / "guest", tmp_path / "spool"
+    payloads = {
+        "/data/logs/planned-a.log.1": b"source-a\n",
+        "/data/logs/planned-b.log.1": b"source-b\n",
+    }
+    wires = _freeze_many(guest, spool, payloads)
+    executor = _NodeExecutor(guest, spool, offline_after_first=True)
+    with hs.RemoteSnapshotPool(executor, "123", list(wires.values())) as pool:
+        with hs.RemoteLogReader(executor, "123", wires["/data/logs/planned-a.log.1"], pool=pool) as raw:
+            assert raw.read() == b"source-a\n"
+        renamed = dict(wires["/data/logs/planned-b.log.1"], path="/data/logs/unplanned.log.1")
+        with hs.RemoteLogReader(executor, "123", renamed, pool=pool) as raw:
+            with pytest.raises(hs.RemoteSourceError) as error:
+                raw.read()
+        assert error.value.code == "transport"
+        with hs.RemoteLogReader(executor, "123", wires["/data/logs/planned-b.log.1"], pool=pool) as raw:
+            assert raw.read() == b"source-b\n"
+
+
+def test_pool_ignores_live_wire_and_keeps_singleton_behavior(tmp_path: Path) -> None:
+    guest = tmp_path / "guest"
+    spool = tmp_path / "spool"
+    payload = b"live-singleton-bytes\n"
+    log = _write(guest, LIVE_PATH, payload)
+    wire = _live_wire(LIVE_PATH, log.stat())
+    executor = _NodeExecutor(guest, spool)
+    scratch = _scratch_dir(tmp_path)
+    with hs.RemoteSnapshotPool(
+        executor, "123", [wire], scratch_dir=str(scratch)
+    ) as pool:
+        with hs.RemoteLogReader(
+            executor, "123", wire, scratch_dir=str(scratch), pool=pool
+        ) as raw:
+            assert raw.read() == payload
+            assert raw.sha256 == hashlib.sha256(payload).hexdigest()
+    assert list(scratch.iterdir()) == []
+
+
+def test_pool_batches_many_frozen_ranges_within_bounds(tmp_path: Path) -> None:
+    guest = tmp_path / "guest"
+    spool = tmp_path / "spool"
+    payloads = {
+        f"/data/logs/many-{index:03d}.log.1": f"range-{index:03d}\n".encode()
+        for index in range(70)
+    }
+    wires = _freeze_many(guest, spool, payloads)
+    executor = _NodeExecutor(guest, spool)
+    scratch = _scratch_dir(tmp_path)
+    with hs.RemoteSnapshotPool(
+        executor, "123", list(wires.values()), scratch_dir=str(scratch)
+    ) as pool:
+        _read_through_pool(pool, executor, wires, payloads, scratch=str(scratch))
+    for call in executor.calls:
+        assert len(call["files"]) <= hs.MAX_POOL_RANGES
+        assert sum(int(entry["length"]) for entry in call["files"]) <= hs.MAX_FETCH_BYTES
+    assert list(scratch.iterdir()) == []
+
+
+def test_pool_splits_batches_at_the_raw_byte_bound(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(hs, "MAX_FETCH_BYTES", 1 << 20)
+    guest = tmp_path / "guest"
+    spool = tmp_path / "spool"
+    payloads = {
+        f"/data/logs/big-{index}.log.1": bytes([0x40 + index]) * (1 << 20)
+        for index in range(3)
+    }
+    wires = _freeze_many(guest, spool, payloads)
+    executor = _NodeExecutor(guest, spool)
+    scratch = _scratch_dir(tmp_path)
+    with hs.RemoteSnapshotPool(
+        executor, "123", list(wires.values()), scratch_dir=str(scratch)
+    ) as pool:
+        _read_through_pool(pool, executor, wires, payloads, scratch=str(scratch))
+    for call in executor.calls:
+        assert sum(int(entry["length"]) for entry in call["files"]) <= hs.MAX_FETCH_BYTES
+    assert list(scratch.iterdir()) == []
+
+
+def test_pool_later_window_of_oversized_blob_falls_back_to_singleton(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(hs, "MAX_FETCH_BYTES", 8)
+    guest = tmp_path / "guest"
+    spool = tmp_path / "spool"
+    payloads = {"/data/logs/oversized.log.1": bytes(range(20))}
+    wires = _freeze_many(guest, spool, payloads)
+    executor = _NodeExecutor(guest, spool)
+    scratch = _scratch_dir(tmp_path)
+    with hs.RemoteSnapshotPool(
+        executor, "123", list(wires.values()), scratch_dir=str(scratch)
+    ) as pool:
+        _read_through_pool(pool, executor, wires, payloads, scratch=str(scratch))
+    assert list(scratch.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "over", "code"),
+    [
+        ("later_truncated", None, "truncated"),
+        (
+            "later_offset",
+            lambda entries: entries[1].__setitem__("offset", entries[1]["offset"] + 1),
+            "conflict",
+        ),
+        (
+            "later_identity",
+            lambda entries: entries[1].__setitem__("capture_id", "f" * 96),
+            "conflict",
+        ),
+        ("later_duplicate", None, "unexpected_member"),
+    ],
+)
+def test_pool_rejects_bad_later_member_before_any_payload(
+    tmp_path: Path, kind: str, over, code: str
+) -> None:
+    guest = tmp_path / "guest"
+    spool = tmp_path / "spool"
+    payloads = {
+        f"/data/logs/guarded-{index}.log.1": f"guarded-{index}\n".encode()
+        for index in range(3)
+    }
+    wires = _freeze_many(guest, spool, payloads)
+    first = next(iter(payloads))
+    writer = _over_writer(over) if over is not None else _pool_corruption(kind)
+    executor = _WriterExecutor(writer)
+    scratch = _scratch_dir(tmp_path)
+    with hs.RemoteSnapshotPool(
+        executor, "123", list(wires.values()), scratch_dir=str(scratch)
+    ) as pool:
+        with pytest.raises(hs.RemoteSourceError) as excinfo:
+            pool.take(wires[first], offset=0, length=len(payloads[first]))
+        assert excinfo.value.code == code
+    assert list(scratch.iterdir()) == []
+
+
+def test_pooled_reader_still_enforces_the_source_digest(tmp_path: Path) -> None:
+    guest = tmp_path / "guest"
+    spool = tmp_path / "spool"
+    payloads = {"/data/logs/hash-guard.log.1": b"tampered-digest-guard\n"}
+    wires = _freeze_many(guest, spool, payloads)
+    path = next(iter(payloads))
+    executor = _WriterExecutor(_valid_writer(b"X"))
+    scratch = _scratch_dir(tmp_path)
+    with hs.RemoteSnapshotPool(
+        executor, "123", [wires[path]], scratch_dir=str(scratch)
+    ) as pool:
+        with hs.RemoteLogReader(
+            executor, "123", wires[path], scratch_dir=str(scratch), pool=pool
+        ) as raw:
+            with pytest.raises(hs.RemoteSourceError) as excinfo:
+                raw.read()
+        assert excinfo.value.code == "conflict"
+    assert list(scratch.iterdir()) == []
+
+
+def test_pool_cleans_scratch_on_close_and_budget_stop(tmp_path: Path) -> None:
+    guest = tmp_path / "guest"
+    spool = tmp_path / "spool"
+    payloads = {"/data/logs/stop.log.1": b"unconsumed-batch-bytes\n"}
+    wires = _freeze_many(guest, spool, payloads)
+    path = next(iter(payloads))
+    executor = _NodeExecutor(guest, spool)
+    scratch = _scratch_dir(tmp_path)
+    with hs.RemoteSnapshotPool(
+        executor, "123", [wires[path]], scratch_dir=str(scratch)
+    ) as pool:
+        handle = pool.take(wires[path], offset=0, length=len(payloads[path]))
+        assert handle is not None  # fetched, then abandoned on the stop
+    assert list(scratch.iterdir()) == []
+
+
+def test_pool_owns_and_removes_its_scratch(tmp_path: Path) -> None:
+    guest = tmp_path / "guest"
+    spool = tmp_path / "spool"
+    payloads = {"/data/logs/owned.log.1": b"owned-scratch\n"}
+    wires = _freeze_many(guest, spool, payloads)
+    executor = _NodeExecutor(guest, spool)
+    pool = hs.RemoteSnapshotPool(executor, "123", list(wires.values()))
+    scratch = pool._scratch
+    assert os.path.isdir(scratch)
+    with pool:
+        _read_through_pool(pool, executor, wires, payloads)
+    assert not os.path.exists(scratch)
+
+
+def test_pool_rejects_use_after_close(tmp_path: Path) -> None:
+    pool = hs.RemoteSnapshotPool(_NodeExecutor(tmp_path, tmp_path), "123", [])
+    pool.close()
+    with pytest.raises(hs.HousekeepingStreamError):
+        pool.take({}, offset=0, length=1)
+
+
+# --------------------------------------------------------------------------- #
 # DecodedLogReader: plain / concatenated gzip / concatenated zstd
 # --------------------------------------------------------------------------- #
 
