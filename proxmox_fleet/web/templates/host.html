@@ -129,7 +129,7 @@ endblock %} {% block content %}
     <span class="when">
       <a
         class="mono"
-        href="/history/{{ entry.timestamp }}"
+        href="{{ entry.history_base or '/history' }}/{{ entry.timestamp }}"
         title="{{ entry.timestamp }}"
         >{{ entry.timestamp | ts_span }}</a
       >
@@ -138,6 +138,9 @@ endblock %} {% block content %}
         class="pill {% if entry.bucket == 'errors' %}fail{% elif entry.bucket == 'warnings' %}warn{% else %}muted{% endif %}"
         >{{ entry.bucket }}</span
       >
+      {% if entry.history_kind == "housekeeping" %}<span class="pill info"
+        >housekeeping</span
+      >{% endif %}
     </span>
     <div class="body">
       {% for col in entry.columns %} {% set val = entry.record.get(col) %} {% if
@@ -157,6 +160,7 @@ endblock %} {% block content %}
             endif %}{% endfor %}
           </div>
         </details>
+        {% elif col == "housekeeping" %}{{ housekeeping_text(val) }}
         {% else %}{{ val }}{% endif %}</small
       >
       {% endif %} {% endfor %}

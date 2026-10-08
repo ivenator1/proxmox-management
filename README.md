@@ -19,6 +19,7 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 * **Apt-Proxy Awareness:** Optimized for environments using `apt-cacher-ng`; automatically waits for the proxy service to be online before allowing subsequent nodes to start updates.
 * **Tag-Based Discovery:** Processes LXCs tagged `community-script` or `proxmox-helper-scripts`, plus explicitly configured OS-only containers.
 * **Automatic Alloy Compliance:** Optional desired-state enforcement installs Grafana Alloy from its official apt repository, validates/deploys the guest config, grants journal access, and repairs the service on every managed LXC/VM. `--alloy-only` audits or migrates guests without regular updates or snapshots.
+* **Opt-In Log Housekeeping:** When enabled, managed LXCs get NPM/PBS file-log retention in Loki: a 48-hour (size-capped) local buffer, acknowledged import of all pre-existing file-log history *before* anything is pruned, scoped Alloy file sources, and recurring APT/Yarn/npm/pnpm cache cleanup. `--housekeeping-only` performs that maintenance with no updates, snapshots or reboots, and writes to its own history namespace.
 * **Multi-Host Support:** Handles LXC containers, QEMU VMs, non-Proxmox remote hosts, and config-driven custom systems in a single run.
 * **Flexible Backup Strategy:** Choose per-run between lightweight snapshots, full `vzdump` backups (including PBS), both, or none.
 * **Snapshot-Lock Retry:** Transient Proxmox task locks (`CT is locked`) are retried automatically (up to 3 times, 15 s apart by default) before a snapshot failure is recorded as a non-fatal warning.
@@ -34,8 +35,8 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 * **Manual-Update Monitoring:** TrueNAS SCALE and OPNsense appliances are *tracked, never auto-updated* — the six-hour `--scan` runs fixed read-only vendor checks, over SSH by default (`midclt` for TrueNAS, `opnsense-version` + `opnsense-update -c` for OPNsense) or optionally over the appliance REST API (`manual_adapter=opnsense_api` / `truenas_scale_api` with per-host `api_url`/`api_key`/`api_secret`/`verify_ssl`). Scans refresh dashboard/reminder state without notifying; due manual attention piggybacks on the next normal fleet briefing. Applying the update always stays a manual GUI action on the appliance.
 * **Run History & Replay:** Every run persists a JSON record to `fleet_history_dir`; `--history [N]` tables recent runs and `--history-show latest` replays a stored briefing.
 * **Fleet Run Lock:** A fleet-wide `flock` guarantees the dashboard trigger, the systemd timer, cron, and manual shell runs can never mutate the fleet concurrently.
-* **Web Dashboard:** Optional `fleet-dashboard` web UI (`pip install -e '.[web]'`, or via `install.sh`) — session-based login (admin account, password set during install), pending updates across the fleet (agentless, PatchMon-style, including community-script app versions), browsable run history with per-host drill-down, a run trigger with live console output (SSE), an inventory & enrollment page (add hosts to `hosts.ini`, generate/push/test SSH keys from the browser — no manual `ssh-copy-id` needed), and a comment-preserving `vars.yml` settings editor. Triggered runs launch the CLI as a detached subprocess under the shared fleet run lock.
-* **One-Shot Installer:** `./install.sh` sets up the venv, all dependencies, and reboot-persistent systemd units for the dashboard and the scan timer; `--update` and `--uninstall` round-trip it.
+* **Web Dashboard:** Optional `fleet-dashboard` web UI (`pip install -e '.[web]'`, or via `install.sh`) — session-based login (admin account, password set during install), pending updates across the fleet (agentless, PatchMon-style, including community-script app versions), browsable run history with per-host drill-down (plus a separate `/housekeeping` maintenance-history namespace), a run trigger with live console output (SSE), an inventory & enrollment page (add hosts to `hosts.ini`, generate/push/test SSH keys from the browser — no manual `ssh-copy-id` needed), and a comment-preserving `vars.yml` settings editor. Triggered runs launch the CLI as a detached subprocess under the shared fleet run lock.
+* **One-Shot Installer:** `./install.sh` sets up the venv, all dependencies, and reboot-persistent systemd units for the dashboard, the scan timer, and (when enabled) the hourly housekeeping timer; `--update` and `--uninstall` round-trip it.
 
 ## 🐍 Python Control Plane
 A typed-Python "brain" (`proxmox_fleet/`) owns all decision logic, config/state
@@ -74,13 +75,14 @@ lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
 * **SSH Trust:** Passwordless SSH keys distributed from the Manager to all Proxmox Nodes — via `ssh-copy-id` or the dashboard's Inventory & enrollment page (see step 3).
 * **API Token:** A Proxmox API Token for `root@pam` with "Privilege Separation" unchecked.
 * **proxmoxer ≥ 2.3:** required by the `community.proxmox` collection (2.x); installed into the project venv together with `ansible-core` (step 2 / `install.sh`).
-* **Uptime Kuma:** A Public Status Page (e.g., slug: `proxmox-sg1`) containing the monitors to be validated.
+* **Uptime Kuma:** A Public Status Page (e.g. slug: `proxmox-sg1`) containing the monitors to be validated.
+* **Guest `acl` (only for log housekeeping):** the targeted NPM/PBS guests need the `acl` package installed **once** during initial setup so scoped read/traverse ACLs can be granted to the `alloy` user. Recurring maintenance never installs packages — if `setfacl`/`getfacl` is missing or access cannot be repaired, that profile is reported `Blocked` and its file logs are retained.
 
 ## 📂 Project Structure
 ```text
 ~/proxmox-management/
 ├── fleet-update.py                  # Runnable wrapper — ./fleet-update.py [--dry-run|--scan|--limit|…]
-├── install.sh                       # Root installer: venv + deps + systemd units (dashboard service, 6h scan timer)
+├── install.sh                       # Root installer: venv + deps + systemd units (dashboard service, 6h scan timer, hourly housekeeping timer when enabled)
 ├── ansible.cfg                      # Performance & connection settings
 ├── hosts.ini                        # List of nodes (gitignored — copy from .example)
 ├── vars.yml                         # Credentials and cluster config (gitignored — copy from .example)
@@ -92,6 +94,13 @@ lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
 │   ├── cli.py / driver.py           # Entrypoint + run_fleet() orchestrator
 │   ├── flows/                       # Per-host control flows (custom/lxc/vm/remote/node)
 │   ├── executor.py / alloy.py       # Execution adapters + shared Alloy compliance policy
+│   ├── housekeeping.py             # LXC maintenance sequencing and logging preparation
+│   ├── housekeeping_stream.py      # Bounded transport, decompression and log framing
+│   ├── housekeeping_sources.py     # Source lineage, frozen-prefix completion and current coverage
+│   ├── housekeeping_native.py      # Guarded native policy writes and logrotate parsing
+│   ├── housekeeping_retention.py   # Delivery verification and centralized deletion authorization
+│   ├── housekeeping_import.py / housekeeping_checkpoint.py   # Loki acknowledgement, capture and resume
+│   ├── housekeeping_cache.py       # Fixed native cache profiles and successful-clean cadence
 │   ├── status.py / changes.py       # Decision trees + change detection
 │   ├── briefing.py / notifiers.py / history.py   # Phase 4 (briefing/notify/history)
 │   ├── scan.py / lock.py            # Read-only pending-updates scan (incl. manual-update state refresh) + fleet-wide run lock
@@ -135,7 +144,7 @@ cp configs/guest.alloy.example configs/guest.alloy
 # Edit configs/guest.alloy and replace REPLACE_WITH_LOKI_ENDPOINT.
 ```
 
-Then set `alloy_enabled: true` in `vars.yml`. Add any log receiver or guest with a purpose-specific Alloy config to `lxc_alloy_exclude_list`; use bare IDs fleet-wide or `cluster/ID` for one cluster. `vm_alloy_exclude_list` uses VM inventory names.
+Then set `alloy_enabled: true` in `vars.yml`. Add any log receiver or guest with a purpose-specific Alloy config to `lxc_alloy_exclude_list`; use bare IDs fleet-wide or `cluster/ID` for one cluster. `vm_alloy_exclude_list` uses VM inventory names. The example's journal `max_age` defaults to `48h` and can be aligned by the housekeeping retention drop-in; do not add a second journal reader. When log housekeeping is enabled, the per-guest desired config is extended with fleet-managed file sources (the base journal pipeline and stored positions are preserved); `--alloy-only` prepares those sources but runs no cache cleanup or file pruning.
 
 Audit first, then migrate:
 
@@ -146,6 +155,45 @@ Audit first, then migrate:
 ```
 
 Alloy-only mode honors limits, exclusions, VM maintenance windows, and `--force-window`, but takes no snapshots and skips package/app updates, reboots, and Kuma workload checks. A missing/placeholder desired config or unresolved guest drift produces an amber attention notification while the run remains successful (`rc=0`, successful dead-man ping). Once every guest reports compliant, retire the separate `install-alloy-guests.yml` rollout.
+
+### 🗄️ Log Housekeeping for Managed LXCs (opt-in)
+An opt-in LXC maintenance feature that retains Nginx Proxy Manager (NPM) and Proxmox Backup Server (PBS) file logs in Loki, keeps a short local buffer, and runs recurring cache cleanup. Ordinary LXC runs opt in with `housekeeping_enabled: true` (housekeeping runs before disk warnings, snapshots, and updates so cache reclamation can prevent a storage refusal); `--housekeeping-only` requests the same feature with no update work at all. Enabled settings require `housekeeping_loki_url`: an absolute `http(s)` base with no credentials, query, or fragment. Explicit maintenance without a configured endpoint can still clean eligible caches, but reports blocked logging and never authorizes log deletion. The manager appends `/loki/api/v1/...` itself.
+
+```bash
+# Audit intended actions first, then apply — limited to the log guests:
+./fleet-update.py --housekeeping-only --check --limit 120,123
+./fleet-update.py --housekeeping-only --limit 120,123
+./fleet-update.py --housekeeping-only --check      # fleet-wide audit
+./fleet-update.py --housekeeping-only              # fleet-wide apply
+```
+
+`--housekeeping-only` is incompatible with `--scan`, `--alloy-only`, explicit `--phases`, and `--history`/`--history-show`. It touches only managed LXCs — stopped and template guests are skipped (never started), and an Alloy-excluded guest that is explicitly ID-targeted gets an explanatory warning with no retention/file-pruning actions (ordinary exclusions are skipped silently). It uses a single worker to bound importer disk/network use.
+
+Policy (`vars.yml` → `housekeeping_*`):
+
+* **48 h local retention:** files older than `housekeeping_local_retention_hours` are pruned only after their full current content has acknowledged Loki coverage, their identity/digest is unchanged, no writer/task is active, current permissions and owned policy hashes match, Alloy is healthy with the expected configuration, and Loki readiness currently passes against the verified delivery endpoint. A batch acknowledgement is not frozen-prefix completion; frozen-prefix completion is not current-file coverage. Every initial file prefix must be acknowledged before any file-log pruning begins; until then the run reports `Backfill pending` and resumes on later runs within `housekeeping_backfill_budget_mb` per guest per run.
+* **Hard journald caps:** a fleet-owned drop-in sets `SystemMaxUse`/`SystemKeepFree`/`MaxRetentionSec` from the settings and restarts journald only on drift. `.journal` files are never deleted by hand.
+* **Cache cleanup** runs at most every `housekeeping_cache_interval_hours` (24 h), independently of Loki/backfill health.
+
+**Cache cleanup** uses only fixed allowlisted roots and each native tool's own command — `apt-get clean`, `yarn cache clean`, `npm cache clean --force`, `pnpm store prune` — for APT `/var/cache/apt/archives`; Yarn `/usr/local/share/.cache/yarn` or `/root/.cache/yarn`; npm `/root/.npm`; pnpm `/root/.local/share/pnpm/store`. It never runs autoremove, never deletes browser caches, application dependencies/databases, unsupported or configured roots, and never touches PBS datastores. Busy package/build activity or a failed command leaves that tool's successful cadence unchanged; missing cache directories are simply idle.
+
+**Deployment prerequisites (initial only, never recurring):** the affected NPM/PBS guests need the `acl` package so scoped read/traverse ACLs can be granted to the `alloy` user during initial setup — install it once per targeted guest while APT is idle. Recurring maintenance never installs packages: if `setfacl`/`getfacl` is missing, or log access cannot be repaired, that profile reports `Blocked` (and, in standalone mode, the run fails) while its file logs are retained.
+
+Permission verification checks effective access as the `alloy` user and separately requires an inherited named-user ACL with an effective read/traverse mask on every managed log directory. A successful permission-repair command alone never authorizes archival or retention.
+
+**Delivery gates and outage behaviour:** import sends at most a 512 KiB push body per request and only HTTP 204 acknowledges a batch; timeouts/429/5xx are retried with bounded backoff, other 4xx fail immediately, and a failed batch reports `Blocked` with progress intact. A readiness/query failure pauses fleet-managed file deletion even for already-acknowledged files. Applications' own native rotation limits and journald's hard caps remain finite buffers during an outage — this feature does not promise infinite outage retention. PBS `task-log-max-days` is not shortened to two days; existing native limits still apply independently. PBS task index/control files and active task logs are never pruned.
+
+**Backfill and spool:** pre-existing history is frozen once into a root-only (`0700`/`0600`) node spool under `/var/tmp/fleet-log-import/<sha256(cluster/node/id)>/<capture_id>/` (requiring node free space ≥ captured bytes + 2 GiB) so native rotation cannot erase history mid-import, then streamed oldest-first. Captured blobs are released only after every one of their bytes is acknowledged. The checkpoint database lives at `<fleet_history_dir>/housekeeping.sqlite3`; a missing DB starts an import, a corrupt/unwritable one blocks file-log deletion rather than guessing.
+
+**Querying live vs. archive:** each file source emits two labelled streams — the live Alloy reader (`delivery="live"`, immediate visibility) and the acknowledged importer (`delivery="archive"`, the authoritative retained history). Query them separately to avoid double-counting. Lines are packed JSON, so `| unpack` restores the original log line from `_entry` and exposes `filename`:
+
+```logql
+# Live NPM application logs, original log line restored:
+{job="lxc-file", delivery="live", app="nginxproxymanager"} | unpack | line_format "{{.filename}}: {{._entry}}"
+
+# Archived history for one container (survives rotation):
+{job="lxc-file", delivery="archive", guest_id="123", app="nginxproxymanager"} | unpack | filename=~"/data/logs/.*"
+```
 
 ### 🔄 Backup Strategy
 * `lxc_backup_strategy`: `snapshot` (default) | `vzdump` | `both` | `none`
@@ -275,10 +323,12 @@ All previously-hardcoded timeouts and retry counts are overridable per environme
 * `force_notify`: Send a notification even if nothing changed (same as `--force-notify`).
 * `fleet_history_enabled` / `fleet_history_dir` / `fleet_history_keep`: Each run writes `<dir>/run-<UTC-timestamp>.json` and overwrites `<dir>/latest.json`, pruned to the newest N (`0` = keep all). Read back with `--history` / `--history-show`.
 * `scan_history_keep`: How many `pending-*.json` scan snapshots (`--scan`) to keep in the same directory.
-* `fleet_deadmans_url`: Pinged at the end of every run (e.g. a [healthchecks.io](https://healthchecks.io)-style URL) so its *absence* alerts you if the orchestrator stops running; `<url>/fail` is pinged on failure.
+* `fleet_deadmans_url`: Pinged at the end of every ordinary run (e.g. a [healthchecks.io](https://healthchecks.io)-style URL) so its *absence* alerts you if the orchestrator stops running; `<url>/fail` is pinged on failure.
+* **Housekeeping history:** hourly `--housekeeping-only` runs write their own `run-*.json`/`latest.json` into `<fleet_history_dir>/housekeeping/`, with `fleet_history_keep` applied separately in that directory and no package-detail stripping. The main `latest.json`, normal `run-*.json` retention, package-detail window, cumulative update totals and update dead-man state are all unaffected. Read it with `--history --history-kind housekeeping` / `--history-show <ref> --history-kind housekeeping`, or the dashboard's `/housekeeping` pages. Maintenance runs still notify and persist history, but they do **not** ping `fleet_deadmans_url` — hourly cleanup must never clear or mask a failed scheduled update.
 
 ### 🖥️ Web Dashboard
 * `dashboard_host` / `dashboard_port`: Bind address and port for `fleet-dashboard` (default `0.0.0.0:8421`).
+* **Housekeeping history:** protected `/housekeeping` and `/housekeeping/{ref}` pages show the hourly maintenance runs (own namespace, `history_base="/housekeeping"`); the existing `/history` pages remain the update history. The run trigger has a **Housekeeping only** checkbox (`--housekeeping-only`, mutually exclusive with scan/alloy-only/phases).
 * **Authentication:** All pages require login. Single `admin` account with password set during `install.sh`. Session-based auth via HTTP-only cookies (SQLite database in `fleet_history_dir/.fleet-users.db`). No configuration needed — password is prompted during installation.
 
 ## 🚀 Setup Instructions
@@ -289,8 +339,11 @@ On a fresh Manager LXC, `install.sh` automates steps 2 and 6 below and wires eve
 systemd — it prompts for a dashboard admin password, creates the `.venv`, installs the
 package (with the web-dashboard extras), ansible-core and the Ansible collections, seeds
 `vars.yml`/`hosts.ini` from the `.example` templates if missing, initializes the login
-database, and installs + enables two units that persist across reboots: `fleet-dashboard.service`
-(the web UI on port 8421, login required) and `fleet-scan.timer` (`fleet-update --scan` every 6 hours).
+database, and installs + enables the units that persist across reboots:
+`fleet-dashboard.service` (the web UI on port 8421, login required) and
+`fleet-scan.timer` (`fleet-update --scan` every 6 hours), plus
+`fleet-housekeeping.timer` (`fleet-update --housekeeping-only` hourly) which is
+written on every install but enabled only when `housekeeping_enabled: true`.
 
 ```bash
 git clone https://github.com/ivenator1/proxmox-management.git
@@ -435,12 +488,29 @@ flags, and a built-in `--help`. Run it from the project root.
 ```
 `--alloy-only` cannot be combined with `--scan` or `--phases`.
 
+### Log Housekeeping Only
+```bash
+./fleet-update.py --housekeeping-only --check            # audit log/cache maintenance, no changes
+./fleet-update.py --housekeeping-only --check --limit 120,123
+./fleet-update.py --housekeeping-only --limit 120,123    # apply for just these guests
+./fleet-update.py --housekeeping-only                    # all eligible managed LXCs
+```
+Log import requires `housekeeping_loki_url`; the feature is normally switched on
+with `housekeeping_enabled: true`. No updates, snapshots, reboots or stopped-container
+starts are performed. Cache cleanup runs independently of import health, while
+file pruning waits for full acknowledged coverage and verified live delivery.
+
 ### Pending-Updates Scan & Run History
 ```bash
 ./fleet-update.py --scan                 # read-only: what *would* update, fleet-wide
 ./fleet-update.py --history 5            # table of the last 5 persisted runs
 ./fleet-update.py --history-show latest  # replay a stored run's briefing
+./fleet-update.py --history 5 --history-kind housekeeping         # hourly maintenance history
+./fleet-update.py --history-show latest --history-kind housekeeping
 ```
+`--history-kind` selects the parent `fleet` history (default) or the separate
+`housekeeping` namespace the hourly timer writes into; it is only valid together
+with `--history`/`--history-show`.
 
 ### All Flags
 ```
@@ -452,8 +522,10 @@ flags, and a built-in `--help`. Run it from the project root.
 --phases P1,P2             Run only these phases (remote,custom,lxc,vm,node,manager)
 --scan                     Read-only pending-updates scan → pending-*.json (no fleet run; refreshes manual-update state)
 --alloy-only               Audit/repair Alloy on managed LXC/VM guests; skip regular updates and snapshots
+--housekeeping-only        Log/cache housekeeping on managed LXCs only; no updates, snapshots or reboots
 --history [N]              Show the last N persisted runs and exit (default: 10)
 --history-show TS|latest   Print one persisted run's briefing and exit
+--history-kind KIND        History namespace for --history/--history-show: fleet (default) or housekeeping
 -e KEY=VALUE               Raw extra var (repeatable). Only fleet_dry_run, lxc_verbose,
                            force_notify, force_window, custom_dry_run are honoured; any
                            other key is accepted and silently ignored.
@@ -463,6 +535,15 @@ flags, and a built-in `--help`. Run it from the project root.
 
 ### Automated Schedule
 `install.sh` already schedules the read-only scan every 6 hours (`fleet-scan.timer`).
+When `housekeeping_enabled: true`, it also writes and enables the hourly
+`fleet-housekeeping.timer` → `fleet-housekeeping.service`
+(`fleet-update --housekeeping-only`, oneshot, 1 h start timeout, low CPU/IO
+weight, `RandomizedDelaySec=300`, `Persistent=true`). The units are written on
+every install but the timer is **enabled only when the setting resolves true** —
+install and `--update` reconcile the enabled state, so flipping
+`housekeeping_enabled` off and re-running the installer stops the timer again. A
+timer tick that meets a running fleet job refuses and exits; the next tick retries.
+
 For unattended *update* runs, add a cron entry on the Manager LXC (`crontab -e`),
 e.g. 4:00 AM daily:
 ```cron
@@ -505,6 +586,7 @@ The orchestrator sends one consolidated embed per run:
 * **App status per container:** `Updated: X → Y` (version changed), `UPDATED` (packages changed, no version file), `OK` (nothing changed), `NO SCRIPT` (no community-script update binary), `FAILED`.
 * **OS status per container:** `Updated (N upgraded)` (with package count), `OK`, `SKIPPED` (in `os_update_exclude_list`), `FAILED`.
 * **Alloy status per guest:** `Installed`, `Configured`, or `Service repaired` appears only when remediation changed the guest; compliant guests stay silent.
+* **Housekeeping line per guest:** `Housekeeping: <status> (<reclaimed> reclaimed; <archived> archived)` appears only when a housekeeping summary exists (statuses `Configured`, `Cleaned`, `Backfill pending`, `Blocked`, `Audit`). A housekeeping failure never changes OS/app update status or update counts; standalone maintenance still fails on blocked operations.
 * **Remote Hosts section:** Listed separately (not tied to a PVE node).
 * **Error Log:** Structured entries showing which host failed, which task failed, and the first 300 characters of stderr.
 * Containers where nothing changed produce no embed entry — they are absorbed into `*No container changes.*` for that node.

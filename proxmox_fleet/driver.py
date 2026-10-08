@@ -46,6 +46,7 @@ from proxmox_fleet.cluster import (
 from proxmox_fleet.executor import RunnerExecutor
 from proxmox_fleet.flows._pkg import kuma_healthy
 from proxmox_fleet.flows.custom import run_custom_update
+from proxmox_fleet.flows.housekeeping import run_lxc_housekeeping
 from proxmox_fleet.flows.lxc import LxcFlowOutcome, _discover_lxcs, run_lxc_update
 from proxmox_fleet.flows.node import run_manager_update, run_node_update
 from proxmox_fleet.flows.remote import RemoteFlowOutcome, run_remote_update
@@ -111,6 +112,7 @@ _MANAGER_LIMIT_TOKENS = frozenset({"manager", "localhost", "Ansible-Manager"})
 
 # Status recorded for hosts whose wave was aborted by a canary failure.
 CANARY_SKIP_STATUS = "SKIPPED (canary failed)"
+
 
 # Distinguishes "phase called directly; load once here" from "run_fleet already
 # tried to load and intentionally passed None after a manager-level warning".
@@ -385,8 +387,15 @@ def run_lxc_phase(
     limit: Optional[Set[str]] = None,
     alloy_only: bool = False,
     alloy_config: Any = _ALLOY_CONFIG_UNSET,
+    housekeeping_only: bool = False,
 ) -> FleetState:
     """Run Phase 1 (LXC container updates) via the Python driver.
+
+    With *housekeeping_only*, every eligible managed container runs the
+    maintenance policy (logging preparation, acknowledged archival, gated
+    retention/cache cleanup) instead of an update: one worker, no canary waves,
+    no snapshot/package/reboot work, and stopped/template guests are skipped
+    without being started.
 
     For each Proxmox node: discovers tagged LXCs, then updates them
     concurrently (max_workers=lxc_forks, default 20), mirroring Ansible's
@@ -408,10 +417,15 @@ def run_lxc_phase(
 
     Never raises for per-container failures — those become FAILED records.
     """
+    if alloy_only and housekeeping_only:
+        raise SystemExit("--housekeeping-only cannot be combined with --alloy-only")
     nodes = inventory.load_proxmox_nodes(inventory_path, host_vars_dir=settings.host_vars_dir)
     dry_run = check or settings.fleet_dry_run or settings.lxc_dry_run
     state = FleetState()
-    alloy_requested = alloy_only or settings.alloy_enabled
+    # Housekeeping needs the base desired Alloy config to render per-guest file
+    # sources; a load failure leaves alloy_config None so the policy still runs
+    # safe cache cleanup and reports Blocked instead of skipping maintenance.
+    alloy_requested = alloy_only or settings.alloy_enabled or housekeeping_only or settings.housekeeping_enabled
     if alloy_requested and alloy_config is _ALLOY_CONFIG_UNSET:
         alloy_config, config_warning = _load_alloy_config(settings)
         if config_warning is not None:
@@ -464,6 +478,19 @@ def run_lxc_phase(
                 i for i in lxc_ids
                 if not matches_any(settings.lxc_alloy_exclude_list, node_cluster, i)
             ]
+        if housekeeping_only:
+            lxc_ids = [
+                i for i in lxc_ids
+                if not matches_any(settings.lxc_housekeeping_exclude_list, node_cluster, i)
+            ]
+            # Alloy-excluded guests are normally skipped silently, but an
+            # explicitly id-targeted one is kept so the policy can emit the
+            # explanatory warning (and still perform no retention/pruning).
+            lxc_ids = [
+                i for i in lxc_ids
+                if not matches_any(settings.lxc_alloy_exclude_list, node_cluster, i)
+                or (limit is not None and limit_selects_id(limit, node_cluster, i))
+            ]
 
         print(f"[{node_name}] found {len(lxc_ids)} managed LXC(s): {', '.join(lxc_ids) or 'none'}")
         discovered.append((node_name, api_host, node_cluster, lxc_ids))
@@ -511,6 +538,11 @@ def run_lxc_phase(
         # Concurrent per-container updates (lxc_continue_on_error is the default)
         def _run_one(lxc_id: str) -> LxcFlowOutcome:
             ex = RunnerExecutor(node_name, inventory=inventory_path, check=check)
+            if housekeeping_only:
+                return run_lxc_housekeeping(
+                    node_name, lxc_id, ex, settings,
+                    dry_run=dry_run, cluster=cluster, alloy_config=alloy_config,
+                )
             guest_alloy_config = alloy_config
             if (
                 not alloy_requested
@@ -526,7 +558,8 @@ def run_lxc_phase(
         results = run_concurrent(
             ids,
             _run_one,
-            max_workers=settings.lxc_forks,
+            # One worker in maintenance mode bounds importer disk/network use.
+            max_workers=1 if housekeeping_only else settings.lxc_forks,
         )
 
         for lxc_id, outcome, run_err in results:
@@ -539,7 +572,11 @@ def run_lxc_phase(
                     # app/os already ("FAILED + ROLLED BACK", "FAILED"), and a bare
                     # "FAILED" hides which of the two actually broke.
                     alloy_text = f"  alloy={rec.alloy}" if rec.alloy else ""
-                    print(f"  [{node_name}/{lxc_id}] {rec.name}: app={rec.app}  os={rec.os}{alloy_text}")
+                    housekeeping_text = (
+                        f"  housekeeping={rec.housekeeping.status}"
+                        if rec.housekeeping else ""
+                    )
+                    print(f"  [{node_name}/{lxc_id}] {rec.name}: app={rec.app}  os={rec.os}{alloy_text}{housekeeping_text}")
                 else:
                     print(f"  [{node_name}/{lxc_id}] idle (no changes)")
             elif run_err is not None:
@@ -547,7 +584,7 @@ def run_lxc_phase(
                 wave_failed = True
                 state.errors.append(ErrorEntry(
                     host=f"{node_name}/{lxc_id}",
-                    task="run_lxc_update",
+                    task="run_lxc_housekeeping" if housekeeping_only else "run_lxc_update",
                     error=str(run_err)[:300],
                 ))
                 print(f"  [{node_name}/{lxc_id}] ERROR: {run_err}")
@@ -556,12 +593,18 @@ def run_lxc_phase(
     all_pairs = [(cluster, i) for _, _, cluster, ids in discovered for i in ids]
     canary_pairs = (
         []
-        if alloy_only
+        if alloy_only or housekeeping_only
         else [(c, i) for c, i in all_pairs if matches_any(settings.canary_hosts, c, i)]
     )
     rest_pairs = [(c, i) for c, i in all_pairs if not matches_any(settings.canary_hosts, c, i)]
 
-    if not canary_pairs or not rest_pairs:
+    if housekeeping_only:
+        # No canary staging/soak: maintenance is idempotent and serialised by the
+        # per-node one-worker pool.
+        for node_name, api_host, cluster, ids in discovered:
+            if ids:
+                _run_node_ids(node_name, api_host, cluster, ids)
+    elif not canary_pairs or not rest_pairs:
         for node_name, api_host, cluster, ids in discovered:
             _run_node_ids(node_name, api_host, cluster, ids)
     else:
@@ -1024,6 +1067,7 @@ def run_notify_phase(
     settings: GlobalSettings,
     state: FleetState,
     check: bool = False,
+    housekeeping_only: bool = False,
 ) -> str:
     """Run Phase 4 (final briefing) via the Python driver.
 
@@ -1033,11 +1077,17 @@ def run_notify_phase(
     status or the dead-man signal. History captures the rendered body even when
     dispatch is suppressed.
 
+    With *housekeeping_only*, the briefing/history are written to the fixed
+    ``<fleet_history_dir>/housekeeping`` child with the keep setting applied
+    independently and no package-detail stripping, manual-scan reminders are not
+    consumed, and the update dead-man URL is not pinged: hourly maintenance must
+    never mask a failed scheduled update.
+
     Returns the rendered briefing body (handy for tests / logging). Never raises
     — notification/history failures must not abort the run.
     """
     manual_decision: Optional[scan_notifications.ManualDecision] = None
-    if settings.manual_update_notifications:
+    if settings.manual_update_notifications and not housekeeping_only:
         manual_state = scan_notifications.load_state(settings.fleet_history_dir)
         manual_decision = scan_notifications.decide_stored_notifications(
             manual_state,
@@ -1076,16 +1126,30 @@ def run_notify_phase(
             )
 
     if settings.fleet_history_enabled:
-        history.write_history(
-            state,
-            history_dir=settings.fleet_history_dir,
-            keep=settings.fleet_history_keep,
-            keep_detail=settings.fleet_package_detail_keep,
-            briefing=body,
-        )
+        if housekeeping_only:
+            # Maintenance history lives in its own child so the update
+            # latest.json/run-*.json retention, package-detail window and
+            # cumulative totals are untouched. No detail stripping: maintenance
+            # records carry no package detail anyway.
+            history.write_history(
+                state,
+                history_dir=Path(settings.fleet_history_dir) / history.HOUSEKEEPING_HISTORY_SUBDIR,
+                keep=settings.fleet_history_keep,
+                keep_detail=0,
+                briefing=body,
+            )
+        else:
+            history.write_history(
+                state,
+                history_dir=settings.fleet_history_dir,
+                keep=settings.fleet_history_keep,
+                keep_detail=settings.fleet_package_detail_keep,
+                briefing=body,
+            )
 
-    notifiers.ping_deadmans(settings.fleet_deadmans_url, failed=failed,
-                            retries=settings.deadmans_retries)
+    if not housekeeping_only:
+        notifiers.ping_deadmans(settings.fleet_deadmans_url, failed=failed,
+                                retries=settings.deadmans_retries)
     return body
 
 
@@ -1116,12 +1180,19 @@ def run_fleet(
     limit: Optional[Set[str]] = None,
     phases: Optional[Set[str]] = None,
     alloy_only: bool = False,
+    housekeeping_only: bool = False,
 ) -> int:
     """End-to-end fleet update — the Python orchestrator (the sole entrypoint).
 
     Runs the pre-flight apt-proxy check, then every phase in order
     (remote → custom → lxc → vm → node+manager), merging each phase's FleetState
     into one fleet-wide state, then renders/dispatches the final briefing.
+
+    With *housekeeping_only*, only the managed-LXC maintenance pass runs: the
+    inventory/manual-overlap and node-uniqueness safety checks still apply, but
+    the apt-proxy pre-flight and every update phase are skipped, maintenance
+    history goes to the separate child directory, and the update dead-man URL is
+    never pinged.
 
     *phases* (subset of :data:`PHASE_NAMES`) selects which phases run; the
     pre-flight check and Phase 4 (notify/history) always run. *limit* restricts
@@ -1138,6 +1209,8 @@ def run_fleet(
 
     if alloy_only and phases is not None:
         raise SystemExit("--alloy-only cannot be combined with --phases")
+    if housekeeping_only and (alloy_only or phases is not None):
+        raise SystemExit("--housekeeping-only cannot be combined with --alloy-only or --phases")
 
     if phases is not None:
         unknown = sorted(set(phases) - set(PHASE_NAMES))
@@ -1162,7 +1235,8 @@ def run_fleet(
 
     # Pre-flight: the apt-cacher-ng proxy must be reachable or the whole run aborts
     # (port of the "Verify Apt-Cacher-NG is Online" / "Halt if Proxy is Offline" play).
-    if settings.apt_proxy_ip:
+    # Maintenance mode performs no installs, so the proxy check does not apply.
+    if settings.apt_proxy_ip and not housekeeping_only:
         try:
             http.wait_for_port(settings.apt_proxy_ip, settings.apt_proxy_port,
                                timeout=settings.apt_proxy_check_timeout)
@@ -1176,11 +1250,22 @@ def run_fleet(
 
     state = FleetState()
     desired_alloy: Optional[Any] = None
-    alloy_phase_selected = alloy_only or _phase_on("lxc") or _phase_on("vm")
-    if (alloy_only or settings.alloy_enabled) and alloy_phase_selected:
+    alloy_phase_selected = housekeeping_only or alloy_only or _phase_on("lxc") or _phase_on("vm")
+    if housekeeping_only or ((alloy_only or settings.alloy_enabled) and alloy_phase_selected):
         desired_alloy, alloy_warning = _load_alloy_config(settings)
         if alloy_warning is not None:
             state.warnings.append(alloy_warning)
+
+    if housekeeping_only:
+        # Managed-LXC maintenance only: discovery/quorum/exclusions plus notify
+        # and (isolated) history. No updates, snapshots, reboots, VM/remote/node
+        # or manager phases, canary soak or apt-proxy pre-flight.
+        _merge_state(state, run_lxc_phase(
+            settings=settings, inventory_path=inventory_path, check=check,
+            state_output_path=None, limit=limit,
+            alloy_config=desired_alloy, housekeeping_only=True))
+        run_notify_phase(settings=settings, state=state, check=check, housekeeping_only=True)
+        return 1 if state.failed else 0
 
     if not alloy_only and _phase_on("remote"):
         _merge_state(state, run_remote_phase(

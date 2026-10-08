@@ -121,6 +121,33 @@ vm_alloy_exclude_list: []
 #   ./fleet-update.py --alloy-only --limit 101,media-vm
 #   ./fleet-update.py --alloy-only
 
+# --- LOG HOUSEKEEPING FOR MANAGED LXCs (opt-in) ---
+# Retains Nginx Proxy Manager (NPM) and Proxmox Backup Server (PBS) file logs in
+# Loki, keeps a short local buffer, and runs recurring cache cleanup. Ordinary
+# LXC runs opt in with housekeeping_enabled; `--housekeeping-only` requests the
+# same feature explicitly (no updates, snapshots or reboots).
+#
+# housekeeping_loki_url is the canonical base the manager appends
+# /loki/api/v1/... to — an absolute http(s) URL with no credentials, query or
+# fragment. Secrets stay in real configuration, never in CLI output. It is
+# REQUIRED whenever housekeeping is requested (housekeeping_enabled: true or an
+# explicit --housekeeping-only run).
+housekeeping_enabled: false
+housekeeping_loki_url: ""        # e.g. "http://loki.example.lan:3100" (no trailing path)
+# Closed-file cutoff and the desired Alloy journal age limit (hours).
+housekeeping_local_retention_hours: 48
+# Fleet-owned journald drop-in bounds (MB): hard local budget and keep-free floor.
+housekeeping_journal_max_mb: 256
+housekeeping_journal_keep_free_mb: 512
+# Cache-cleanup cadence, independent of the hourly log tick.
+housekeeping_cache_interval_hours: 24
+# Max acknowledged archive payload per guest per run (MiB); import resumes on
+# later runs until every initial file prefix is acknowledged.
+housekeeping_backfill_budget_mb: 1024
+# Bare LXC ids apply fleet-wide; qualify cluster/ID for one cluster. Matches
+# matches_any() like the other exclusion lists.
+lxc_housekeeping_exclude_list: []
+
 # --- LXC TAG DISCOVERY ---
 lxc_tags:
   - "community-script"

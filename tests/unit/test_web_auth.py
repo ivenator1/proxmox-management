@@ -128,7 +128,7 @@ def test_login_sets_cookie_and_grants_access(history_dir):
     assert resp.status_code == 204
     assert auth.COOKIE_NAME in client.cookies
 
-    for page in ("/", "/pending", "/history", "/trigger", "/inventory"):
+    for page in ("/", "/pending", "/history", "/housekeeping", "/trigger", "/inventory"):
         assert client.get(page).status_code == 200, page
 
 
@@ -160,6 +160,7 @@ def test_every_page_locked_without_login(history_dir):
     _create_admin(history_dir)
     client = _client(history_dir)
     pages = ("/", "/pending", "/history", "/history/latest", "/hosts/somehost",
+             "/housekeeping", "/housekeeping/latest",
              "/trigger", "/inventory", "/settings",
              # the run console/log/stream leak fleet output if left open —
              # 401 must win over 404 even for unknown run ids

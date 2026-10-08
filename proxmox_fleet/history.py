@@ -16,6 +16,9 @@ from typing import Any, Dict, List, Mapping, Optional, Union
 
 from proxmox_fleet.models.state import FleetState
 
+# Maintenance run JSON has its own retention/counters; lock/checkpoint stay at root.
+HOUSEKEEPING_HISTORY_SUBDIR = "housekeeping"
+
 
 def _ts_now() -> str:
     """UTC timestamp with microsecond precision to avoid same-second collisions."""

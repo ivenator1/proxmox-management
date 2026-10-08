@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 from typing import Any
 
 import pytest
@@ -16,6 +17,7 @@ DesiredAlloyConfig = alloy_mod.DesiredAlloyConfig
 load_desired_config = alloy_mod.load_desired_config
 parse_probe = alloy_mod.parse_probe
 reconcile_alloy = alloy_mod.reconcile_alloy
+render_lxc_log_config = alloy_mod.render_lxc_log_config
 
 
 def _desired(content: str = "logging {}\n") -> DesiredAlloyConfig:
@@ -219,3 +221,191 @@ def test_final_service_verification_failure_is_attention_not_exception():
     result = reconcile_alloy(ex, desired)
     assert result.changed is True
     assert "service is not active" in str(result.warning)
+
+
+_GUEST_BASE = (
+    'loki.relabel "journal" {\n'
+    "  forward_to = []\n"
+    "}\n"
+    "\n"
+    'loki.source.journal "journal" {\n'
+    "  forward_to    = [loki.write.default.receiver]\n"
+    "  relabel_rules = loki.relabel.journal.rules\n"
+    '  labels        = { job = "systemd-journal", role = "guest" }\n'
+    '  max_age       = coalesce(sys.env("FLEET_JOURNAL_MAX_AGE"), "48h")\n'
+    "}\n"
+    "\n"
+    'loki.write "default" {\n'
+    "  endpoint {\n"
+    '    url = "http://10.0.0.1:3100/loki/api/v1/push"\n'
+    "  }\n"
+    "}\n"
+)
+
+
+def _render(profiles: set[str], **overrides: object) -> Any:
+    kwargs: dict[str, object] = {
+        "node": "pve1",
+        "cluster": "main",
+        "lxc_id": "123",
+        "name": "npm",
+        "profiles": profiles,
+        "retention_hours": 48,
+    }
+    kwargs.update(overrides)
+    return render_lxc_log_config(_desired(_GUEST_BASE), **kwargs)
+
+
+def test_render_appends_npm_source_and_preserves_base_verbatim():
+    base = _desired(_GUEST_BASE)
+    result = render_lxc_log_config(
+        base,
+        node="pve1",
+        cluster="main",
+        lxc_id="123",
+        name="npm",
+        profiles={"npm"},
+        retention_hours=48,
+    )
+    assert result.content.startswith(_GUEST_BASE)
+    assert result.content != base.content
+    assert result.sha256 == hashlib.sha256(result.content.encode("utf-8")).hexdigest()
+    # base journal component names and storage config are untouched
+    assert 'loki.source.journal "journal"' in result.content
+    assert 'loki.write "default"' in result.content
+    # only the npm source plus the shared packer are generated
+    assert 'loki.source.file "fleet_npm"' in result.content
+    assert 'loki.process "fleet_file_pack"' in result.content
+    assert 'loki.source.file "fleet_pbs_tasks"' not in result.content
+    assert alloy_mod.NPM_LIVE_LOG_GLOB in result.content
+
+
+def test_render_npm_labels_and_quarantine_exclusion():
+    result = _render({"npm"})
+    expected = {
+        "job": "lxc-file",
+        "delivery": "live",
+        "cluster": "main",
+        "node": "pve1",
+        "guest_id": "123",
+        "host": "npm",
+        "app": "nginxproxymanager",
+        "log_kind": "application",
+    }
+    for key, value in expected.items():
+        assert f"{key} = {json.dumps(value)}" in result.content
+    quarantine = f"/data/logs/**/{alloy_mod.QUARANTINE_DIRNAME}/**"
+    assert quarantine in result.content
+    # filename is packed into the JSON body, never an indexed label
+    assert "filename = " not in result.content
+    assert json.dumps("filename") in result.content
+
+
+def test_render_pbs_covers_tasks_and_api_sources():
+    result = _render({"pbs"})
+    assert 'loki.source.file "fleet_pbs_tasks"' in result.content
+    assert 'loki.source.file "fleet_pbs_api"' in result.content
+    assert 'loki.source.file "fleet_npm"' not in result.content
+    assert alloy_mod.PBS_LIVE_TASKS_GLOB in result.content
+    for api_path in alloy_mod.PBS_LIVE_API_GLOBS:
+        assert api_path in result.content
+    assert f"/var/log/proxmox-backup/tasks/**/{alloy_mod.QUARANTINE_DIRNAME}/**" in result.content
+    assert f'app = {json.dumps("proxmox-backup")}' in result.content
+    assert f"log_kind = {json.dumps('task')}" in result.content
+    assert f"log_kind = {json.dumps('api')}" in result.content
+    # UPID identity stays inside the glob only, never an indexed label
+    assert "UPID = " not in result.content
+
+
+def test_render_both_profiles_generates_every_source():
+    result = _render({"npm", "pbs"})
+    for component in ("fleet_npm", "fleet_pbs_tasks", "fleet_pbs_api"):
+        assert f'loki.source.file "{component}"' in result.content
+
+
+def test_render_retention_hours_drive_ignore_older_than():
+    result = _render({"npm"}, retention_hours=24)
+    assert json.dumps("24h") in result.content
+    assert json.dumps("12h") not in result.content
+
+
+def test_render_without_discovered_profiles_returns_base_unchanged():
+    base = _desired(_GUEST_BASE)
+    result = render_lxc_log_config(
+        base,
+        node="pve1",
+        cluster="main",
+        lxc_id="123",
+        name="npm",
+        profiles=set(),
+        retention_hours=48,
+    )
+    assert result.content == base.content
+    assert result.sha256 == base.sha256
+
+
+def test_render_rejects_unknown_profiles():
+    with pytest.raises(AlloyConfigError, match="unsupported log profile"):
+        _render({"nginx"})
+    with pytest.raises(AlloyConfigError, match="unsupported log profile"):
+        _render({"npm", "pbs", "docker"})
+
+
+def test_render_rejects_reserved_component_conflicts():
+    for snippet in (
+        'loki.process "fleet_file_pack" {}',
+        'loki.source.file "fleet_npm" {}',
+        'loki.source.file "fleet_pbs_api" {}',
+    ):
+        base = _desired(_GUEST_BASE + "\n" + snippet + "\n")
+        with pytest.raises(AlloyConfigError, match="reserved"):
+            render_lxc_log_config(
+                base,
+                node="pve1",
+                cluster="main",
+                lxc_id="123",
+                name="npm",
+                profiles={"npm"},
+                retention_hours=48,
+            )
+
+
+def test_render_refuses_to_double_render_generated_config():
+    first = _render({"npm"})
+    with pytest.raises(AlloyConfigError, match="reserved"):
+        render_lxc_log_config(
+            DesiredAlloyConfig(content=first.content, sha256=first.sha256),
+            node="pve1",
+            cluster="main",
+            lxc_id="123",
+            name="npm",
+            profiles={"npm"},
+            retention_hours=48,
+        )
+
+
+def test_render_escapes_hostile_label_values():
+    hostile = 'na"me\\path\nnext'
+    cluster = 'we"ird'
+    result = _render({"npm"}, name=hostile, cluster=cluster)
+    assert json.dumps(hostile) in result.content
+    assert hostile not in result.content
+    assert json.dumps(cluster) in result.content
+    assert cluster not in result.content
+    # escaping must keep the appended HCL structurally balanced
+    assert result.content.count("{") == result.content.count("}")
+
+
+def test_render_handles_base_without_trailing_newline():
+    base = _desired('loki.write "default" {}')
+    result = render_lxc_log_config(
+        base,
+        node="pve1",
+        cluster="main",
+        lxc_id="123",
+        name="npm",
+        profiles={"npm"},
+        retention_hours=48,
+    )
+    assert result.content.startswith(base.content)
+    assert 'loki.source.file "fleet_npm"' in result.content

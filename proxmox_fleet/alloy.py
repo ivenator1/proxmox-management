@@ -7,14 +7,48 @@ runs the direct-guest or pct-mediated probe/deploy primitives selected here.
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Dict, Optional, Protocol, Set
 
+from proxmox_fleet.housekeeping_io import QUARANTINE_DIRNAME
 from proxmox_fleet.runner import PrimitiveResult
 
 
 PLACEHOLDER_MARKER = "REPLACE_WITH_LOKI_ENDPOINT"
+
+# Reserved component names for the fleet-managed file-log pipeline rendered by
+# render_lxc_log_config().  A desired base config must never declare any of
+# these; the renderer refuses to append a second copy rather than silently
+# producing an invalid or ambiguous Alloy configuration.
+FLEET_PROCESS_COMPONENT = "fleet_file_pack"
+FLEET_NPM_SOURCE_COMPONENT = "fleet_npm"
+FLEET_PBS_TASKS_SOURCE_COMPONENT = "fleet_pbs_tasks"
+FLEET_PBS_API_SOURCE_COMPONENT = "fleet_pbs_api"
+RESERVED_COMPONENT_NAMES: frozenset[str] = frozenset(
+    {
+        FLEET_PROCESS_COMPONENT,
+        FLEET_NPM_SOURCE_COMPONENT,
+        FLEET_PBS_TASKS_SOURCE_COMPONENT,
+        FLEET_PBS_API_SOURCE_COMPONENT,
+    }
+)
+
+# Only these probe-reported profiles have a defined live file-source mapping.
+SUPPORTED_LOG_PROFILES: frozenset[str] = frozenset({"npm", "pbs"})
+
+# Exact live (non-archive) discovery globs.  Rotated/compressed archives are
+# handled by the acknowledged importer, never by these readers.
+NPM_LOG_ROOT = "/data/logs"
+PBS_TASKS_ROOT = "/var/log/proxmox-backup/tasks"
+NPM_LIVE_LOG_GLOB = f"{NPM_LOG_ROOT}/**/*.log"
+PBS_LIVE_TASKS_GLOB = f"{PBS_TASKS_ROOT}/[0-9A-F][0-9A-F]/UPID:*"
+PBS_LIVE_API_GLOBS = (
+    "/var/log/proxmox-backup/api/access.log",
+    "/var/log/proxmox-backup/api/auth.log",
+)
 
 
 class AlloyConfigError(ValueError):
@@ -245,3 +279,192 @@ def reconcile_alloy(
             probe=final,
         )
     return AlloyResult(status=status, changed=changed, probe=final)
+
+
+def _hcl_string(value: str) -> str:
+    """Emit an HCL string literal using JSON escaping (HCL-compatible)."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _reserved_conflicts(content: str) -> list[str]:
+    """Return reserved fleet component names already present in the base HCL."""
+    return sorted(
+        name
+        for name in RESERVED_COMPONENT_NAMES
+        if re.search(rf"\b{re.escape(name)}\b", content)
+    )
+
+
+def _quarantine_exclude(root: str) -> str:
+    """Glob that excludes every quarantine tree below a managed log root."""
+    return f"{root}/**/{QUARANTINE_DIRNAME}/**"
+
+
+def _fleet_target(
+    *,
+    path: str,
+    app: str,
+    log_kind: str,
+    cluster: str,
+    node: str,
+    lxc_id: str,
+    name: str,
+    exclude: Optional[str] = None,
+) -> list[tuple[str, str]]:
+    """Build one file-match target map with the shared live-delivery labels."""
+    fields: list[tuple[str, str]] = [("__path__", path)]
+    if exclude is not None:
+        fields.append(("__path_exclude__", exclude))
+    fields.extend(
+        [
+            ("job", "lxc-file"),
+            ("delivery", "live"),
+            ("cluster", cluster),
+            ("node", node),
+            ("guest_id", lxc_id),
+            ("host", name),
+            ("app", app),
+            ("log_kind", log_kind),
+        ]
+    )
+    return fields
+
+
+def _source_stanza(
+    component: str,
+    targets: list[list[tuple[str, str]]],
+    retention_hours: int,
+) -> str:
+    lines = [f'loki.source.file "{component}" {{', "  targets = ["]
+    for target in targets:
+        lines.append("    {")
+        for key, value in target:
+            lines.append(f"      {key} = {_hcl_string(value)},")
+        lines.append("    },")
+    lines.append("  ]")
+    lines.append(f"  forward_to = [loki.process.{FLEET_PROCESS_COMPONENT}.receiver]")
+    lines.append("  tail_from_end = false")
+    lines.append('  on_positions_file_error = "restart_from_beginning"')
+    lines.append("")
+    lines.append("  file_match {")
+    lines.append("    enabled = true")
+    lines.append('    sync_period = "10s"')
+    lines.append(f'    ignore_older_than = "{retention_hours}h"')
+    lines.append("  }")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _process_stanza() -> str:
+    return (
+        f'loki.process "{FLEET_PROCESS_COMPONENT}" {{\n'
+        "  forward_to = [loki.write.default.receiver]\n"
+        "\n"
+        "  stage.pack {\n"
+        '    labels = ["filename"]\n'
+        "    ingest_timestamp = true\n"
+        "  }\n"
+        "}"
+    )
+
+
+def render_lxc_log_config(
+    base: DesiredAlloyConfig,
+    *,
+    node: str,
+    cluster: str,
+    lxc_id: str,
+    name: str,
+    profiles: Set[str],
+    retention_hours: int,
+) -> DesiredAlloyConfig:
+    """Append fleet-managed live file sources to a guest's desired Alloy HCL.
+
+    The base content, journal component names and storage path are preserved
+    verbatim; only the discovered-profile sources, the shared packing process
+    and the exact resulting content hash are added.  Unknown profiles and base
+    configs that already use a reserved component name are rejected before any
+    deployment.
+    """
+    wanted = set(profiles)
+    unknown = sorted(wanted - SUPPORTED_LOG_PROFILES)
+    if unknown:
+        raise AlloyConfigError("unsupported log profile(s): " + ", ".join(unknown))
+    if not wanted:
+        return base
+    hours = int(retention_hours)
+    if hours < 1:
+        raise AlloyConfigError("retention_hours must be a positive integer")
+    conflicts = _reserved_conflicts(base.content)
+    if conflicts:
+        raise AlloyConfigError(
+            "desired config already uses reserved fleet component name(s): "
+            + ", ".join(conflicts)
+        )
+
+    blocks = [_process_stanza()]
+    if "npm" in wanted:
+        blocks.append(
+            _source_stanza(
+                FLEET_NPM_SOURCE_COMPONENT,
+                [
+                    _fleet_target(
+                        path=NPM_LIVE_LOG_GLOB,
+                        exclude=_quarantine_exclude(NPM_LOG_ROOT),
+                        app="nginxproxymanager",
+                        log_kind="application",
+                        cluster=cluster,
+                        node=node,
+                        lxc_id=lxc_id,
+                        name=name,
+                    )
+                ],
+                hours,
+            )
+        )
+    if "pbs" in wanted:
+        blocks.append(
+            _source_stanza(
+                FLEET_PBS_TASKS_SOURCE_COMPONENT,
+                [
+                    _fleet_target(
+                        path=PBS_LIVE_TASKS_GLOB,
+                        exclude=_quarantine_exclude(PBS_TASKS_ROOT),
+                        app="proxmox-backup",
+                        log_kind="task",
+                        cluster=cluster,
+                        node=node,
+                        lxc_id=lxc_id,
+                        name=name,
+                    )
+                ],
+                hours,
+            )
+        )
+        blocks.append(
+            _source_stanza(
+                FLEET_PBS_API_SOURCE_COMPONENT,
+                [
+                    _fleet_target(
+                        path=api_path,
+                        app="proxmox-backup",
+                        log_kind="api",
+                        cluster=cluster,
+                        node=node,
+                        lxc_id=lxc_id,
+                        name=name,
+                    )
+                    for api_path in PBS_LIVE_API_GLOBS
+                ],
+                hours,
+            )
+        )
+
+    content = base.content
+    if not content.endswith("\n"):
+        content += "\n"
+    content += "\n" + "\n\n".join(blocks) + "\n"
+    return DesiredAlloyConfig(
+        content=content,
+        sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    )

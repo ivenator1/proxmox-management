@@ -36,6 +36,13 @@
     </span>
   </label>
   <label class="option-row">
+    <span class="switch"><input type="checkbox" name="housekeeping_only" value="true"><span class="track"></span></span>
+    <span class="option-text">
+      <span class="option-title">Housekeeping only</span>
+      <span class="option-desc"><code>--housekeeping-only</code> — log/cache maintenance on managed LXCs; no updates, snapshots or reboots</span>
+    </span>
+  </label>
+  <label class="option-row">
     <span class="switch"><input type="checkbox" name="force_notify" value="true"><span class="track"></span></span>
     <span class="option-text">
       <span class="option-title">Force notification</span>
@@ -82,7 +89,8 @@
       The dashboard launches <code>fleet-update</code> as a detached process —
       closing this page (or restarting the dashboard) never kills a run.
       Only one fleet run can be in flight at a time; you'll get a live console
-      with streaming output.
+      with streaming output. Hourly maintenance runs appear in the
+      <a href="/housekeeping">housekeeping history</a>.
     </p>
   </div>
 </div>

@@ -54,6 +54,7 @@ Dashboard{% endblock %} {% block content %}
             </div>
           </details>
           {% elif col == "packages" %}<span class="muted">—</span>
+          {% elif col == "housekeeping" %}{{ housekeeping_text(val) }}
           {% else %}{{ val if val is not none else "" }}{% endif %}
         </td>
         {% endfor %}

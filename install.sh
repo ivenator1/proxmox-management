@@ -3,6 +3,7 @@
 #
 # Usage (as root, from the cloned repo):
 #   ./install.sh              install: venv + deps, systemd scan timer, dashboard service
+#                             (plus the hourly housekeeping timer when housekeeping_enabled=true)
 #   ./install.sh --update     git pull, reinstall deps, rewrite units, restart services
 #   ./install.sh --uninstall  remove units + venv (prompts before deleting run history)
 #   ./install.sh --help
@@ -20,6 +21,8 @@ UNIT_DIR="/etc/systemd/system"
 HISTORY_DIR_DEFAULT="/var/log/fleet-update"
 SCAN_SERVICE="fleet-scan.service"
 SCAN_TIMER="fleet-scan.timer"
+HOUSEKEEPING_SERVICE="fleet-housekeeping.service"
+HOUSEKEEPING_TIMER="fleet-housekeeping.timer"
 DASH_SERVICE="fleet-dashboard.service"
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"   # overridable for testing without systemd
 
@@ -40,8 +43,17 @@ PYEOF
     printf '%s' "${value:-$fallback}"
 }
 
+# True when an installed-settings string is a truthy boolean (true/1/yes).
+# resolve_setting prints Python bools as "True"/"False".
+setting_is_true() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        true|1|yes) return 0 ;;
+        *)          return 1 ;;
+    esac
+}
+
 usage() {
-    sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 require_root() {
@@ -160,6 +172,35 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+    cat > "$UNIT_DIR/$HOUSEKEEPING_SERVICE" <<EOF
+[Unit]
+Description=Fleet log housekeeping (fleet-update --housekeeping-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=$REPO_DIR
+ExecStart=$VENV/bin/fleet-update --housekeeping-only
+Environment=PYTHONUNBUFFERED=1
+TimeoutStartSec=3600
+CPUWeight=10
+IOWeight=10
+EOF
+
+    cat > "$UNIT_DIR/$HOUSEKEEPING_TIMER" <<EOF
+[Unit]
+Description=Run fleet log housekeeping hourly
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
     cat > "$UNIT_DIR/$DASH_SERVICE" <<EOF
 [Unit]
 Description=Fleet web dashboard (fleet-dashboard)
@@ -184,9 +225,40 @@ enable_units() {
     "$SYSTEMCTL" enable --now "$SCAN_TIMER" "$DASH_SERVICE"
 }
 
+# The housekeeping service/timer are written on every install but enabled only
+# when housekeeping_enabled resolves true. Install and --update both reconcile
+# the enabled state (never an unconditional enable), so flipping the setting in
+# vars.yml off and re-running the installer stops the timer again.
+reconcile_housekeeping_timer() {
+    local enabled
+    enabled=$(resolve_setting housekeeping_enabled false)
+    if setting_is_true "$enabled"; then
+        info "Enabling and starting $HOUSEKEEPING_TIMER (housekeeping_enabled=true)"
+        "$SYSTEMCTL" enable --now "$HOUSEKEEPING_TIMER"
+        if [ "$("$SYSTEMCTL" is-enabled "$HOUSEKEEPING_TIMER")" != "enabled" ] \
+            || [ "$("$SYSTEMCTL" is-active "$HOUSEKEEPING_TIMER")" != "active" ]; then
+            die "$HOUSEKEEPING_TIMER was not observed enabled and active"
+        fi
+    else
+        info "Housekeeping disabled in settings — leaving $HOUSEKEEPING_TIMER disabled"
+        "$SYSTEMCTL" disable --now "$HOUSEKEEPING_TIMER"
+        local enable_state active_state
+        enable_state=$("$SYSTEMCTL" is-enabled "$HOUSEKEEPING_TIMER") || true
+        active_state=$("$SYSTEMCTL" is-active "$HOUSEKEEPING_TIMER") || true
+        if [ "$enable_state" != "disabled" ] || [ "$active_state" != "inactive" ]; then
+            die "$HOUSEKEEPING_TIMER was not observed disabled and inactive"
+        fi
+    fi
+}
+
 print_summary() {
     local history_dir="$1"
-    local port host_ip
+    local port host_ip hk_line
+    if setting_is_true "$(resolve_setting housekeeping_enabled false)"; then
+        hk_line="hourly ($HOUSEKEEPING_TIMER -> fleet-update --housekeeping-only)"
+    else
+        hk_line="disabled (set housekeeping_enabled=true in vars.yml, then re-run install)"
+    fi
     port=$(resolve_setting dashboard_port 8421)
     host_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
     cat <<EOF
@@ -195,8 +267,9 @@ Install complete.
 
   Dashboard:   http://${host_ip:-<this-host>}:${port:-8421}  ($DASH_SERVICE, login required)
   Scan timer:  every 6 hours ($SCAN_TIMER -> fleet-update --scan)
+  Housekeep:   $hk_line
   History:     $history_dir
-  Both units are enabled and persist across reboots.
+  Enabled units persist across reboots.
 
 Next steps:
   1. Access the dashboard at http://${host_ip:-<this-host>}:${port:-8421} (admin@fleet.lan, password set during install)
@@ -218,6 +291,7 @@ do_install() {
     init_admin_user "$history_dir"
     write_units
     enable_units
+    reconcile_housekeeping_timer
     print_summary "$history_dir"
 }
 
@@ -232,6 +306,7 @@ do_update() {
     info "Restarting services"
     "$SYSTEMCTL" enable --now "$SCAN_TIMER"
     "$SYSTEMCTL" restart "$DASH_SERVICE"
+    reconcile_housekeeping_timer
     info "Update complete."
 }
 
@@ -243,8 +318,10 @@ do_uninstall() {
     history_dir=$(resolve_setting fleet_history_dir "$HISTORY_DIR_DEFAULT")
 
     info "Stopping and disabling units"
-    "$SYSTEMCTL" disable --now "$SCAN_TIMER" "$DASH_SERVICE" "$SCAN_SERVICE" 2>/dev/null || true
-    rm -f "$UNIT_DIR/$SCAN_SERVICE" "$UNIT_DIR/$SCAN_TIMER" "$UNIT_DIR/$DASH_SERVICE"
+    "$SYSTEMCTL" disable --now "$SCAN_TIMER" "$DASH_SERVICE" "$SCAN_SERVICE" \
+        "$HOUSEKEEPING_TIMER" "$HOUSEKEEPING_SERVICE" 2>/dev/null || true
+    rm -f "$UNIT_DIR/$SCAN_SERVICE" "$UNIT_DIR/$SCAN_TIMER" "$UNIT_DIR/$DASH_SERVICE" \
+        "$UNIT_DIR/$HOUSEKEEPING_SERVICE" "$UNIT_DIR/$HOUSEKEEPING_TIMER"
     "$SYSTEMCTL" daemon-reload
     "$SYSTEMCTL" reset-failed 2>/dev/null || true
 

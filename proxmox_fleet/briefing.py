@@ -23,6 +23,19 @@ _COLOR_WARNING = 16766720
 _COLOR_OK = 3066993
 
 
+def human_bytes(value: int) -> str:
+    """Render non-negative byte totals with binary units for reports and UI."""
+    value = max(0, value)
+    if value < 1024:
+        return f"{value} B"
+    size = float(value)
+    for unit in ("KiB", "MiB", "GiB", "TiB", "PiB"):
+        size /= 1024
+        if size < 1024 or unit == "PiB":
+            return f"{size:.1f} {unit}"
+    raise AssertionError("unreachable byte unit")
+
+
 def render_briefing(state: FleetState, *, manual_section: str = "") -> str:
     """Render the briefing body exactly as ``discord_briefing.j2`` would.
 
@@ -45,6 +58,14 @@ def render_briefing(state: FleetState, *, manual_section: str = "") -> str:
                     seg += f" | OS: {lx.os}"
                 if lx.alloy:
                     seg += f"{' |' if lx.app or lx.os else ' —'} Alloy: {lx.alloy}"
+                if lx.housekeeping is not None:
+                    summary = lx.housekeeping
+                    separator = " |" if lx.app or (lx.os and lx.os != "None") or lx.alloy else " —"
+                    seg += (
+                        f"{separator} Housekeeping: {summary.status} "
+                        f"({human_bytes(summary.bytes_reclaimed)} reclaimed; "
+                        f"{human_bytes(summary.bytes_archived)} archived)"
+                    )
                 # Alloy-only runs intentionally skip snapshots; reserve the
                 # marker for update records where a snapshot was applicable.
                 if not lx.snap and (lx.app or lx.os):

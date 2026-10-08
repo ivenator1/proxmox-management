@@ -8,10 +8,39 @@ reboot_host primitives via ansible-runner; tests supply a fake.
 
 from __future__ import annotations
 
+import json
+import shlex
 import time
-from typing import Any, Callable, Dict, Optional, Protocol
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Protocol
 
+from proxmox_fleet.alloy import AlloyExecutor
 from proxmox_fleet.runner import PrimitiveResult, invoke_primitive
+
+# Node-side stdlib helper staged by the housekeeping primitives. Kept next to
+# this module so the source travels with the package; the primitives copy its
+# exact contents into a root-only node temp dir and run it with python3.
+_HELPER_PATH = Path(__file__).with_name("housekeeping_io.py")
+
+
+def housekeeping_helper_source() -> str:
+    """Read the node-side housekeeping helper source to stage per operation."""
+    return _HELPER_PATH.read_text(encoding="utf-8")
+
+
+def _housekeeping_extravars(lxc_id: str, request: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the transport extravars shared by all housekeeping primitives.
+
+    The request carries no policy: it is the exact manager-built JSON object of
+    file wire records (and capture_id where applicable). It is serialized
+    compactly and staged as a file so no log bodies or request text can leak
+    into runner facts/stdout.
+    """
+    return {
+        "lxc_id": lxc_id,
+        "housekeeping_helper_content": housekeeping_helper_source(),
+        "housekeeping_request_json": json.dumps(request, separators=(",", ":")),
+    }
 
 
 class SnapshotExecutor(Protocol):
@@ -34,7 +63,15 @@ class SnapshotExecutor(Protocol):
         ...
 
 
-class Executor(Protocol):
+class Executor(AlloyExecutor, Protocol):
+    """Everything a flow may ask a bound host to do.
+
+    Inherits :class:`AlloyExecutor` so the typed logging/housekeeping policy can
+    require both Alloy compliance and the bounded maintenance transport from one
+    interface. ``RunnerExecutor`` implements both; missing capabilities are a
+    typing error, never a silent ``getattr``/``Any`` fallback.
+    """
+
     host: str
 
     def run_shell(
@@ -153,6 +190,62 @@ class Executor(Protocol):
 
     def pct_stop(self, lxc_id: str) -> PrimitiveResult:
         """Stop a container via the pct_stop primitive."""
+        ...
+
+    def housekeeping_probe(self, lxc_id: str) -> PrimitiveResult:
+        """Read-only housekeeping facts for one container via its node.
+
+        Returns facts keys ``guest``, ``disk``, ``journal_bytes``, ``profiles``,
+        ``files``, ``cache_paths``, ``busy_tools``, ``binaries``,
+        ``log_access_ready`` and ``policy_sha256``. The primitive runs under
+        check mode too; it performs no guest writes.
+        """
+        ...
+
+    def housekeeping_capture(
+        self, lxc_id: str, *, files: List[Dict[str, Any]], capture_id: str
+    ) -> PrimitiveResult:
+        """Freeze initial file high-water prefixes into the node root-only spool.
+
+        ``files`` are exact manager-built wire records; ``capture_id`` encodes
+        the sharded spool namespace. Returns facts ``capture_id`` and ``files``
+        (wire records plus ``sha256`` and ``blob_path``). The persistent spool is
+        never cleaned up here — only the transient helper/request stage is.
+        """
+        ...
+
+    def housekeeping_snapshot(
+        self, lxc_id: str, *, files: List[Dict[str, Any]], destination: str
+    ) -> PrimitiveResult:
+        """Tar requested byte ranges on the node and fetch them to the manager.
+
+        ``destination`` is the exact manager-side tar path. Returns facts
+        ``files`` (observed metadata); raw bytes are never placed in facts or
+        stdout and a failed fetch fails the primitive closed.
+        """
+        ...
+
+    def housekeeping_apply(self, lxc_id: str, *, command: str) -> PrimitiveResult:
+        """Action transport only: run *command* in the container via ``pct exec``.
+
+        Quoting is shlex-safe and ``lxc_id`` must be numeric; the manager
+        constructs every command and controls dry-run, so no policy lives here.
+        The real container exit status is preserved.
+        """
+        ...
+
+    def housekeeping_prune(
+        self,
+        lxc_id: str,
+        *,
+        files: List[Dict[str, Any]],
+    ) -> PrimitiveResult:
+        """Quarantine-then-unlink approved closed files inside the container.
+
+        ``files`` carry exact identities/digests and persisted quarantine paths,
+        including unfinished recovery intents. Returns per-file outcomes and
+        measured reclaimed bytes.
+        """
         ...
 
 
@@ -358,6 +451,72 @@ class RunnerExecutor:
             inventory=self.inventory,
             host_pattern=self.host,
             extravars={"lxc_id": lxc_id},
+            check=self.check,
+        ))
+
+    def housekeeping_probe(self, lxc_id: str) -> PrimitiveResult:
+        return _merge_facts(invoke_primitive(
+            "lxc_housekeeping_probe",
+            inventory=self.inventory,
+            host_pattern=self.host,
+            extravars=_housekeeping_extravars(lxc_id, {}),
+            check=self.check,
+        ))
+
+    def housekeeping_capture(
+        self, lxc_id: str, *, files: List[Dict[str, Any]], capture_id: str
+    ) -> PrimitiveResult:
+        return _merge_facts(invoke_primitive(
+            "lxc_log_capture",
+            inventory=self.inventory,
+            host_pattern=self.host,
+            extravars=_housekeeping_extravars(
+                lxc_id, {"files": files, "capture_id": capture_id}
+            ),
+            check=self.check,
+        ))
+
+    def housekeeping_snapshot(
+        self, lxc_id: str, *, files: List[Dict[str, Any]], destination: str
+    ) -> PrimitiveResult:
+        extravars = _housekeeping_extravars(lxc_id, {"files": files})
+        extravars["housekeeping_manager_destination"] = destination
+        return _merge_facts(invoke_primitive(
+            "lxc_log_snapshot",
+            inventory=self.inventory,
+            host_pattern=self.host,
+            extravars=extravars,
+            check=self.check,
+        ))
+
+    def housekeeping_apply(self, lxc_id: str, *, command: str) -> PrimitiveResult:
+        # The ID is interpolated into a shell string (pct exec), so it MUST be a
+        # bare container number; the command is shlex-quoted and passed as one
+        # argv to `sh -c`. ignore_errors keeps run_shell's set_stats reachable so
+        # the container's real exit status survives for the caller.
+        container_id = str(lxc_id).strip()
+        if not container_id.isdigit():
+            return PrimitiveResult(
+                rc=1,
+                stdout="",
+                stderr=f"housekeeping_apply refused non-numeric lxc_id: {lxc_id!r}",
+                changed=False,
+                failed=True,
+            )
+        wrapped = f"pct exec {container_id} -- sh -c {shlex.quote(command)}"
+        return self.run_shell(wrapped, ignore_errors=True)
+
+    def housekeeping_prune(
+        self,
+        lxc_id: str,
+        *,
+        files: List[Dict[str, Any]],
+    ) -> PrimitiveResult:
+        return _merge_facts(invoke_primitive(
+            "lxc_log_prune",
+            inventory=self.inventory,
+            host_pattern=self.host,
+            extravars=_housekeeping_extravars(lxc_id, {"files": files}),
             check=self.check,
         ))
 

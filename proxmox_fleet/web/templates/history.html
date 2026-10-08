@@ -1,8 +1,8 @@
 {% extends "base.html" %}
-{% block title %}Run history — Fleet Dashboard{% endblock %}
+{% block title %}{{ history_title or "Run history" }} — Fleet Dashboard{% endblock %}
 {% block content %}
 <div class="page-head">
-  <h1>Run history</h1>
+  <h1>{{ history_title or "Run history" }}</h1>
   {% if rows %}<span class="sub">{{ rows | length }} persisted run(s)</span>{% endif %}
 </div>
 
@@ -49,7 +49,7 @@
   <tbody>
   {% for row in rows %}
     <tr>
-      <td><a class="mono" href="/history/{{ row.timestamp }}" title="{{ row.timestamp }}">{{ row.timestamp | ts_span }}</a></td>
+      <td><a class="mono" href="{{ history_base or '/history' }}/{{ row.timestamp }}" title="{{ row.timestamp }}">{{ row.timestamp | ts_span }}</a></td>
       <td>
         {% if row.failed %}<span class="pill fail">failed</span>
         {% elif row.changed %}<span class="pill info">changed</span>
@@ -74,7 +74,7 @@
 {% else %}
 <div class="empty">
   <span class="glyph" aria-hidden="true">⟡</span>
-  <p>No run history yet.</p>
+  <p>{{ history_empty or "No run history yet." }}</p>
 </div>
 {% endif %}
 {% endblock %}

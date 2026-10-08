@@ -366,3 +366,16 @@ def test_snapshot_with_retry_injectable_sleep_called():
                         api_host="1.2.3.4", api_user="u",
                         api_token_id="t", api_token_secret="s")
     assert sleeps == [7.5]
+
+
+def test_housekeeping_apply_rejects_non_numeric_id(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        executor_mod, "invoke_primitive",
+        lambda *a, **k: calls.append(a) or _pr(),
+    )
+    result = RunnerExecutor("pve-01").housekeeping_apply("12; rm -rf /", command="true")
+    assert result.failed is True
+    assert calls == []
+
+

@@ -6,12 +6,26 @@ health check, dry-run, was_stopped handling, resource scaling, and status string
 """
 import importlib
 import time
+import hashlib
+from pathlib import Path
 from typing import Any, cast
 
+import pytest
+
+from proxmox_fleet import housekeeping_import as hi
 from proxmox_fleet import http as http_mod
 from proxmox_fleet.flows.lxc import _discover_lxcs, _os_update_cmd, run_lxc_update
 from proxmox_fleet.models.settings import GlobalSettings
+from proxmox_fleet.models.state import HousekeepingSummary
 from proxmox_fleet.runner import PrimitiveResult
+from tests.unit.test_housekeeping import (
+    CacheSpec,
+    Guest,
+    LokiStub,
+    _base,
+    _cache_dir,
+    _measure,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -247,14 +261,25 @@ def test_alloy_reconciliation_runs_after_snapshot_before_packages(monkeypatch):
     assert alloy_index < os_index
 
 
-def test_alloy_only_skips_snapshot_package_reboot_and_app_work(monkeypatch):
+def test_alloy_only_uses_logging_preparation_and_skips_update_work(monkeypatch):
+    """--alloy-only runs logging-only preparation (install-capable) and never
+    touches packages, snapshots, reboots or the full maintenance policy."""
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
     alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+    hk_mod = importlib.import_module("proxmox_fleet.housekeeping")
     desired = alloy_mod.DesiredAlloyConfig(content="config\n", sha256="hash")
+    captured: dict = {}
+
+    def fake_prepare(executor, settings, **kwargs):
+        captured.update(kwargs)
+        return hk_mod.HousekeepingResult(
+            summary=HousekeepingSummary(status="Configured"), changed=True
+        )
+
+    monkeypatch.setattr(hk_mod, "prepare_lxc_logging", fake_prepare)
     monkeypatch.setattr(
-        alloy_mod,
-        "reconcile_alloy",
-        lambda *args, **kwargs: alloy_mod.AlloyResult(status="Installed", changed=True),
+        hk_mod, "run_housekeeping",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("alloy-only must not run the full policy")),
     )
     ex = ScriptedLxcExecutor(introspect_facts=_INTROSPECT_NO_SCRIPT)
     out = run_lxc_update(
@@ -266,8 +291,12 @@ def test_alloy_only_skips_snapshot_package_reboot_and_app_work(monkeypatch):
         alloy_config=desired,
         alloy_only=True,
     )
+    # allow_install=True preserves the mode's existing installer behaviour.
+    assert captured["allow_install"] is True
+    assert captured["base"] is desired
+    assert captured["dry_run"] is False
     assert out.changed is True
-    assert out.record is not None and out.record.alloy == "Installed"
+    assert out.record is not None and out.record.housekeeping.status == "Configured"
     assert ex.snapshots_created == []
     assert not any(
         marker in command
@@ -1497,3 +1526,274 @@ def test_run_lxc_update_kuma_map_exact_qualified_key_wins(monkeypatch):
     ex = _exec_normal(ver_before="1.0", ver_after="1.1")
     run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10", cluster="alpha")
     assert captured["monitor_id"] == "9"
+
+
+# ---------------------------------------------------------------------------
+# Ordinary housekeeping integration (opt-in via housekeeping_enabled)
+# ---------------------------------------------------------------------------
+
+_DF_FULL = "/dev/root 104857600 103809024 1048576 99% /\n"       # 1 GiB free
+_DF_ROOMY = "/dev/root 104857600 93323264 11534336 11% /\n"       # 11 GiB free
+
+
+class HousekeepingPolicyExecutor(ScriptedLxcExecutor):
+    """Flow executor whose maintenance transport is the real execution layer.
+
+    Flow-only commands (introspect, version probes, ``df``, snapshots) stay
+    scripted, but the housekeeping and Alloy primitives delegate to the
+    execution-layer ``Guest`` adapter the policy suite drives: it *really*
+    reclaims a temporary cache directory and records the requested native
+    actions, so cache reclamation is measured I/O rather than a mocked result.
+    """
+
+    def __init__(self, *args, hk_guest, yarn_dir=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.hk = hk_guest
+        self._yarn_dir = yarn_dir
+        self.cache_empty_at_snapshot = None
+
+    def housekeeping_probe(self, lxc_id):
+        return self.hk.housekeeping_probe(lxc_id)
+
+    def housekeeping_capture(self, lxc_id, *, files, capture_id):
+        return self.hk.housekeeping_capture(lxc_id, files=files, capture_id=capture_id)
+
+    def housekeeping_snapshot(self, lxc_id, *, files, destination):
+        return self.hk.housekeeping_snapshot(lxc_id, files=files, destination=destination)
+
+    def housekeeping_prune(self, lxc_id, *, files):
+        return self.hk.housekeeping_prune(lxc_id, files=files)
+
+    def housekeeping_apply(self, lxc_id, *, command):
+        return self.hk.housekeeping_apply(lxc_id, command=command)
+
+    def alloy_probe(self, *, lxc_id=None):
+        deployed = Path(self.hk.guest_root) / "etc/alloy/config.alloy"
+        self.hk.alloy_config_sha = hashlib.sha256(deployed.read_bytes()).hexdigest() if deployed.exists() else ""
+        return self.hk.alloy_probe(lxc_id=lxc_id)
+
+    def alloy_reconcile(self, **kwargs):
+        result = self.hk.alloy_reconcile(**kwargs)
+        if result.ok and kwargs.get("configure"):
+            deployed = Path(self.hk.guest_root) / "etc/alloy/config.alloy"
+            deployed.parent.mkdir(parents=True, exist_ok=True)
+            deployed.write_text(kwargs["desired_content"])
+        return result
+
+    def snapshot(self, vmid, **kwargs):
+        # Record whether the maintenance cache reclamation has already happened
+        # by the time the update snapshot is taken.
+        if self._yarn_dir is not None and self.cache_empty_at_snapshot is None:
+            self.cache_empty_at_snapshot = _measure(self._yarn_dir) == 0
+        return super().snapshot(vmid, **kwargs)
+
+
+def _policy_guest(tmp_path, monkeypatch, name="sonarr"):
+    root = tmp_path / "guest"
+    (root / "data" / "logs").mkdir(parents=True)
+    spool = tmp_path / "spool"
+    monkeypatch.setattr(hi, "SPOOL_ROOT", str(spool))
+    guest = Guest(root, spool)
+    guest.name = name
+    return guest
+
+
+def _ordinary_script():
+    return {
+        # More specific key first -- "df -Pk /" would otherwise swallow /boot.
+        "df -Pk /boot": [_ok(stdout=_DF_ROOMY)],
+        "df -Pk /": [_ok(stdout=_DF_ROOMY)],
+        "cat ~/.sonarr": [_ok(stdout="1.0")],
+        "dpkg-query": [_ok(stdout="hash_before  -\n", changed=False)],
+        "test -f /var/run/reboot-required": [_fail(rc=1)],
+    }
+
+
+def _stub_github(monkeypatch):
+    """Serve the detect-phase GitHub fetch locally, leaving Loki traffic real."""
+    real_request = http_mod.request
+
+    def routed(url, *args, **kwargs):
+        if "github" in str(url):
+            return http_mod.HttpResponse(200, "")
+        return real_request(url, *args, **kwargs)
+
+    monkeypatch.setattr(http_mod, "request", routed)
+
+
+def _upkeep_settings(history, url="", **overrides):
+    values = {
+        "lxc_backup_strategy": "snapshot",
+        "lxc_backup_storage": "local",
+        "lxc_auto_reboot": False,
+        "lxc_unattended": True,
+        "pve_api_user": "root@pam",
+        "pve_api_token_id": "tok",
+        "pve_api_token_secret": "secret",
+        "fleet_history_dir": str(history),
+        "housekeeping_enabled": bool(url),
+        "housekeeping_loki_url": url,
+    }
+    values.update(overrides)
+    return GlobalSettings.model_validate(values)
+
+
+def _upkeep_executor(tmp_path, monkeypatch, *, yarn=None, introspect_facts=None):
+    guest = _policy_guest(tmp_path, monkeypatch)
+    if yarn is not None:
+        guest.cache_specs["yarn"] = CacheSpec("/usr/local/share/.cache/yarn/v6", yarn, "1.22.19")
+    ex = HousekeepingPolicyExecutor(
+        introspect_facts=(
+            introspect_facts if introspect_facts is not None else _INTROSPECT_WITH_SCRIPT
+        ),
+        script=_ordinary_script(),
+        lxc_os_result=_ok(stdout="2 upgraded, 0 newly installed"),
+        post_update_facts={"dpkg_hash_after": "hash_before  -\n", "version_after": "1.1"},
+        hk_guest=guest,
+        yarn_dir=yarn,
+    )
+    return ex, guest
+
+
+def test_housekeeping_enabled_requires_a_loki_url():
+    """Enabling maintenance without a usable Loki base is rejected up front: the
+    ordinary update path must never run an unverifiable archive/retention pass."""
+    with pytest.raises(ValueError, match="housekeeping_loki_url"):
+        GlobalSettings.model_validate({"housekeeping_enabled": True})
+
+
+def test_ordinary_housekeeping_cleans_cache_before_snapshot_and_refreshes_disk(monkeypatch, tmp_path):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    _stub_github(monkeypatch)
+    yarn = _cache_dir(tmp_path, "yarn")
+    before = _measure(yarn)
+    assert before > 0
+
+    with LokiStub() as stub:
+        base = _base(stub.url)
+        settings = _upkeep_settings(
+            tmp_path, url=stub.url, lxc_disk_warn_percent=75, lxc_disk_min_free_gb=10
+        )
+        ex, guest = _upkeep_executor(
+            tmp_path, monkeypatch, yarn=yarn,
+            introspect_facts=dict(
+                _INTROSPECT_WITH_SCRIPT, df_stdout=_DF_FULL, boot_df_stdout=_DF_FULL
+            ),
+        )
+        out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10", alloy_config=base)
+
+    assert guest.probe_calls > 0
+    # Real reclamation, measured from the temporary cache directory.
+    assert _measure(yarn) == 0
+    # The cache was already empty when the snapshot was taken, so maintenance
+    # provably ran before the snapshot (and before package work).
+    assert ex.cache_empty_at_snapshot is True
+    assert ex.snapshots_created == ["101"]
+    assert out.record is not None and out.record.housekeeping is not None
+    assert out.record.housekeeping.bytes_reclaimed == before
+    # The post-cleanup df refresh suppressed the warning the stale 99%/1-GiB
+    # reading would have produced.
+    assert not any(w.task == "disk space" for w in out.warnings)
+    assert out.failed is False
+
+
+def test_ordinary_housekeeping_feeds_generated_alloy_config_to_enforcement(monkeypatch, tmp_path):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    _stub_github(monkeypatch)
+    alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+
+    with LokiStub() as stub:
+        base = _base(stub.url)
+        settings = _upkeep_settings(tmp_path, url=stub.url)
+        ex, guest = _upkeep_executor(tmp_path, monkeypatch)
+        guest.profiles = ["npm"]                 # recognized -> live file sources rendered
+        out = run_lxc_update(
+            "pve-01", "101", ex, settings, api_host="192.168.1.10",
+            cluster="alpha", alloy_config=base,
+        )
+
+    expected = alloy_mod.render_lxc_log_config(
+        base,
+        node="pve-01", cluster="alpha", lxc_id="101", name="sonarr",
+        profiles={"npm"}, retention_hours=settings.housekeeping_local_retention_hours,
+    )
+    assert "fleet_npm" in expected.content
+    assert expected.sha256 != base.sha256
+    # The deployed Alloy content is the generated config with live file sources,
+    # never the journal-only base -- a later reconcile must not clobber them.
+    assert (Path(guest.guest_root) / "etc/alloy/config.alloy").read_text() == expected.content
+    assert out.record is not None
+
+
+def test_ordinary_housekeeping_logging_failure_leaves_update_unfailed(monkeypatch, tmp_path):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    _stub_github(monkeypatch)
+    yarn = _cache_dir(tmp_path, "yarn")
+    before = _measure(yarn)
+    assert before > 0
+
+    with LokiStub() as stub:
+        base = _base(stub.url)
+        settings = _upkeep_settings(tmp_path, url=stub.url)
+        ex, guest = _upkeep_executor(tmp_path, monkeypatch, yarn=yarn)
+        guest.alloy_binary = False               # logging preparation must block
+        out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10", alloy_config=base)
+
+    # The cache reclamation is real; the logging failure is only a warning and
+    # never fails the update or rolls it back.
+    assert _measure(yarn) == 0
+    assert out.failed is False
+    assert out.errors == []
+    assert ex.rollback_called is False
+    assert ex.snapshots_created == ["101"]
+    assert any("dist-upgrade" in command for command in ex.commands)
+    assert out.record is not None
+    assert out.record.housekeeping.status == "Blocked"
+    assert out.record.housekeeping.bytes_reclaimed == before
+    assert any(w.notifying for w in out.warnings)
+
+
+def test_housekeeping_summary_survives_update_rescue(monkeypatch, tmp_path):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    _stub_github(monkeypatch)
+    yarn = _cache_dir(tmp_path, "yarn")
+    before = _measure(yarn)
+    assert before > 0
+
+    with LokiStub() as stub:
+        base = _base(stub.url)
+        settings = _upkeep_settings(tmp_path, url=stub.url)
+        ex, _guest = _upkeep_executor(tmp_path, monkeypatch, yarn=yarn)
+
+        def fail_os(*args, **kwargs):
+            raise RuntimeError("hard package failure")
+
+        ex.lxc_os_update = fail_os
+        out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10", alloy_config=base)
+
+    assert out.failed is True
+    assert ex.rollback_called is True
+    # The reclamation really happened before the snapshot, so the rescue record
+    # keeps the actual cleaned summary.
+    assert _measure(yarn) == 0
+    assert out.record is not None
+    assert out.record.housekeeping is not None
+    assert out.record.housekeeping.bytes_reclaimed == before
+
+
+def test_housekeeping_disabled_never_runs_maintenance(monkeypatch, tmp_path):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    _stub_github(monkeypatch)
+    yarn = _cache_dir(tmp_path, "yarn")
+    before = _measure(yarn)
+    assert before > 0
+
+    settings = _upkeep_settings(tmp_path)          # housekeeping_enabled stays False
+    ex, guest = _upkeep_executor(tmp_path, monkeypatch, yarn=yarn)
+    out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10")
+
+    assert out.failed is False
+    assert out.record is not None and out.record.housekeeping is None
+    assert _measure(yarn) == before                # nothing reclaimed
+    assert guest.probe_calls == 0                  # the policy was never called
+    assert not (tmp_path / "housekeeping.sqlite3").exists()

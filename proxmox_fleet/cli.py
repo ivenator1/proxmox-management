@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
 from proxmox_fleet.lock import FleetLockHeld, acquire_run_lock
@@ -62,6 +63,7 @@ _SETTINGS_EXTRAVARS = ("fleet_dry_run", "lxc_verbose", "force_notify", "force_wi
 _HISTORY_COUNT_COLUMNS = ("lxc", "vm", "remote", "node", "custom", "errors", "warnings")
 
 
+
 def _format_history_table(rows: List[Dict[str, Any]]) -> str:
     """Render history_summary() rows as a fixed-width table (newest first)."""
     headers = ["TIMESTAMP", "RESULT", *(c.upper() for c in _HISTORY_COUNT_COLUMNS)]
@@ -91,23 +93,36 @@ def history_main(
     history: Optional[int],
     history_show: Optional[str],
     vars_file: str,
+    history_kind: str = "fleet",
 ) -> int:
     """Handle ``--history [N]`` / ``--history-show REF`` — read-only, no fleet run.
 
     Shared by this CLI and the ``fleet-update.py`` wrapper. Reads
     ``fleet_history_dir`` from settings, never imports the driver (so it works
     without ansible-runner installed).
+
+    ``history_kind`` selects which namespace is read: ``"fleet"`` is the
+    original history root, ``"housekeeping"`` is the fixed maintenance child
+    directory the hourly timer writes into.
     """
     from proxmox_fleet import history as history_mod
     from proxmox_fleet.models.settings import GlobalSettings
 
     settings = GlobalSettings.load(vars_file)
 
+    root = Path(settings.fleet_history_dir)
+    if history_kind == "fleet":
+        directory = root
+    elif history_kind == "housekeeping":
+        directory = root / history_mod.HOUSEKEEPING_HISTORY_SUBDIR
+    else:
+        raise ValueError(f"unknown history kind: {history_kind!r}")
+
     if history_show is not None:
         try:
-            run = history_mod.read_run(settings.fleet_history_dir, history_show)
+            run = history_mod.read_run(directory, history_show)
         except FileNotFoundError:
-            print(f"no history record {history_show!r} in {settings.fleet_history_dir}")
+            print(f"no history record {history_show!r} in {directory}")
             return 1
         briefing = run.get("briefing")
         if briefing:
@@ -117,9 +132,9 @@ def history_main(
             print(json.dumps(run, indent=4, sort_keys=True, ensure_ascii=False))
         return 0
 
-    rows = history_mod.history_summary(settings.fleet_history_dir, limit=history or 0)
+    rows = history_mod.history_summary(directory, limit=history or 0)
     if not rows:
-        print(f"no run history found in {settings.fleet_history_dir}")
+        print(f"no run history found in {directory}")
         return 1
     print(_format_history_table(rows))
     return 0
@@ -176,6 +191,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="show the last N persisted runs (default 10) and exit; no fleet run.")
     parser.add_argument("--history-show", default=None, metavar="TS|latest",
                         help="print one persisted run's briefing (timestamp or 'latest') and exit.")
+    parser.add_argument("--history-kind", choices=("fleet", "housekeeping"), default=None,
+                        help="history namespace to read with --history/--history-show: "
+                             "fleet (default) or housekeeping (the hourly maintenance "
+                             "timer's own history). Only valid with those commands.")
     parser.add_argument("--limit", default=None, metavar="HOST,ID,...",
                         help="restrict the run to these host names and/or LXC/VM ids "
                              "(use cluster/ID, e.g. alpha/101, to target one cluster's "
@@ -192,6 +211,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="audit/repair Alloy on managed LXCs and VMs; skip all regular update work.",
     )
+    parser.add_argument(
+        "--housekeeping-only",
+        action="store_true",
+        help="run only LXC log housekeeping (Alloy file sources, acknowledged log "
+             "import into Loki, short local retention and recurring cache cleanup); "
+             "skip all regular update work.",
+    )
     args = parser.parse_args(argv)
 
     if args.alloy_only and args.scan:
@@ -199,9 +225,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.alloy_only and args.phases is not None:
         parser.error("--alloy-only cannot be combined with --phases")
 
-    if args.history is not None or args.history_show is not None:
+    if args.housekeeping_only and args.scan:
+        parser.error("--housekeeping-only cannot be combined with --scan")
+    if args.housekeeping_only and args.alloy_only:
+        parser.error("--housekeeping-only cannot be combined with --alloy-only")
+    if args.housekeeping_only and args.phases is not None:
+        parser.error("--housekeeping-only cannot be combined with --phases")
+
+    history_requested = args.history is not None or args.history_show is not None
+    if args.housekeeping_only and history_requested:
+        parser.error(
+            "--housekeeping-only cannot be combined with --history/--history-show")
+    if args.history_kind is not None and not history_requested:
+        parser.error("--history-kind is only valid with --history or --history-show")
+
+    if history_requested:
         return history_main(history=args.history, history_show=args.history_show,
-                            vars_file=args.vars_file)
+                            vars_file=args.vars_file,
+                            history_kind=args.history_kind or "fleet")
 
     if args.scan:
         from proxmox_fleet import scan as scan_mod
@@ -226,7 +267,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Propagate CLI extravars that affect driver behaviour into settings.
     settings = apply_extravar_overrides(settings, extravars)
-    alloy_options = {"alloy_only": True} if args.alloy_only else {}
+
+    # Explicit maintenance/audit modes are mutually exclusive with each other
+    # and with --scan/--phases (validated above); only set what was asked for.
+    mode_options: Dict[str, bool] = {}
+    if args.alloy_only:
+        mode_options["alloy_only"] = True
+    if args.housekeeping_only:
+        mode_options["housekeeping_only"] = True
 
     return run_locked(settings, lambda: driver.run_fleet(
         settings=settings,
@@ -235,7 +283,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         extra_vars=extravars,
         limit=_parse_csv_set(args.limit),
         phases=_parse_csv_set(args.phases),
-        **alloy_options,
+        **mode_options,
     ))
 
 

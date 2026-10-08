@@ -1,5 +1,8 @@
 """Tests for proxmox_fleet.models.settings.GlobalSettings."""
 
+import pytest
+from pydantic import ValidationError
+
 from proxmox_fleet.models.settings import GlobalSettings, PveClusterCreds
 
 
@@ -295,3 +298,141 @@ def test_manual_update_settings_int_types(tmp_path):
     s = GlobalSettings.load(f)
     assert s.manual_update_reminder_hours == 12
     assert s.manual_update_forks == 1
+
+
+# --- housekeeping settings (step 1) -----------------------------------------
+
+
+def test_housekeeping_defaults():
+    s = GlobalSettings()
+    assert s.housekeeping_enabled is False
+    assert s.housekeeping_loki_url == ""
+    assert s.housekeeping_local_retention_hours == 48
+    assert s.housekeeping_journal_max_mb == 256
+    assert s.housekeeping_journal_keep_free_mb == 512
+    assert s.housekeeping_cache_interval_hours == 24
+    assert s.housekeeping_backfill_budget_mb == 1024
+    assert s.lxc_housekeeping_exclude_list == []
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "housekeeping_local_retention_hours",
+        "housekeeping_journal_max_mb",
+        "housekeeping_journal_keep_free_mb",
+        "housekeeping_cache_interval_hours",
+        "housekeeping_backfill_budget_mb",
+    ],
+)
+@pytest.mark.parametrize("bad", [0, -1])
+def test_housekeeping_positive_int_fields_reject_nonpositive(field, bad):
+    with pytest.raises(ValidationError):
+        GlobalSettings.model_validate({field: bad})
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://10.10.10.39:3100",
+        "https://loki.example.com:3100",
+        "https://loki.example.com/loki",
+        "http://loki",
+    ],
+)
+def test_housekeeping_loki_url_accepts_absolute_http_bases(url):
+    s = GlobalSettings.model_validate({"housekeeping_loki_url": url})
+    assert s.housekeeping_loki_url == url
+    assert s.require_loki_url() == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "loki:3100",  # scheme is "loki", not http(s)
+        "10.10.10.39:3100",  # no scheme at all
+        "//loki:3100",  # protocol-relative, no scheme
+        "ftp://loki:3100",  # wrong scheme
+        "http://",  # no host
+        "http://user:pass@loki:3100",  # credentials must never live here
+        "http://loki:3100?tenant=x",  # query
+        "https://loki:3100/#frag",  # fragment
+    ],
+)
+def test_housekeeping_loki_url_rejects_unusable_bases(url):
+    with pytest.raises(ValidationError):
+        GlobalSettings.model_validate({"housekeeping_loki_url": url})
+
+
+def test_housekeeping_enabled_requires_loki_url():
+    with pytest.raises(ValidationError):
+        GlobalSettings.model_validate({"housekeeping_enabled": True})
+    s = GlobalSettings.model_validate(
+        {
+            "housekeeping_enabled": True,
+            "housekeeping_loki_url": "http://10.10.10.39:3100",
+        }
+    )
+    assert s.require_loki_url() == "http://10.10.10.39:3100"
+
+
+def test_require_loki_url_exposed_for_explicit_mode():
+    """--housekeeping-only requests the feature without setting
+    housekeeping_enabled, so the URL check must be callable directly."""
+    disabled = GlobalSettings()
+    assert disabled.housekeeping_enabled is False
+    with pytest.raises(ValueError):
+        disabled.require_loki_url()
+
+    configured = GlobalSettings.model_validate({"housekeeping_loki_url": "https://loki.example"})
+    assert configured.require_loki_url() == "https://loki.example"
+    # validate_assignment is off, so a mutated instance must still be guarded.
+    configured.housekeeping_loki_url = "http://u:p@loki:3100"
+    with pytest.raises(ValueError):
+        configured.require_loki_url()
+
+
+def test_validate_loki_base_url_classmethod_exposed():
+    assert GlobalSettings.validate_loki_base_url("") == ""
+    assert GlobalSettings.validate_loki_base_url("http://loki:3100") == "http://loki:3100"
+    with pytest.raises(ValueError):
+        GlobalSettings.validate_loki_base_url("http://loki:3100?q=1")
+    with pytest.raises(ValueError):
+        GlobalSettings.validate_loki_base_url("http://u:p@loki:3100")
+
+
+def test_housekeeping_exclude_list_entries_coerced_to_str():
+    s = GlobalSettings.model_validate({"lxc_housekeeping_exclude_list": [121, "alpha/129"]})
+    assert s.lxc_housekeeping_exclude_list == ["121", "alpha/129"]
+
+
+def test_housekeeping_settings_load_from_yaml(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text(
+        "housekeeping_enabled: true\n"
+        "housekeeping_loki_url: http://10.10.10.39:3100\n"
+        "housekeeping_local_retention_hours: 24\n"
+        "housekeeping_journal_max_mb: 128\n"
+        "housekeeping_journal_keep_free_mb: 256\n"
+        "housekeeping_cache_interval_hours: 12\n"
+        "housekeeping_backfill_budget_mb: 512\n"
+        "lxc_housekeeping_exclude_list:\n"
+        '  - 121\n'
+        '  - "beta/129"\n'
+    )
+    s = GlobalSettings.load(f)
+    assert s.housekeeping_enabled is True
+    assert s.housekeeping_loki_url == "http://10.10.10.39:3100"
+    assert s.housekeeping_local_retention_hours == 24
+    assert s.housekeeping_journal_max_mb == 128
+    assert s.housekeeping_journal_keep_free_mb == 256
+    assert s.housekeeping_cache_interval_hours == 12
+    assert s.housekeeping_backfill_budget_mb == 512
+    assert s.lxc_housekeeping_exclude_list == ["121", "beta/129"]
+
+
+def test_housekeeping_enabled_with_bad_url_from_yaml_rejected(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text("housekeeping_enabled: true\nhousekeeping_loki_url: 10.10.10.39:3100\n")
+    with pytest.raises(ValidationError):
+        GlobalSettings.load(f)

@@ -477,3 +477,123 @@ def test_known_boolean_extra_var_does_reach_settings():
     out = cli.apply_extravar_overrides(
         GlobalSettings(), cli._parse_extra_vars(["fleet_dry_run=true"]))
     assert out.fleet_dry_run is True
+
+
+# ---------------------------------------------------------------------------
+# cli.main() — --housekeeping-only mode validation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--housekeeping-only", "--scan"],
+        ["--housekeeping-only", "--alloy-only"],
+        ["--housekeeping-only", "--phases", "lxc"],
+        ["--housekeeping-only", "--history"],
+        ["--housekeeping-only", "--history-show", "latest"],
+    ],
+)
+def test_housekeeping_only_rejects_ambiguous_modes(argv):
+    with pytest.raises(SystemExit):
+        cli.main(argv)
+
+
+def test_housekeeping_only_takes_the_fleet_lock_in_the_original_root(tmp_path, capsys):
+    """--housekeeping-only is a mutating run: it must refuse to overlap a run
+    already holding the lock in fleet_history_dir, the original history root."""
+    from proxmox_fleet.lock import acquire_run_lock
+
+    with (
+        patch("proxmox_fleet.models.settings.GlobalSettings.load",
+              return_value=_settings_with_history(tmp_path)),
+        patch("proxmox_fleet.driver.run_fleet") as mock_fleet,
+        acquire_run_lock(tmp_path),
+    ):
+        rc = cli.main(["--housekeeping-only"])
+
+    mock_fleet.assert_not_called()
+    assert rc == 1
+    assert "another fleet run is active" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# cli.main() — --history-kind namespace selection
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--history-kind", "fleet"],
+        ["--history-kind", "housekeeping"],
+        ["--scan", "--history-kind", "housekeeping"],
+    ],
+)
+def test_history_kind_requires_a_history_command(argv):
+    with pytest.raises(SystemExit):
+        cli.main(argv)
+
+
+def test_history_default_kind_reads_fleet_root(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z")
+    _write_history(tmp_path / "housekeeping", timestamp="20260102T000000000000Z")
+
+    with patch("proxmox_fleet.models.settings.GlobalSettings.load",
+               return_value=_settings_with_history(tmp_path)):
+        rc = cli.main(["--history"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "20260101T000000000000Z" in out
+    assert "20260102T000000000000Z" not in out
+
+
+def test_history_kind_housekeeping_reads_maintenance_child(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z")
+    _write_history(tmp_path / "housekeeping", timestamp="20260102T000000000000Z")
+
+    with patch("proxmox_fleet.models.settings.GlobalSettings.load",
+               return_value=_settings_with_history(tmp_path)):
+        rc = cli.main(["--history", "--history-kind", "housekeeping"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "20260102T000000000000Z" in out
+    assert "20260101T000000000000Z" not in out
+
+
+def test_history_show_housekeeping_kind_prints_that_run(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z", briefing="FLEET BRIEF")
+    _write_history(tmp_path / "housekeeping", timestamp="20260102T000000000000Z",
+                   briefing="HOUSEKEEPING BRIEF")
+
+    with patch("proxmox_fleet.models.settings.GlobalSettings.load",
+               return_value=_settings_with_history(tmp_path)):
+        rc = cli.main(["--history-show", "latest", "--history-kind", "housekeeping"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "HOUSEKEEPING BRIEF" in out and "FLEET BRIEF" not in out
+
+
+def test_history_kind_housekeeping_missing_child_reports_that_path(tmp_path, capsys):
+    with patch("proxmox_fleet.models.settings.GlobalSettings.load",
+               return_value=_settings_with_history(tmp_path)):
+        rc = cli.main(["--history", "--history-kind", "housekeeping"])
+
+    assert rc == 1
+    assert str(tmp_path / "housekeeping") in capsys.readouterr().out
+
+
+def test_history_main_housekeeping_kind_reads_child_from_vars_file(tmp_path, capsys):
+    """The wrapper shares history_main, so the kind must work off the loaded
+    vars file, not the caller's cwd."""
+    _write_history(tmp_path / "housekeeping", timestamp="20260102T000000000000Z",
+                   briefing="HOUSEKEEPING BRIEF")
+    vars_file = tmp_path / "vars.yml"
+    vars_file.write_text(f"fleet_history_dir: {tmp_path}\n", encoding="utf-8")
+
+    rc = cli.history_main(history=None, history_show="latest",
+                          vars_file=str(vars_file), history_kind="housekeeping")
+
+    assert rc == 0
+    assert "HOUSEKEEPING BRIEF" in capsys.readouterr().out

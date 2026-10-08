@@ -1,0 +1,95 @@
+---
+# Transport-only housekeeping probe for one LXC via its Proxmox node.
+#
+# Stages the root-only node helper (proxmox_fleet/housekeeping_io.py) plus the
+# exact manager-built JSON request in a unique root-only temp dir, runs
+# `python3 helper --operation probe --lxc-id ID --request FILE`, and returns the
+# helper's compact JSON as set_stats facts. No policy, age or cadence decisions
+# live in this file; the helper is read-only and writes nothing in the guest.
+# The transient helper/request stage is removed in `always`, also under --check.
+#
+# Params (extravars):
+#   target_hosts                Proxmox node hosting the container
+#   lxc_id                      Container VMID
+#   housekeeping_helper_content Full helper source to stage (0600, root)
+#   housekeeping_request_json   Compact JSON request object (probe: {})
+- name: "LXC housekeeping probe primitive"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  tasks:
+    - name: "Housekeeping probe transport"
+      block:
+        - name: "Create root-only housekeeping stage directory"
+          ansible.builtin.command:
+            argv: [mktemp, -d, /tmp/fleet-housekeeping.XXXXXX]
+          register: _hk_stage
+          changed_when: false
+          check_mode: false
+
+        - name: "Resolve housekeeping stage directory"
+          ansible.builtin.set_fact:
+            _hk_stage_dir: "{{ _hk_stage.stdout | trim }}"
+          check_mode: false
+
+        - name: "Stage housekeeping helper on node"
+          ansible.builtin.copy:
+            content: "{{ housekeeping_helper_content }}"
+            dest: "{{ _hk_stage_dir }}/housekeeping_io.py"
+            owner: root
+            group: root
+            mode: "0600"
+          check_mode: false
+
+        - name: "Stage housekeeping request on node"
+          ansible.builtin.copy:
+            content: "{{ housekeeping_request_json }}"
+            dest: "{{ _hk_stage_dir }}/request.json"
+            owner: root
+            group: root
+            mode: "0600"
+          check_mode: false
+
+        - name: "Run housekeeping probe helper"
+          ansible.builtin.command:
+            argv:
+              - python3
+              - "{{ _hk_stage_dir }}/housekeeping_io.py"
+              - --operation
+              - probe
+              - --lxc-id
+              - "{{ lxc_id }}"
+              - --request
+              - "{{ _hk_stage_dir }}/request.json"
+          register: _hk_run
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: "Parse housekeeping probe output"
+          ansible.builtin.set_fact:
+            _hk_facts: "{{ (_hk_run.stdout | default('')) | trim | from_json }}"
+          when: ((_hk_run.stdout | default('')) | trim | length) > 0
+          check_mode: false
+
+        - name: "Return housekeeping probe facts"
+          ansible.builtin.set_stats:
+            data: "{{ _hk_facts | default({}) }}"
+            aggregate: false
+          check_mode: false
+
+        - name: "Fail on housekeeping probe helper error"
+          ansible.builtin.fail:
+            msg: >-
+              housekeeping probe transport failed (rc={{ _hk_run.rc | default(1) }}):
+              {{ ((_hk_run.stderr | default('')) or (_hk_run.stdout | default('')))[-400:] | trim }}
+          when: (_hk_run.rc | default(1)) != 0
+          check_mode: false
+      always:
+        - name: "Remove transient housekeeping stage directory"
+          ansible.builtin.file:
+            path: "{{ _hk_stage_dir | default('') }}"
+            state: absent
+          when: ((_hk_stage_dir | default('')) | length) > 0
+          changed_when: false
+          failed_when: false
+          check_mode: false

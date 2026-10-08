@@ -9,9 +9,27 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
+
+
+class HousekeepingSummary(BaseModel):
+    """Per-guest log-housekeeping outcome for one run.
+
+    Set on an :class:`LxcRecord` only when housekeeping did something worth
+    reporting (reclamation, pending backfill, block, audit finding, or a
+    logging-retention configuration change); an omitted summary keeps idle
+    records byte-identical to legacy ones. ``status`` mirrors the policy's
+    classification in ``proxmox_fleet.housekeeping``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    status: Literal["Configured", "Cleaned", "Backfill pending", "Blocked", "Audit"]
+    bytes_reclaimed: int = Field(default=0, ge=0)
+    bytes_archived: int = Field(default=0, ge=0)
+    files_pruned: int = Field(default=0, ge=0)
 
 
 class LxcRecord(BaseModel):
@@ -27,6 +45,11 @@ class LxcRecord(BaseModel):
     # records carry detail (see flows.lxc).
     packages: Optional[List[Dict[str, str]]] = Field(default=None, exclude_if=lambda value: value is None)
     alloy: Optional[str] = Field(default=None, exclude_if=lambda value: value is None)
+    # Log-housekeeping outcome — omitted entirely when None, preserving the
+    # legacy record byte shape for guests that did nothing relevant.
+    housekeeping: Optional[HousekeepingSummary] = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class VmRecord(BaseModel):

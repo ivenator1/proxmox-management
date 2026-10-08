@@ -441,3 +441,49 @@ def test_scan_flag_skips_fleet_run():
     mock_fleet.assert_not_called()
     assert rc == 0
     assert captured["limit"] == {"105"}
+
+
+# ---------------------------------------------------------------------------
+# Tests: --housekeeping-only mode validation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--housekeeping-only", "--scan"],
+        ["--housekeeping-only", "--alloy-only"],
+        ["--housekeeping-only", "--phases", "lxc"],
+        ["--housekeeping-only", "--history"],
+        ["--housekeeping-only", "--history-show", "latest"],
+        ["--history-kind", "housekeeping"],
+    ],
+)
+def test_housekeeping_only_and_history_kind_reject_bad_combinations(argv):
+    with patch.object(sys, "argv", ["./fleet-update.py", *argv]):
+        with pytest.raises(SystemExit):
+            _wrapper.main()
+
+
+
+# ---------------------------------------------------------------------------
+# Tests: --history-kind namespace selection
+# ---------------------------------------------------------------------------
+
+def test_history_kind_housekeeping_reads_maintenance_child(tmp_path, capsys):
+    _write_history(tmp_path, timestamp="20260101T000000000000Z")
+    _write_history(tmp_path / "housekeeping", timestamp="20260102T000000000000Z")
+
+    with (
+        patch.object(sys, "argv",
+                     ["./fleet-update.py", "--history", "--history-kind", "housekeeping"]),
+        patch("proxmox_fleet.driver.run_fleet") as mock_fleet,
+        patch("proxmox_fleet.models.settings.GlobalSettings.load",
+              return_value=GlobalSettings(fleet_history_dir=str(tmp_path))),
+    ):
+        rc = _wrapper.main()
+
+    mock_fleet.assert_not_called()
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "20260102T000000000000Z" in out
+    assert "20260101T000000000000Z" not in out

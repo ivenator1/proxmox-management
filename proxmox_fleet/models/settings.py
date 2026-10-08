@@ -8,9 +8,16 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlsplit
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator  # pyright: ignore[reportMissingImports]
+from pydantic import (  # pyright: ignore[reportMissingImports]
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 class PveClusterCreds(BaseModel):
@@ -26,7 +33,7 @@ class PveClusterCreds(BaseModel):
 
 
 class GlobalSettings(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="allow", hide_input_in_errors=True)
 
     # Kuma / health check (shared across phases)
     kuma_url: str = ""
@@ -57,6 +64,27 @@ class GlobalSettings(BaseModel):
     alloy_config_path: str = "configs/guest.alloy"
     lxc_alloy_exclude_list: List[str] = Field(default_factory=list)
     vm_alloy_exclude_list: List[str] = Field(default_factory=list)
+
+    # Log housekeeping for managed LXCs: bounded, acknowledged import of
+    # retained NPM/PBS file-log history into Loki plus short local retention
+    # and recurring cache cleanup. Ordinary LXC runs opt in with
+    # housekeeping_enabled; --housekeeping-only requests the feature
+    # explicitly and re-checks the Loki base via require_loki_url().
+    housekeeping_enabled: bool = False
+    # Canonical base for manager-side Loki push/query/readiness. Empty means
+    # "not configured"; a non-empty value must be an absolute http(s) base
+    # without credentials, query, or fragment (see validate_loki_base_url).
+    housekeeping_loki_url: str = ""
+    # Closed-file cutoff and the desired Alloy journal age limit.
+    housekeeping_local_retention_hours: int = Field(default=48, gt=0)
+    # Hard local journal disk budget and the journald reserve floor.
+    housekeeping_journal_max_mb: int = Field(default=256, gt=0)
+    housekeeping_journal_keep_free_mb: int = Field(default=512, gt=0)
+    # Cache cleanup cadence, independent of the hourly log tick.
+    housekeeping_cache_interval_hours: int = Field(default=24, gt=0)
+    # Maximum acknowledged archive payload per guest per run (import resumes).
+    housekeeping_backfill_budget_mb: int = Field(default=1024, gt=0)
+    lxc_housekeeping_exclude_list: List[str] = Field(default_factory=list)
 
     # lxc_update phase settings
     lxc_dry_run: bool = False
@@ -175,6 +203,7 @@ class GlobalSettings(BaseModel):
         "snapshot_exclude_list",
         "os_only_lxc_list",
         "lxc_alloy_exclude_list",
+        "lxc_housekeeping_exclude_list",
         mode="before",
     )
     @classmethod
@@ -200,6 +229,63 @@ class GlobalSettings(BaseModel):
         if isinstance(value, dict):
             return {str(k): v for k, v in value.items()}
         return value
+
+    @classmethod
+    def validate_loki_base_url(cls, value: str) -> str:
+        """Validate a manager-side Loki base URL, returning it unchanged.
+
+        Empty is allowed (housekeeping is off by default). A non-empty value
+        must be an absolute ``http(s)`` URL with no credentials, query, or
+        fragment: it is the canonical base the manager appends fixed
+        ``/loki/api/v1/...`` paths to, so credential-bearing or query-carrying
+        values are rejected rather than silently misused. Explicit maintenance
+        mode (``--housekeeping-only``) calls :meth:`require_loki_url`, which
+        delegates here, to enforce the same rules without setting
+        ``housekeeping_enabled``.
+        """
+        if not value:
+            return value
+        parsed = urlsplit(value)
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("housekeeping_loki_url has an invalid port") from exc
+        if (
+            parsed.scheme not in ("http", "https")
+            or not parsed.hostname
+            or any(ch.isspace() or ord(ch) < 32 for ch in value)
+            or (port is not None and port <= 0)
+        ):
+            raise ValueError("housekeeping_loki_url must be an absolute http(s) base URL")
+        if parsed.username is not None or parsed.password is not None or "?" in value or "#" in value:
+            raise ValueError("housekeeping_loki_url must not carry credentials, a query, or a fragment")
+        return value
+
+    @field_validator("housekeeping_loki_url")
+    @classmethod
+    def _validate_loki_url(cls, value: str) -> str:
+        return cls.validate_loki_base_url(value)
+
+    @model_validator(mode="after")
+    def _require_loki_url_when_enabled(self) -> "GlobalSettings":
+        """Requesting housekeeping (``housekeeping_enabled``) needs a usable URL."""
+        if self.housekeeping_enabled:
+            self.require_loki_url()
+        return self
+
+    def require_loki_url(self) -> str:
+        """Return the configured Loki base for an explicit housekeeping request.
+
+        Raises ``ValueError`` when housekeeping is requested (via
+        ``housekeeping_enabled`` or explicit ``--housekeeping-only`` mode) but
+        no usable endpoint is configured. Secrets never live in this value —
+        the URL itself carries none.
+        """
+        if not self.housekeeping_loki_url:
+            raise ValueError(
+                "housekeeping_loki_url is required when housekeeping is requested"
+            )
+        return self.validate_loki_base_url(self.housekeeping_loki_url)
 
     @classmethod
     def load(cls, path: Union[str, Path] = "vars.yml") -> "GlobalSettings":

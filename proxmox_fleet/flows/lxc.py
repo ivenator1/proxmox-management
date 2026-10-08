@@ -37,7 +37,12 @@ from proxmox_fleet.lxc_parse import (
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.pkg_detail import parse_upgraded, pkg_mgr_for_ostype
 from proxmox_fleet.runner import UnreachableHostError
-from proxmox_fleet.models.state import ErrorEntry, LxcRecord, WarningEntry
+from proxmox_fleet.models.state import (
+    ErrorEntry,
+    HousekeepingSummary,
+    LxcRecord,
+    WarningEntry,
+)
 from proxmox_fleet.status import (
     lxc_app_did_update,
     lxc_app_status,
@@ -116,6 +121,27 @@ _COMMUNITY_STORAGE_ABORT_PERCENT = 80
 def _has_minimum_free_space(df_stdout: str, minimum_gb: float) -> bool:
     available_kb = parse_df_available_kb(df_stdout)
     return available_kb is not None and available_kb >= minimum_gb * _KIB_PER_GIB
+
+
+def _read_disk_facts(executor: Executor, lxc_id: str) -> Dict[str, Any]:
+    """Re-read the root/boot ``df`` facts the introspect primitive captured.
+
+    Used after housekeeping reclaimed local cache/log space so the disk warning
+    and the community-script storage guard judge the *current* free space
+    instead of the pre-cleanup reading. Read-only (``pct exec ... df``); on a
+    failed/empty read the original fact is left untouched, which fails safe to
+    the more conservative pre-cleanup warning.
+    """
+    facts: Dict[str, Any] = {}
+    for key, path in (("df_stdout", "/"), ("boot_df_stdout", "/boot")):
+        res = executor.run_shell(
+            f"pct exec {lxc_id} -- df -Pk {path}",
+            changed_when=False,
+            ignore_errors=True,
+        )
+        if not getattr(res, "failed", False) and str(getattr(res, "stdout", "")).strip():
+            facts[key] = res.stdout
+    return facts
 
 
 def disk_warning(
@@ -360,10 +386,62 @@ def run_lxc_update(
                 notifying=True,
             ))
 
+    # Opted-in log/cache housekeeping runs after the container is reachable but
+    # before any disk decision, snapshot or package work: reclaiming cache space
+    # here is what can keep a full container from refusing the update. It never
+    # rolls back with the update, and its failures are warnings — never a failed
+    # OS/app status. --alloy-only must not run it (that mode is logging-only).
+    housekeeping_summary: Optional[HousekeepingSummary] = None
+    housekeeping_changed = False
+    if settings.housekeeping_enabled and not alloy_only:
+        housekeeping_mod = importlib.import_module("proxmox_fleet.housekeeping")
+        try:
+            hk = housekeeping_mod.run_housekeeping(
+                executor,
+                settings,
+                node=node,
+                cluster=cluster,
+                lxc_id=lxc_id,
+                name=name,
+                desired_alloy=alloy_config,
+                dry_run=dry_run,
+            )
+        except Exception as exc:  # noqa: BLE001 - maintenance must never abort an update
+            outcome.warnings.append(WarningEntry(
+                host=f"{node}/{lxc_id}",
+                task="Housekeeping",
+                warning=f"housekeeping unavailable ({type(exc).__name__})",
+                notifying=True,
+            ))
+            alloy_config = None
+        else:
+            housekeeping_changed = hk.changed
+            housekeeping_summary = hk.summary
+            for message in hk.warnings:
+                outcome.warnings.append(WarningEntry(
+                    host=f"{node}/{lxc_id}",
+                    task="Housekeeping",
+                    warning=message,
+                    notifying=hk.failed,
+                ))
+            if hk.failed:
+                # An unverified/unavailable config (e.g. probe failure) must never
+                # be reconciled over the guest's managed file sources; leave Alloy
+                # as-is.
+                alloy_config = None
+            elif hk.effective_alloy is not None:
+                alloy_config = hk.effective_alloy
+            if housekeeping_summary is not None and housekeeping_summary.bytes_reclaimed > 0:
+                try:
+                    introspect_res.facts.update(_read_disk_facts(executor, lxc_id))
+                except Exception:  # noqa: BLE001 - best-effort refresh, keep prior facts
+                    pass
+
     # Health warnings are raised before any update runs — and outside the try, so
     # they survive a later failure and are emitted on the dry-run path too, which
     # is the point: they are meant to arrive before the maintenance window, not
-    # in the same briefing as the failure they predict.
+    # in the same briefing as the failure they predict. Disk facts were refreshed
+    # above whenever housekeeping actually reclaimed space.
     disk_msg = disk_warning(
         introspect_res.facts,
         settings.lxc_disk_warn_percent,
@@ -384,18 +462,42 @@ def run_lxc_update(
         # work.  The surrounding introspection/start/finally logic still makes
         # stopped managed containers safely reachable for the audit.
         if alloy_only:
-            _enforce_alloy()
-            outcome.changed = alloy_changed
-            if alloy_status is not None:
-                outcome.record = LxcRecord(
+            if alloy_config is not None:
+                # Logging-only preparation: probe profile/access, repair scoped
+                # ACLs, render live file sources and reconcile for real. Unlike
+                # run_housekeeping it never archives/caches/prunes. The installer
+                # capability is preserved here (allow_install=True) so the audit
+                # mode can still deploy Alloy on a guest that lacks it.
+                housekeeping_mod = importlib.import_module("proxmox_fleet.housekeeping")
+                prepared = housekeeping_mod.prepare_lxc_logging(
+                    executor,
+                    settings,
                     node=node,
+                    cluster=cluster,
+                    lxc_id=lxc_id,
                     name=name,
-                    id=lxc_id,
-                    app="",
-                    os="",
-                    snap=False,
-                    alloy=alloy_status,
+                    base=alloy_config,
+                    dry_run=dry_run,
+                    allow_install=True,
                 )
+                outcome.changed = prepared.changed
+                for message in prepared.warnings:
+                    outcome.warnings.append(WarningEntry(
+                        host=f"{node}/{lxc_id}",
+                        task="Alloy logging",
+                        warning=message,
+                        notifying=True,
+                    ))
+                if prepared.summary is not None:
+                    outcome.record = LxcRecord(
+                        node=node,
+                        name=name,
+                        id=lxc_id,
+                        app="",
+                        os="",
+                        snap=False,
+                        housekeeping=prepared.summary,
+                    )
             return outcome
 
         # ------------------------------------------------------------------
@@ -474,9 +576,11 @@ def run_lxc_update(
                     installed_ver=installed_ver,
                     latest_tag=latest_tag,
                 )
+            outcome.changed = outcome.changed or housekeeping_changed
             outcome.record = LxcRecord(
                 node=node, name=name, id=lxc_id,
                 app=dry_status, os="", snap=False, alloy=alloy_status,
+                housekeeping=housekeeping_summary,
             )
             return outcome
 
@@ -675,11 +779,12 @@ def run_lxc_update(
             reboot_done=reboot_done,
         )
 
-        outcome.changed = something_changed or alloy_changed
+        outcome.changed = something_changed or alloy_changed or housekeeping_changed
         # A non-zero OS or app update does not raise (the flow carries on so the
         # other line still gets reported), but it is still a failed run: without
         # this the record says FAILED while state.failed stays false, so the exit
         # code, the history entry and the dashboard all report success.
+        # Housekeeping failures never contribute here — they are warnings.
         outcome.failed = bool(outcome.errors)
         script_expected = not matches_any(settings.os_only_lxc_list, cluster, lxc_id)
         if (
@@ -690,6 +795,7 @@ def run_lxc_update(
                 script_expected=script_expected,
             )
             or alloy_status is not None
+            or housekeeping_summary is not None
         ):
             # Exact OS packages (PR1) — success records only: skip when the OS
             # step failed (partial output), and store None for an empty parse
@@ -703,6 +809,7 @@ def run_lxc_update(
                 app=app_status_str, os=os_status_str, snap=snap_taken,
                 packages=os_packages,
                 alloy=alloy_status,
+                housekeeping=housekeeping_summary,
             )
         return outcome
 
@@ -735,6 +842,9 @@ def run_lxc_update(
             # A completed rollback reverted the Alloy mutation too.  Without a
             # rollback (no snapshot or rollback failure), report what remains.
             alloy=None if rollback_done else alloy_status,
+            # Housekeeping ran before the snapshot, so its reclamation and
+            # logging changes are part of the snapshot and survive a rollback.
+            housekeeping=housekeeping_summary,
         )
         outcome.error = ErrorEntry(
             host=f"{node}/{lxc_id}", task=str(failed_task), error=str(exc)[:300]

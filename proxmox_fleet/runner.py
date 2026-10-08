@@ -148,6 +148,11 @@ def invoke_primitive(
         evars.setdefault("target_hosts", host_pattern)
     cmdline = "--check" if check else None
 
+    # Runner silently drops event results above 700 kB by default. PBS file
+    # manifests exceed that even though they contain metadata only, not logs.
+    runner_options: Dict[str, Any] = {}
+    if primitive in {"lxc_housekeeping_probe", "lxc_log_capture", "lxc_log_snapshot", "lxc_log_prune"}:
+        runner_options["envvars"] = {"MAX_EVENT_RES": str(128 * 1024 * 1024)}
     runner = ansible_runner.run(
         playbook=f"ansible/primitives/{primitive}.yml",
         inventory=str(Path(inventory).resolve()),
@@ -156,5 +161,6 @@ def invoke_primitive(
         project_dir=project_dir if project_dir is not None else os.getcwd(),
         cmdline=cmdline,
         quiet=quiet,
+        **runner_options,
     )
     return _harvest(runner)

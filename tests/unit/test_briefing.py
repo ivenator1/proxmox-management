@@ -169,6 +169,19 @@ def test_alloy_only_status_renders_without_blank_update_status():
     assert "*(no snap)*" not in out
 
 
+def test_maintenance_report_preserves_empty_update_status_and_no_snapshot_marker():
+    state = _state(fleet_lxc_data=[lxc(app="", os="", snap=False, housekeeping={
+        "status": "Cleaned", "bytes_reclaimed": 6 * 1024 ** 3,
+        "bytes_archived": 13 * 1024 ** 3, "files_pruned": 30,
+    })])
+    rendered = render_briefing(state)
+    assert "Housekeeping: Cleaned (6.0 GiB reclaimed; 13.0 GiB archived)" in rendered
+    assert "UPDATED" not in rendered
+    assert "*(no snap)*" not in rendered
+    assert not rendered.endswith("\n")
+    assert state.lxc[0].app == "" and state.lxc[0].os == ""
+
+
 def test_vm_pkg_count_absent_when_zero():
     out = render_briefing(_state(fleet_node_data=[node()], fleet_vm_data=[vm(pkg_count=0)]))
     assert "upgraded" not in out

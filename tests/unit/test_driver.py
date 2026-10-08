@@ -28,6 +28,7 @@ from proxmox_fleet.inventory import VmSpec
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import FleetState, WarningEntry
 from proxmox_fleet.runner import PrimitiveResult
+from tests.unit.test_housekeeping import CacheSpec, Guest, _base, _cache_dir, _measure
 
 
 def _ok(stdout: str = "", changed: bool = True, facts: Optional[Dict[str, Any]] = None) -> PrimitiveResult:
@@ -2924,3 +2925,454 @@ def test_vm_phase_shared_vmid_targets_own_cluster_node(tmp_path, monkeypatch):
         ("vm-a", "alpha-01", "10.0.0.1", "alpha"),
         ("vm-b", "beta-01", "10.1.0.1", "beta"),
     ]
+
+
+# --------------------------------------------------------------------------- #
+# housekeeping-only mode — driver orchestration (behavioural)
+# --------------------------------------------------------------------------- #
+#
+# These tests drive the real ``run_lxc_phase(housekeeping_only=True)`` path:
+# node discovery runs through the executor's ``run_shell`` transport (never a
+# patched ``_discover_lxcs``), and each container is maintained by the real
+# ``proxmox_fleet.housekeeping`` policy against the temporary cache roots and
+# SQLite checkpoint it reports.  Update/snapshot/reboot primitives fail at the
+# execution layer, so a maintenance run that strayed into the update flow breaks
+# the test instead of passing over a mocked producer.
+
+
+def _two_cluster_inventory_hk(tmp_path) -> str:
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\nalpha-01 ansible_host=10.0.0.1 cluster=alpha\n"
+        "beta-01 ansible_host=10.1.0.1 cluster=beta\n",
+        encoding="utf-8",
+    )
+    return str(p)
+
+
+class _ForbiddenNode:
+    """Executor for a host that housekeeping-only mode must never touch."""
+
+    def __init__(self, host: str, harness: "_HousekeepingHarness") -> None:
+        self.host = host
+        self._harness = harness
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("__"):
+            raise AttributeError(name)
+
+        def _refuse(*args: Any, **kw: Any) -> Any:
+            self._harness.forbidden.append(f"{self.host}:{name}")
+            pytest.fail(f"{self.host}.{name} reached the execution layer in housekeeping-only mode")
+
+        return _refuse
+
+
+class _HousekeepingNode:
+    """Node executor whose per-guest adapters run the real housekeeping helper."""
+
+    def __init__(self, harness: "_HousekeepingHarness", node: str, ids: List[str]) -> None:
+        self.harness = harness
+        self.host = node
+        self.node = node
+        self.ids = list(ids)
+        self.guests: Dict[str, Guest] = {}
+
+    # -- discovery: native `pct list` stdout through the shell transport ------ #
+
+    def run_shell(self, command: str, **opts: Any) -> PrimitiveResult:
+        if "pct list" in command:
+            self.harness.discovery_commands.append(command)
+            return PrimitiveResult(rc=0, changed=False, stdout="\n".join(self.ids), facts={})
+        self.harness.forbidden.append(f"{self.node}:run_shell")
+        return PrimitiveResult(rc=1, failed=True, stderr="unexpected node command", facts={})
+
+    # -- read-only introspection -------------------------------------------- #
+
+    def introspect(self, lxc_id: str) -> PrimitiveResult:
+        guest = self.guests[lxc_id]
+        running = guest.running and not guest.template
+        return PrimitiveResult(
+            rc=0,
+            facts={
+                "config_stdout": (
+                    f"hostname: {guest.name}\nostype: {guest.os_type}\n"
+                    + ("template: 1\n" if guest.template else "")
+                ),
+                "status_stdout": "status: running" if running else "status: stopped",
+                "df_stdout": "",
+                "boot_df_stdout": "",
+                "pull_rc": 1,
+                "script_stdout": "",
+            },
+        )
+
+    # -- maintenance primitives delegated to the real per-guest adapter ------ #
+
+    def housekeeping_probe(self, lxc_id: str) -> PrimitiveResult:
+        self.harness.probe_enter()
+        try:
+            return self.guests[lxc_id].housekeeping_probe(lxc_id)
+        finally:
+            self.harness.probe_exit()
+
+    def housekeeping_capture(self, lxc_id: str, *, files: Any, capture_id: str) -> PrimitiveResult:
+        return self.guests[lxc_id].housekeeping_capture(lxc_id, files=files, capture_id=capture_id)
+
+    def housekeeping_snapshot(self, lxc_id: str, *, files: Any, destination: str) -> PrimitiveResult:
+        return self.guests[lxc_id].housekeeping_snapshot(lxc_id, files=files, destination=destination)
+
+    def housekeeping_prune(self, lxc_id: str, *, files: Any) -> PrimitiveResult:
+        return self.guests[lxc_id].housekeeping_prune(lxc_id, files=files)
+
+    def housekeeping_apply(self, lxc_id: str, *, command: str) -> PrimitiveResult:
+        return self.guests[lxc_id].housekeeping_apply(lxc_id, command=command)
+
+    def alloy_probe(self, *, lxc_id: Optional[str] = None) -> PrimitiveResult:
+        return self.guests[lxc_id].alloy_probe(lxc_id=lxc_id)
+
+    def alloy_reconcile(self, *, lxc_id: Optional[str] = None, **kw: Any) -> PrimitiveResult:
+        return self.guests[lxc_id].alloy_reconcile(lxc_id=lxc_id, **kw)
+
+    # -- update-loop primitives that maintenance mode never reaches ---------- #
+
+    def reboot(self, **kw: Any) -> Any:
+        pytest.fail(f"[{self.node}] reboot reached the execution layer in housekeeping-only mode")
+
+    def node_post_upgrade(self, **kw: Any) -> Any:
+        pytest.fail(f"[{self.node}] node_post_upgrade reached the execution layer in housekeeping-only mode")
+
+    def snapshot(self, *args: Any, **kw: Any) -> Any:
+        pytest.fail(f"[{self.node}] snapshot reached the execution layer in housekeeping-only mode")
+
+
+class _HousekeepingHarness:
+    """Executor factory plus observations for one maintenance orchestration test."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.tmp_path = tmp_path
+        (tmp_path / "history").mkdir()
+        self.constructed: List[str] = []
+        self.discovery_commands: List[str] = []
+        self.forbidden: List[str] = []
+        self.nodes: Dict[str, _HousekeepingNode] = {}
+        self._active = 0
+        self.peak = 0
+
+    def add_node(self, node: str, ids: List[str]) -> None:
+        self.nodes[node] = _HousekeepingNode(self, node, ids)
+
+    def add_guest(self, node: str, lxc_id: str, name: str, *, size: int = 8192) -> Path:
+        root = self.tmp_path / f"guest-{node}-{lxc_id}"
+        (root / "data" / "logs").mkdir(parents=True, exist_ok=True)
+        guest = Guest(root, self.tmp_path / f"spool-{node}-{lxc_id}")
+        guest.name = name
+        yarn = _cache_dir(self.tmp_path, f"yarn-{node}-{lxc_id}", size=size)
+        guest.cache_specs["yarn"] = CacheSpec("/usr/local/share/.cache/yarn/v6", yarn, "1.22.19")
+        self.nodes[node].guests[lxc_id] = guest
+        return yarn
+
+    def guest(self, node: str, lxc_id: str) -> Guest:
+        return self.nodes[node].guests[lxc_id]
+
+    def factory(self, host: str, **kw: Any) -> Any:
+        self.constructed.append(host)
+        if host in self.nodes:
+            return self.nodes[host]
+        return _ForbiddenNode(host, self)
+
+    def probe_enter(self) -> None:
+        self._active += 1
+        self.peak = max(self.peak, self._active)
+
+    def probe_exit(self) -> None:
+        self._active -= 1
+
+
+def test_run_lxc_phase_housekeeping_only_reclaims_real_caches_without_updates(tmp_path, monkeypatch):
+    inv = tmp_path / "hosts.ini"
+    inv.write_text("[proxmox_nodes]\npve-01 ansible_host=10.0.0.1\n", encoding="utf-8")
+
+    harness = _HousekeepingHarness(tmp_path)
+    harness.add_node("pve-01", ["101", "102"])
+    yarn101 = harness.add_guest("pve-01", "101", "npm")
+    yarn102 = harness.add_guest("pve-01", "102", "pbs")
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", harness.factory)
+
+    settings = GlobalSettings(fleet_history_dir=str(tmp_path / "history"))
+    state = driver_mod.run_lxc_phase(
+        settings=settings, inventory_path=str(inv), state_output_path=None,
+        housekeeping_only=True, alloy_config=_base("http://127.0.0.1:9"),
+    )
+
+    # Both containers' independent cache roots were really reclaimed.
+    assert _measure(yarn101) == 0
+    assert _measure(yarn102) == 0
+    assert len(state.lxc) == 2
+    for rec in state.lxc:
+        assert rec.app == "" and rec.os == "" and rec.snap is False
+        assert rec.housekeeping is not None
+        assert rec.housekeeping.status == "Blocked"  # no Loki URL => logging blocked
+        assert rec.housekeeping.bytes_reclaimed > 0
+    # A blocked standalone maintenance run fails the phase and checkpoints durably.
+    assert state.failed is True
+    assert state.changed is True
+    assert (tmp_path / "history" / "housekeeping.sqlite3").exists()
+    # No update/snapshot/reboot/package surface was touched, and the one-worker
+    # maintenance pool serialised the two containers.
+    assert harness.forbidden == []
+    assert harness.peak == 1
+
+
+def test_run_lxc_phase_housekeeping_qualified_exclusion_leaves_other_cluster_untouched(tmp_path, monkeypatch):
+    inv = _two_cluster_inventory_hk(tmp_path)
+    harness = _HousekeepingHarness(tmp_path)
+    harness.add_node("alpha-01", ["101"])
+    harness.add_node("beta-01", ["101"])
+    alpha_yarn = harness.add_guest("alpha-01", "101", "npm")
+    beta_yarn = harness.add_guest("beta-01", "101", "npm")
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", harness.factory)
+
+    settings = GlobalSettings(
+        fleet_history_dir=str(tmp_path / "history"),
+        lxc_housekeeping_exclude_list=["alpha/101"],
+    )
+    state = driver_mod.run_lxc_phase(
+        settings=settings, inventory_path=inv, state_output_path=None,
+        housekeeping_only=True, alloy_config=_base("http://127.0.0.1:9"),
+    )
+
+    # Only the qualified-excluded cluster is left untouched.
+    assert harness.guest("alpha-01", "101").probe_calls == 0
+    assert _measure(alpha_yarn) > 0
+    assert harness.guest("beta-01", "101").probe_calls > 0
+    assert _measure(beta_yarn) == 0
+    assert [rec.node for rec in state.lxc] == ["beta-01"]
+    assert state.lxc[0].housekeeping.status == "Blocked"
+
+
+def test_run_lxc_phase_housekeeping_targeted_alloy_excluded_guest_warns_without_reclaim(tmp_path, monkeypatch):
+    inv = _two_cluster_inventory_hk(tmp_path)
+    harness = _HousekeepingHarness(tmp_path)
+    harness.add_node("alpha-01", ["101"])
+    harness.add_node("beta-01", ["101"])
+    alpha_yarn = harness.add_guest("alpha-01", "101", "npm")
+    beta_yarn = harness.add_guest("beta-01", "101", "npm")
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", harness.factory)
+
+    settings = GlobalSettings(
+        fleet_history_dir=str(tmp_path / "history"),
+        lxc_alloy_exclude_list=["101"],
+    )
+    state = driver_mod.run_lxc_phase(
+        settings=settings, inventory_path=inv, state_output_path=None,
+        housekeeping_only=True, limit={"alpha/101"},
+        alloy_config=_base("http://127.0.0.1:9"),
+    )
+
+    # The explicitly targeted, Alloy-excluded guest is kept so the policy can
+    # report why; no cache, retention or pruning action happens anywhere and no
+    # checkpoint is opened.
+    assert state.lxc == []
+    assert state.failed is False and state.changed is False
+    assert any("excluded from Alloy" in w.warning for w in state.warnings)
+    assert _measure(alpha_yarn) > 0
+    assert _measure(beta_yarn) > 0
+    assert harness.guest("alpha-01", "101").probe_calls == 0
+    assert harness.guest("beta-01", "101").probe_calls == 0
+    assert not (tmp_path / "history" / "housekeeping.sqlite3").exists()
+
+
+def test_run_lxc_phase_housekeeping_bare_id_targets_id_on_every_node(tmp_path, monkeypatch):
+    inv = _two_cluster_inventory_hk(tmp_path)
+    harness = _HousekeepingHarness(tmp_path)
+    harness.add_node("alpha-01", ["101"])
+    harness.add_node("beta-01", ["101"])
+    alpha_yarn = harness.add_guest("alpha-01", "101", "npm")
+    beta_yarn = harness.add_guest("beta-01", "101", "npm")
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", harness.factory)
+
+    state = driver_mod.run_lxc_phase(
+        settings=GlobalSettings(fleet_history_dir=str(tmp_path / "history")),
+        inventory_path=inv, state_output_path=None,
+        housekeeping_only=True, limit={"101"},
+        alloy_config=_base("http://127.0.0.1:9"),
+    )
+
+    # A bare id targets that container in every cluster, each reclaiming only
+    # its own node's cache root.
+    assert _measure(alpha_yarn) == 0
+    assert _measure(beta_yarn) == 0
+    assert sorted(rec.node for rec in state.lxc) == ["alpha-01", "beta-01"]
+
+
+def test_run_lxc_phase_housekeeping_qualified_id_targets_only_that_node(tmp_path, monkeypatch):
+    inv = _two_cluster_inventory_hk(tmp_path)
+    harness = _HousekeepingHarness(tmp_path)
+    harness.add_node("alpha-01", ["101"])
+    harness.add_node("beta-01", ["101"])
+    alpha_yarn = harness.add_guest("alpha-01", "101", "npm")
+    beta_yarn = harness.add_guest("beta-01", "101", "npm")
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", harness.factory)
+
+    state = driver_mod.run_lxc_phase(
+        settings=GlobalSettings(fleet_history_dir=str(tmp_path / "history")),
+        inventory_path=inv, state_output_path=None,
+        housekeeping_only=True, limit={"alpha/101"},
+        alloy_config=_base("http://127.0.0.1:9"),
+    )
+
+    # A cluster-qualified id leaves the colliding id in the other cluster alone.
+    assert _measure(alpha_yarn) == 0
+    assert _measure(beta_yarn) > 0
+    assert [rec.node for rec in state.lxc] == ["alpha-01"]
+
+
+def test_run_lxc_phase_housekeeping_only_rejects_alloy_only_combination(tmp_path):
+    with pytest.raises(SystemExit, match="cannot be combined"):
+        driver_mod.run_lxc_phase(
+            settings=GlobalSettings(), inventory_path="x", state_output_path=None,
+            housekeeping_only=True, alloy_only=True,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# run_fleet — housekeeping-only selection
+# --------------------------------------------------------------------------- #
+
+
+def test_run_fleet_housekeeping_only_skips_update_surfaces_and_persists_maintenance_history(tmp_path, monkeypatch):
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[proxmox_nodes]\npve-01 ansible_host=10.0.0.1\n"
+        "[proxmox_vms]\nvm-a ansible_host=10.0.0.2 vmid=900\n",
+        encoding="utf-8",
+    )
+
+    harness = _HousekeepingHarness(tmp_path)
+    harness.add_node("pve-01", ["101"])
+    yarn = harness.add_guest("pve-01", "101", "npm")
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", harness.factory)
+
+    base_path = tmp_path / "guest.alloy"
+    base_path.write_text(_base("http://127.0.0.1:9").content, encoding="utf-8")
+
+    settings = GlobalSettings(
+        fleet_history_dir=str(tmp_path / "history"),
+        alloy_config_path=str(base_path),
+        # A configured-but-dead proxy aborts an ordinary run before any phase;
+        # maintenance mode must never perform the pre-flight.
+        apt_proxy_ip="127.0.0.1",
+        apt_proxy_port=1,
+        notifiers=[{"type": "webhook", "enabled": False, "url": ""}],
+    )
+    rc = run_fleet(settings=settings, inventory_path=str(inv), housekeeping_only=True)
+
+    # Logging is Blocked without a Loki base, but the maintenance pass really ran.
+    assert rc == 1
+    assert _measure(yarn) == 0
+    # Only the maintenance node executor was constructed at all: no VM, remote,
+    # custom, node or manager update transport, and no forbidden primitive
+    # reached the execution layer.
+    assert set(harness.constructed) == {"pve-01"}
+    assert harness.forbidden == []
+    # Maintenance history is isolated from the update-history root.
+    root = tmp_path / "history"
+    assert not (root / "latest.json").exists()
+    child = root / "housekeeping"
+    latest = json.loads((child / "latest.json").read_text(encoding="utf-8"))
+    assert [rec["id"] for rec in latest["lxc"]] == ["101"]
+    assert latest["lxc"][0]["housekeeping"]["status"] == "Blocked"
+    assert latest["vm"] == [] and latest["node"] == [] and latest["custom"] == []
+    # The explicit notifier list (not the discord_webhook shim) is what the
+    # maintenance dispatch resolves.
+    from proxmox_fleet import notifiers as notifiers_mod
+
+    assert notifiers_mod.resolve_notifiers(settings) == settings.notifiers
+
+
+def test_run_fleet_housekeeping_only_rejects_phases_and_alloy_only():
+    settings = GlobalSettings(apt_proxy_ip="", housekeeping_loki_url="http://loki:3100")
+    with pytest.raises(SystemExit, match="cannot be combined"):
+        run_fleet(settings=settings, inventory_path="x", housekeeping_only=True, phases={"lxc"})
+    with pytest.raises(SystemExit, match="cannot be combined"):
+        run_fleet(settings=settings, inventory_path="x", housekeeping_only=True, alloy_only=True)
+
+
+# --------------------------------------------------------------------------- #
+# run_notify_phase — maintenance history isolation
+# --------------------------------------------------------------------------- #
+
+
+def test_notify_phase_housekeeping_writes_isolated_history_and_skips_deadman(tmp_path, monkeypatch):
+    calls = _patch_notifiers(monkeypatch)
+    settings = GlobalSettings(
+        discord_webhook="https://d/hook",
+        fleet_history_dir=str(tmp_path),
+        fleet_deadmans_url="https://hc.io/abc",
+    )
+    state = _notify_state(
+        fleet_changed=True,
+        fleet_lxc_data=[{
+            "node": "pve-01", "name": "npm", "id": "123",
+            "app": "", "os": "", "snap": False,
+            "housekeeping": {"status": "Cleaned", "bytes_reclaimed": 4096},
+        }],
+    )
+    body = run_notify_phase(settings=settings, state=state, housekeeping_only=True)
+
+    assert not (tmp_path / "latest.json").exists()          # update history untouched
+    assert not list(tmp_path.glob("run-*.json"))
+    child = tmp_path / "housekeeping"
+    assert (child / "latest.json").exists()
+    latest = json.loads((child / "latest.json").read_text())
+    assert latest["briefing"] == body
+    assert calls["ping"] == []                              # never clears the update dead-man
+    assert len(calls["dispatch"]) == 1
+
+
+def test_maintenance_history_cannot_disturb_update_history(tmp_path, monkeypatch):
+    calls = _patch_notifiers(monkeypatch)
+    settings = GlobalSettings(
+        discord_webhook="https://d/hook",
+        fleet_history_dir=str(tmp_path),
+        fleet_deadmans_url="https://hc.io/abc",
+        fleet_package_detail_keep=7,
+    )
+    normal = _notify_state(
+        fleet_changed=True,
+        fleet_failed=True,
+        fleet_lxc_data=[{
+            "node": "pve-01", "name": "npm", "id": "123",
+            "app": "FAILED", "os": "Updated (4 upgraded)", "snap": True,
+            "packages": [{"name": "libx", "from": "1", "to": "2"}],
+        }],
+    )
+    run_notify_phase(settings=settings, state=normal)
+
+    root_latest = (tmp_path / "latest.json").read_bytes()
+    root_totals = (tmp_path / "totals.json").read_bytes()
+    root_runs = sorted(p.name for p in tmp_path.glob("run-*.json"))
+    assert json.loads(root_latest)["failed"] is True
+    assert len(calls["ping"]) == 1
+
+    for _ in range(31):   # more than the 30-run keep window
+        run_notify_phase(settings=settings, state=_notify_state(), housekeeping_only=True)
+
+    # The update history, totals and dead-man signal are all untouched.
+    assert (tmp_path / "latest.json").read_bytes() == root_latest
+    assert (tmp_path / "totals.json").read_bytes() == root_totals
+    assert sorted(p.name for p in tmp_path.glob("run-*.json")) == root_runs
+    assert len(calls["ping"]) == 1
+    # Package detail in the update record survives.
+    assert json.loads(root_latest)["lxc"][0]["packages"] == [{"name": "libx", "from": "1", "to": "2"}]
+    # Maintenance history keeps only its own newest `keep` runs.
+    child = tmp_path / "housekeeping"
+    assert len(list(child.glob("run-*.json"))) == settings.fleet_history_keep
+    assert (child / "latest.json").exists()
+    # Maintenance runs contribute no OS/app update or package totals.
+    from proxmox_fleet import history as history_mod
+
+    child_latest = json.loads((child / "latest.json").read_text())
+    assert history_mod.count_updates(child_latest) == {"os": 0, "app": 0}
+    assert history_mod.count_packages(child_latest) == 0

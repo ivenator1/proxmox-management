@@ -22,7 +22,9 @@ loki.source.journal "journal" {
   forward_to    = [loki.write.default.receiver]
   relabel_rules = loki.relabel.journal.rules
   labels        = { job = "systemd-journal", role = "guest" }
-  max_age       = "12h"
+  // Defaults to 48h without housekeeping; the fleet retention drop-in sets
+  // FLEET_JOURNAL_MAX_AGE to keep restart catch-up aligned with the policy.
+  max_age       = coalesce(sys.env("FLEET_JOURNAL_MAX_AGE"), "48h")
 }
 
 loki.write "default" {

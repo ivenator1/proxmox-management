@@ -31,6 +31,7 @@ from fastapi.staticfiles import StaticFiles  # pyright: ignore[reportMissingImpo
 from fastapi.templating import Jinja2Templates  # pyright: ignore[reportMissingImports]
 from markupsafe import Markup, escape
 
+from proxmox_fleet import briefing
 from proxmox_fleet import history as history_mod
 from proxmox_fleet import inventory_edit, ledger as ledger_mod, manual_updates, vars_edit
 from proxmox_fleet import scan as scan_mod
@@ -82,7 +83,7 @@ _LIMIT_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$")
 # ``packages`` (PR1 exact OS package detail) is rendered as a `<details>`
 # disclosure by both templates instead of a plain cell.
 BUCKET_COLUMNS: Dict[str, Tuple[str, ...]] = {
-    "lxc": ("node", "id", "name", "os", "app", "alloy", "packages"),
+    "lxc": ("node", "id", "name", "os", "app", "alloy", "housekeeping", "packages"),
     "vm": ("node", "vmid", "name", "status", "alloy", "pkg_count", "packages"),
     "remote": ("host", "status", "pkg_count", "packages"),
     "node": ("node", "status", "pkg_count", "packages"),
@@ -189,6 +190,42 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def human_bytes(value: Any) -> str:
+    """Dashboard byte formatting for legacy/corrupt persisted values.
+
+    Coerces whatever the persisted record carries (missing/null/string or a
+    negative count) to a non-negative int, then defers to
+    :func:`briefing.human_bytes` for the binary-unit rendering — the core
+    formatter stays the single source of truth for the display algorithm.
+    """
+    return briefing.human_bytes(max(0, _safe_int(value, 0)))
+
+
+def format_housekeeping(summary: Any) -> str:
+    """One-line display for a persisted ``LxcRecord.housekeeping`` summary.
+
+    Returns ``""`` for legacy records without the key (the template renders
+    the cell blank); otherwise the status followed by the non-zero reclaimed /
+    archived / pruned totals — never a raw Python dict dump.
+    """
+    if not isinstance(summary, Mapping):
+        return ""
+    status = str(summary.get("status") or "").strip()
+    parts: List[str] = []
+    reclaimed = _safe_int(summary.get("bytes_reclaimed"))
+    archived = _safe_int(summary.get("bytes_archived"))
+    pruned = _safe_int(summary.get("files_pruned"))
+    if reclaimed:
+        parts.append(f"{human_bytes(reclaimed)} reclaimed")
+    if archived:
+        parts.append(f"{human_bytes(archived)} archived")
+    if pruned:
+        parts.append(f"{pruned} file(s) pruned")
+    if not status:
+        return ", ".join(parts)
+    return f"{status} — {', '.join(parts)}" if parts else status
 
 
 def _health_score(latest_run: Optional[Mapping[str, Any]], pending_row: Optional[Mapping[str, Any]]) -> int:
@@ -394,16 +431,25 @@ def build_run_args(form: Mapping[str, Any]) -> List[str]:
     args: List[str] = []
     scan = _truthy(form.get("scan"))
     alloy_only = _truthy(form.get("alloy_only"))
+    housekeeping_only = _truthy(form.get("housekeeping_only"))
     phases = _csv_tokens(str(form.get("phases") or ""))
     if scan and alloy_only:
         raise ValueError("--alloy-only cannot be combined with --scan")
     if alloy_only and phases:
         raise ValueError("--alloy-only cannot be combined with --phases")
+    if housekeeping_only and scan:
+        raise ValueError("--housekeeping-only cannot be combined with --scan")
+    if housekeeping_only and alloy_only:
+        raise ValueError("--housekeeping-only cannot be combined with --alloy-only")
+    if housekeeping_only and phases:
+        raise ValueError("--housekeeping-only cannot be combined with --phases")
     if scan:
         args.append("--scan")
     else:
         if alloy_only:
             args.append("--alloy-only")
+        if housekeeping_only:
+            args.append("--housekeeping-only")
         if _truthy(form.get("dry_run")):
             args.append("--check")
         if _truthy(form.get("force_notify")):
@@ -479,8 +525,19 @@ def _record_matches_host(record: Dict[str, Any], name: str) -> bool:
     return str(record.get("id", "")) == id_part or str(record.get("vmid", "")) == id_part
 
 
-def _host_records(history_dir: str, name: str) -> List[Dict[str, Any]]:
-    """A host's records across all persisted runs, newest run first."""
+def _host_records(
+    history_dir: str,
+    name: str,
+    *,
+    history_base: str = "/history",
+    history_kind: str = "fleet",
+) -> List[Dict[str, Any]]:
+    """A host's records across all persisted runs, newest run first.
+
+    ``history_base``/``history_kind`` label which history root a record came
+    from (the root run history or its ``housekeeping`` child) so the host
+    page can link back to the correct run and tag the timeline entry.
+    """
     out: List[Dict[str, Any]] = []
     for row in history_mod.history_summary(history_dir, limit=0):
         try:
@@ -496,6 +553,8 @@ def _host_records(history_dir: str, name: str) -> List[Dict[str, Any]]:
                             "bucket": bucket,
                             "record": record,
                             "columns": columns,
+                            "history_base": history_base,
+                            "history_kind": history_kind,
                         }
                     )
     return out
@@ -583,6 +642,16 @@ def _host_pending_entries(history_dir: str, name: str) -> List[Dict[str, Any]]:
     return out
 
 
+def _housekeeping_history_dir(history_dir: str) -> str:
+    """The fixed maintenance-history child of the fleet history root.
+
+    The hourly ``--housekeeping-only`` runs write their own
+    ``run-*.json``/``latest.json`` here so they never perturb the update
+    history totals or dead-man state; the dashboard reads it read-only.
+    """
+    return str(Path(history_dir) / history_mod.HOUSEKEEPING_HISTORY_SUBDIR)
+
+
 def _host_timeline(history_dir: str, name: str, events: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
     """The host page's merged timeline: run records + pending-snapshot entries
     + ledger OS-upgrade events.
@@ -595,8 +664,21 @@ def _host_timeline(history_dir: str, name: str, events: Sequence[Mapping[str, An
     into a single timeline. Event entries are tagged ``kind == "event"``;
     pending entries ``kind == "host"/"lxc"`` with ``bucket == "pending"``;
     record entries stay untagged.
+
+    Maintenance-history records from the ``housekeeping`` child are merged in
+    too, tagged ``history_kind == "housekeeping"`` and carrying
+    ``history_base == "/housekeeping"`` so their run links resolve against the
+    child root rather than the fleet history.
     """
     timeline: List[Dict[str, Any]] = _host_records(history_dir, name)
+    timeline.extend(
+        _host_records(
+            _housekeeping_history_dir(history_dir),
+            name,
+            history_base="/housekeeping",
+            history_kind="housekeeping",
+        )
+    )
     timeline.extend(_host_pending_entries(history_dir, name))
     for event in events:
         timeline.append(
@@ -741,6 +823,7 @@ def create_app(
     templates.env.filters["ts_iso"] = ts_iso
     templates.env.filters["ts_span"] = ts_span
     templates.env.filters["spark_points"] = spark_points
+    templates.env.globals["housekeeping_text"] = format_housekeeping
 
     # Exception handler: redirect 401 (unauthenticated) to login for HTML requests
     @app.exception_handler(HTTPException)
@@ -768,6 +851,7 @@ def create_app(
             {"kind": "page", "label": "Overview", "url": "/"},
             {"kind": "page", "label": "Pending updates", "url": "/pending"},
             {"kind": "page", "label": "Run history", "url": "/history"},
+            {"kind": "page", "label": "Housekeeping history", "url": "/housekeeping"},
             {"kind": "page", "label": "Search packages", "url": "/packages"},
             {"kind": "page", "label": "Trigger a run", "url": "/trigger"},
             {"kind": "page", "label": "Inventory & enrollment", "url": "/inventory"},
@@ -962,9 +1046,11 @@ def create_app(
             },
         )
 
-    @protected.get("/history/{ref}")
-    def history_show(request: Request, ref: str) -> Any:
-        run = _read_run_or_none(ref)
+    def _render_run_detail(request: Request, directory: str, ref: str) -> Any:
+        try:
+            run = history_mod.read_run(directory, ref)
+        except (OSError, ValueError):
+            run = None
         if run is None:
             raise HTTPException(404, f"no history record {ref!r}")
         buckets = [(bucket, columns, run.get(bucket, []) or []) for bucket, columns in BUCKET_COLUMNS.items()]
@@ -977,6 +1063,37 @@ def create_app(
                 "buckets": buckets,
             },
         )
+
+    @protected.get("/history/{ref}")
+    def history_show(request: Request, ref: str) -> Any:
+        return _render_run_detail(request, history_dir, ref)
+
+    @protected.get("/housekeeping")
+    def housekeeping_history(request: Request) -> Any:
+        """Maintenance-run history (the fixed ``housekeeping`` history child).
+
+        Same readers/template as ``/history`` — only the history root and the
+        link/title defaults differ, so the fleet update history and the hourly
+        maintenance history stay fully separate. A missing child directory
+        renders the empty state.
+        """
+        rows = _history_rows_with_deltas(_housekeeping_history_dir(history_dir))
+        return templates.TemplateResponse(
+            request,
+            "history.html",
+            {
+                "rows": rows,
+                "count_keys": _COUNT_KEYS,
+                "heatmap": _activity_weeks(rows),
+                "history_base": "/housekeeping",
+                "history_title": "Housekeeping history",
+                "history_empty": "No housekeeping runs yet.",
+            },
+        )
+
+    @protected.get("/housekeeping/{ref}")
+    def housekeeping_show(request: Request, ref: str) -> Any:
+        return _render_run_detail(request, _housekeeping_history_dir(history_dir), ref)
 
     @protected.get("/packages")
     def packages(request: Request, q: str = "") -> Any:

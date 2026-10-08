@@ -76,9 +76,17 @@ EXAMPLES
   ./fleet-update.py --history 5
   ./fleet-update.py --history-show latest
 
+  # Read the hourly maintenance timer's own history instead of the update history:
+  ./fleet-update.py --history --history-kind housekeeping
+  ./fleet-update.py --history-show latest --history-kind housekeeping
+
   # Audit Alloy, then repair it without running package-update phases:
   ./fleet-update.py --dry-run --alloy-only
   ./fleet-update.py --alloy-only --limit 105,media-vm
+
+  # Log housekeeping only (dry-run first), then for just the log guests:
+  ./fleet-update.py --housekeeping-only --check
+  ./fleet-update.py --housekeeping-only --limit 120,123
 
   # Re-run a single failed LXC (dry-run first), or only the VM phase:
   ./fleet-update.py --dry-run --phases lxc --limit 105
@@ -153,6 +161,16 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         help="Print one persisted run's briefing (run timestamp or 'latest') and exit.",
     )
     parser.add_argument(
+        "--history-kind",
+        choices=("fleet", "housekeeping"),
+        default=None,
+        help=(
+            "History namespace to read with --history/--history-show: fleet "
+            "(default) or housekeeping (the hourly maintenance timer's own "
+            "history). Only valid with those commands."
+        ),
+    )
+    parser.add_argument(
         "--limit",
         default=None,
         metavar="HOST,ID,...",
@@ -189,6 +207,15 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
             "skipping snapshots and all regular update work."
         ),
     )
+    parser.add_argument(
+        "--housekeeping-only",
+        action="store_true",
+        help=(
+            "Run only LXC log housekeeping (Alloy file sources, acknowledged "
+            "log import into Loki, short local retention and recurring cache "
+            "cleanup) while skipping all regular update work."
+        ),
+    )
 
 
 def main() -> int:
@@ -200,6 +227,20 @@ def main() -> int:
         parser.error("--alloy-only cannot be combined with --scan")
     if args.alloy_only and args.phases is not None:
         parser.error("--alloy-only cannot be combined with --phases")
+
+    if args.housekeeping_only and args.scan:
+        parser.error("--housekeeping-only cannot be combined with --scan")
+    if args.housekeeping_only and args.alloy_only:
+        parser.error("--housekeeping-only cannot be combined with --alloy-only")
+    if args.housekeeping_only and args.phases is not None:
+        parser.error("--housekeeping-only cannot be combined with --phases")
+
+    history_requested = args.history is not None or args.history_show is not None
+    if args.housekeeping_only and history_requested:
+        parser.error(
+            "--housekeeping-only cannot be combined with --history/--history-show")
+    if args.history_kind is not None and not history_requested:
+        parser.error("--history-kind is only valid with --history or --history-show")
 
     try:
         from proxmox_fleet import driver
@@ -214,9 +255,10 @@ def main() -> int:
     except ImportError as exc:
         raise SystemExit(f"Cannot import proxmox_fleet — is the venv active? ({exc})")
 
-    if args.history is not None or args.history_show is not None:
+    if history_requested:
         return history_main(history=args.history, history_show=args.history_show,
-                            vars_file=args.vars_file)
+                            vars_file=args.vars_file,
+                            history_kind=args.history_kind or "fleet")
 
     if args.scan:
         from proxmox_fleet import scan as scan_mod
@@ -245,7 +287,12 @@ def main() -> int:
         settings = settings.model_copy(update={"lxc_verbose": True})
     if args.force_window:
         settings = settings.model_copy(update={"force_window": True})
-    alloy_options = {"alloy_only": True} if args.alloy_only else {}
+
+    mode_options: dict = {}
+    if args.alloy_only:
+        mode_options["alloy_only"] = True
+    if args.housekeeping_only:
+        mode_options["housekeeping_only"] = True
 
     return run_locked(settings, lambda: driver.run_fleet(
         settings=settings,
@@ -254,7 +301,7 @@ def main() -> int:
         extra_vars=extravars,
         limit=_parse_csv_set(args.limit),
         phases=_parse_csv_set(args.phases),
-        **alloy_options,
+        **mode_options,
     ))
 
 

@@ -2,8 +2,12 @@
 
 import json
 
+import pytest
+from pydantic import ValidationError
+
 from proxmox_fleet.models.state import (
     FleetState,
+    HousekeepingSummary,
     LxcRecord,
     NodeRecord,
     RemoteRecord,
@@ -225,3 +229,96 @@ def test_round_trip_file(tmp_path):
     assert reloaded.lxc[0].id == "1"
     # file is valid JSON
     assert json.loads(p.read_text())["changed"] is True
+
+
+# --- housekeeping summary (step 1) ------------------------------------------ #
+
+
+def test_housekeeping_summary_defaults():
+    s = HousekeepingSummary(status="Cleaned")
+    assert s.bytes_reclaimed == 0
+    assert s.bytes_archived == 0
+    assert s.files_pruned == 0
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["Configured", "Cleaned", "Backfill pending", "Blocked", "Audit"],
+)
+def test_housekeeping_summary_accepts_exact_statuses(status):
+    assert HousekeepingSummary(status=status).status == status
+
+
+def test_housekeeping_summary_rejects_unknown_status():
+    with pytest.raises(ValidationError):
+        HousekeepingSummary(status="Done")
+
+
+@pytest.mark.parametrize("field", ["bytes_reclaimed", "bytes_archived", "files_pruned"])
+def test_housekeeping_summary_rejects_negative_counts(field):
+    with pytest.raises(ValidationError):
+        HousekeepingSummary(status="Cleaned", **{field: -1})
+
+
+def test_lxc_housekeeping_omitted_when_none():
+    """A guest that did nothing relevant stays key-free (legacy byte shape)."""
+    r = LxcRecord(node="pve-01", name="sonarr", id="101", app="OK")
+    assert r.housekeeping is None
+    assert "housekeeping" not in r.model_dump()
+
+
+def test_lxc_housekeeping_present_when_set():
+    r = LxcRecord(
+        node="pve-01",
+        name="npm",
+        id="123",
+        app="OK",
+        housekeeping=HousekeepingSummary(
+            status="Cleaned", bytes_reclaimed=1024, bytes_archived=2048, files_pruned=3
+        ),
+    )
+    assert r.model_dump()["housekeeping"] == {
+        "status": "Cleaned",
+        "bytes_reclaimed": 1024,
+        "bytes_archived": 2048,
+        "files_pruned": 3,
+    }
+
+
+def test_lxc_housekeeping_accepts_dict_and_round_trips(tmp_path):
+    state = FleetState(
+        lxc=[
+            LxcRecord(
+                node="pve-01",
+                name="pbs",
+                id="120",
+                app="OK",
+                housekeeping={
+                    "status": "Backfill pending",
+                    "bytes_archived": 4096,
+                },
+            )
+        ]
+    )
+    assert state.lxc[0].housekeeping is not None
+    assert state.lxc[0].housekeeping.status == "Backfill pending"
+
+    p = tmp_path / "state.json"
+    state.dump(p)
+    loaded = FleetState.load(p)
+    assert loaded.lxc[0].housekeeping.status == "Backfill pending"
+    assert loaded.lxc[0].housekeeping.bytes_archived == 4096
+    assert loaded.lxc[0].housekeeping.bytes_reclaimed == 0
+
+
+def test_legacy_lxc_record_serialization_unchanged():
+    """Adding the optional summary must not add or shift legacy keys."""
+    legacy = LxcRecord(node="pve-01", name="sonarr", id="101", app="OK", os="OK", snap=True)
+    assert legacy.model_dump() == {
+        "node": "pve-01",
+        "name": "sonarr",
+        "id": "101",
+        "app": "OK",
+        "os": "OK",
+        "snap": True,
+    }

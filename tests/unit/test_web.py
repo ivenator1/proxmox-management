@@ -3032,3 +3032,167 @@ def test_palette_includes_package_search_page(history_dir):
     items = _palette_items(_client(history_dir).get("/"))
     pages = {i["label"]: i["url"] for i in items if i["kind"] == "page"}
     assert pages["Search packages"] == "/packages"
+
+
+# --- housekeeping dashboard (phase 6) --------------------------------------- #
+
+
+def _write_housekeeping_run(history_dir, *, ts, housekeeping=None):
+    """Write one run into the ``housekeeping`` history child carrying an LXC
+    record for sonarr (the same host the fixture's fleet runs cover)."""
+    record = dict(node="pve-01", name="sonarr", id="101", app="", os="", snap=False)
+    if housekeeping is not None:
+        record["housekeeping"] = housekeeping
+    write_history(
+        _state(fleet_lxc_data=[record], fleet_changed=True),
+        history_dir=Path(history_dir) / "housekeeping",
+        keep=0,
+        timestamp=ts,
+    )
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        {"housekeeping_only": "on", "scan": "on"},
+        {"housekeeping_only": "on", "alloy_only": "on"},
+        {"housekeeping_only": "on", "phases": "lxc"},
+    ],
+)
+def test_build_args_rejects_housekeeping_ambiguity(form):
+    with pytest.raises(ValueError, match="housekeeping-only"):
+        build_run_args(form)
+
+
+def test_trigger_housekeeping_only_ambiguous_rejected(history_dir):
+    client = _client(history_dir, run_manager=FakeManager())
+    assert client.post("/runs", data={"housekeeping_only": "on", "scan": "on"}).status_code == 400
+    assert client.post("/runs", data={"housekeeping_only": "on", "phases": "lxc"}).status_code == 400
+
+
+
+def test_run_detail_formats_housekeeping_summary(history_dir):
+    """An lxc record's nested housekeeping summary renders as status + byte/file
+    totals, never a raw Python dict dump."""
+    state = _state(
+        fleet_lxc_data=[
+            dict(
+                node="pve-01",
+                name="sonarr",
+                id="101",
+                app="",
+                os="",
+                snap=False,
+                housekeeping={
+                    "status": "Cleaned",
+                    "bytes_reclaimed": 1536,
+                    "bytes_archived": 4096,
+                    "files_pruned": 3,
+                },
+            )
+        ],
+        fleet_changed=True,
+    )
+    write_history(state, history_dir=history_dir, keep=0, timestamp="20260115T000000000000Z")
+    resp = _client(history_dir).get("/history/20260115T000000000000Z")
+    assert resp.status_code == 200
+    assert "Cleaned — 1.5 KiB reclaimed, 4.0 KiB archived, 3 file(s) pruned" in resp.text
+    assert "{'status'" not in resp.text
+    assert "&#39;status&#39;" not in resp.text
+
+
+def test_run_detail_legacy_lxc_record_blank_housekeeping(history_dir):
+    """Fixture lxc records predate the housekeeping key: the column header is
+    present but the cell stays blank (no 0 totals, no dict dump)."""
+    resp = _client(history_dir).get("/history/20260102T000000000000Z")
+    assert resp.status_code == 200
+    assert ">housekeeping<" in resp.text
+    assert "reclaimed" not in resp.text
+    assert "{'status'" not in resp.text
+
+
+def test_host_page_formats_housekeeping_summary(history_dir):
+    state = _state(
+        fleet_lxc_data=[
+            dict(
+                node="pve-01",
+                name="sonarr",
+                id="101",
+                app="",
+                os="",
+                snap=False,
+                housekeeping={"status": "Cleaned", "bytes_reclaimed": 1024, "files_pruned": 2},
+            )
+        ],
+        fleet_changed=True,
+    )
+    write_history(state, history_dir=history_dir, keep=0, timestamp="20260116T000000000000Z")
+    resp = _client(history_dir).get("/hosts/sonarr")
+    assert resp.status_code == 200
+    assert "Cleaned — 1.0 KiB reclaimed, 2 file(s) pruned" in resp.text
+    assert "{'status'" not in resp.text
+
+
+def test_housekeeping_history_lists_child_runs_only(history_dir):
+    _write_housekeeping_run(history_dir, ts="20260120T000000000000Z")
+    resp = _client(history_dir).get("/housekeeping")
+    assert resp.status_code == 200
+    assert "Housekeeping history" in resp.text
+    assert "20260120T000000000000Z" in resp.text
+    assert 'href="/housekeeping/20260120T000000000000Z"' in resp.text
+    assert "1 persisted run(s)" in resp.text  # fleet runs stay in the root history
+
+
+def test_housekeeping_history_empty_when_child_missing(history_dir):
+    resp = _client(history_dir).get("/housekeeping")
+    assert resp.status_code == 200
+    assert "No housekeeping runs yet." in resp.text
+
+
+def test_housekeeping_detail_renders_child_run(history_dir):
+    _write_housekeeping_run(history_dir, ts="20260120T000000000000Z", housekeeping={"status": "Configured"})
+    resp = _client(history_dir).get("/housekeeping/20260120T000000000000Z")
+    assert resp.status_code == 200
+    assert "Configured" in resp.text
+
+
+def test_housekeeping_detail_unknown_ref_404(history_dir):
+    assert _client(history_dir).get("/housekeeping/nope").status_code == 404
+    # a fleet-history run is not addressable through the maintenance namespace
+    assert _client(history_dir).get("/housekeeping/20260102T000000000000Z").status_code == 404
+
+
+def test_fleet_history_keeps_root_links(history_dir):
+    resp = _client(history_dir).get("/history")
+    assert resp.status_code == 200
+    assert 'href="/history/20260102T000000000000Z"' in resp.text
+    assert 'href="/housekeeping/' not in resp.text
+
+
+def test_host_timeline_merges_housekeeping_child_run(history_dir):
+    _write_housekeeping_run(history_dir, ts="20260120T000000000000Z", housekeeping={"status": "Cleaned"})
+    resp = _client(history_dir).get("/hosts/sonarr")
+    assert resp.status_code == 200
+    assert "20260120T000000000000Z" in resp.text
+    assert 'href="/housekeeping/20260120T000000000000Z"' in resp.text
+    # fleet records keep linking against the root history
+    assert 'href="/history/20260102T000000000000Z"' in resp.text
+
+
+
+def test_overview_ignores_housekeeping_child_runs(history_dir):
+    """Maintenance runs never merge into the overview update trend/recent list.
+
+    The rendered overview must be byte-identical before and after a
+    housekeeping child run lands — counters, trend, recent list and health all
+    read the root history only.
+    """
+    before = _client(history_dir).get("/").text
+    _write_housekeeping_run(
+        history_dir,
+        ts="20260120T000000000000Z",
+        housekeeping={"status": "Cleaned", "bytes_reclaimed": 123456, "files_pruned": 9},
+    )
+    after = _client(history_dir).get("/").text
+    assert after == before
+
