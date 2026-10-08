@@ -84,7 +84,9 @@ __all__ = [
 # Constants
 # --------------------------------------------------------------------------- #
 
-SPOOL_ROOT = "/var/tmp/fleet-log-import"
+# Persistent captures require owner-only directories; creation/resume reject
+# symlinks, foreign owners and group/other access before opening any blob.
+SPOOL_ROOT = "/var/tmp/fleet-log-import"  # nosec B108
 QUARANTINE_DIRNAME = ".fleet-housekeeping-quarantine"
 FREE_RESERVE_BYTES = 2 * 1024 ** 3
 MAX_SNAPSHOT_BYTES = 32 * 1024 ** 2

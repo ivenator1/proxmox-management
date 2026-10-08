@@ -861,22 +861,15 @@ class CheckpointStore:
     def delete_guest(self, key: GuestKey) -> None:
         """Remove every row for one guest (explicit reset, never automatic)."""
         with self._transaction() as conn:
-            for table in ("source", "blob", "pending_batch", "cache_clean"):
-                self._execute(
-                    conn,
-                    f"DELETE FROM {table} WHERE cluster = ? AND node = ? AND lxc_id = ?",
-                    key.tuple,
-                )
-            self._execute(
-                conn,
+            for statement in (
+                "DELETE FROM source WHERE cluster = ? AND node = ? AND lxc_id = ?",
+                "DELETE FROM blob WHERE cluster = ? AND node = ? AND lxc_id = ?",
+                "DELETE FROM pending_batch WHERE cluster = ? AND node = ? AND lxc_id = ?",
+                "DELETE FROM cache_clean WHERE cluster = ? AND node = ? AND lxc_id = ?",
                 "DELETE FROM prune_intent WHERE cluster = ? AND node = ? AND lxc_id = ?",
-                key.tuple,
-            )
-            self._execute(
-                conn,
                 "DELETE FROM guest WHERE cluster = ? AND node = ? AND lxc_id = ?",
-                key.tuple,
-            )
+            ):
+                self._execute(conn, statement, key.tuple)
 
     # -- sources ------------------------------------------------------------ #
 

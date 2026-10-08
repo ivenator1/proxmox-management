@@ -187,6 +187,8 @@ Native policy reads are bounded and JSON-framed so transport trimming cannot cha
 
 **Backfill and spool:** pre-existing history is frozen once into a root-only (`0700`/`0600`) node spool under `/var/tmp/fleet-log-import/<sha256(cluster/node/id)>/<capture_id>/` (requiring node free space ≥ captured bytes + 2 GiB) so native rotation cannot erase history mid-import, then streamed oldest-first. Captured blobs are released only after every one of their bytes is acknowledged. The checkpoint database lives at `<fleet_history_dir>/housekeeping.sqlite3`; a missing DB starts an import, a corrupt/unwritable one blocks file-log deletion rather than guessing.
 
+Capture creation and resume reject symlinked, foreign-owned, or group/other-accessible spool directories. An unsafe spool blocks import rather than resetting checkpoints or removing retained history.
+
 **Querying live vs. archive:** each file source emits two labelled streams — the live Alloy reader (`delivery="live"`, immediate visibility) and the acknowledged importer (`delivery="archive"`, the authoritative retained history). Query them separately to avoid double-counting. Lines are packed JSON, so `| unpack` restores the original log line from `_entry` and exposes `filename`:
 
 ```logql
