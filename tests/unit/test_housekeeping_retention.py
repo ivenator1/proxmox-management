@@ -166,7 +166,10 @@ class Guest:
             result = subprocess.run(mapped, capture_output=True, text=True, check=False)
             if program == retention._NATIVE_LOG_PROGRAM:
                 self.native_stdout.append(result.stdout)
-            return PrimitiveResult(rc=result.returncode, stdout=result.stdout, stderr=result.stderr)
+            return PrimitiveResult(
+                rc=result.returncode, stdout=result.stdout.rstrip("\r\n"),
+                stderr=result.stderr.rstrip("\r\n"),
+            )
         if parts[0] == "install":
             self.path(parts[-1]).mkdir(parents=True, exist_ok=True)
         elif parts[0] == "logger":
@@ -319,13 +322,20 @@ def store(tmp_path):
         yield value
 
 
-def test_native_cutover_preserves_three_writer_mechanisms_and_unrelated_policy(guest, store):
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+@pytest.mark.parametrize("final_newlines", [0, 1, 3])
+def test_native_cutover_preserves_three_writer_mechanisms_and_unrelated_policy(
+    guest, store, line_ending, final_newlines,
+):
+    original = NATIVE.rstrip("\n").replace("\n", line_ending) + line_ending * final_newlines
+    guest.put(native.NPM_LOGROTATE_ORIGINAL, original)
     with Loki(guest) as loki:
         result = run(guest, store, loki)
     assert not result.failed
-    assert guest.path(native.NPM_LOGROTATE_BACKUP).read_text() == NATIVE
-    remaining = guest.path(native.NPM_LOGROTATE_ORIGINAL).read_text()
-    assert remaining == NATIVE[:NATIVE.index("/data/logs/")]
+    assert guest.path(native.NPM_LOGROTATE_BACKUP).read_bytes() == original.encode()
+    remaining = guest.path(native.NPM_LOGROTATE_ORIGINAL).read_bytes()
+    unrelated = original[:original.index("/data/logs/")] + line_ending * max(final_newlines - 1, 0)
+    assert remaining == unrelated.encode()
     parsed = native.parse_logrotate(guest.path(native.NPM_LOGROTATE_MANAGED).read_text())
     assert parsed.ambiguous is None
     assert [block.header for block in parsed.npm_blocks] == [

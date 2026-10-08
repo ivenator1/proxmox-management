@@ -39,7 +39,6 @@ __all__ = [
     "NPM_LOGROTATE_MANAGED",
     "NPM_LOGROTATE_BACKUP",
     "NPM_LOGROTATE_STATE",
-    "MISSING_SENTINEL",
     "journald_policy_content",
     "journald_policy_commands",
     "journal_vacuum_commands",
@@ -70,8 +69,6 @@ NPM_LOGROTATE_DIR = posixpath.dirname(NPM_LOGROTATE_MANAGED)
 NPM_LOGROTATE_BACKUP = f"{NPM_LOGROTATE_DIR}/npm-logrotate.conf.orig"
 NPM_LOGROTATE_STATE = f"{NPM_LOGROTATE_DIR}/npm-logrotate.state"
 
-#: Emitted to stdout by the bounded reader when a managed file is absent.
-MISSING_SENTINEL = "__FLEET_MISSING_7c31__"
 
 #: Fixed owned policy files this module may write or replace: the monitored
 #: ``housekeeping_io.POLICY_FILES`` (journald, alloy env, managed NPM policy)
@@ -224,12 +221,15 @@ finally:
     os.close(directory)
 """
 _READ_PROGRAM = (
-    "import sys\n"
+    "import json,sys\n"
     "try:\n"
-    "    with open(sys.argv[1], 'r', encoding='utf-8', errors='surrogateescape') as handle:\n"
-    "        sys.stdout.write(handle.read())\n"
+    "    with open(sys.argv[1], 'rb') as handle:\n"
+    "        raw = handle.read(1048577)\n"
+    "    if len(raw) > 1048576:\n"
+    "        raise ValueError('native policy exceeds 1 MiB')\n"
+    "    sys.stdout.write(json.dumps({'content': raw.decode('utf-8')}))\n"
     "except FileNotFoundError:\n"
-    "    sys.stdout.write(sys.argv[2])\n"
+    "    sys.stdout.write(json.dumps({'missing': True}))\n"
 )
 
 
@@ -244,11 +244,8 @@ def write_file_command(
     )
 
 
-def read_file_command(path: str, *, sentinel: str = MISSING_SENTINEL) -> str:
-    return (
-        f"python3 -c {shlex.quote(_READ_PROGRAM)} "
-        f"{shlex.quote(path)} {shlex.quote(sentinel)}"
-    )
+def read_file_command(path: str) -> str:
+    return f"python3 -c {shlex.quote(_READ_PROGRAM)} {shlex.quote(path)}"
 
 
 # --------------------------------------------------------------------------- #

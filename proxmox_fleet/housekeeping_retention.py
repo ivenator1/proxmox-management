@@ -351,9 +351,16 @@ def _read_guest_file(
     error, result = _apply(executor, lxc_id, native.read_file_command(path))
     if error is not None:
         return "error", None, error
-    if result.stdout == native.MISSING_SENTINEL:
-        return "missing", None, None
-    return "ok", result.stdout, None
+    try:
+        envelope = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        return "error", None, "invalid native policy read response"
+    if isinstance(envelope, dict):
+        if set(envelope) == {"missing"} and envelope["missing"] is True:
+            return "missing", None, None
+        if set(envelope) == {"content"} and isinstance(envelope["content"], str):
+            return "ok", envelope["content"], None
+    return "error", None, "invalid native policy read response"
 
 
 def _read_native_log(executor: Executor, lxc_id: str, path: str, mode: str, *tokens: str) -> Dict[str, Any]:
