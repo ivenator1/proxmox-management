@@ -655,3 +655,51 @@ def test_rotation_requires_observed_writer_reopen(
             assert guest.path(rotated).read_bytes() == b"before rotation\nafter maintenance\n"
     finally:
         guest.writer.close()
+
+
+def test_rotation_drift_after_initial_probe_preserves_writer_tail(
+    tmp_path: Path, store: CheckpointStore,
+) -> None:
+    current = "/data/logs/proxy_access.log"
+    rotated = "/data/logs/proxy_access.log-20261009T000000"
+
+    class DriftingGuest(Guest):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.put(current, "before rotation\n")
+            self.writer = self.path(current).open("ab")
+
+        def wire(self, name: str) -> Dict[str, Any]:
+            value = super().wire(name)
+            held = os.fstat(self.writer.fileno())
+            value["is_active"] = (value["device"], value["inode"]) == (held.st_dev, held.st_ino)
+            return value
+
+        def housekeeping_apply(self, lxc_id: str, *, command: str) -> PrimitiveResult:
+            parts = shlex.split(command)
+            if (
+                parts[:2] == ["python3", "-c"] and parts[2] == native._WRITE_PROGRAM
+                and parts[3] == native.NPM_LOGROTATE_MANAGED
+            ):
+                self.path(current).rename(self.path(rotated))
+                self.put(current, "")
+            if parts[:2] == ["systemctl", "kill"]:
+                return PrimitiveResult(rc=0)  # acknowledged, but the fd did not move
+            if parts[0] == "logrotate":
+                self.path(rotated).unlink()  # native compression removes its input
+                return PrimitiveResult(rc=0)
+            return super().housekeeping_apply(lxc_id, command=command)
+
+    root = tmp_path / "drifting-writer"
+    root.mkdir()
+    guest = DriftingGuest(root)
+    try:
+        with Loki(guest) as loki:
+            result = run(guest, store, loki)
+        guest.writer.write(b"tail after drift\n")
+        guest.writer.flush()
+        assert result.failed
+        assert guest.path(rotated).read_bytes() == b"before rotation\ntail after drift\n"
+        assert guest.path(current).read_bytes() == b""
+    finally:
+        guest.writer.close()

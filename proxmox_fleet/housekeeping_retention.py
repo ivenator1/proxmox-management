@@ -1336,7 +1336,7 @@ def apply_guest_retention(
     npm_managed_content: Optional[str] = None
     if "npm" in recognized:
         npm_changed, npm_managed_content, npm_error = _apply_npm_cutover(
-            executor, key, probe
+            executor, key
         )
         if npm_error is not None:
             return RetentionResult(
@@ -1566,11 +1566,11 @@ def _persist_verification(
 
 
 def _reopen_rotated_npm_writers(
-    executor: Executor, key: GuestKey, probe: Optional[HousekeepingProbe] = None,
+    executor: Executor, key: GuestKey,
 ) -> Tuple[bool, Optional[str]]:
     """Repair only observed stale writers; verify their fds actually moved."""
     try:
-        before = probe if probe is not None else probe_housekeeping(executor, key.lxc_id)
+        before = probe_housekeeping(executor, key.lxc_id)
         if not before.is_running or before.is_template:
             return False, "NPM writer state is unavailable for a stopped guest or template"
         if _lingering_npm_writer(before.files) is None:
@@ -1592,7 +1592,6 @@ def _reopen_rotated_npm_writers(
 def _apply_npm_cutover(
     executor: Executor,
     key: GuestKey,
-    probe: HousekeepingProbe,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     status, original, error = _read_guest_file(executor, key.lxc_id, native.NPM_LOGROTATE_ORIGINAL)
     if status == "error":
@@ -1636,7 +1635,7 @@ def _apply_npm_cutover(
             return changed, managed_content, f"NPM logrotate cutover failed: {error}"
         changed = True
 
-    reopened, error = _reopen_rotated_npm_writers(executor, key, probe)
+    reopened, error = _reopen_rotated_npm_writers(executor, key)
     changed |= reopened
     if error is not None:
         return changed, managed_content, error
