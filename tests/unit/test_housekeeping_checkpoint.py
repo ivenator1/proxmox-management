@@ -639,6 +639,30 @@ def test_prune_intents_are_guest_scoped(tmp_path):
         assert len(store.prune_intents()) == 2
 
 
+def test_absent_intent_is_terminal_and_separate_from_deletion_metrics(tmp_path):
+    now = time.time_ns()
+    with _store(tmp_path) as store:
+        store.record_prune_intent(_intent("pi-absent"))
+        store.resolve_prune_intent(
+            "pi-absent",
+            "absent",
+            reclaimed_bytes=0,
+            detail="source and quarantine both absent; deletion origin unknown",
+        )
+        resolved = store.prune_intent("pi-absent")
+        assert resolved.state == "absent"
+        assert resolved.reclaimed_bytes == 0
+        # Terminal: never replayed as open, never contributes reclaimed bytes.
+        assert store.open_prune_intents(_key()) == []
+        assert store.reclaimed_bytes(_key()) == 0
+        # An observed absence no longer owns quarantined bytes for its tombstone.
+        store.record_source(_key(), "src-1", _identity())
+        store.mark_source_acknowledged(_key(), "src-1")
+        store.mark_source_absent(_key(), "src-1", ts_ns=now)
+        assert store.purge_tombstones(now_ts_ns=now + 100 * DAY_NS) == 1
+        assert store.source(_key(), "src-1") is None
+
+
 # --------------------------------------------------------------------------- #
 # Tombstones
 # --------------------------------------------------------------------------- #

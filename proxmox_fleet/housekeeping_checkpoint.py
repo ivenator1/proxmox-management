@@ -53,7 +53,11 @@ ABSENT_TOMBSTONE_SECONDS = 30 * 24 * 60 * 60
 DB_FILENAME = "housekeeping.sqlite3"
 
 CAPTURE_STATES: Tuple[str, ...] = ("pending", "complete", "failed")
-PRUNE_STATES: Tuple[str, ...] = ("pending", "done", "restored", "conflict")
+#: ``absent`` is terminal like ``done``/``restored`` but records *observed*
+#: absence of both the source and its quarantine with an unknown deletion
+#: origin.  It is deliberately NOT ``done``: the import path reads ``done`` as a
+#: proven owned deletion, so absence must not be consumable as one.
+PRUNE_STATES: Tuple[str, ...] = ("pending", "done", "restored", "conflict", "absent")
 
 _COMPRESSIONS: Tuple[str, ...] = ("plain", "gzip", "zstd")
 _PROFILES: Tuple[str, ...] = ("npm", "pbs")
@@ -1907,7 +1911,7 @@ class CheckpointStore:
                     WHERE prune_intent.cluster = source.cluster
                         AND prune_intent.node = source.node
                         AND prune_intent.lxc_id = source.lxc_id
-                        AND prune_intent.state NOT IN ('done', 'restored')
+                        AND prune_intent.state NOT IN ('done', 'restored', 'absent')
                         AND (
                             prune_intent.source_id = source.source_id
                             OR (prune_intent.source_id IS NULL AND prune_intent.path = source.path)

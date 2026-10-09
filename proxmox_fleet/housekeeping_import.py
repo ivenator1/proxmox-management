@@ -800,7 +800,7 @@ def _build_plan(
     *,
     existing_ids: Sequence[str],
     base_id: str,
-    current_paths: Set[str],
+    current_paths: Mapping[str, Tuple[int, int]],
 ) -> _FilePlan:
     reference = wire or manifest_wire
     assert reference is not None
@@ -922,6 +922,34 @@ def refreshed_identity(record: SourceRecord) -> SourceIdentity:
     )
 
 
+def _record_indexes(
+    records: Sequence[SourceRecord],
+) -> Tuple[Dict[Tuple[int, int], SourceRecord], Dict[str, SourceRecord]]:
+    """Prefer higher generations; tombstone timestamps cannot supersede them."""
+    by_inode: Dict[Tuple[int, int], SourceRecord] = {}
+    by_path: Dict[str, SourceRecord] = {}
+    for record in records:
+        previous = by_path.get(record.path)
+        rank = (sources.SourceProvenance.parse(record.provenance).generation, record.updated_ns)
+        if previous is None or rank > (
+            sources.SourceProvenance.parse(previous.provenance).generation, previous.updated_ns,
+        ):
+            by_path[record.path] = record
+        identities = [(record.device, record.inode)]
+        identities.extend(
+            (alias["device"], alias["inode"])
+            for alias in record.aliases or []
+            if isinstance(alias, dict) and "device" in alias and "inode" in alias
+        )
+        for identity in identities:
+            previous = by_inode.get(identity)
+            if previous is None or rank > (
+                sources.SourceProvenance.parse(previous.provenance).generation, previous.updated_ns,
+            ):
+                by_inode[identity] = record
+    return by_inode, by_path
+
+
 def _match_record(
     by_inode: Mapping[Tuple[int, int], SourceRecord],
     by_path: Mapping[str, SourceRecord],
@@ -930,11 +958,17 @@ def _match_record(
 ) -> Optional[SourceRecord]:
     """Select the durable record that may own *wire*.
 
-    An inode match is only honoured for the same logical source: a different
-    PBS task UPID that re-used the device+inode is never selected as that task's
-    rename/append lineage.  The path map is consulted only for a compatible
-    record, so a row already rewritten to the impostor's path is rejected too.
+    An exact path/inode match takes precedence over an older inode alias.  All
+    fallbacks must belong to the same logical source: a different PBS task UPID
+    never inherits a reused inode's rename/append lineage or acknowledgement.
     """
+    candidate = by_path.get(wire["path"])
+    if (
+        candidate is not None
+        and (candidate.device, candidate.inode) == (wire["device"], wire["inode"])
+        and sources.identity_compatible(candidate, wire)
+    ):
+        return candidate
     record = by_inode.get((wire["device"], wire["inode"]))
     if record is not None and not sources.identity_compatible(record, wire):
         record = None
@@ -959,16 +993,15 @@ def _matching_identity_capsule(
     """The canonical intent capsule that proves this row's archived identity.
 
     Archive-generation proof and deletion-completion proof are deliberately
-    separate: the capsule (a pending *or* done prune intent for the canonical
-    path) records the original device/inode/size/mtime/digest, and it is
+    separate: a pending, done or observed-absent canonical capsule
+    records the original device/inode/size/mtime/digest, and it is
     accepted only when it lines up exactly with the row's own preserved,
-    acknowledged complete-provenance size and digest.  A pending capsule still
-    proves the archived identity — but never a completed deletion — so callers
-    must decide whether the file may be tombstoned; a pending intent is never
-    read as completion.  Nothing here mutates the intent.
+    acknowledged complete-provenance size and digest. Pending and absent
+    capsules prove only the archived identity, never an owned deletion.
+    Nothing here mutates the intent.
     """
     for intent in store.prune_intents(key):
-        if intent.state not in ("pending", "done") or intent.path != canonical:
+        if intent.state not in ("pending", "done", "absent") or intent.path != canonical:
             continue
         if (intent.device, intent.inode) != (record.device, record.inode):
             continue
@@ -1094,15 +1127,8 @@ def _plan_sources(state: _ImportState, wires: Sequence[Dict[str, Any]]) -> List[
     _recover_reassigned_sources(store, key, state)
     intent = store.capture_intent(key)
     records = list(store.sources(key))
-    by_inode: Dict[Tuple[int, int], SourceRecord] = {}
-    by_path: Dict[str, SourceRecord] = {}
+    by_inode, by_path = _record_indexes(records)
     record: Optional[SourceRecord]
-    for record in records:
-        by_inode.setdefault((record.device, record.inode), record)
-        by_path.setdefault(record.path, record)
-        for alias in record.aliases or []:
-            if isinstance(alias, dict) and "device" in alias and "inode" in alias:
-                by_inode.setdefault((alias["device"], alias["inode"]), record)
     blob_by_source: Dict[str, BlobState] = {}
     manifest_wire_by_source: Dict[str, Dict[str, Any]] = {}
     blob: Optional[BlobState]
@@ -1120,7 +1146,7 @@ def _plan_sources(state: _ImportState, wires: Sequence[Dict[str, Any]]) -> List[
 
     existing_ids = [record.source_id for record in records]
     by_id = {record.source_id: record for record in records}
-    current_paths = {wire["path"] for wire in wires}
+    current_paths = {wire["path"]: (wire["device"], wire["inode"]) for wire in wires}
     plans: List[_FilePlan] = []
     consumed: Set[str] = set()
     for wire in wires:
@@ -1406,7 +1432,7 @@ def _import_source(
             with DecodedLogReader(raw, plan.read_wire["compression"]) as decoded:
                 fragments = iter_log_fragments(
                     decoded,
-                    filename=record.path,
+                    filename=sources.SourceProvenance.parse(record.provenance).canonical_path or record.path,
                     source_id=plan.source_id,
                     start_offset=plan.start_offset,
                     line_number=plan.line_number,
@@ -1700,7 +1726,7 @@ def _rebuild_pending(state: _ImportState, executor: Executor, pending: PendingBa
             with DecodedLogReader(raw, read_wire["compression"]) as decoded:
                 regions = iter_log_fragments(
                     decoded,
-                    filename=record.path,
+                    filename=sources.SourceProvenance.parse(record.provenance).canonical_path or record.path,
                     source_id=record.source_id,
                     start_offset=record.decoded_offset,
                     line_number=record.line_number or 1,
@@ -1814,16 +1840,9 @@ def _maybe_release(executor: Executor, state: _ImportState) -> None:
 
 def _audit(store: CheckpointStore, key: GuestKey, wires: Sequence[Dict[str, Any]], warnings: List[str]) -> ImportResult:
     records = list(store.sources(key))
-    by_inode: Dict[Tuple[int, int], SourceRecord] = {}
-    by_path: Dict[str, SourceRecord] = {}
+    by_inode, by_path = _record_indexes(records)
     by_id = {record.source_id: record for record in records}
     record: Optional[SourceRecord]
-    for record in records:
-        by_inode.setdefault((record.device, record.inode), record)
-        by_path.setdefault(record.path, record)
-        for alias in record.aliases or []:
-            if isinstance(alias, dict) and "device" in alias and "inode" in alias:
-                by_inode.setdefault((alias["device"], alias["inode"]), record)
     covered: List[Dict[str, Any]] = []
     pending_findings = 0
     for wire in wires:

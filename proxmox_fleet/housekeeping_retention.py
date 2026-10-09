@@ -69,6 +69,7 @@ from proxmox_fleet.housekeeping_io import (
     PBS_API_ROOT,
     QUARANTINE_DIRNAME,
 )
+from proxmox_fleet.housekeeping_sources import SourceProvenance, same_logical_source
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.runner import PrimitiveResult
 
@@ -110,6 +111,12 @@ _SUPPORTED_OS: frozenset = frozenset({"debian", "ubuntu"})
 _VALID_COMPRESSION = frozenset({"plain", "gzip", "zstd"})
 _VALID_PROFILE = frozenset({"npm", "pbs"})
 _VALID_LOG_KIND = frozenset({"application", "task", "api", "task_index"})
+
+#: The exact detail old builds wrote for a prune whose original path was
+#: missing.  Only this deliberately recorded conflict may be re-observed; every
+#: other conflict detail (digest/identity/writer/quarantine) stays terminal so
+#: a re-observation never becomes a wholesale conflict reset.
+LEGACY_MISSING_DETAIL = "file is missing"
 
 
 # --------------------------------------------------------------------------- #
@@ -553,9 +560,9 @@ def _identity(wire: _Wire) -> Tuple[int, int, int, int]:
     return (wire.device, wire.inode, wire.size, wire.mtime_ns)
 
 
-#: Exact identity of a deletion this policy owns: (path, device, inode, size,
-#: mtime_ns, acknowledged digest).  A covered source that vanished under an
-#: owned identity is the expected result of our own quarantine, never a finding.
+#: Exact resolved-prune identity: (path, device, inode, size, mtime_ns, digest).
+#: Resolution proves either our completed deletion or observed absence; only
+#: completed deletions contribute newly pruned files and reclaimed bytes.
 _OwnedDeletion = Tuple[str, int, int, int, int, str]
 
 
@@ -596,11 +603,10 @@ def plan_prune_candidates(
     still be closed, older than the cutoff, non-active and identity-unchanged in
     the current probe.  Returns ``(specs, warnings)``.
 
-    ``owned_deletions`` carries the exact identities this policy already
-    resolved by an observed helper outcome (or persisted as ``done`` intents).
-    A covered source absent under one of those identities is the expected result
-    of our own deletion and is skipped silently; a source missing for any other
-    reason stays a conservative finding.
+    ``owned_deletions`` carries exact identities resolved as ``done`` or
+    positively observed ``absent`` outcomes.  Matching missing sources are
+    skipped silently; absence never implies our deletion or new reclamation.
+    A source missing without that resolution stays a conservative finding.
     """
     warnings: List[str] = []
     candidates: List[Dict[str, Any]] = []
@@ -675,32 +681,61 @@ def _recovery_spec(
     intent: PruneIntent,
     warnings: List[str],
 ) -> Optional[Tuple[PruneIntent, Dict[str, Any]]]:
+    """Independent re-observation proof for an unresolved intent.
+
+    Returns the wire spec (carrying ``recovery: true``) only when the durable
+    source still proves *complete* acknowledged coverage of the exact recorded
+    identity in its own canonical namespace, and the recorded quarantine path
+    is the canonical one for the intent's allowlisted path.  Anything unproven
+    (missing record, incomplete/frozen prefix, coverage conflict, identity
+    drift, protected name, foreign quarantine path) is refused: the helper must
+    never be told this is a recovery it may resolve as an absence.
+    """
     record = store.source(key, intent.source_id) if intent.source_id else None
+    if record is None:
+        warnings.append("unresolved prune intent has no durable source record; retained")
+        return None
+    provenance = SourceProvenance.parse(record.provenance)
+    canonical = provenance.canonical_path or record.path
+    digest = intent.digest
+    try:
+        expected_quarantine = quarantine_path_for(intent.path)
+    except ValueError as exc:
+        warnings.append(f"unresolved prune intent {intent.path} is outside the allowlist ({exc}); retained")
+        return None
     if (
-        record is None or not record.acknowledged or record.digest != intent.digest
-        or (record.provenance or {}).get("complete_size") != intent.size
-        or (record.device, record.inode, record.size, record.mtime_ns) != (
-            intent.device, intent.inode, intent.size, intent.mtime_ns
-        )
-        or record.is_active or is_protected_log_name(intent.path, record.log_kind) is not None
+        not record.acknowledged
+        or not isinstance(digest, str)
+        or not _SHA256_RE.match(digest)
+        or record.digest != digest
+        or not provenance.complete
+        or provenance.coverage_conflict
+        or provenance.complete_size != intent.size
+        or (record.device, record.inode, record.size, record.mtime_ns)
+        != (intent.device, intent.inode, intent.size, intent.mtime_ns)
+        or record.is_active
+        or is_protected_log_name(intent.path, record.log_kind) is not None
+        or _log_root_for(canonical) != _log_root_for(intent.path)
+        or not same_logical_source(record.profile, record.log_kind, canonical, intent.path)
+        or intent.quarantine_path != expected_quarantine
     ):
         warnings.append("unresolved prune intent lacks durable full-content coverage; retained")
         return None
-    profile, log_kind = record.profile, record.log_kind
-    compression, allocated, is_active = record.compression, record.allocated_bytes, False
     spec = {
         "path": intent.path,
         "device": intent.device,
         "inode": intent.inode,
         "size": intent.size,
         "mtime_ns": intent.mtime_ns,
-        "allocated_bytes": allocated,
-        "compression": compression,
-        "profile": profile,
-        "log_kind": log_kind,
-        "is_active": is_active,
-        "sha256": intent.digest,
-        "quarantine_path": intent.quarantine_path,
+        "allocated_bytes": record.allocated_bytes,
+        "compression": record.compression,
+        "profile": record.profile,
+        "log_kind": record.log_kind,
+        "is_active": record.is_active,
+        "sha256": digest,
+        "quarantine_path": expected_quarantine,
+        # Only a spec proven above may authorize the helper's absence outcome.
+        "recovery": True,
     }
     return intent, spec
 
@@ -714,23 +749,28 @@ def _resolve_outcomes(
 ) -> Tuple[int, int, bool]:
     facts = result.facts if isinstance(result.facts, dict) else {}
     entries = facts.get("files")
-    by_path: Dict[str, Dict[str, Any]] = {}
-    if isinstance(entries, list):
-        for entry in entries:
-            if isinstance(entry, dict) and isinstance(entry.get("path"), str):
-                by_path.setdefault(entry["path"], entry)
+    entries = entries if isinstance(entries, list) else []
     bytes_total = 0
     pruned = 0
     failed = False
-    for intent, spec in batch:
-        entry = by_path.get(spec["path"])
+    # The helper returns one ordered outcome per request.  Pathnames alone are
+    # ambiguous when recovery contains different generations of the same path.
+    for index, (intent, spec) in enumerate(batch):
+        entry = entries[index] if index < len(entries) else None
         if entry is None:
             warnings.append(
                 f"prune outcome missing for {spec['path']}; intent retained for recovery"
             )
             failed = True
             continue
-        state = str(entry.get("state") or "conflict")
+        observed = _validated_wire(entry)
+        if observed is None or observed != _validated_wire(spec):
+            warnings.append(
+                f"prune outcome identity mismatch for {spec['path']}; intent retained"
+            )
+            failed = True
+            continue
+        state = entry.get("state")
         reclaimed = entry.get("bytes_reclaimed")
         reclaimed = reclaimed if isinstance(reclaimed, int) and not isinstance(reclaimed, bool) and reclaimed >= 0 else 0
         detail = _bounded(entry.get("detail") or "", 200)
@@ -743,6 +783,9 @@ def _resolve_outcomes(
             owned_deletions.add(_spec_owned_deletion(spec))
             bytes_total += reclaimed
             pruned += 1
+            if entry.get("blocked") is True:
+                warnings.append(f"prune completed for {spec['path']}: {detail}; further pruning paused")
+                failed = True
         elif state == "restored":
             store.resolve_prune_intent(
                 intent.intent_id,
@@ -751,11 +794,52 @@ def _resolve_outcomes(
                 detail=detail or "original path restored",
             )
             warnings.append(f"prune restored {spec['path']}: {detail or 'original path retained'}")
-        else:
+        elif state == "absent":
+            # Positively observed absence of BOTH the source and its quarantine
+            # under the allowlisted pinned roots, for a proofed recovery spec.
+            # The intent is resolved without claiming a new deletion: nothing
+            # was reclaimed and no archive acknowledgement is altered.  An
+            # absence reported for anything but our own proofed recovery spec is
+            # never trusted.
+            if spec.get("recovery") is not True:
+                warnings.append(
+                    f"prune reported an absence for {spec['path']} without a proofed "
+                    "recovery spec; intent retained"
+                )
+                failed = True
+                continue
+            store.resolve_prune_intent(
+                intent.intent_id,
+                "absent",
+                reclaimed_bytes=0,
+                detail=(
+                    "source and quarantine paths are both absent; deletion origin "
+                    "unknown (0 bytes reclaimed, 0 new files pruned)"
+                ),
+            )
+            owned_deletions.add(_spec_owned_deletion(spec))
+        elif state in ("blocked", "pending"):
+            # Non-terminal: the helper could not complete this file.  The intent
+            # keeps its prior state/detail (pending stays pending; a legacy
+            # conflict keeps its recorded detail) and the run reports failure.
+            warnings.append(
+                f"prune {state} for {spec['path']}: "
+                f"{detail or 'filesystem state unknown'}; intent retained"
+            )
+            failed = True
+        elif state == "conflict":
             store.resolve_prune_intent(
                 intent.intent_id, "conflict", reclaimed_bytes=0, detail=detail or None
             )
             warnings.append(f"prune conflict for {spec['path']}: {detail or 'file retained'}")
+        else:
+            warnings.append(
+                f"prune outcome for {spec['path']} is unrecognised; intent retained"
+            )
+            failed = True
+    if len(entries) > len(batch):
+        warnings.append("prune returned unexpected extra outcomes; further pruning paused")
+        failed = True
     return bytes_total, pruned, failed
 
 
@@ -1046,6 +1130,22 @@ def _manifest_gate(state: InitialManifestState) -> Optional[str]:
     return None
 
 
+def _legacy_missing_intents(store: CheckpointStore, key: GuestKey) -> List[PruneIntent]:
+    """Terminal conflicts deliberately recorded as an already-missing source.
+
+    Only the exact legacy detail ``file is missing`` qualifies.  These, plus
+    still-pending intents, stay eligible for an independently authorized
+    re-observation — never a wholesale conflict reset — so an interrupted
+    quarantine whose source *and* quarantine paths are now absent can finally
+    resolve without inventing a deletion.
+    """
+    return [
+        intent
+        for intent in store.prune_intents(key)
+        if intent.state == "conflict" and intent.detail == LEGACY_MISSING_DETAIL
+    ]
+
+
 @dataclass(frozen=True)
 class _DeletionAuthorization:
     candidates: Tuple[Dict[str, Any], ...] = ()
@@ -1178,13 +1278,19 @@ def apply_guest_retention(
     try:
         manifest = store.initial_manifest_state(key)
         stored = store.delivery_verification(key)
-        open_intents = store.open_prune_intents(key)
+        open_intents = store.open_prune_intents(key) + _legacy_missing_intents(store, key)
         # Durable evidence of this policy's own completed deletions: a covered
         # source absent under one of these exact identities is expected, never
         # a finding.  Same-run successes are added as their outcomes are read.
+        # ``absent`` intents are included: they are an exact, authorized,
+        # already-observed-absent tuple (deletion origin recorded as unknown).
         owned_deletions: Set[_OwnedDeletion] = set()
         for intent in store.prune_intents(key):
-            identity = _intent_owned_deletion(intent) if intent.state == "done" else None
+            identity = (
+                _intent_owned_deletion(intent)
+                if intent.state in ("done", "absent")
+                else None
+            )
             if identity is not None:
                 owned_deletions.add(identity)
     except Exception as exc:  # noqa: BLE001 - untrusted checkpoint blocks deletion
@@ -1436,19 +1542,38 @@ def apply_guest_retention(
     new_warnings: List[str] = []
     recovered_files = 0
     recovered_bytes = 0
+    cutoff_ns = int(clock_ns()) - int(settings.housekeeping_local_retention_hours) * 3600 * 1_000_000_000
     for offset in range(0, len(open_intents), 128):
         chunk = open_intents[offset:offset + 128]
         recovery_batch: List[Tuple[PruneIntent, Dict[str, Any]]] = []
         for intent in chunk:
+            if intent.mtime_ns >= cutoff_ns:
+                # Current retention no longer covers this file (e.g. the window
+                # was lengthened).  Keep the intent and any quarantine for a
+                # later run: never delete it and never infer an absence from a
+                # file that merely is not due yet.
+                new_warnings.append(
+                    f"recovery of {intent.path} deferred until it is older than the "
+                    f"{int(settings.housekeeping_local_retention_hours)}h retention cutoff"
+                )
+                continue
             spec_pair = _recovery_spec(store, key, intent, new_warnings)
             if spec_pair is None:
-                return RetentionResult(
-                    changed=changed or recovered_bytes > 0,
-                    bytes_reclaimed=bytes_reclaimed + recovered_bytes,
-                    files_pruned=recovered_files,
-                    warnings=_dedup(warnings + new_warnings), failed=True,
-                )
+                if intent.state == "pending":
+                    # An in-flight intent we cannot prove must fail closed: a
+                    # quarantine may exist and must not be silently forgotten.
+                    return RetentionResult(
+                        changed=changed or recovered_bytes > 0,
+                        bytes_reclaimed=bytes_reclaimed + recovered_bytes,
+                        files_pruned=recovered_files,
+                        warnings=_dedup(warnings + new_warnings), failed=True,
+                    )
+                # A legacy terminal conflict that cannot be re-proven now keeps
+                # its recorded state/detail; it is not an in-flight operation.
+                continue
             recovery_batch.append(spec_pair)
+        if not recovery_batch:
+            continue
         try:
             current_probe = probe_housekeeping(executor, key.lxc_id)
         except Exception as exc:
@@ -1729,7 +1854,12 @@ def _audit(
             owned_deletions=owned_deletions,
         )
         for intent in open_intents:
-            findings.append(f"an unfinished quarantine intent exists for {intent.path}")
+            if intent.state == "pending":
+                findings.append(f"an unfinished quarantine intent exists for {intent.path}")
+            else:
+                findings.append(
+                    f"a legacy missing-file conflict for {intent.path} is eligible for re-observation"
+                )
         if candidates:
             reclaimed = sum(int(spec.get("allocated_bytes") or 0) for spec in candidates)
             findings.append(

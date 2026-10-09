@@ -507,6 +507,84 @@ def test_numeric_rename_reuses_coverage_without_replay(env):
     assert {entry["path"] for entry in result.covered_files} == {"/data/logs/access.log.2"}
 
 
+def test_recreated_live_path_preserves_rotated_prefix_and_repeat_is_idle(env):
+    guest, _spool, executor, store = env
+    current = "/data/logs/access.log"
+    rotated = "/data/logs/access.log-20261009T211137"
+    head, tail = b"acknowledged head\n", b"new closed tail\n"
+    original = _write(guest, current, head)
+    with LokiServer() as server:
+        first = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct",
+            files=[_wire(guest, current, is_active=True)],
+        )
+        assert not first.failed
+        source_id = store.sources(KEY)[0].source_id
+        with original.open("ab") as handle:
+            handle.write(tail)
+        original.rename(guest / rotated.lstrip("/"))
+        _write(guest, current, b"fresh live stream\n")
+        wires = [
+            _wire(guest, current, is_active=True),
+            _wire(guest, rotated),
+        ]
+        server.requests.clear()
+        closed = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct", files=wires,
+        )
+        assert not closed.failed
+        assert _reconstruct(_iter_entries(server)) == tail
+        assert [entry["filename"] for entry in _iter_entries(server)] == [current]
+        assert closed.covered_files[0]["source_id"] == source_id
+        assert closed.covered_files[0]["sha256"] == hashlib.sha256(head + tail).hexdigest()
+        server.requests.clear()
+        repeated = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct", files=wires,
+        )
+        assert not repeated.failed
+        assert server.requests == []
+        assert repeated.bytes_archived == 0
+        assert repeated.covered_files == closed.covered_files
+
+
+def test_compression_uses_latest_generation_not_newer_absence_timestamp(env):
+    guest, _spool, executor, store = env
+    path = "/data/logs/access.log.1"
+    old = _write(guest, path, b"old generation\n")
+    with LokiServer() as server:
+        hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct",
+            files=[_wire(guest, path)],
+        )
+        old_id = store.sources(KEY)[0].source_id
+        old.rename(guest / "held-old-inode")
+        payload = b"replacement generation, fully acknowledged\n"
+        current = _write(guest, path, payload)
+        replacement = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct",
+            files=[_wire(guest, path)],
+        )
+        assert not replacement.failed
+        latest = store.source(KEY, replacement.covered_files[0]["source_id"])
+        # A later observation (or skewed clock) can refresh an old tombstone;
+        # it must not make that older content the compression predecessor.
+        store.clear_source_absent(KEY, old_id)
+        store.mark_source_absent(KEY, old_id, ts_ns=latest.updated_ns + 3_600_000_000_000)
+        current.rename(guest / "held-current-inode")
+        compressed = path + ".gz"
+        _write(guest, compressed, gzip.compress(payload))
+        server.requests.clear()
+        successor = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct",
+            files=[_wire(guest, compressed, compression="gzip")],
+        )
+        assert not successor.failed
+        assert server.requests == []
+        assert successor.covered_files[0]["sha256"] == hashlib.sha256(
+            (guest / compressed.lstrip("/")).read_bytes()
+        ).hexdigest()
+
+
 def test_replacement_and_truncation_are_fresh_generations(env):
     guest, _spool, executor, store = env
     _write(guest, "/data/logs/access.log.1", b"original\n")
@@ -1570,8 +1648,8 @@ def _poison_reassigned(
         state="pending",
     )
     store.record_prune_intent(intent)
-    if proof == "done":
-        store.resolve_prune_intent("poison-1", "done")
+    if proof in ("done", "absent"):
+        store.resolve_prune_intent("poison-1", proof)
 
 
 @pytest.mark.parametrize("new_data", [b"unrelated-new-task\nsecond-line\n", b"old-task-alpha\nold-task-beta\n"])
@@ -1750,8 +1828,9 @@ def test_resumed_poisoned_task_row_is_restored_from_durable_proof(env):
     assert _reconstruct(_iter_entries(second)) == new_data
 
 
-def test_poisoned_task_row_pending_capsule_repairs_without_inferring_deletion(env):
-    """A pending capsule proves the archived identity but never a deletion."""
+@pytest.mark.parametrize("proof", ["pending", "absent"])
+def test_task_archive_capsule_repairs_without_inferring_owned_deletion(env, proof: str) -> None:
+    """An archived generation can be proved without claiming who deleted it."""
     guest, _spool, executor, store = env
     old_path = _task_path("D4", OLD_UPID)
     new_path = _task_path("D7", NEW_UPID)
@@ -1767,7 +1846,7 @@ def test_poisoned_task_row_pending_capsule_repairs_without_inferring_deletion(en
     _reuse_inode(guest, old_path, new_path, new_data)
     _poison_reassigned(
         guest, store, old_path=old_path, old_id=old_id, old_record=old_record,
-        new_path=new_path, proof="pending",
+        new_path=new_path, proof=proof,
     )
 
     with LokiServer() as second:
@@ -1779,8 +1858,8 @@ def test_poisoned_task_row_pending_capsule_repairs_without_inferring_deletion(en
     assert restored.path == old_path
     assert restored.digest == old_record.digest
     assert sources.SourceProvenance.parse(restored.provenance).complete is True
-    assert restored.absent is False  # pending proof never infers deletion
-    assert store.prune_intent("poison-1").state == "pending"  # intent untouched
+    assert restored.absent is False
+    assert store.prune_intent("poison-1").state == proof
 
     new_id = hi.base_source_id("pbs", "task", new_path)
     assert new_id != old_id

@@ -22,16 +22,20 @@ Contract
 
 Execution topology
 ------------------
-``capture`` / ``snapshot`` run on the node; guest ``path`` values are resolved
-against a pinned running init process's private mount root (or explicit test
-``--sysroot``); never guess the node's potentially empty rootfs mount. Node
-``blob_path`` and ``--destination`` are node-absolute and used verbatim.
-``probe`` / ``prune`` need the guest's own ``/proc`` (writer identity), so on a
-node the helper obtains guest state via read-only ``pct config``/``pct status``
-(never starting the container) and runs its own logic inside the container with
-``pct exec <id> -- python3 -`` and the staged helper file on stdin.  Passing
-``--guest-local`` (internal) means "do not orchestrate, run against
-``--sysroot``" and is what the in-container invocation uses.
+``capture`` / ``snapshot`` / ``prune`` run on the node; guest ``path`` values
+are resolved against a pinned running init process's private mount root (or an
+explicit test ``--sysroot``); never guess the node's potentially empty rootfs
+mount.  Node ``blob_path`` and ``--destination`` are node-absolute and used
+verbatim.  Prune's writer and quarantine-ownership checks read the guest
+``/proc`` and root through that pinned root: the node's initial-user-namespace
+root can inspect every guest process descriptor, whereas the container's own
+root cannot always read a non-dumpable task's ``fd`` table -- so prune is never
+delegated to ``pct exec``.  ``probe`` still needs the guest's own ``/proc``
+identity, so on a node the helper obtains guest state via read-only ``pct
+config``/``pct status`` (never starting the container) and runs its logic inside
+the container with ``pct exec <id> -- python3 -`` and the staged helper file on
+stdin.  Passing ``--guest-local`` (internal) means "do not orchestrate, run
+against ``--sysroot``".
 
 Everything is resolved through a *sysroot* string so the same code paths can be
 driven against a temporary fixture tree by the regression tests.
@@ -259,6 +263,19 @@ class HelperError(RuntimeError):
     def __init__(self, message: str, *, detail: Optional[Dict[str, Any]] = None) -> None:
         super().__init__(message)
         self.detail: Dict[str, Any] = dict(detail or {})
+
+
+class _PruneBlocked(Exception):
+    """A per-file environmental refusal during prune.
+
+    Raised when the helper cannot trust the environment -- an unreadable guest
+    ``/proc`` writer table, a foreign-owned quarantine directory, a failed
+    space measurement.  It is *not* a structural request error: ``prune()``
+    converts it into a ``blocked`` wire entry, keeps every already-emitted
+    outcome, reports the remaining unattempted files as ``pending`` and stops
+    all further deletions.  It is deliberately not a ``HelperError`` so a
+    nested ``except HelperError`` cannot swallow and re-label it.
+    """
 
 
 Runner = Callable[[Sequence[str]], Optional[Tuple[int, str, str]]]
@@ -2407,13 +2424,6 @@ def _open_parent(joined: str) -> Tuple[int, str]:
     return _open_dir_path(parent), basename
 
 
-def _open_dir_optional(joined: str) -> Optional[int]:
-    try:
-        return _open_dir_path(joined)
-    except HelperError:
-        return None
-
-
 def _stat_at(dirfd: int, name: str) -> Optional[os.stat_result]:
     try:
         return os.stat(name, dir_fd=dirfd, follow_symlinks=False)
@@ -2446,6 +2456,113 @@ def _sha256_at(dirfd: int, name: str, length: int) -> Optional[str]:
         return digest.hexdigest()
     finally:
         os.close(fd)
+
+
+def _scan_writable(proc_root: str) -> Set[Tuple[int, int]]:
+    """The writable-fd inode set, or a ``blocked`` refusal on unknown state.
+
+    A failed ``/proc`` enumeration means the writer identity cannot be trusted,
+    so the caller must never guess -- it becomes a blocking per-file outcome.
+    """
+    try:
+        return _scan_proc(proc_root)[0]
+    except HelperError as exc:
+        raise _PruneBlocked(str(exc)) from exc
+
+
+def _used_bytes_or_block(path: str) -> int:
+    try:
+        return _fs_used_bytes(path)
+    except OSError as exc:
+        raise _PruneBlocked(
+            f"cannot measure free space on {path}: {exc.strerror or exc}"
+        ) from exc
+
+
+def _path_positively_absent(sysroot: str, abs_path: str) -> bool:
+    """True only when a no-symlink walk proves the path is missing.
+
+    Missing ancestors count as absence; a symlinked or non-directory component,
+    an unreadable component or any other error returns ``False`` so a symlink
+    can never masquerade as a deleted file.  Never follows guest symlinks.
+    """
+    joined = _join(sysroot, abs_path)
+    parts = [p for p in joined.split("/") if p]
+    fd: Optional[int] = None
+    for anchor, pinned in _PINNED_GUEST_ROOTS.items():
+        if joined == anchor or joined.startswith(anchor + "/"):
+            parts = [p for p in joined[len(anchor):].split("/") if p]
+            fd = os.dup(pinned)
+            break
+    if not parts:
+        if fd is not None:
+            os.close(fd)
+        return False
+    if fd is None:
+        fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for comp in parts[:-1]:
+            try:
+                child = os.open(
+                    comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
+                )
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False
+            os.close(fd)
+            fd = child
+        try:
+            os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return False
+    finally:
+        os.close(fd)
+
+
+def _translated_root_owner(sysroot: str) -> Tuple[int, int]:
+    """The host-side uid/gid the guest sees as root (from the pinned root).
+
+    An unprivileged container's root directory is owned by its translated host
+    ids (e.g. 100000:100000), so quarantine directories created on its behalf
+    must carry those ids instead of the node helper's host root 0.
+    """
+    pinned = _PINNED_GUEST_ROOTS.get(sysroot)
+    st = os.fstat(pinned) if pinned is not None else os.stat(sysroot)
+    return int(st.st_uid), int(st.st_gid)
+
+
+
+def _finalize_quarantine_dir(fd: int, sysroot: str) -> None:
+    """Enforce owner-only quarantine permissions under the translated owner.
+
+    An existing directory is acceptable only when owned by the current helper
+    or by the translated guest root; anything else is a foreign-owned tree we
+    refuse to reuse.  Newly created or previously host-owned directories are
+    chowned to the translated guest root so the guest's own root sees them as
+    its own.
+    """
+    uid, gid = _translated_root_owner(sysroot)
+    observed = os.fstat(fd)
+    owner = observed.st_uid
+    if owner not in (os.geteuid(), uid):
+        raise _PruneBlocked(
+            "quarantine directory has an unexpected owner "
+            f"({owner} is neither {os.geteuid()} nor {uid})"
+        )
+    try:
+        if stat.S_IMODE(observed.st_mode) != 0o700:
+            os.fchmod(fd, 0o700)
+        if (observed.st_uid, observed.st_gid) != (uid, gid):
+            os.fchown(fd, uid, gid)
+        final = os.fstat(fd)
+    except OSError as exc:
+        raise _PruneBlocked(f"cannot establish quarantine ownership: {exc.strerror or exc}") from exc
+    if (final.st_uid, final.st_gid) != (uid, gid) or stat.S_IMODE(final.st_mode) != 0o700:
+        raise _PruneBlocked("quarantine ownership or permissions were not observed after repair")
 
 
 def _prune_protection(path: str, log_kind: Optional[str]) -> Optional[str]:
@@ -2497,18 +2614,37 @@ def _identity_mismatch(spec: Dict[str, Any], st: os.stat_result, index: int) -> 
     return None
 
 
-def _ensure_quarantine_root(sysroot: str, log_root: str) -> None:
-    joined = _join(sysroot, log_root + "/" + QUARANTINE_DIRNAME)
-    fd = _open_dir_path(joined, create=True)
+def _open_quarantine_parent(
+    sysroot: str, log_root: str, quarantine: str, *, create: bool = False,
+) -> Optional[int]:
+    """Pin and validate every private ancestor, translating host-created owners."""
+    fd = _open_dir_path(_join(sysroot, log_root))
+    components = os.path.dirname(quarantine[len(log_root):]).strip("/").split("/")
     try:
-        os.fchmod(fd, 0o700)
-    except OSError as exc:
-        raise HelperError(
-            f"cannot enforce quarantine directory permissions: {exc.strerror or exc}",
-            detail={"path": joined},
-        )
-    finally:
+        for component in components:
+            if create:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            try:
+                child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    os.close(fd)
+                    return None
+                raise
+            try:
+                _finalize_quarantine_dir(child, sysroot)
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
         os.close(fd)
+        raise
 
 
 def _quarantine_recheck(
@@ -2524,7 +2660,7 @@ def _quarantine_recheck(
         return "quarantined file vanished"
     if (int(st.st_dev), int(st.st_ino)) != wanted:
         return "quarantined inode changed"
-    if wanted in _scan_proc(proc_root)[0]:
+    if wanted in _scan_writable(proc_root):
         return "an open writable fd appeared during quarantine"
     if _sha256_at(q_parent_fd, q_name, size) != digest:
         return "quarantined digest changed"
@@ -2558,6 +2694,19 @@ def _restore_or_retain(
     )
 
 
+def _completed_deletion(spec: Dict[str, Any], root: str, before: int) -> Dict[str, Any]:
+    try:
+        after = _fs_used_bytes(root)
+    except OSError as exc:
+        entry = _result_entry(
+            spec, "done",
+            f"deleted; reclaimed space is unknown ({exc.strerror or exc}); further pruning paused", 0,
+        )
+        entry["blocked"] = True
+        return entry
+    return _result_entry(spec, "done", "", max(0, before - after))
+
+
 def _recover_leftover(
     spec: Dict[str, Any],
     index: int,
@@ -2574,7 +2723,7 @@ def _recover_leftover(
 ) -> Dict[str, Any]:
     """Recover an interrupted quarantine recorded by an earlier run."""
     wanted = (int(qst.st_dev), int(qst.st_ino))
-    if wanted in _scan_proc(proc_root)[0]:
+    if wanted in _scan_writable(proc_root):
         return _result_entry(
             spec, "conflict", "quarantined file has an open writable fd; retained", 0
         )
@@ -2592,16 +2741,13 @@ def _recover_leftover(
         return _result_entry(
             spec, "conflict", "quarantined digest changed; retained", 0
         )
-    before = _fs_used_bytes(root_joined)
+    before = _used_bytes_or_block(root_joined)
     try:
         os.unlink(q_name, dir_fd=q_parent_fd)
         os.fsync(q_parent_fd)
     except OSError as exc:
-        return _result_entry(
-            spec, "conflict", f"unlink failed: {exc.strerror or exc}", 0
-        )
-    after = _fs_used_bytes(root_joined)
-    return _result_entry(spec, "done", "", max(0, before - after))
+        raise _PruneBlocked(f"unlink or directory durability failed: {exc.strerror or exc}") from exc
+    return _completed_deletion(spec, root_joined, before)
 
 
 def _prune_one(
@@ -2617,8 +2763,13 @@ def _prune_one(
     protected = _prune_protection(path, spec.get("log_kind"))
     if protected is not None:
         return _result_entry(spec, "conflict", protected, 0)
-    if spec.get("log_kind") == "task" and os.path.basename(path) in _pbs_active_tasks(sysroot):
-        return _result_entry(spec, "conflict", "currently active PBS task file", 0)
+    if spec.get("log_kind") == "task":
+        try:
+            active_tasks = _pbs_active_tasks(sysroot)
+        except HelperError as exc:
+            raise _PruneBlocked(str(exc)) from exc
+        if os.path.basename(path) in active_tasks:
+            return _result_entry(spec, "conflict", "currently active PBS task file", 0)
     digest = spec.get("sha256")
     if not isinstance(digest, str) or not digest:
         raise HelperError(
@@ -2635,14 +2786,20 @@ def _prune_one(
     root_joined = _join(sysroot, log_root)
     if not os.path.isdir(root_joined):
         return _result_entry(spec, "conflict", "log root is missing", 0)
-    root_dev = int(os.stat(root_joined).st_dev)
+    recovery = spec.get("recovery") is True
+    if (
+        recovery
+        and _path_positively_absent(sysroot, path)
+        and _path_positively_absent(sysroot, quarantine)
+    ):
+        return _result_entry(spec, "absent", "both paths absent; deletion origin unknown", 0)
 
     parent_fd, name = _open_parent(_join(sysroot, path))
     q_parent_fd: Optional[int] = None
     try:
         pst = _stat_at(parent_fd, name)
         q_name = os.path.basename(quarantine)
-        q_parent_fd = _open_dir_optional(_join(sysroot, os.path.dirname(quarantine)))
+        q_parent_fd = _open_quarantine_parent(sysroot, log_root, quarantine)
         qst = _stat_at(q_parent_fd, q_name) if q_parent_fd is not None else None
 
         # A leftover quarantine from an interrupted run is recovered first.
@@ -2665,17 +2822,34 @@ def _prune_one(
                 digest=digest,
             )
         if pst is None:
+            # Both paths observed positively absent is the only recovery outcome
+            # that resolves the intent without claiming a fresh deletion: the
+            # deletion origin is unknowable.  A fresh candidate stays a conflict.
+            if recovery and _path_positively_absent(sysroot, quarantine):
+                return _result_entry(
+                    spec,
+                    "absent",
+                    "original and quarantine paths are both absent; "
+                    "deletion origin unknown",
+                    0,
+                )
             return _result_entry(spec, "conflict", "file is missing", 0)
         if not stat.S_ISREG(pst.st_mode):
             raise HelperError(
                 "refusing to prune a non-regular file", detail={"path": path}
             )
+        try:
+            root_dev = int(os.stat(root_joined).st_dev)
+        except OSError as exc:
+            raise _PruneBlocked(
+                f"cannot stat the log filesystem: {exc.strerror or exc}"
+            ) from exc
         if int(pst.st_dev) != root_dev:
             return _result_entry(spec, "conflict", "file is outside the log filesystem", 0)
         mismatch = _identity_mismatch(spec, pst, index)
         if mismatch is not None:
             return _result_entry(spec, "conflict", mismatch, 0)
-        if wanted in _scan_proc(proc_root)[0]:
+        if wanted in _scan_writable(proc_root):
             return _result_entry(spec, "conflict", "file has an open writable fd", 0)
         observed = _sha256_at(parent_fd, name, size)
         if observed is None:
@@ -2687,52 +2861,52 @@ def _prune_one(
                 spec, "conflict", "quarantine target holds a different file", 0
             )
 
-        _ensure_quarantine_root(sysroot, log_root)
         if q_parent_fd is None:
-            # The quarantine path preserves the source-relative directory, so a
-            # nested fanout needs its descendants created (root-only) beneath the
-            # quarantine root before the file can be renamed into place.  The
-            # pinned directory-fd/O_NOFOLLOW helper refuses symlinked or
-            # non-directory components rather than following them.
-            joined_parent = _join(sysroot, os.path.dirname(quarantine))
-            try:
-                q_parent_fd = _open_dir_path(joined_parent, create=True, mode=0o700)
-            except HelperError as exc:
-                raise HelperError(
-                    "cannot open the quarantine directory",
-                    detail={"quarantine_path": quarantine, "reason": str(exc)},
-                ) from exc
-            try:
-                os.fchmod(q_parent_fd, 0o700)
-            except OSError as exc:
-                os.close(q_parent_fd)
-                q_parent_fd = None
-                raise HelperError(
-                    f"cannot enforce quarantine directory permissions: {exc.strerror or exc}",
-                    detail={"quarantine_path": quarantine},
-                ) from exc
-        before = _fs_used_bytes(root_joined)
+            q_parent_fd = _open_quarantine_parent(sysroot, log_root, quarantine, create=True)
+            if q_parent_fd is None:
+                raise _PruneBlocked("quarantine parent was not observed after creation")
+        before = _used_bytes_or_block(root_joined)
         try:
             os.rename(name, q_name, src_dir_fd=parent_fd, dst_dir_fd=q_parent_fd)
         except OSError as exc:
             return _result_entry(
                 spec, "conflict", f"quarantine rename failed: {exc.strerror or exc}", 0
             )
-        reason = _quarantine_recheck(q_parent_fd, q_name, wanted, size, digest, proc_root)
+        try:
+            reason = _quarantine_recheck(
+                q_parent_fd, q_name, wanted, size, digest, proc_root
+            )
+        except (HelperError, _PruneBlocked, OSError) as exc:
+            restored = _restore_or_retain(
+                spec, parent_fd, name, q_parent_fd, q_name,
+                f"cannot verify the quarantined file ({exc})",
+            )
+            return _result_entry(spec, "blocked", restored["detail"], 0)
         if reason is None:
             try:
                 os.unlink(q_name, dir_fd=q_parent_fd)
                 os.fsync(q_parent_fd)
             except OSError as exc:
-                reason = f"unlink failed: {exc.strerror or exc}"
+                restored = _restore_or_retain(
+                    spec, parent_fd, name, q_parent_fd, q_name,
+                    f"unlink or directory durability failed ({exc.strerror or exc})",
+                )
+                return _result_entry(spec, "blocked", restored["detail"], 0)
             else:
-                after = _fs_used_bytes(root_joined)
-                return _result_entry(spec, "done", "", max(0, before - after))
+                return _completed_deletion(spec, root_joined, before)
         return _restore_or_retain(spec, parent_fd, name, q_parent_fd, q_name, reason)
     finally:
         if q_parent_fd is not None:
             os.close(q_parent_fd)
         os.close(parent_fd)
+
+
+def _validate_recovery(spec: Dict[str, Any], *, index: int) -> None:
+    if "recovery" in spec and not isinstance(spec["recovery"], bool):
+        raise HelperError(
+            f"request files[{index}].recovery must be a boolean",
+            detail={"index": index, "path": spec.get("path")},
+        )
 
 
 def prune(
@@ -2741,7 +2915,16 @@ def prune(
     sysroot: str = "/",
     proc_root: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Identity-checked quarantine deletion of approved closed log files."""
+    """Identity-checked quarantine deletion of approved closed log files.
+
+    Per-file wire states: ``done`` (deleted), ``restored``/``conflict`` (file
+    kept), ``absent`` (only for a ``recovery`` spec whose original *and*
+    quarantine paths are both positively missing; resolves without claiming a
+    deletion), ``blocked`` (untrusted environment) and ``pending`` (not
+    attempted once an earlier file blocked).  A blocked file stops all further
+    deletions but preserves every earlier outcome; ``files_pruned`` never counts
+    ``absent``.  Structural request faults still raise.
+    """
     proc = proc_root or _default_proc_root(sysroot)
     specs = _request_files(
         request,
@@ -2757,14 +2940,43 @@ def prune(
             "log_kind",
         ),
     )
-    files: List[Dict[str, Any]] = []
-    reclaimed = 0
-    pruned = 0
+    # Validate every spec before mutating anything so a malformed later entry
+    # cannot leave earlier deletions unreported.
     for index, spec in enumerate(specs):
         _validate_compression(spec, index=index)
         _validate_profile(spec, index=index)
         _validate_log_kind(spec, index=index)
-        entry = _prune_one(spec, index, sysroot=sysroot, proc_root=proc)
+        _validate_recovery(spec, index=index)
+        digest = spec.get("sha256")
+        if not isinstance(digest, str) or not digest:
+            raise HelperError(
+                "prune requests must carry the acknowledged sha256",
+                detail={"index": index, "path": spec["path"]},
+            )
+        log_root = _validate_guest_log_path(spec["path"])
+        _validate_quarantine_path(spec.get("quarantine_path"), log_root)
+        for key in ("size", "device", "inode", "mtime_ns"):
+            _int_field(spec, key, index=index)
+
+    files: List[Dict[str, Any]] = []
+    reclaimed = 0
+    pruned = 0
+    blocked = False
+    for index, spec in enumerate(specs):
+        if blocked:
+            files.append(
+                _result_entry(
+                    spec, "pending", "not attempted; an earlier file is blocked", 0
+                )
+            )
+            continue
+        try:
+            entry = _prune_one(spec, index, sysroot=sysroot, proc_root=proc)
+        except (HelperError, _PruneBlocked, OSError) as exc:
+            entry = _result_entry(spec, "blocked", str(exc), 0)
+            blocked = True
+        if entry["state"] == "blocked" or entry.get("blocked") is True:
+            blocked = True
         files.append(entry)
         reclaimed += int(entry["bytes_reclaimed"])
         if entry["state"] == "done":
@@ -3018,7 +3230,10 @@ def dispatch(args: argparse.Namespace, request: Dict[str, Any]) -> Dict[str, Any
                 "refusing to prune: the guest is not running",
                 detail={"lxc_id": args.lxc_id},
             )
-        return _pct_guest_call(pct, "prune", args.lxc_id, request)
+        # Run against the pinned running init root on the node: the host's
+        # initial user namespace can inspect every guest process descriptor,
+        # which the container's own root cannot always do.  Never pct exec.
+        return prune(request, sysroot=_required_sysroot(args))
     if operation == "capture":
         return capture(request, sysroot=_required_sysroot(args))
     if operation == "snapshot":

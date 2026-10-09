@@ -1428,8 +1428,8 @@ def test_prune_refuses_symlinked_nested_quarantine_ancestor(guest: Path) -> None
         quarantine=f"/data/logs/{hio.QUARANTINE_DIRNAME}/sub/access.log.1",
     )
 
-    with pytest.raises(hio.HelperError):
-        hio.prune({"files": [spec]}, sysroot=str(guest))
+    facts = hio.prune({"files": [spec]}, sysroot=str(guest))
+    assert facts["files"][0]["state"] == "blocked"
 
     assert log.exists()
     assert list(outside.iterdir()) == []
@@ -1527,8 +1527,8 @@ def test_prune_rejects_symlinked_ancestor_directory(guest: Path) -> None:
         "/data/logs/sub/evil.log.1",
         quarantine="/data/logs/.fleet-housekeeping-quarantine/evil.log.1",
     )
-    with pytest.raises(hio.HelperError):
-        hio.prune({"files": [spec]}, sysroot=str(guest))
+    facts = hio.prune({"files": [spec]}, sysroot=str(guest))
+    assert facts["files"][0]["state"] == "blocked"
     assert log.exists()
 
 
@@ -1639,6 +1639,200 @@ def test_prune_missing_log_root_and_missing_file(guest: Path) -> None:
     facts = hio.prune({"files": [spec]}, sysroot=str(guest))
     assert facts["files"][0]["detail"] == "file is missing"
     assert facts["files_pruned"] == 0
+
+
+def _absent_spec(guest_path: str, **over):
+    """A wire record for a path that may not exist (recovery re-observation)."""
+    spec = {
+        "path": guest_path,
+        "quarantine_path": _quarantine_for(guest_path),
+        "device": 11,
+        "inode": 22,
+        "size": 33,
+        "mtime_ns": 44,
+        "compression": "plain",
+        "profile": "npm",
+        "log_kind": "application",
+        "is_active": False,
+        "sha256": "cd" * 32,
+    }
+    spec.update(over)
+    return spec
+
+
+@pytest.mark.parametrize("path", ["/data/logs/access.log.1", "/data/logs/removed-parent/access.log.1"])
+def test_prune_recovery_both_paths_absent_resolves_without_deletion(guest: Path, path: str) -> None:
+    _mkdir(guest, "/data/logs")
+    spec = _absent_spec(path, recovery=True)
+
+    facts = hio.prune({"files": [spec]}, sysroot=str(guest))
+
+    entry = facts["files"][0]
+    assert entry["state"] == "absent"
+    assert entry["bytes_reclaimed"] == 0
+    assert facts["files_pruned"] == 0
+    assert facts["bytes_reclaimed"] == 0
+    # Resolving an absent recovery source never fabricates a quarantine tree.
+    assert not (guest / "data/logs" / hio.QUARANTINE_DIRNAME).exists()
+
+
+def test_prune_fresh_missing_is_a_conflict_not_absent(guest: Path) -> None:
+    _mkdir(guest, "/data/logs")
+    spec = _absent_spec("/data/logs/access.log.1")
+
+    facts = hio.prune({"files": [spec]}, sysroot=str(guest))
+
+    assert facts["files"][0]["state"] == "conflict"
+
+
+def test_prune_recovery_requires_both_paths_positively_absent(guest: Path) -> None:
+    _mkdir(guest, "/data/logs")
+    # An unrelated file occupying the quarantine path is not positive absence.
+    _mkdir(guest, "/data/logs/" + hio.QUARANTINE_DIRNAME, 0o700)
+    other = _write(
+        guest, f"/data/logs/{hio.QUARANTINE_DIRNAME}/access.log.1", b"someone else\n"
+    )
+    spec = _absent_spec("/data/logs/access.log.1", recovery=True)
+
+    facts = hio.prune({"files": [spec]}, sysroot=str(guest))
+
+    assert facts["files"][0]["state"] == "conflict"
+    assert other.read_bytes() == b"someone else\n"
+
+
+def test_prune_recovery_symlinked_quarantine_is_not_absent(guest: Path) -> None:
+    _mkdir(guest, "/data/logs")
+    outside = _mkdir(guest, "/data/outside", 0o755)
+    (guest / "data/logs" / hio.QUARANTINE_DIRNAME).symlink_to(outside)
+    spec = _absent_spec("/data/logs/access.log.1", recovery=True)
+
+    facts = hio.prune({"files": [spec]}, sysroot=str(guest))
+
+    assert facts["files"][0]["state"] == "blocked"
+    assert list(outside.iterdir()) == []
+
+
+def test_prune_recovery_occupied_original_is_a_conflict(guest: Path) -> None:
+    _mkdir(guest, "/data/logs")
+    log = _write(guest, "/data/logs/access.log.1", b"a replacement\n")
+    spec = _absent_spec("/data/logs/access.log.1", recovery=True)
+
+    facts = hio.prune({"files": [spec]}, sysroot=str(guest))
+
+    assert facts["files"][0]["state"] == "conflict"
+    assert "device/inode changed" in facts["files"][0]["detail"]
+    assert log.exists()
+    assert not (guest / "data/logs" / hio.QUARANTINE_DIRNAME).exists()
+
+
+def test_prune_recovery_prunes_a_still_present_matching_source(guest: Path) -> None:
+    _mkdir(guest, "/data/logs")
+    log = _write(guest, "/data/logs/access.log.1", b"still here\n")
+    spec = _prune_spec(guest, "/data/logs/access.log.1", recovery=True)
+
+    facts = hio.prune({"files": [spec]}, sysroot=str(guest))
+
+    # The rename never happened: the recorded identity is intact and prunable.
+    assert facts["files"][0]["state"] == "done"
+    assert facts["files_pruned"] == 1
+    assert not log.exists()
+
+
+def test_prune_recovery_completes_a_matching_quarantined_file(guest: Path) -> None:
+    _mkdir(guest, "/data/logs")
+    quarantine_dir = _mkdir(guest, "/data/logs/" + hio.QUARANTINE_DIRNAME, 0o700)
+    quarantined = quarantine_dir / "access.log.1"
+    quarantined.write_bytes(b"old access\n")
+    st = quarantined.lstat()
+    spec = _absent_spec(
+        "/data/logs/access.log.1",
+        recovery=True,
+        device=st.st_dev,
+        inode=st.st_ino,
+        size=st.st_size,
+        mtime_ns=st.st_mtime_ns,
+        sha256=hashlib.sha256(b"old access\n").hexdigest(),
+    )
+
+    facts = hio.prune({"files": [spec]}, sysroot=str(guest))
+
+    assert facts["files"][0]["state"] == "done"
+    assert facts["files_pruned"] == 1
+    assert not quarantined.exists()
+
+
+@pytest.mark.parametrize("fault_at", ["next_file", "quarantine_recheck"])
+def test_prune_blocked_stops_batch_and_keeps_done_and_pending(
+    monkeypatch, guest: Path, fault_at: str,
+) -> None:
+    _mkdir(guest, "/data/logs")
+    first = _write(guest, "/data/logs/access.log.1", b"one\n")
+    second = _write(guest, "/data/logs/access.log.2", b"two\n")
+    third = _write(guest, "/data/logs/access.log.3", b"three\n")
+    specs = [
+        _prune_spec(guest, "/data/logs/access.log.1"),
+        _prune_spec(guest, "/data/logs/access.log.2"),
+        _prune_spec(guest, "/data/logs/access.log.3"),
+    ]
+    real_scan = hio._scan_proc
+
+    def fake_scan(proc_root):
+        first_done = not first.exists() and not (guest / _quarantine_for(specs[0]["path"]).lstrip("/")).exists()
+        if first_done and (fault_at == "next_file" or not second.exists()):
+            raise hio.HelperError("uninspectable process descriptors")
+        return real_scan(proc_root)
+
+    monkeypatch.setattr(hio, "_scan_proc", fake_scan)
+
+    facts = hio.prune({"files": specs}, sysroot=str(guest))
+
+    assert [entry["state"] for entry in facts["files"]] == ["done", "blocked", "pending"]
+    assert facts["files_pruned"] == 1
+    assert not first.exists()
+    assert second.read_bytes() == b"two\n"
+    assert third.read_bytes() == b"three\n"
+
+
+def test_prune_blocks_when_a_live_writer_fd_is_uninspectable(
+    monkeypatch, guest: Path
+) -> None:
+    _mkdir(guest, "/data/logs")
+    log = _write(guest, "/data/logs/access.log.1", b"live writer\n")
+    _add_denied_proc(guest, 7777, state="R")
+    _deny_fd_enumeration(monkeypatch, [7777])
+    spec = _prune_spec(guest, "/data/logs/access.log.1")
+
+    facts = hio.prune({"files": [spec]}, sysroot=str(guest))
+
+    assert facts["files"][0]["state"] == "blocked"
+    assert log.read_bytes() == b"live writer\n"
+    assert facts["files_pruned"] == 0
+    assert not (guest / "data/logs" / hio.QUARANTINE_DIRNAME).exists()
+
+
+def test_prune_foreign_owned_quarantine_is_blocked(monkeypatch, guest: Path) -> None:
+    _mkdir(guest, "/data/logs")
+    log = _write(guest, "/data/logs/access.log.1", b"keep me\n")
+    spec = _prune_spec(guest, "/data/logs/access.log.1")
+    real_fstat = os.fstat
+
+    def foreign_owner(fd):
+        observed = real_fstat(fd)
+        if stat.S_ISDIR(observed.st_mode) and os.readlink(f"/proc/self/fd/{fd}").endswith(hio.QUARANTINE_DIRNAME):
+            fields = list(observed)
+            fields[4] = os.geteuid() + 4242
+            return os.stat_result(fields)
+        return observed
+
+    monkeypatch.setattr(hio.os, "fstat", foreign_owner)
+
+    facts = hio.prune({"files": [spec]}, sysroot=str(guest))
+
+    assert facts["files"][0]["state"] == "blocked"
+    assert log.read_bytes() == b"keep me\n"
+    assert facts["files_pruned"] == 0
+
+
 
 
 # --------------------------------------------------------------------------- #

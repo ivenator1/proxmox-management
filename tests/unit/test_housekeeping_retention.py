@@ -303,13 +303,17 @@ def setup(store, guest, name="/data/logs/proxy_access.log.1", *, acknowledge=Tru
     return {**wire, "source_id": name, "sha256": digest}
 
 
-def run(guest, store, loki, covered=(), *, dry_run=False):
-    settings = GlobalSettings(housekeeping_enabled=True, housekeeping_loki_url=loki.url)
+def run(guest, store, loki, covered=(), *, dry_run=False, retention_hours=48):
+    settings = GlobalSettings(
+        housekeeping_enabled=True,
+        housekeeping_loki_url=loki.url,
+        housekeeping_local_retention_hours=retention_hours,
+    )
     content = ('loki.write "default" { endpoint { url = "' + loki.url + '/loki/api/v1/push" } }\n'
                'loki.source.journal "journal" { max_age = coalesce(sys.env("FLEET_JOURNAL_MAX_AGE"), "48h") }\n')
     base = DesiredAlloyConfig(content=content, sha256=sha(content.encode()))
     effective = housekeeping.render_lxc_log_config(base, node=KEY.node, cluster=KEY.cluster,
-        lxc_id=KEY.lxc_id, name="guest", profiles=guest.profiles, retention_hours=48)
+        lxc_id=KEY.lxc_id, name="guest", profiles=guest.profiles, retention_hours=retention_hours)
     if not guest.path("/etc/alloy/config.alloy").exists() and not dry_run:
         guest.put("/etc/alloy/config.alloy", effective.content)
     probe = housekeeping.probe_housekeeping(guest, KEY.lxc_id)
@@ -703,3 +707,273 @@ def test_rotation_drift_after_initial_probe_preserves_writer_tail(
         assert guest.path(current).read_bytes() == b""
     finally:
         guest.writer.close()
+
+
+# --------------------------------------------------------------------------- #
+# Recovery wire outcomes: absent / blocked / pending / legacy revalidation
+# --------------------------------------------------------------------------- #
+
+
+
+
+
+
+def test_both_paths_absent_resolves_intent_without_inferring_deletion(guest, store):
+    coverage = setup(store, guest)
+    pending_intent(store, coverage)
+    guest.path(coverage["path"]).unlink()  # crash after unlink, before the response
+    with Loki(guest) as loki:
+        result = run(guest, store, loki, [coverage])
+        follow = run(guest, store, loki, [coverage])
+    assert not result.failed
+    assert result.files_pruned == 0
+    assert result.bytes_reclaimed == 0
+    intent = store.prune_intent("pi-" + coverage["source_id"])
+    assert intent.state == "absent"
+    assert intent.reclaimed_bytes == 0
+    # The follow-up observation finds nothing new and never re-warns or deletes.
+    assert not follow.failed
+    assert follow.files_pruned == 0
+    assert warnings_for(follow, coverage["path"]) == []
+
+
+def test_blocked_recovery_outcome_keeps_intent_pending(guest, store, monkeypatch):
+    coverage = setup(store, guest)
+    pending_intent(store, coverage)
+    def unavailable(proc_root):
+        raise io.HelperError("uninspectable writer state")
+
+    monkeypatch.setattr(io, "_scan_proc", unavailable)
+    with Loki(guest) as loki:
+        result = run(guest, store, loki, [coverage])
+    assert result.failed
+    assert result.files_pruned == 0
+    assert store.prune_intent("pi-" + coverage["source_id"]).state == "pending"
+    assert guest.path(coverage["path"]).exists()
+
+
+def test_partially_reported_outcomes_preserve_confirmed_progress(guest, store, monkeypatch):
+    covered = [setup(store, guest, f"/data/logs/proxy{index}_access.log.1") for index in range(3)]
+    for item in covered:
+        pending_intent(store, item)
+
+    real_scan = io._scan_proc
+    first_path = covered[0]["path"]
+
+    def scan_after_deletion(proc_root):
+        if (
+            not guest.path(first_path).exists()
+            and not guest.path(retention.quarantine_path_for(first_path)).exists()
+        ):
+            raise io.HelperError("writer state became unavailable after a completed deletion")
+        return real_scan(proc_root)
+
+    monkeypatch.setattr(io, "_scan_proc", scan_after_deletion)
+    with Loki(guest) as loki:
+        result = run(guest, store, loki, covered)
+    assert result.failed
+    assert result.files_pruned == 1
+    resolved = {intent.path: intent for intent in store.prune_intents(KEY)}
+    assert resolved[first_path].state == "done"
+    assert not guest.path(first_path).exists()
+    for item in covered[1:]:
+        assert resolved[item["path"]].state == "pending"
+        assert guest.path(item["path"]).read_text() == "old retained content\n"
+
+
+def test_legacy_missing_conflict_is_reobserved_without_resetting_other_conflicts(guest, store):
+    legacy = setup(store, guest, "/data/logs/legacy_access.log.1")
+    other = setup(store, guest, "/data/logs/other_access.log.1")
+    pending_intent(store, legacy, intent_id="legacy")
+    store.resolve_prune_intent("legacy", "conflict", reclaimed_bytes=0, detail="file is missing")
+    pending_intent(store, other, intent_id="other")
+    store.resolve_prune_intent("other", "conflict", reclaimed_bytes=0, detail="digest changed")
+    guest.path(legacy["path"]).unlink()
+    guest.path(other["path"]).unlink()
+    with Loki(guest) as loki:
+        result = run(guest, store, loki, [legacy, other])
+    assert not result.failed
+    assert result.files_pruned == 0
+    assert store.prune_intent("legacy").state == "absent"
+    unchanged = store.prune_intent("other")
+    assert unchanged.state == "conflict"
+    assert unchanged.detail == "digest changed"
+
+
+@pytest.mark.parametrize("mismatch", ["inode", "sha256"])
+def test_owned_deletion_only_silences_the_exact_identity(guest, store, mismatch):
+    coverage = setup(store, guest)
+    intent = pending_intent(store, coverage)
+    store.resolve_prune_intent(intent.intent_id, "done", reclaimed_bytes=0, detail="deleted by us")
+    guest.path(coverage["path"]).unlink()
+    changed = {**coverage, mismatch: coverage["inode"] + 1 if mismatch == "inode" else "a" * 64}
+    with Loki(guest) as loki:
+        result = run(guest, store, loki, [changed])
+    assert result.files_pruned == 0
+    # Neither a re-used pathname nor a different digest may inherit the silence.
+    assert warnings_for(result, coverage["path"])
+
+
+def test_missing_covered_row_without_intent_still_warns(guest, store):
+    coverage = setup(store, guest)
+    guest.path(coverage["path"]).unlink()
+    with Loki(guest) as loki:
+        result = run(guest, store, loki, [coverage])
+    assert not result.failed
+    assert result.files_pruned == 0
+    assert warnings_for(result, coverage["path"])
+
+
+def test_recovery_parse_never_turns_conflict_into_absent(guest, store):
+    coverage = setup(store, guest)
+    pending_intent(store, coverage)
+    guest.put(coverage["path"], "a distinctly longer replacement identity\n", age=10 * DAY)
+    with Loki(guest) as loki:
+        result = run(guest, store, loki, [coverage])
+    assert not result.failed
+    assert result.files_pruned == 0
+    assert guest.path(coverage["path"]).read_text() == "a distinctly longer replacement identity\n"
+    intent = store.prune_intent("pi-" + coverage["source_id"])
+    assert intent.state == "conflict"
+
+
+def test_absent_for_non_recovery_spec_is_not_trusted(guest, store, monkeypatch):
+    coverage = setup(store, guest)
+
+    def unexpected_absence(lxc_id, *, files):
+        # External loss races the fresh prune.  Corrupt only the actual helper's
+        # disposition, retaining its full request identity for consumer checks.
+        guest.path(coverage["path"]).unlink()
+        facts = io.prune({"files": files}, sysroot=str(guest.root))
+        facts["files"][0]["state"] = "absent"
+        return PrimitiveResult(rc=0, facts=facts)
+
+    monkeypatch.setattr(guest, "housekeeping_prune", unexpected_absence)
+    with Loki(guest) as loki:
+        result = run(guest, store, loki, [coverage])
+    assert result.failed
+    assert result.files_pruned == 0
+    assert result.bytes_reclaimed == 0
+    # Only independently authorized recovery may resolve an absent intent.
+    assert len(store.open_prune_intents(KEY)) == 1
+
+
+
+
+def test_interrupted_quarantine_completes_as_done_not_absent(guest, store):
+    coverage = setup(store, guest)
+    pending_intent(store, coverage)
+    quarantine = retention.quarantine_path_for(coverage["path"])
+    guest.path(quarantine).parent.mkdir(parents=True, exist_ok=True)
+    guest.path(coverage["path"]).rename(guest.path(quarantine))
+    with Loki(guest) as loki:
+        result = run(guest, store, loki, [coverage])
+    assert not result.failed
+    assert result.files_pruned == 1
+    assert store.prune_intent("pi-" + coverage["source_id"]).state == "done"
+    assert not guest.path(quarantine).exists()
+
+
+def test_recovery_defers_intent_not_yet_due_under_longer_retention(guest, store):
+    coverage = setup(store, guest)  # ten days old
+    pending_intent(store, coverage)
+    quarantine = retention.quarantine_path_for(coverage["path"])
+    guest.path(quarantine).parent.mkdir(parents=True, exist_ok=True)
+    guest.path(coverage["path"]).rename(guest.path(quarantine))
+    guest.put(io.POLICY_FILES["alloy_env"], housekeeping.journal_env_content(30 * 24))
+    with Loki(guest) as loki:
+        result = run(guest, store, loki, [coverage], retention_hours=30 * 24)
+    assert not result.failed
+    assert result.files_pruned == 0
+    # Current retention no longer authorizes the interrupted deletion.
+    assert guest.pruned == []
+    assert store.prune_intent("pi-" + coverage["source_id"]).state == "pending"
+    assert guest.path(quarantine).exists()
+    assert warnings_for(result, coverage["path"])
+
+@pytest.mark.parametrize("reordered", [False, True])
+def test_same_path_recovery_resolves_each_generation_from_its_own_outcome(
+    guest, store, monkeypatch, reordered,
+):
+    old = setup(store, guest)
+    old_id = "older-generation"
+    wire = {key: old[key] for key in (
+        "path", "device", "inode", "size", "mtime_ns", "allocated_bytes",
+        "compression", "profile", "log_kind", "is_active",
+    )}
+    store.record_source(
+        KEY, old_id, SourceIdentity(**wire),
+        provenance={"complete": True, "complete_size": old["size"]},
+    )
+    store.set_source_digest(KEY, old_id, old["sha256"])
+    store.mark_source_acknowledged(KEY, old_id)
+    older = pending_intent(store, {**old, "source_id": old_id})
+    store.resolve_prune_intent(older.intent_id, "conflict", detail="file is missing")
+    retained = guest.path("/data/logs/retained-old.log.1")
+    guest.path(old["path"]).rename(retained)
+    current = setup(store, guest)
+    newer = pending_intent(store, current)
+    assert old["inode"] != current["inode"]
+    actual_prune = guest.housekeeping_prune
+    if reordered:
+        def reorder_outcomes(lxc_id, *, files):
+            result = actual_prune(lxc_id, files=files)
+            result.facts["files"].reverse()
+            return result
+
+        monkeypatch.setattr(guest, "housekeeping_prune", reorder_outcomes)
+    with Loki(guest) as loki:
+        result = run(guest, store, loki, [current])
+        if reordered:
+            assert result.failed
+            assert result.files_pruned == 0
+            assert store.prune_intent(newer.intent_id).state == "pending"
+            assert store.prune_intent(older.intent_id).state == "conflict"
+            monkeypatch.setattr(guest, "housekeeping_prune", actual_prune)
+            resumed = run(guest, store, loki, [current])
+            assert not resumed.failed
+            assert resumed.files_pruned == 0
+            assert store.prune_intent(newer.intent_id).state == "absent"
+        else:
+            assert not result.failed
+            assert result.files_pruned == 1
+            assert store.prune_intent(newer.intent_id).state == "done"
+        assert store.prune_intent(older.intent_id).state == "absent"
+        assert store.prune_intent(older.intent_id).reclaimed_bytes == 0
+    assert not guest.path(current["path"]).exists()
+    assert retained.read_bytes() == b"old retained content\n"
+
+
+
+def test_directory_sync_failure_resumes_as_observed_absence(guest, store, monkeypatch):
+    covered = [setup(store, guest, f"/data/logs/proxy{index}_access.log.1") for index in range(3)]
+    for item in covered:
+        pending_intent(store, item)
+    uncertain = covered[1]["path"]
+    actual_sync = io.os.fsync
+
+    def fail_after_unlink(fd):
+        if (
+            not guest.path(uncertain).exists()
+            and not guest.path(retention.quarantine_path_for(uncertain)).exists()
+        ):
+            raise OSError("directory durability unavailable")
+        return actual_sync(fd)
+
+    monkeypatch.setattr(io.os, "fsync", fail_after_unlink)
+    with Loki(guest) as loki:
+        first = run(guest, store, loki, covered)
+        assert first.failed
+        assert first.files_pruned == 1
+        assert store.prune_intent("pi-" + covered[0]["source_id"]).state == "done"
+        assert store.prune_intent("pi-" + covered[1]["source_id"]).state == "pending"
+        assert not guest.path(uncertain).exists()
+        assert guest.path(covered[2]["path"]).exists()
+        monkeypatch.setattr(io.os, "fsync", actual_sync)
+        resumed = run(guest, store, loki, covered)
+    assert not resumed.failed
+    assert resumed.files_pruned == 1
+    assert store.prune_intent("pi-" + covered[1]["source_id"]).state == "absent"
+    assert store.prune_intent("pi-" + covered[1]["source_id"]).reclaimed_bytes == 0
+    assert not store.open_prune_intents(KEY)
+    assert all(not guest.path(item["path"]).exists() for item in covered)

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import posixpath
 from dataclasses import dataclass, replace
-from typing import Any, Dict, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from proxmox_fleet.housekeeping_checkpoint import SourceRecord
 from proxmox_fleet.housekeeping_io import NPM_ARCHIVE_RE, PBS_API_ARCHIVE_RE
@@ -304,7 +304,10 @@ def next_generation(existing_ids: Sequence[str], base: str) -> Tuple[str, int]:
     return f"{base}.g{generation}", generation
 
 
-def same_generation(record: SourceRecord, wire: Optional[Dict[str, Any]], current_paths: Set[str]) -> bool:
+def same_generation(
+    record: SourceRecord, wire: Optional[Dict[str, Any]],
+    current_paths: Mapping[str, Tuple[int, int]],
+) -> bool:
     """True when *wire* is the same logical source (rename or append), not a reset."""
     if wire is None:
         return True
@@ -316,7 +319,11 @@ def same_generation(record: SourceRecord, wire: Optional[Dict[str, Any]], curren
         return False
     if record.size == wire["size"] and record.mtime_ns == wire["mtime_ns"]:
         return True
-    renamed = record.path != wire["path"] and record.path not in current_paths
+    # A recreated live pathname does not mean its former inode stayed there.
+    renamed = (
+        record.path != wire["path"]
+        and current_paths.get(record.path) != (record.device, record.inode)
+    )
     if wire["compression"] == "plain" and wire["size"] > record.size and (record.path == wire["path"] or renamed):
         return True
     return False
@@ -345,12 +352,17 @@ def lineage_predecessor(records: Sequence[SourceRecord], wire: Dict[str, Any]) -
     predecessor_path = _plain_log_path(path)
     if predecessor_path == path:
         return None
-    for record in records:
-        if (
-            record.path == predecessor_path
-            and record.profile == wire["profile"]
-            and record.log_kind == wire["log_kind"]
-            and record.compression == "plain"
-        ):
-            return record
-    return None
+    candidates = (
+        record for record in records
+        if record.path == predecessor_path
+        and record.profile == wire["profile"]
+        and record.log_kind == wire["log_kind"]
+        and record.compression == "plain"
+    )
+    return max(
+        candidates,
+        key=lambda record: (
+            SourceProvenance.parse(record.provenance).generation, record.updated_ns,
+        ),
+        default=None,
+    )
