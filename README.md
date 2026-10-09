@@ -185,15 +185,21 @@ Permission verification checks effective access as the `alloy` user and separate
 
 Native policy reads are bounded and JSON-framed so transport trimming cannot change line endings, file identity hashes, or the original-rule backup. Logrotate cutover retains the existing writer mechanisms and unrelated policy bytes.
 
+Before and after NPM rotation, a fresh descriptor probe checks for writers still holding rotated logs. When needed, maintenance signals the existing `openresty.service` main process with `USR1` and verifies that its descriptors moved; a successful signal command alone is insufficient. This repairs a stale vendor PID-file hook without replacing opaque native hooks, changing copytruncate mechanisms, or restarting the application. Unknown writer state or unsuccessful reopening blocks rotation.
+
 **Delivery gates and outage behaviour:** import sends at most a 512 KiB push body per request and only HTTP 204 acknowledges a batch; timeouts/429/5xx are retried with bounded backoff, other 4xx fail immediately, and a failed batch reports `Blocked` with progress intact. A readiness/query failure pauses fleet-managed file deletion even for already-acknowledged files. Applications' own native rotation limits and journald's hard caps remain finite buffers during an outage — this feature does not promise infinite outage retention. PBS `task-log-max-days` is not shortened to two days; existing native limits still apply independently. PBS task index/control files and active task logs are never pruned.
 
 **Backfill and spool:** pre-existing history is frozen once into a root-only (`0700`/`0600`) node spool under `/var/tmp/fleet-log-import/<sha256(cluster/node/id)>/<capture_id>/` (requiring node free space ≥ captured bytes + 2 GiB) so native rotation cannot erase history mid-import, then streamed oldest-first. Each captured blob is released only after every one of its bytes is acknowledged, even if other frozen prefixes still need backfill. Releases use bounded shell-command batches; an interruption preserves the remaining blobs and resumes from durable per-blob progress without re-archiving acknowledged content. The checkpoint database lives at `<fleet_history_dir>/housekeeping.sqlite3`; a missing DB starts an import, a corrupt/unwritable one blocks file-log deletion rather than guessing.
 
 Frozen inputs share bounded multi-range snapshot fetches: at most 64 ranges and 32 MiB raw data per tar, with a 64 KiB manifest limit. Every entry is validated against its exact source request before reading; each source retains its own raw digest and HTTP acknowledgement. Prefetched bytes are not archive coverage. Live-source prefix verification remains separate.
 
+Source lineage includes the profile/log-kind namespace. For PBS task logs it also includes the filename's UPID: a reused inode cannot lend a different task its frozen prefix or acknowledgement. Shard-directory renames and gzip/zstd compression of the same task preserve verified lineage.
+
 **Quarantine and recovery:** approved closed files retain their source-relative path beneath a same-root `.fleet-housekeeping-quarantine` directory. Missing nested parents (including PBS task hex fanouts and nested NPM archives) are created with `0700` permissions through pinned directory descriptors; symlinked/non-directory ancestors are rejected. A failed prune transport keeps its durable intents for revalidation and recovery on a later maintenance run. Initial archive completion is not proof that file cleanup succeeded.
 
 Recovery uses bounded 128-file batches with fresh policy, permissions, Alloy and Loki authorization per batch; each helper operation still checks the individual inode, digest and writers. Only observed successful outcomes or exact durable completed-intent identities establish deletion completion, so already-deleted files are not reported as unexplained losses. Process-enumeration failures remain blocking unless disappearance or a completely exited thread group is proved; a dead leader with surviving or uninspectable threads is not safe, even when its own descriptor table is empty.
+
+An exact canonical prune capsule may recover the archived identity of a PBS task row that an older build reassigned after inode reuse. A pending capsule establishes only that archived identity, never that deletion finished; recovery must still observe the filesystem. Missing or inconsistent proof remains blocked, without resetting an independently acknowledged replacement task.
 
 Reclaimed file-log space is the observed decrease in allocated filesystem usage around deletion, clamped to zero—not a guaranteed sum of the removed files' allocated blocks. Directory metadata and concurrent filesystem activity can affect the measurement; deletion completion is reported separately as `files_pruned`.
 
@@ -562,6 +568,8 @@ install. `housekeeping_timer_enabled` controls activation independently;
 abort instead of falling back to an unrestricted run. A timer tick that meets
 a running fleet job refuses and exits; the next tick retries. Cache cadence
 remains daily regardless of the hourly log tick.
+
+When an update changes `install.sh`, the updater re-executes the freshly pulled installer with the original arguments before dependency and unit reconciliation. A failed pull stops the update. Verify the installed service's actual `--limit` and timer state, not just the repository commit.
 
 For unattended *update* runs, add a cron entry on the Manager LXC (`crontab -e`),
 e.g. 4:00 AM daily:
