@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import os
 import sys
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional
 
 
@@ -94,10 +96,18 @@ def _harvest(runner: Any) -> PrimitiveResult:
                 stderr_chunks.append(res["stderr"])
             if isinstance(res.get("msg"), str):
                 stderr_chunks.append(res["msg"])
+        if event.get("event") == "error":
+            # Controller failures (for example an OOM-killed worker) do not
+            # produce runner_on_failed; their diagnostic is top-level stdout.
+            failed = True
+            if isinstance(event.get("stdout"), str):
+                stderr_chunks.append(event["stdout"])
 
     rc = getattr(runner, "rc", 1)
     status = getattr(runner, "status", "")
     failed = failed or status == "failed" or rc != 0
+    if failed and not any(chunk.strip() for chunk in stderr_chunks):
+        stderr_chunks.append(f"Ansible Runner {status or 'failed'} (rc={rc})")
     return PrimitiveResult(
         rc=rc,
         changed=changed,
@@ -130,6 +140,9 @@ def invoke_primitive(
     the relative path ``ansible/primitives/<primitive>.yml`` resolves correctly.
     Defaults to the current working directory (callers must ensure CWD is the
     project root — the fleet-update CLI and mol_run_flow.py both guarantee this).
+
+    Automatically created execution artifacts are removed after harvesting,
+    including failed runs. A caller-supplied ``private_data_dir`` is retained.
     """
     import ansible_runner  # lazy: only needed when actually executing
 
@@ -153,14 +166,22 @@ def invoke_primitive(
     runner_options: Dict[str, Any] = {}
     if primitive in {"lxc_housekeeping_probe", "lxc_log_capture", "lxc_log_snapshot", "lxc_log_prune"}:
         runner_options["envvars"] = {"MAX_EVENT_RES": str(128 * 1024 * 1024)}
-    runner = ansible_runner.run(
-        playbook=f"ansible/primitives/{primitive}.yml",
-        inventory=str(Path(inventory).resolve()),
-        extravars=evars,
-        private_data_dir=private_data_dir,
-        project_dir=project_dir if project_dir is not None else os.getcwd(),
-        cmdline=cmdline,
-        quiet=quiet,
-        **runner_options,
+    # Runner otherwise retains every automatic private directory in /tmp. On
+    # tmpfs, large manifest copies accumulate against the manager's memory cap.
+    context = (
+        nullcontext(private_data_dir)
+        if private_data_dir
+        else TemporaryDirectory(prefix="fleet-primitive-")
     )
-    return _harvest(runner)
+    with context as run_dir:
+        runner = ansible_runner.run(
+            playbook=f"ansible/primitives/{primitive}.yml",
+            inventory=str(Path(inventory).resolve()),
+            extravars=evars,
+            private_data_dir=run_dir,
+            project_dir=project_dir if project_dir is not None else os.getcwd(),
+            cmdline=cmdline,
+            quiet=quiet,
+            **runner_options,
+        )
+        return _harvest(runner)

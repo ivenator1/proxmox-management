@@ -1,8 +1,12 @@
-"""Tests for proxmox_fleet.runner._harvest — event-parsing in isolation.
+"""Runner event parsing and transient artifact ownership tests."""
+import json
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 
-Creates a minimal fake ansible-runner object (no ansible_runner import needed).
-"""
-from proxmox_fleet.runner import _harvest
+import pytest
+
+from proxmox_fleet.runner import _harvest, invoke_primitive
 
 
 class _FakeRunner:
@@ -129,12 +133,6 @@ def test_harvest_changed_accumulates_true():
     assert result.changed is True
 
 
-def test_harvest_result_has_events_list():
-    runner = _FakeRunner(events=[_ok_event()])
-    result = _harvest(runner)
-    assert len(result.events) == 1
-
-
 def test_harvest_unreachable_flag():
     runner = _FakeRunner(events=[_unreachable_event()], rc=4, status="failed")
     result = _harvest(runner)
@@ -147,3 +145,108 @@ def test_harvest_plain_failure_is_not_unreachable():
     result = _harvest(runner)
     assert result.failed is True
     assert result.unreachable is False
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_primitive_removes_automatic_artifacts_after_harvesting(monkeypatch, tmp_path, failed):
+    import ansible_runner
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    directories = []
+
+    def run(**kwargs):
+        directory = Path(kwargs["private_data_dir"] or tempfile.mkdtemp())
+        directories.append(directory)
+        event_file = directory / "result.json"
+        event_file.write_text(json.dumps(_failed_event(msg="execution failed") if failed else _ok_event()))
+
+        class DiskRunner:
+            rc = 2 if failed else 0
+            status = "failed" if failed else "successful"
+
+            @property
+            def events(self):
+                yield json.loads(event_file.read_text())
+
+        return DiskRunner()
+
+    monkeypatch.setattr(ansible_runner, "run", run)
+    result = invoke_primitive("fixture", inventory=str(tmp_path / "inventory"))
+
+    assert result.failed is failed
+    if failed:
+        assert "execution failed" in result.stderr
+    assert all(not directory.exists() for directory in directories)
+
+
+def test_primitive_preparation_failure_removes_automatic_artifacts(monkeypatch, tmp_path):
+    import ansible_runner
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    directories = []
+
+    def run(**kwargs):
+        directory = Path(kwargs["private_data_dir"] or tempfile.mkdtemp())
+        directories.append(directory)
+        (directory / "partial-event").write_text("incomplete")
+        raise RuntimeError("preparation failed")
+
+    monkeypatch.setattr(ansible_runner, "run", run)
+    with pytest.raises(RuntimeError, match="preparation failed"):
+        invoke_primitive("fixture", inventory=str(tmp_path / "inventory"))
+    assert all(not directory.exists() for directory in directories)
+
+
+def test_primitive_keeps_caller_owned_artifacts_after_failure(monkeypatch, tmp_path):
+    import ansible_runner
+
+    directory = tmp_path / "caller-owned"
+    directory.mkdir()
+    original = directory / "caller-data"
+    original.write_text("preserve")
+
+    def run(**kwargs):
+        (Path(kwargs["private_data_dir"]) / "diagnostic").write_text("failure detail")
+        return SimpleNamespace(rc=2, status="failed", events=[_failed_event(msg="execution failed")])
+
+    monkeypatch.setattr(ansible_runner, "run", run)
+    result = invoke_primitive("fixture", private_data_dir=str(directory))
+
+    assert result.failed
+    assert original.read_text() == "preserve"
+    assert (directory / "diagnostic").read_text() == "failure detail"
+
+
+def test_primitive_reports_aborted_runner_despite_complete_task_output(monkeypatch, tmp_path):
+    import ansible_runner
+
+    runner = _FakeRunner(
+        rc=1, status="failed",
+        events=[_ok_event(stdout=json.dumps({"profiles": ["pbs"], "files": ["completed metadata"]}))],
+    )
+    monkeypatch.setattr(ansible_runner, "run", lambda **kwargs: runner)
+
+    result = invoke_primitive("fixture", private_data_dir=str(tmp_path))
+
+    assert result.failed
+    assert "failed" in result.stderr
+    assert "rc=1" in result.stderr
+
+
+def test_primitive_preserves_callback_error_without_failed_task_event(monkeypatch, tmp_path):
+    import ansible_runner
+
+    runner = _FakeRunner(
+        rc=1, status="failed",
+        events=[
+            _ok_event(stdout=json.dumps({"profiles": ["pbs"]})),
+            {"event": "error", "stdout": "[ERROR]: A worker was found in a dead state",
+             "event_data": {"error": True, "task": "Return housekeeping probe facts"}},
+        ],
+    )
+    monkeypatch.setattr(ansible_runner, "run", lambda **kwargs: runner)
+
+    result = invoke_primitive("fixture", private_data_dir=str(tmp_path))
+
+    assert result.failed
+    assert "worker" in result.stderr and "dead state" in result.stderr

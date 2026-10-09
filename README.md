@@ -189,6 +189,8 @@ Native policy reads are bounded and JSON-framed so transport trimming cannot cha
 
 Frozen inputs share bounded multi-range snapshot fetches: at most 64 ranges and 32 MiB raw data per tar, with a 64 KiB manifest limit. Every entry is validated against its exact source request before reading; each source retains its own raw digest and HTTP acknowledgement. Prefetched bytes are not archive coverage. Live-source prefix verification remains separate.
 
+Primitive execution uses transient Ansible Runner directories, removed after results are harvested on success or failure so large manifests cannot accumulate on a manager's `/tmp` tmpfs. API callers that explicitly provide `private_data_dir` retain their diagnostic artifacts. Durable housekeeping checkpoints and frozen-source spools are separate and are never removed by this cleanup. A Runner failure without task stderr reports its status and return code instead of an unrelated manifest tail.
+
 Capture creation and resume reject symlinked, foreign-owned, or group/other-accessible spool directories. An unsafe spool blocks import rather than resetting checkpoints or removing retained history.
 
 **Querying live vs. archive:** each file source emits two labelled streams — the live Alloy reader (`delivery="live"`, immediate visibility) and the acknowledged importer (`delivery="archive"`, the authoritative retained history). Query them separately to avoid double-counting. Lines are packed JSON, so `| unpack` restores the original log line from `_entry` and exposes `filename`:
