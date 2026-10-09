@@ -393,10 +393,11 @@ def run_lxc_update(
     # OS/app status. --alloy-only must not run it (that mode is logging-only).
     housekeeping_summary: Optional[HousekeepingSummary] = None
     housekeeping_changed = False
-    # Scheduled guests keep their live sources during ordinary updates, without
-    # opting the rest of the fleet into archival, retention or cache cleanup.
+    # Explicit schedule targets retain their live sources even while the timer
+    # is paused. Neither this nor an enabled timer opts ordinary updates into
+    # archival, retention or cache cleanup.
     scheduled_logging = (
-        settings.housekeeping_timer_effective_enabled
+        (settings.housekeeping_timer_effective_enabled or bool(settings.housekeeping_timer_targets))
         and alloy_config is not None
         and not matches_any(settings.lxc_housekeeping_exclude_list, cluster, lxc_id)
         and (

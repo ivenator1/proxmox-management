@@ -815,7 +815,10 @@ def _build_plan(
             or provenance.coverage_conflict
             or not sources.is_prefix_complete(record)
         ):
-            verify_raw_size = provenance.verified_raw_size or provenance.complete_size or record.size
+            # Zero is a valid completed frozen prefix, not missing coverage.
+            verify_raw_size = provenance.verified_raw_size or (
+                provenance.complete_size if provenance.complete else record.size
+            )
             verify_raw_sha256 = record.digest
     if not same:
         fresh_manifest_source = record is None

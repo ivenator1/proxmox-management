@@ -507,11 +507,12 @@ def test_numeric_rename_reuses_coverage_without_replay(env):
     assert {entry["path"] for entry in result.covered_files} == {"/data/logs/access.log.2"}
 
 
-def test_recreated_live_path_preserves_rotated_prefix_and_repeat_is_idle(env):
+@pytest.mark.parametrize("head", [b"acknowledged head\n", b""])
+def test_recreated_live_path_preserves_rotated_prefix_and_repeat_is_idle(env, head, monkeypatch):
     guest, _spool, executor, store = env
     current = "/data/logs/access.log"
     rotated = "/data/logs/access.log-20261009T211137"
-    head, tail = b"acknowledged head\n", b"new closed tail\n"
+    tail = b"new closed tail\n"
     original = _write(guest, current, head)
     with LokiServer() as server:
         first = hi.import_guest_logs(
@@ -528,23 +529,38 @@ def test_recreated_live_path_preserves_rotated_prefix_and_repeat_is_idle(env):
             _wire(guest, current, is_active=True),
             _wire(guest, rotated),
         ]
-        server.requests.clear()
-        closed = hi.import_guest_logs(
-            executor, _settings(server.url), store, KEY, name="npm-ct", files=wires,
-        )
-        assert not closed.failed
-        assert _reconstruct(_iter_entries(server)) == tail
-        assert [entry["filename"] for entry in _iter_entries(server)] == [current]
-        assert closed.covered_files[0]["source_id"] == source_id
-        assert closed.covered_files[0]["sha256"] == hashlib.sha256(head + tail).hexdigest()
-        server.requests.clear()
-        repeated = hi.import_guest_logs(
-            executor, _settings(server.url), store, KEY, name="npm-ct", files=wires,
-        )
-        assert not repeated.failed
-        assert server.requests == []
-        assert repeated.bytes_archived == 0
-        assert repeated.covered_files == closed.covered_files
+        class SimulatedCrash(BaseException):
+            pass
+
+        def crash_before_prefix_verification(*args, **kwargs):
+            raise SimulatedCrash()
+
+        with monkeypatch.context() as patch:
+            patch.setattr(hi, "_prepare_live_input", crash_before_prefix_verification)
+            with pytest.raises(SimulatedCrash):
+                hi.import_guest_logs(
+                    executor, _settings(server.url), store, KEY, name="npm-ct", files=wires,
+                )
+        checkpoint = store.path
+        store.close()
+        with CheckpointStore.open(checkpoint) as resumed:
+            server.requests.clear()
+            closed = hi.import_guest_logs(
+                executor, _settings(server.url), resumed, KEY, name="npm-ct", files=wires,
+            )
+            assert not closed.failed
+            assert _reconstruct(_iter_entries(server)) == tail
+            assert [entry["filename"] for entry in _iter_entries(server)] == [current]
+            assert closed.covered_files[0]["source_id"] == source_id
+            assert closed.covered_files[0]["sha256"] == hashlib.sha256(head + tail).hexdigest()
+            server.requests.clear()
+            repeated = hi.import_guest_logs(
+                executor, _settings(server.url), resumed, KEY, name="npm-ct", files=wires,
+            )
+            assert not repeated.failed
+            assert server.requests == []
+            assert repeated.bytes_archived == 0
+            assert repeated.covered_files == closed.covered_files
 
 
 def test_compression_uses_latest_generation_not_newer_absence_timestamp(env):

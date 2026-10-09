@@ -1725,9 +1725,10 @@ def test_ordinary_housekeeping_feeds_generated_alloy_config_to_enforcement(monke
     assert out.record is not None
 
 
-@pytest.mark.parametrize("selected", [True, False])
+@pytest.mark.parametrize("timer_enabled", [True, False])
+@pytest.mark.parametrize("scope", ["selected", "unselected", "all"])
 def test_scheduled_logging_survives_ordinary_update_without_fleet_housekeeping(
-    monkeypatch, tmp_path, selected
+    monkeypatch, tmp_path, scope, timer_enabled
 ):
     monkeypatch.setattr(time, "sleep", lambda s: None)
     _stub_github(monkeypatch)
@@ -1738,15 +1739,17 @@ def test_scheduled_logging_survives_ordinary_update_without_fleet_housekeeping(
         base = _base(stub.url)
         settings = _upkeep_settings(
             tmp_path, url=stub.url, housekeeping_enabled=False,
-            housekeeping_timer_enabled=True,
-            housekeeping_timer_targets=["alpha/101" if selected else "alpha/102"],
+            housekeeping_timer_enabled=timer_enabled,
+            housekeeping_timer_targets=(
+                [] if scope == "all" else ["alpha/101" if scope == "selected" else "alpha/102"]
+            ),
         )
         ex, guest = _upkeep_executor(tmp_path, monkeypatch, yarn=yarn)
         guest.profiles = ["npm"]
         expected = alloy_mod.render_lxc_log_config(
             base, node="pve-01", cluster="alpha", lxc_id="101", name="sonarr",
             profiles={"npm"}, retention_hours=48,
-        ) if selected else base
+        ) if scope == "selected" or (scope == "all" and timer_enabled) else base
         root = Path(guest.guest_root)
         deployed = root / "etc/alloy/config.alloy"
         deployed.parent.mkdir(parents=True, exist_ok=True)
