@@ -79,6 +79,8 @@ class Guest:
         self.journal: List[str] = []
         self.native_stdout: List[str] = []
         self.pruned: List[List[str]] = []
+        self.prune_calls = 0
+        self.prune_fail_at = None
         self.prune_failure = False
         self.probe_failure_after_write = False
         self.acknowledge_without_write = False
@@ -183,7 +185,8 @@ class Guest:
 
     def housekeeping_prune(self, lxc_id, *, files):
         self.pruned.append([item["path"] for item in files])
-        if self.prune_failure:
+        self.prune_calls += 1
+        if self.prune_failure or self.prune_fail_at == self.prune_calls:
             return PrimitiveResult(rc=1, failed=True)
         result = io.prune({"files": files}, sysroot=str(self.root))
         if self.after_prune:
@@ -529,3 +532,69 @@ def test_mid_prune_drift_preserves_remaining_archives_and_measured_progress(gues
     for item in covered:
         if item["path"] not in deleted:
             assert guest.path(item["path"]).read_text() == "old retained content\n"
+
+
+def pending_intent(store, coverage, intent_id=None):
+    """Persist the exact recovery intent a crashed run would have left behind."""
+    intent = PruneIntent(
+        intent_id=intent_id or ("pi-" + coverage["source_id"]),
+        key=KEY,
+        path=coverage["path"],
+        quarantine_path=retention.quarantine_path_for(coverage["path"]),
+        device=coverage["device"],
+        inode=coverage["inode"],
+        size=coverage["size"],
+        mtime_ns=coverage["mtime_ns"],
+        source_id=coverage["source_id"],
+        digest=coverage["sha256"],
+    )
+    store.record_prune_intent(intent)
+    return intent
+
+
+def warnings_for(result, path):
+    """Warnings that name a path at all, without pinning their wording."""
+    return [warning for warning in result.warnings if path in warning]
+
+
+def test_batched_crash_recovery_prunes_without_stale_missing_findings(guest, store):
+    covered = [setup(store, guest, f"/data/logs/proxy{index}_access.log.1") for index in range(130)]
+    for item in covered[:128]:
+        pending_intent(store, item)
+    # A file removed outside housekeeping has no owned identity: it must stay a
+    # conservative finding, unlike the identities this run itself deletes.
+    removed_externally = covered[129]
+    guest.path(removed_externally["path"]).unlink()
+    with Loki(guest) as loki:
+        result = run(guest, store, loki, covered)
+    assert not result.failed
+    assert result.files_pruned == 129
+    assert not store.open_prune_intents(KEY)
+    for item in covered[:128]:
+        assert warnings_for(result, item["path"]) == []
+    # The unowned removal is still reported as a negative (absence) finding.
+    assert any("absent" in warning for warning in warnings_for(result, removed_externally["path"]))
+    assert all(not guest.path(item["path"]).exists() for item in covered)
+
+
+def test_crash_resume_boundary_keeps_gates_and_completes_remaining_batches(guest, store):
+    covered = [setup(store, guest, f"/data/logs/proxy{index}_access.log.1") for index in range(300)]
+    with Loki(guest) as loki:
+        guest.prune_fail_at = 2  # the second bounded helper batch fails at the transport boundary
+        first = run(guest, store, loki, covered)
+        assert first.failed
+        deleted = {item["path"] for item in covered if not guest.path(item["path"]).exists()}
+        assert len(deleted) == 128
+        assert first.files_pruned == 128
+        # Unconfirmed intents are retained for the next run, not inferred done.
+        assert len(store.open_prune_intents(KEY)) == 128
+        assert {intent.path for intent in store.open_prune_intents(KEY)} == {
+            item["path"] for item in covered[128:256]
+        }
+        guest.prune_fail_at = None
+        second = run(guest, store, loki, covered)
+    assert not second.failed
+    assert second.files_pruned == 172
+    assert not store.open_prune_intents(KEY)
+    assert all(not guest.path(item["path"]).exists() for item in covered)
+    assert all(not warnings_for(second, item["path"]) for item in covered)

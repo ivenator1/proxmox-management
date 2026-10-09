@@ -1725,6 +1725,46 @@ def test_ordinary_housekeeping_feeds_generated_alloy_config_to_enforcement(monke
     assert out.record is not None
 
 
+@pytest.mark.parametrize("selected", [True, False])
+def test_scheduled_logging_survives_ordinary_update_without_fleet_housekeeping(
+    monkeypatch, tmp_path, selected
+):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    _stub_github(monkeypatch)
+    alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+    yarn = _cache_dir(tmp_path, "yarn")
+    cache_before = {p.relative_to(yarn): p.read_bytes() for p in yarn.rglob("*") if p.is_file()}
+    with LokiStub() as stub:
+        base = _base(stub.url)
+        settings = _upkeep_settings(
+            tmp_path, url=stub.url, housekeeping_enabled=False,
+            housekeeping_timer_enabled=True,
+            housekeeping_timer_targets=["alpha/101" if selected else "alpha/102"],
+        )
+        ex, guest = _upkeep_executor(tmp_path, monkeypatch, yarn=yarn)
+        guest.profiles = ["npm"]
+        expected = alloy_mod.render_lxc_log_config(
+            base, node="pve-01", cluster="alpha", lxc_id="101", name="sonarr",
+            profiles={"npm"}, retention_hours=48,
+        ) if selected else base
+        root = Path(guest.guest_root)
+        deployed = root / "etc/alloy/config.alloy"
+        deployed.parent.mkdir(parents=True, exist_ok=True)
+        deployed.write_text(expected.content)
+        archive = root / "data/logs/proxy_access.log.1"
+        archive.write_text("retained archive\n")
+        outcome = run_lxc_update(
+            "pve-01", "101", ex, settings, api_host="192.168.1.10",
+            cluster="alpha", alloy_config=base,
+        )
+    assert not outcome.failed
+    assert deployed.read_text() == expected.content
+    assert archive.read_text() == "retained archive\n"
+    assert {p.relative_to(yarn): p.read_bytes() for p in yarn.rglob("*") if p.is_file()} == cache_before
+    assert not (tmp_path / "housekeeping.sqlite3").exists()
+    assert not (root / "etc/systemd/journald.conf.d/60-fleet-retention.conf").exists()
+
+
 def test_ordinary_housekeeping_logging_failure_leaves_update_unfailed(monkeypatch, tmp_path):
     monkeypatch.setattr(time, "sleep", lambda s: None)
     _stub_github(monkeypatch)

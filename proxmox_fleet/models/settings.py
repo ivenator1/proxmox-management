@@ -6,6 +6,7 @@ running with defaults, which is fine for --check runs).
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlsplit
@@ -18,6 +19,14 @@ from pydantic import (  # pyright: ignore[reportMissingImports]
     field_validator,
     model_validator,
 )
+
+#: Shape of a ``--limit`` token: a bare host name/id or one cluster-qualified
+#: ``cluster/id`` segment. Mirrors ``web/app.py``'s ``_LIMIT_TOKEN_RE`` (the
+#: ``--limit`` tokenizer) so the installer can write ``housekeeping_timer_targets``
+#: verbatim into a systemd ``ExecStart``: no whitespace/quoting and no ``%``/``$``
+#: for systemd to expand as a specifier or environment variable. Kept local to
+#: avoid importing the web layer (which imports this module) from the schema.
+_LIMIT_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$")
 
 
 class PveClusterCreds(BaseModel):
@@ -85,6 +94,18 @@ class GlobalSettings(BaseModel):
     # Maximum acknowledged archive payload per guest per run (import resumes).
     housekeeping_backfill_budget_mb: int = Field(default=1024, gt=0)
     lxc_housekeeping_exclude_list: List[str] = Field(default_factory=list)
+    # Hourly fleet-housekeeping.timer control. None (the default) keeps the
+    # legacy behaviour where the schedule follows housekeeping_enabled; explicit
+    # true schedules hourly maintenance even when ordinary fleet housekeeping is
+    # off; explicit false always disables the timer, even when
+    # housekeeping_enabled is true. Either way that resolves true requests the
+    # feature, so a usable housekeeping_loki_url is required.
+    housekeeping_timer_enabled: Optional[bool] = None
+    # Optional targets for the scheduled run, written as one `--limit` value
+    # (bare ids, or cluster-qualified "cluster/id"). Empty keeps the legacy
+    # whole-fleet schedule. Entries share the --limit token shape, which keeps
+    # the generated systemd ExecStart literal (no quoting and no %/$ to expand).
+    housekeeping_timer_targets: List[str] = Field(default_factory=list)
 
     # lxc_update phase settings
     lxc_dry_run: bool = False
@@ -204,6 +225,7 @@ class GlobalSettings(BaseModel):
         "os_only_lxc_list",
         "lxc_alloy_exclude_list",
         "lxc_housekeeping_exclude_list",
+        "housekeeping_timer_targets",
         mode="before",
     )
     @classmethod
@@ -216,6 +238,26 @@ class GlobalSettings(BaseModel):
         """
         if isinstance(value, list):
             return [str(v) for v in value]
+        return value
+
+    @field_validator("housekeeping_timer_targets", mode="after")
+    @classmethod
+    def _validate_timer_targets(cls, value: List[str]) -> List[str]:
+        """Reject targets that cannot become a literal systemd ``--limit`` value.
+
+        The installer writes these into the housekeeping unit's ``ExecStart``.
+        Whitespace or quotes would change argument splitting, control characters
+        could corrupt the unit file, and ``%``/``$`` would be expanded by systemd
+        as specifiers/environment variables. Restricting entries to the same
+        bare-or-qualified token shape as ``--limit`` (see ``_LIMIT_TOKEN_RE``)
+        keeps the generated argument unambiguous.
+        """
+        for token in value:
+            if not _LIMIT_TOKEN_RE.match(token):
+                raise ValueError(
+                    f"housekeeping_timer_targets entry {token!r} is not a valid "
+                    "id/name token (use bare ids or cluster/id)"
+                )
         return value
 
     @field_validator("lxc_kuma_map", "vm_kuma_map", "remote_kuma_map", mode="before")
@@ -268,8 +310,13 @@ class GlobalSettings(BaseModel):
 
     @model_validator(mode="after")
     def _require_loki_url_when_enabled(self) -> "GlobalSettings":
-        """Requesting housekeeping (``housekeeping_enabled``) needs a usable URL."""
-        if self.housekeeping_enabled:
+        """Requesting housekeeping needs a usable URL.
+
+        Both the ordinary opt-in (``housekeeping_enabled``) and an explicitly
+        scheduled timer request the feature, so either one requires a configured
+        Loki base — even when the other is false.
+        """
+        if self.housekeeping_enabled or self.housekeeping_timer_enabled is True:
             self.require_loki_url()
         return self
 
@@ -286,6 +333,26 @@ class GlobalSettings(BaseModel):
                 "housekeeping_loki_url is required when housekeeping is requested"
             )
         return self.validate_loki_base_url(self.housekeeping_loki_url)
+
+    @property
+    def housekeeping_timer_effective_enabled(self) -> bool:
+        """Whether the hourly fleet-housekeeping timer must be enabled.
+
+        The single decision shared by the installer's install/update
+        reconciliation and its summary: an explicit
+        ``housekeeping_timer_enabled`` wins, and ``None`` (the default) falls
+        back to ``housekeeping_enabled``. Exposed as a property so the installer
+        resolves it through ``GlobalSettings.load()`` (``resolve_setting``)
+        rather than inferring state from a command's success.
+        """
+        if self.housekeeping_timer_enabled is not None:
+            return self.housekeeping_timer_enabled
+        return self.housekeeping_enabled
+
+    @property
+    def housekeeping_timer_limit(self) -> str:
+        """Comma-joined ``--limit`` value for the scheduled run ("" = whole fleet)."""
+        return ",".join(self.housekeeping_timer_targets)
 
     @classmethod
     def load(cls, path: Union[str, Path] = "vars.yml") -> "GlobalSettings":

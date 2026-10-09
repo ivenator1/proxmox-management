@@ -159,6 +159,8 @@ Alloy-only mode honors limits, exclusions, VM maintenance windows, and `--force-
 ### 🗄️ Log Housekeeping for Managed LXCs (opt-in)
 An opt-in LXC maintenance feature that retains Nginx Proxy Manager (NPM) and Proxmox Backup Server (PBS) file logs in Loki, keeps a short local buffer, and runs recurring cache cleanup. Ordinary LXC runs opt in with `housekeeping_enabled: true` (housekeeping runs before disk warnings, snapshots, and updates so cache reclamation can prevent a storage refusal); `--housekeeping-only` requests the same feature with no update work at all. Enabled settings require `housekeeping_loki_url`: an absolute `http(s)` base with no credentials, query, or fragment. Explicit maintenance without a configured endpoint can still clean eligible caches, but reports blocked logging and never authorizes log deletion. The manager appends `/loki/api/v1/...` itself.
 
+The hourly schedule can be enabled independently: `housekeeping_timer_enabled: null` (default) follows `housekeeping_enabled`; explicit `true` enables scheduled maintenance while ordinary fleet housekeeping can remain off, and explicit `false` disables the timer. `housekeeping_timer_targets` selects the scheduled CLI targets (IDs, `cluster/ID`, or inventory node names). An empty list means **whole fleet**, not disabled. For a staged rollout, leave `housekeeping_enabled: false` and configure only the proved guests as timer targets. Ordinary updates preserve those scheduled guests' live file sources through logging-only preparation, without running archival, retention or cache cleanup on the rest of the fleet.
+
 ```bash
 # Audit intended actions first, then apply — limited to the log guests:
 ./fleet-update.py --housekeeping-only --check --limit 120,123
@@ -190,6 +192,8 @@ Native policy reads are bounded and JSON-framed so transport trimming cannot cha
 Frozen inputs share bounded multi-range snapshot fetches: at most 64 ranges and 32 MiB raw data per tar, with a 64 KiB manifest limit. Every entry is validated against its exact source request before reading; each source retains its own raw digest and HTTP acknowledgement. Prefetched bytes are not archive coverage. Live-source prefix verification remains separate.
 
 **Quarantine and recovery:** approved closed files retain their source-relative path beneath a same-root `.fleet-housekeeping-quarantine` directory. Missing nested parents (including PBS task hex fanouts and nested NPM archives) are created with `0700` permissions through pinned directory descriptors; symlinked/non-directory ancestors are rejected. A failed prune transport keeps its durable intents for revalidation and recovery on a later maintenance run. Initial archive completion is not proof that file cleanup succeeded.
+
+Recovery uses bounded 128-file batches with fresh policy, permissions, Alloy and Loki authorization per batch; each helper operation still checks the individual inode, digest and writers. Only observed successful outcomes or exact durable completed-intent identities establish deletion completion, so already-deleted files are not reported as unexplained losses. Process-enumeration failures remain blocking unless disappearance or a completely exited thread group is proved; a dead leader with surviving or uninspectable threads is not safe, even when its own descriptor table is empty.
 
 Reclaimed file-log space is the observed decrease in allocated filesystem usage around deletion, clamped to zero—not a guaranteed sum of the removed files' allocated blocks. Directory metadata and concurrent filesystem activity can affect the measurement; deletion completion is reported separately as `files_pruned`.
 
@@ -355,7 +359,8 @@ database, and installs + enables the units that persist across reboots:
 `fleet-dashboard.service` (the web UI on port 8421, login required) and
 `fleet-scan.timer` (`fleet-update --scan` every 6 hours), plus
 `fleet-housekeeping.timer` (`fleet-update --housekeeping-only` hourly) which is
-written on every install but enabled only when `housekeeping_enabled: true`.
+written on every install but enabled only when `housekeeping_timer_enabled` resolves true
+(`null` follows `housekeeping_enabled`).
 
 ```bash
 git clone https://github.com/ivenator1/proxmox-management.git
@@ -547,14 +552,16 @@ with `--history`/`--history-show`.
 
 ### Automated Schedule
 `install.sh` already schedules the read-only scan every 6 hours (`fleet-scan.timer`).
-When `housekeeping_enabled: true`, it also writes and enables the hourly
-`fleet-housekeeping.timer` → `fleet-housekeeping.service`
-(`fleet-update --housekeeping-only`, oneshot, 1 h start timeout, low CPU/IO
-weight, `RandomizedDelaySec=300`, `Persistent=true`). The units are written on
-every install but the timer is **enabled only when the setting resolves true** —
-install and `--update` reconcile the enabled state, so flipping
-`housekeeping_enabled` off and re-running the installer stops the timer again. A
-timer tick that meets a running fleet job refuses and exits; the next tick retries.
+The hourly `fleet-housekeeping.timer` → `fleet-housekeeping.service` is separate
+from scans and update schedules (oneshot, 1 h start timeout, low CPU/IO weight,
+`RandomizedDelaySec=300`, `Persistent=true`). The units are written on every
+install. `housekeeping_timer_enabled` controls activation independently;
+`null` follows the ordinary `housekeeping_enabled` opt-in. Both install and
+`--update` reconcile and verify the observed enabled/active state.
+`housekeeping_timer_targets` becomes the service's `--limit`; invalid settings
+abort instead of falling back to an unrestricted run. A timer tick that meets
+a running fleet job refuses and exits; the next tick retries. Cache cadence
+remains daily regardless of the hourly log tick.
 
 For unattended *update* runs, add a cron entry on the Manager LXC (`crontab -e`),
 e.g. 4:00 AM daily:
@@ -599,6 +606,7 @@ The orchestrator sends one consolidated embed per run:
 * **OS status per container:** `Updated (N upgraded)` (with package count), `OK`, `SKIPPED` (in `os_update_exclude_list`), `FAILED`.
 * **Alloy status per guest:** `Installed`, `Configured`, or `Service repaired` appears only when remediation changed the guest; compliant guests stay silent.
 * **Housekeeping line per guest:** `Housekeeping: <status> (<reclaimed> reclaimed; <archived> archived)` appears only when a housekeeping summary exists (statuses `Configured`, `Cleaned`, `Backfill pending`, `Blocked`, `Audit`). A housekeeping failure never changes OS/app update status or update counts; standalone maintenance still fails on blocked operations.
+* **Quiet maintenance:** routine successful housekeeping-only runs and audits do not send notifications. Failures, notifying warnings and `--force-notify` still do. The complete maintenance result remains in the protected `/housekeeping` history and per-host timeline, without changing update history or dead-man monitoring.
 * **Remote Hosts section:** Listed separately (not tied to a PVE node).
 * **Error Log:** Structured entries showing which host failed, which task failed, and the first 300 characters of stderr.
 * Containers where nothing changed produce no embed entry — they are absorbed into `*No container changes.*` for that node.

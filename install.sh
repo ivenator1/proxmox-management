@@ -3,7 +3,8 @@
 #
 # Usage (as root, from the cloned repo):
 #   ./install.sh              install: venv + deps, systemd scan timer, dashboard service
-#                             (plus the hourly housekeeping timer when housekeeping_enabled=true)
+#                             (plus the hourly housekeeping timer when
+#                              housekeeping_timer_enabled / housekeeping_enabled is true)
 #   ./install.sh --update     git pull, reinstall deps, rewrite units, restart services
 #   ./install.sh --uninstall  remove units + venv (prompts before deleting run history)
 #   ./install.sh --help
@@ -31,15 +32,18 @@ warn()  { printf '\033[1;33mWARNING:\033[0m %s\n' "$*" >&2; }
 die()   { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # Ask the installed package for a GlobalSettings value (single source of
-# truth — vars.yml + model defaults). Usage: resolve_setting <field> <fallback>
+# truth — vars.yml + model defaults). Omitting the fallback makes loading strict.
 resolve_setting() {
-    local field="$1" fallback="$2" value
+    local field="$1" fallback="${2-}" value
     value=$(cd "$REPO_DIR" && "$VENV/bin/python" - "$field" <<'PYEOF' 2>/dev/null
 import sys
 from proxmox_fleet.models.settings import GlobalSettings
 print(getattr(GlobalSettings.load(), sys.argv[1]))
 PYEOF
-    ) || value=""
+    ) || {
+        [ "$#" -ge 2 ] || die "Cannot load validated settings for $field"
+        value=""
+    }
     printf '%s' "${value:-$fallback}"
 }
 
@@ -146,6 +150,17 @@ init_admin_user() {
 write_units() {
     info "Writing systemd units to $UNIT_DIR"
 
+    # Scheduled maintenance targets (empty = legacy whole-fleet schedule). The
+    # value is a validated bare/cluster-qualified token list, so it needs no
+    # quoting and carries no `%`/`$` for systemd to expand as a specifier or
+    # environment variable.
+    local hk_limit hk_exec
+    hk_limit=$(resolve_setting housekeeping_timer_limit)
+    hk_exec="$VENV/bin/fleet-update --housekeeping-only"
+    if [ -n "$hk_limit" ]; then
+        hk_exec="$hk_exec --limit $hk_limit"
+    fi
+
     cat > "$UNIT_DIR/$SCAN_SERVICE" <<EOF
 [Unit]
 Description=Fleet pending-updates scan (fleet-update --scan, read-only)
@@ -181,7 +196,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=$REPO_DIR
-ExecStart=$VENV/bin/fleet-update --housekeeping-only
+ExecStart=$hk_exec
 Environment=PYTHONUNBUFFERED=1
 TimeoutStartSec=3600
 CPUWeight=10
@@ -226,21 +241,23 @@ enable_units() {
 }
 
 # The housekeeping service/timer are written on every install but enabled only
-# when housekeeping_enabled resolves true. Install and --update both reconcile
-# the enabled state (never an unconditional enable), so flipping the setting in
-# vars.yml off and re-running the installer stops the timer again.
+# when the resolved housekeeping timer decision is true. That decision
+# (housekeeping_timer_effective_enabled) is explicit housekeeping_timer_enabled,
+# falling back to housekeeping_enabled when unset. Install and --update both
+# reconcile the enabled state (never an unconditional enable), so flipping the
+# setting in vars.yml off and re-running the installer stops the timer again.
 reconcile_housekeeping_timer() {
     local enabled
-    enabled=$(resolve_setting housekeeping_enabled false)
+    enabled=$(resolve_setting housekeeping_timer_effective_enabled)
     if setting_is_true "$enabled"; then
-        info "Enabling and starting $HOUSEKEEPING_TIMER (housekeeping_enabled=true)"
+        info "Enabling and starting $HOUSEKEEPING_TIMER (housekeeping schedule enabled)"
         "$SYSTEMCTL" enable --now "$HOUSEKEEPING_TIMER"
         if [ "$("$SYSTEMCTL" is-enabled "$HOUSEKEEPING_TIMER")" != "enabled" ] \
             || [ "$("$SYSTEMCTL" is-active "$HOUSEKEEPING_TIMER")" != "active" ]; then
             die "$HOUSEKEEPING_TIMER was not observed enabled and active"
         fi
     else
-        info "Housekeeping disabled in settings — leaving $HOUSEKEEPING_TIMER disabled"
+        info "Housekeeping schedule disabled in settings — leaving $HOUSEKEEPING_TIMER disabled"
         "$SYSTEMCTL" disable --now "$HOUSEKEEPING_TIMER"
         local enable_state active_state
         enable_state=$("$SYSTEMCTL" is-enabled "$HOUSEKEEPING_TIMER") || true
@@ -253,11 +270,17 @@ reconcile_housekeeping_timer() {
 
 print_summary() {
     local history_dir="$1"
-    local port host_ip hk_line
-    if setting_is_true "$(resolve_setting housekeeping_enabled false)"; then
-        hk_line="hourly ($HOUSEKEEPING_TIMER -> fleet-update --housekeeping-only)"
+    local port host_ip hk_line hk_targets hk_enabled
+    hk_enabled=$(resolve_setting housekeeping_timer_effective_enabled)
+    if setting_is_true "$hk_enabled"; then
+        hk_targets=$(resolve_setting housekeeping_timer_limit)
+        if [ -n "$hk_targets" ]; then
+            hk_line="hourly ($HOUSEKEEPING_TIMER -> fleet-update --housekeeping-only --limit $hk_targets)"
+        else
+            hk_line="hourly ($HOUSEKEEPING_TIMER -> fleet-update --housekeeping-only)"
+        fi
     else
-        hk_line="disabled (set housekeeping_enabled=true in vars.yml, then re-run install)"
+        hk_line="disabled (set housekeeping_timer_enabled=true in vars.yml, then re-run install)"
     fi
     port=$(resolve_setting dashboard_port 8421)
     host_ip=$(hostname -I 2>/dev/null | awk '{print $1}')

@@ -845,6 +845,67 @@ def _profile_evidence(sysroot: str) -> Dict[str, Dict[str, Any]]:
     return {"npm": npm, "pbs": pbs}
 
 
+_DEAD_TASK_STATES = frozenset({"Z", "X", "x"})
+
+
+def _proc_task_state(pid_dir: str, tid: str) -> Optional[str]:
+    """Return the state from ``<pid_dir>/stat``, or ``None`` if the task is gone.
+
+    ``/proc/<pid>/stat`` stays mode 0444 even for a non-dumpable task whose
+    ``/proc/<pid>/fd`` directory is root-owned and denied, so it remains the
+    liveness source when descriptor enumeration is refused.  ``""`` means the
+    state could not be read, parsed, or identified: callers must fail closed.
+    """
+    try:
+        with open(os.path.join(pid_dir, "stat"), "rb") as handle:
+            raw = handle.read(4096)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return ""
+    end = raw.rfind(b")")
+    if end < 0:
+        return ""
+    if raw[:end].split(b" ", 1)[0] != tid.encode():
+        return ""
+    fields = raw[end + 1:].split()
+    if not fields or len(fields[0]) != 1:
+        return ""
+    return chr(fields[0][0])
+
+
+def _departed_process(pid_dir: str, pid: str) -> bool:
+    """True only when ``pid`` provably no longer holds any file descriptor.
+
+    A denied ``/proc/<pid>/fd`` listing is *not* proof of absence: a live,
+    non-dumpable process keeps a descriptor table we cannot read, so permission
+    denial must never be treated as "no writers".  The kernel releases a task's
+    file table during ``do_exit`` before the zombie state, so a fully reaped PID
+    -- or a thread group whose every thread is itself dead -- cannot reference a
+    live writer.  A live leader, a surviving sibling thread, an unreadable or
+    unidentifiable state, and an incomplete ``task`` enumeration all return
+    ``False`` so the caller keeps failing closed.
+    """
+    state = _proc_task_state(pid_dir, pid)
+    if state is None:
+        return True
+    if state not in _DEAD_TASK_STATES:
+        return False
+    try:
+        threads = _listdir(os.path.join(pid_dir, "task"))
+    except HelperError:
+        return False
+    if not threads or pid not in threads:
+        return False
+    for tid in threads:
+        if not tid.isdigit():
+            return False
+        tstate = _proc_task_state(os.path.join(pid_dir, "task", tid), tid)
+        if tstate not in _DEAD_TASK_STATES:
+            return False
+    return True
+
+
 def _scan_proc(proc_root: str) -> Tuple[Set[Tuple[int, int]], List[str]]:
     """Return (writable file inodes, busy tool names) for a guest ``/proc``."""
     names = _listdir(proc_root)
@@ -871,8 +932,27 @@ def _scan_proc(proc_root: str) -> Tuple[Set[Tuple[int, int]], List[str]]:
         except FileNotFoundError:
             continue
         except OSError as exc:
+            if _departed_process(pid_dir, pid):
+                # The task exited while we scanned it: the kernel already
+                # released its file table, so a refused descriptor listing
+                # cannot hide a live writer and this PID is safe to skip.
+                continue
             raise HelperError(
                 f"cannot enumerate {fd_dir}: {exc.strerror or exc}; run as root",
+                detail={
+                    "path": fd_dir,
+                    "task_state": _proc_task_state(pid_dir, pid),
+                },
+            )
+        if (
+            not fds
+            and _proc_task_state(pid_dir, pid) in _DEAD_TASK_STATES
+            and not _departed_process(pid_dir, pid)
+        ):
+            # An exited leader can expose an empty fd table while surviving
+            # threads still write through their own tables.
+            raise HelperError(
+                "cannot trust an empty descriptor table for an incompletely exited process",
                 detail={"path": fd_dir},
             )
         for fd_name in fds:

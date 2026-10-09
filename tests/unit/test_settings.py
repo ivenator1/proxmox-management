@@ -436,3 +436,121 @@ def test_housekeeping_enabled_with_bad_url_from_yaml_rejected(tmp_path):
     f.write_text("housekeeping_enabled: true\nhousekeeping_loki_url: 10.10.10.39:3100\n")
     with pytest.raises(ValidationError):
         GlobalSettings.load(f)
+
+
+# --- housekeeping timer scheduling (installer interface) ---------------------
+
+LOKI_URL = "http://loki.example.lan:3100"
+
+
+@pytest.mark.parametrize(
+    "timer, ordinary, expected",
+    [
+        (None, False, False),  # legacy default: off when ordinary is off
+        (None, True, True),  # unset follows ordinary housekeeping_enabled
+        (False, True, False),  # explicit false overrides an enabled ordinary run
+        (True, False, True),  # explicit true schedules without ordinary runs
+        (True, True, True),
+    ],
+)
+def test_housekeeping_timer_effective_enabled_precedence(timer, ordinary, expected):
+    raw = {"housekeeping_enabled": ordinary}
+    if timer is not None:
+        raw["housekeeping_timer_enabled"] = timer
+    if ordinary or timer:
+        raw["housekeeping_loki_url"] = LOKI_URL
+    s = GlobalSettings.model_validate(raw)
+    assert s.housekeeping_timer_effective_enabled is expected
+
+
+def test_housekeeping_timer_enabled_requires_loki_url():
+    """Scheduling requests the feature, so it needs an endpoint even when
+    ordinary fleet housekeeping is disabled."""
+    with pytest.raises(ValidationError):
+        GlobalSettings.model_validate({"housekeeping_timer_enabled": True})
+    s = GlobalSettings.model_validate({
+        "housekeeping_enabled": False,
+        "housekeeping_timer_enabled": True,
+        "housekeeping_loki_url": LOKI_URL,
+    })
+    assert s.housekeeping_timer_effective_enabled is True
+    assert s.require_loki_url() == LOKI_URL
+
+
+def test_housekeeping_timer_disabled_still_requires_url_for_ordinary_runs():
+    """Explicit false only silences the schedule — an ordinary opt-in still
+    requests housekeeping, so the URL prerequisite still applies."""
+    with pytest.raises(ValidationError):
+        GlobalSettings.model_validate({
+            "housekeeping_enabled": True,
+            "housekeeping_timer_enabled": False,
+        })
+
+
+def test_housekeeping_timer_enabled_bad_url_still_rejected():
+    with pytest.raises(ValidationError):
+        GlobalSettings.model_validate({
+            "housekeeping_timer_enabled": True,
+            "housekeeping_loki_url": "loki:3100",
+        })
+
+
+def test_housekeeping_timer_targets_coerce_numeric_ids():
+    s = GlobalSettings.model_validate({
+        "housekeeping_timer_enabled": True,
+        "housekeeping_loki_url": LOKI_URL,
+        "housekeeping_timer_targets": [120, "default/123", "beta/121"],
+    })
+    assert s.housekeeping_timer_targets == ["120", "default/123", "beta/121"]
+
+
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "120 123",  # whitespace would split the systemd argument
+        "120\n121",  # control character would corrupt the unit file
+        '1"20',  # quoting
+        "$(id)",  # shell/expansion metacharacters
+        "120%i",  # systemd specifier would expand
+        "$HOST",  # systemd environment variable would expand
+        "12\\0",  # backslash
+        "default/120/121",  # at most one qualifier segment
+        "/120",  # empty cluster segment
+        "120/",  # empty id segment
+        "",  # empty token
+    ],
+)
+def test_housekeeping_timer_targets_reject_unsafe_tokens(bad):
+    with pytest.raises(ValidationError):
+        GlobalSettings.model_validate({
+            "housekeeping_timer_enabled": True,
+            "housekeeping_loki_url": LOKI_URL,
+            "housekeeping_timer_targets": [bad],
+        })
+
+
+
+
+def test_housekeeping_timer_settings_load_from_yaml(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text(
+        "housekeeping_enabled: false\n"
+        f"housekeeping_loki_url: {LOKI_URL}\n"
+        "housekeeping_timer_enabled: true\n"
+        "housekeeping_timer_targets:\n"
+        "  - 120\n"
+        '  - "default/123"\n'
+    )
+    s = GlobalSettings.load(f)
+    assert s.housekeeping_enabled is False
+    assert s.housekeeping_timer_effective_enabled is True
+    assert s.housekeeping_timer_targets == ["120", "default/123"]
+
+
+def test_housekeeping_timer_enabled_without_url_from_yaml_rejected(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text("housekeeping_timer_enabled: true\n")
+    with pytest.raises(ValidationError):
+        GlobalSettings.load(f)

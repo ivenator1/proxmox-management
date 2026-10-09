@@ -94,6 +94,36 @@ def _add_fd(root: Path, pid: int, number: int, target: Path, *, writable: bool) 
     _write(root, f"/proc/{pid}/fdinfo/{number}", f"pos:\t0\nflags:\t{flags:o}\n")
 
 
+def _add_denied_proc(root: Path, pid: int, *, state: str, thread_states=None) -> None:
+    """A ``/proc`` entry whose ``fd`` directory refuses enumeration.
+
+    Mirrors the real kernel surfaces for a non-dumpable task: ``fd`` is
+    root-owned and denied while ``stat``/``task`` stay world-readable.  ``state``
+    is the leader state; ``thread_states`` maps every TID to its state.
+    """
+    _mkdir(root, f"/proc/{pid}", 0o755)
+    _write(root, f"/proc/{pid}/cmdline", b"\0")
+    _mkdir(root, f"/proc/{pid}/fd", 0o500)
+    _mkdir(root, f"/proc/{pid}/fdinfo", 0o555)
+    _write(root, f"/proc/{pid}/stat", f"{pid} (logwriter) {state} 1 {pid} 0 -1 0\n")
+    for tid, tstate in (thread_states or {pid: state}).items():
+        _mkdir(root, f"/proc/{pid}/task/{tid}", 0o755)
+        _write(root, f"/proc/{pid}/task/{tid}/stat", f"{tid} (logwriter) {tstate} 1 {tid} 0 -1 0\n")
+
+
+def _deny_fd_enumeration(monkeypatch, pids) -> None:
+    real_listdir = os.listdir
+    suffixes = tuple(f"/proc/{pid}/fd" for pid in pids)
+
+    def guard(path="."):
+        text = str(path).rstrip("/")
+        if text.endswith(suffixes):
+            raise PermissionError(13, "Permission denied", text)
+        return real_listdir(path)
+
+    monkeypatch.setattr(hio.os, "listdir", guard)
+
+
 @pytest.fixture
 def guest(tmp_path: Path) -> Path:
     root = tmp_path / "guest"
@@ -287,6 +317,93 @@ def test_probe_requires_a_visible_process_table(guest: Path) -> None:
     os.rmdir(empty)
     with pytest.raises(hio.HelperError):
         hio.probe({}, sysroot=str(guest), runner=FakeRunner())
+
+
+def test_probe_skips_a_denied_process_after_verified_disappearance(
+    monkeypatch, guest: Path
+) -> None:
+    """A denied ``fd`` listing for a vanished process is not a live writer.
+
+    ``EACCES`` on ``/proc/<pid>/fd`` is *not* "no writers": a live, non-dumpable
+    process keeps a denied descriptor table.  But once the task is gone the
+    kernel has already released its file table, so re-checking the same PID after
+    the denial is the only safe way to tell a departed process from an
+    uninspectable live writer.
+    """
+    _add_npm(guest)
+    _mkdir(guest, "/proc/7171")
+    _write(guest, "/proc/7171/cmdline", b"\0")
+    _mkdir(guest, "/proc/7171/fd", 0o500)
+    _deny_fd_enumeration(monkeypatch, [7171])
+    facts = hio.probe({}, sysroot=str(guest), runner=_acl_runner())
+    assert facts["profiles"] == ["npm"]
+
+
+def test_probe_skips_a_denied_process_with_a_fully_dead_thread_group(
+    monkeypatch, guest: Path
+) -> None:
+    _add_npm(guest)
+    _add_denied_proc(guest, 5150, state="Z")
+    _deny_fd_enumeration(monkeypatch, [5150])
+    facts = hio.probe({}, sysroot=str(guest), runner=_acl_runner())
+    assert facts["profiles"] == ["npm"]
+
+
+def test_probe_refuses_a_denied_live_process(monkeypatch, guest: Path) -> None:
+    _add_npm(guest)
+    _add_denied_proc(guest, 6161, state="S")
+    _deny_fd_enumeration(monkeypatch, [6161])
+    with pytest.raises(hio.HelperError, match="cannot enumerate"):
+        hio.probe({}, sysroot=str(guest), runner=_acl_runner())
+
+
+@pytest.mark.parametrize("denied", [True, False])
+def test_probe_refuses_a_dead_leader_with_a_live_sibling_thread(
+    monkeypatch, guest: Path, denied: bool
+) -> None:
+    _add_npm(guest)
+    _add_denied_proc(guest, 6262, state="Z", thread_states={6262: "Z", 6263: "S"})
+    if denied:
+        _deny_fd_enumeration(monkeypatch, [6262])
+    with pytest.raises(hio.HelperError):
+        hio.probe({}, sysroot=str(guest), runner=_acl_runner())
+
+
+def test_probe_refuses_a_denied_process_with_incomplete_task_enumeration(
+    monkeypatch, guest: Path
+) -> None:
+    _add_npm(guest)
+    _mkdir(guest, "/proc/6363")
+    _write(guest, "/proc/6363/cmdline", b"\0")
+    _mkdir(guest, "/proc/6363/fd", 0o500)
+    _write(guest, "/proc/6363/stat", b"6363 (logwriter) Z 1 6363 0 -1 0\n")
+    _deny_fd_enumeration(monkeypatch, [6363])
+    with pytest.raises(hio.HelperError, match="cannot enumerate"):
+        hio.probe({}, sysroot=str(guest), runner=_acl_runner())
+
+
+def test_probe_refuses_a_dead_leader_when_a_thread_state_vanishes(
+    monkeypatch, guest: Path
+) -> None:
+    _add_npm(guest)
+    _add_denied_proc(guest, 6565, state="Z", thread_states={6565: "Z"})
+    _mkdir(guest, "/proc/6565/task/6566")
+    _deny_fd_enumeration(monkeypatch, [6565])
+    with pytest.raises(hio.HelperError, match="cannot enumerate"):
+        hio.probe({}, sysroot=str(guest), runner=_acl_runner())
+
+
+def test_probe_refuses_a_denied_process_with_unknown_task_state(
+    monkeypatch, guest: Path
+) -> None:
+    _add_npm(guest)
+    _mkdir(guest, "/proc/6464")
+    _write(guest, "/proc/6464/cmdline", b"\0")
+    _mkdir(guest, "/proc/6464/fd", 0o500)
+    _write(guest, "/proc/6464/stat", b"malformed without a close paren\n")
+    _deny_fd_enumeration(monkeypatch, [6464])
+    with pytest.raises(hio.HelperError, match="cannot enumerate"):
+        hio.probe({}, sysroot=str(guest), runner=_acl_runner())
 
 
 def test_probe_stopped_guest_skips_proc_and_never_starts(guest: Path) -> None:

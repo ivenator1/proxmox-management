@@ -393,19 +393,45 @@ def run_lxc_update(
     # OS/app status. --alloy-only must not run it (that mode is logging-only).
     housekeeping_summary: Optional[HousekeepingSummary] = None
     housekeeping_changed = False
-    if settings.housekeeping_enabled and not alloy_only:
+    # Scheduled guests keep their live sources during ordinary updates, without
+    # opting the rest of the fleet into archival, retention or cache cleanup.
+    scheduled_logging = (
+        settings.housekeeping_timer_effective_enabled
+        and alloy_config is not None
+        and not matches_any(settings.lxc_housekeeping_exclude_list, cluster, lxc_id)
+        and (
+            not settings.housekeeping_timer_targets
+            or node in settings.housekeeping_timer_targets
+            or matches_any(settings.housekeeping_timer_targets, cluster, lxc_id)
+        )
+    )
+    if not alloy_only and (settings.housekeeping_enabled or scheduled_logging):
         housekeeping_mod = importlib.import_module("proxmox_fleet.housekeeping")
         try:
-            hk = housekeeping_mod.run_housekeeping(
-                executor,
-                settings,
-                node=node,
-                cluster=cluster,
-                lxc_id=lxc_id,
-                name=name,
-                desired_alloy=alloy_config,
-                dry_run=dry_run,
-            )
+            if settings.housekeeping_enabled:
+                hk = housekeeping_mod.run_housekeeping(
+                    executor,
+                    settings,
+                    node=node,
+                    cluster=cluster,
+                    lxc_id=lxc_id,
+                    name=name,
+                    desired_alloy=alloy_config,
+                    dry_run=dry_run,
+                )
+            else:
+                assert alloy_config is not None  # scheduled_logging requires it
+                hk = housekeeping_mod.prepare_lxc_logging(
+                    executor,
+                    settings,
+                    node=node,
+                    cluster=cluster,
+                    lxc_id=lxc_id,
+                    name=name,
+                    base=alloy_config,
+                    dry_run=dry_run,
+                    allow_install=False,
+                )
         except Exception as exc:  # noqa: BLE001 - maintenance must never abort an update
             outcome.warnings.append(WarningEntry(
                 host=f"{node}/{lxc_id}",

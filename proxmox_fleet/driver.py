@@ -1081,7 +1081,10 @@ def run_notify_phase(
     ``<fleet_history_dir>/housekeeping`` child with the keep setting applied
     independently and no package-detail stripping, manual-scan reminders are not
     consumed, and the update dead-man URL is not pinged: hourly maintenance must
-    never mask a failed scheduled update.
+    never mask a failed scheduled update. Routine maintenance is also quiet:
+    ``changed`` (reclaimed caches, newly covered logs) is not a notification
+    trigger in this mode, so an uneventful tick sends nothing. Explicit
+    ``force_notify``, failures and notifying warnings still announce.
 
     Returns the rendered briefing body (handy for tests / logging). Never raises
     — notification/history failures must not abort the run.
@@ -1102,10 +1105,14 @@ def run_notify_phase(
     body = briefing.prepare_body(state, manual_section=manual_section)
     failed = state.failed
 
+    # Routine maintenance is quiet: a maintenance tick that merely reclaimed
+    # caches or advanced log coverage sets ``changed`` but must not page anyone.
+    # Explicit force, failures and notifying warnings still announce, and
+    # ordinary update runs keep the legacy changed-triggers-notification behavior.
     notify = briefing.should_notify(
         force_notify=settings.force_notify,
-        dry_run=settings.fleet_dry_run,
-        changed=state.changed,
+        dry_run=settings.fleet_dry_run and not housekeeping_only,
+        changed=state.changed and not housekeeping_only,
         failed=failed,
     ) or attention
     if notify:

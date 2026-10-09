@@ -41,7 +41,7 @@ import urllib.error
 import urllib.parse
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import AbstractSet, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit
 
 from proxmox_fleet import http as _http
@@ -553,6 +553,34 @@ def _identity(wire: _Wire) -> Tuple[int, int, int, int]:
     return (wire.device, wire.inode, wire.size, wire.mtime_ns)
 
 
+#: Exact identity of a deletion this policy owns: (path, device, inode, size,
+#: mtime_ns, acknowledged digest).  A covered source that vanished under an
+#: owned identity is the expected result of our own quarantine, never a finding.
+_OwnedDeletion = Tuple[str, int, int, int, int, str]
+
+
+def _wire_owned_deletion(wire: _Wire, digest: str) -> _OwnedDeletion:
+    return (wire.path, wire.device, wire.inode, wire.size, wire.mtime_ns, digest)
+
+
+def _spec_owned_deletion(spec: Dict[str, Any]) -> _OwnedDeletion:
+    return (
+        str(spec["path"]),
+        int(spec["device"]),
+        int(spec["inode"]),
+        int(spec["size"]),
+        int(spec["mtime_ns"]),
+        str(spec["sha256"]),
+    )
+
+
+def _intent_owned_deletion(intent: PruneIntent) -> Optional[_OwnedDeletion]:
+    digest = intent.digest
+    if not isinstance(digest, str) or not _SHA256_RE.match(digest):
+        return None
+    return (intent.path, intent.device, intent.inode, intent.size, intent.mtime_ns, digest)
+
+
 def plan_prune_candidates(
     covered_files: Sequence[Dict[str, Any]],
     *,
@@ -560,12 +588,19 @@ def plan_prune_candidates(
     recognized: Set[str],
     retention_hours: int,
     now_ns: int,
+    owned_deletions: AbstractSet[_OwnedDeletion] = frozenset(),
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Authorize deletions from the importer's acknowledged ``covered_files``.
 
     The candidate digest comes only from the importer; every candidate must
     still be closed, older than the cutoff, non-active and identity-unchanged in
     the current probe.  Returns ``(specs, warnings)``.
+
+    ``owned_deletions`` carries the exact identities this policy already
+    resolved by an observed helper outcome (or persisted as ``done`` intents).
+    A covered source absent under one of those identities is the expected result
+    of our own deletion and is skipped silently; a source missing for any other
+    reason stays a conservative finding.
     """
     warnings: List[str] = []
     candidates: List[Dict[str, Any]] = []
@@ -602,6 +637,8 @@ def plan_prune_candidates(
             continue
         current = probe_by_path.get(wire.path)
         if current is None:
+            if _wire_owned_deletion(wire, digest) in owned_deletions:
+                continue
             warnings.append(
                 f"covered file {wire.path} is absent from the current probe; not pruning"
             )
@@ -673,6 +710,7 @@ def _resolve_outcomes(
     batch: Sequence[Tuple[PruneIntent, Dict[str, Any]]],
     result: PrimitiveResult,
     warnings: List[str],
+    owned_deletions: Set[_OwnedDeletion],
 ) -> Tuple[int, int, bool]:
     facts = result.facts if isinstance(result.facts, dict) else {}
     entries = facts.get("files")
@@ -700,6 +738,9 @@ def _resolve_outcomes(
             store.resolve_prune_intent(
                 intent.intent_id, "done", reclaimed_bytes=reclaimed, detail=detail or None
             )
+            # Only the helper's own per-file identity/digest/writer-checked
+            # outcome authorizes this identity; never the transport's rc.
+            owned_deletions.add(_spec_owned_deletion(spec))
             bytes_total += reclaimed
             pruned += 1
         elif state == "restored":
@@ -724,6 +765,7 @@ def _run_prune(
     key: GuestKey,
     batch: Sequence[Tuple[PruneIntent, Dict[str, Any]]],
     warnings: List[str],
+    owned_deletions: Set[_OwnedDeletion],
 ) -> Tuple[int, int, bool]:
     if not batch:
         return 0, 0, False
@@ -742,7 +784,7 @@ def _run_prune(
             + _detail(result)
         )
         return 0, 0, True
-    return _resolve_outcomes(store, batch, result, warnings)
+    return _resolve_outcomes(store, batch, result, warnings, owned_deletions)
 
 
 def _record_prune_intents(
@@ -1021,6 +1063,7 @@ def _authorize_deletion(
     required_hashes: Dict[str, str],
     *,
     covered_files: Sequence[Dict[str, Any]] = (),
+    owned_deletions: AbstractSet[_OwnedDeletion] = frozenset(),
     now_ns: int,
 ) -> _DeletionAuthorization:
     """One fail-closed policy decision; the helper still checks filesystem races."""
@@ -1045,6 +1088,7 @@ def _authorize_deletion(
         candidates, warnings = plan_prune_candidates(
             covered_files, probe_files=probe.files, recognized=recognized,
             retention_hours=int(settings.housekeeping_local_retention_hours), now_ns=now_ns,
+            owned_deletions=owned_deletions,
         )
         for candidate in candidates:
             source_id = candidate.get("source_id")
@@ -1135,6 +1179,14 @@ def apply_guest_retention(
         manifest = store.initial_manifest_state(key)
         stored = store.delivery_verification(key)
         open_intents = store.open_prune_intents(key)
+        # Durable evidence of this policy's own completed deletions: a covered
+        # source absent under one of these exact identities is expected, never
+        # a finding.  Same-run successes are added as their outcomes are read.
+        owned_deletions: Set[_OwnedDeletion] = set()
+        for intent in store.prune_intents(key):
+            identity = _intent_owned_deletion(intent) if intent.state == "done" else None
+            if identity is not None:
+                owned_deletions.add(identity)
     except Exception as exc:  # noqa: BLE001 - untrusted checkpoint blocks deletion
         return RetentionResult(
             warnings=_dedup(
@@ -1175,6 +1227,7 @@ def apply_guest_retention(
             probe=probe,
             effective_alloy=effective_alloy,
             covered_files=covered_files,
+            owned_deletions=owned_deletions,
             base_url=base_url,
             stored=stored,
             open_intents=open_intents,
@@ -1369,50 +1422,87 @@ def apply_guest_retention(
     probe_for_prune = after_vacuum
     authorization = _authorize_deletion(
         executor, store, key, settings, effective_alloy, probe_for_prune, required_hashes,
-        covered_files=covered_files, now_ns=int(clock_ns()),
+        covered_files=covered_files, owned_deletions=owned_deletions, now_ns=int(clock_ns()),
     )
     if authorization.blocked is not None:
         return RetentionResult(changed=changed, bytes_reclaimed=bytes_reclaimed,
             warnings=_dedup(warnings + [authorization.blocked + "; file deletion paused"]), failed=True)
 
-    # -- acknowledged closed-file pruning ----------------------------------- #
+    # -- crash-resume quarantine recovery ----------------------------------- #
+    # Pending intents from an interrupted run replay in the same bounded
+    # 128-file batches as fresh candidates, with a fresh probe and a fresh
+    # authorization per batch.  An unresolved intent or a failed batch leaves
+    # every unconfirmed intent in place for the next run.
     new_warnings: List[str] = []
     recovered_files = 0
-    for intent in open_intents:
-        spec_pair = _recovery_spec(store, key, intent, new_warnings)
-        if spec_pair is None:
-            return RetentionResult(changed=changed, bytes_reclaimed=bytes_reclaimed,
-                files_pruned=recovered_files, warnings=_dedup(warnings + new_warnings), failed=True)
-        recovery_gate = _authorize_deletion(
-            executor, store, key, settings, effective_alloy, probe_for_prune, required_hashes, now_ns=int(clock_ns())
-        )
-        if recovery_gate.blocked is not None:
-            return RetentionResult(changed=changed, bytes_reclaimed=bytes_reclaimed,
-                files_pruned=recovered_files, warnings=_dedup(warnings + [recovery_gate.blocked]), failed=True)
-        if spec_pair is not None:
-            batch_r: List[Tuple[PruneIntent, Dict[str, Any]]] = [spec_pair]
-            recovered_bytes, recovered_pruned, recovered_failed = _run_prune(
-                executor, store, key, batch_r, new_warnings
-            )
-            bytes_reclaimed += recovered_bytes
-            recovered_files += recovered_pruned
-            if recovered_failed:
-                new_warnings = _dedup(new_warnings)
+    recovered_bytes = 0
+    for offset in range(0, len(open_intents), 128):
+        chunk = open_intents[offset:offset + 128]
+        recovery_batch: List[Tuple[PruneIntent, Dict[str, Any]]] = []
+        for intent in chunk:
+            spec_pair = _recovery_spec(store, key, intent, new_warnings)
+            if spec_pair is None:
                 return RetentionResult(
                     changed=changed or recovered_bytes > 0,
-                    bytes_reclaimed=bytes_reclaimed,
+                    bytes_reclaimed=bytes_reclaimed + recovered_bytes,
                     files_pruned=recovered_files,
-                    warnings=_dedup(warnings + new_warnings),
-                    failed=True,
+                    warnings=_dedup(warnings + new_warnings), failed=True,
                 )
+            recovery_batch.append(spec_pair)
+        try:
+            current_probe = probe_housekeeping(executor, key.lxc_id)
+        except Exception as exc:
+            return RetentionResult(
+                changed=changed or recovered_bytes > 0,
+                bytes_reclaimed=bytes_reclaimed + recovered_bytes,
+                files_pruned=recovered_files,
+                warnings=_dedup(warnings + new_warnings + [
+                    f"cannot observe current recovery state ({type(exc).__name__}); intents retained"
+                ]), failed=True,
+            )
+        recovery_gate = _authorize_deletion(
+            executor, store, key, settings, effective_alloy, current_probe, required_hashes,
+            owned_deletions=owned_deletions, now_ns=int(clock_ns()),
+        )
+        if recovery_gate.blocked is not None:
+            return RetentionResult(
+                changed=changed or recovered_bytes > 0,
+                bytes_reclaimed=bytes_reclaimed + recovered_bytes,
+                files_pruned=recovered_files,
+                warnings=_dedup(warnings + new_warnings + [recovery_gate.blocked]), failed=True,
+            )
+        batch_bytes, batch_files, recovery_failed = _run_prune(
+            executor, store, key, recovery_batch, new_warnings, owned_deletions
+        )
+        recovered_bytes += batch_bytes
+        recovered_files += batch_files
+        if recovery_failed:
+            return RetentionResult(
+                changed=changed or recovered_bytes > 0,
+                bytes_reclaimed=bytes_reclaimed + recovered_bytes,
+                files_pruned=recovered_files,
+                warnings=_dedup(warnings + new_warnings), failed=True,
+            )
+    bytes_reclaimed += recovered_bytes
 
+    # The pre-recovery probe still lists files this run just deleted; re-observe
+    # so candidates reflect the post-recovery filesystem and the identities this
+    # run resolved are recognized instead of reported missing.
+    try:
+        probe_for_prune = probe_housekeeping(executor, key.lxc_id)
+    except Exception as exc:
+        return RetentionResult(changed=changed, bytes_reclaimed=bytes_reclaimed,
+            files_pruned=recovered_files, warnings=_dedup(warnings + new_warnings + [
+                f"cannot observe current deletion state ({type(exc).__name__}); remaining files retained"
+            ]), failed=True)
     authorization = _authorize_deletion(
         executor, store, key, settings, effective_alloy, probe_for_prune, required_hashes,
-        covered_files=covered_files, now_ns=int(clock_ns()),
+        covered_files=covered_files, owned_deletions=owned_deletions, now_ns=int(clock_ns()),
     )
     if authorization.blocked is not None:
         return RetentionResult(changed=changed, bytes_reclaimed=bytes_reclaimed,
-            files_pruned=recovered_files, warnings=_dedup(warnings + [authorization.blocked]), failed=True)
+            files_pruned=recovered_files,
+            warnings=_dedup(warnings + new_warnings + [authorization.blocked]), failed=True)
     candidates = list(authorization.candidates)
     new_warnings.extend(authorization.warnings)
     pruned_files = 0
@@ -1426,7 +1516,8 @@ def apply_guest_retention(
                 ]), failed=True)
         batch_gate = _authorize_deletion(
             executor, store, key, settings, effective_alloy, current_probe, required_hashes,
-            covered_files=candidates[offset:offset + 128], now_ns=int(clock_ns()),
+            covered_files=candidates[offset:offset + 128], owned_deletions=owned_deletions,
+            now_ns=int(clock_ns()),
         )
         new_warnings.extend(batch_gate.warnings)
         if batch_gate.blocked is not None:
@@ -1434,7 +1525,9 @@ def apply_guest_retention(
                 files_pruned=pruned_files + recovered_files,
                 warnings=_dedup(warnings + new_warnings + [batch_gate.blocked]), failed=True)
         batch = _record_prune_intents(store, key, batch_gate.candidates)
-        batch_bytes, batch_files, prune_failed = _run_prune(executor, store, key, batch, new_warnings)
+        batch_bytes, batch_files, prune_failed = _run_prune(
+            executor, store, key, batch, new_warnings, owned_deletions
+        )
         bytes_reclaimed += batch_bytes
         pruned_files += batch_files
         changed |= batch_bytes > 0 or batch_files > 0
@@ -1544,6 +1637,7 @@ def _audit(
     probe: HousekeepingProbe,
     effective_alloy: DesiredAlloyConfig,
     covered_files: Sequence[Dict[str, Any]],
+    owned_deletions: AbstractSet[_OwnedDeletion],
     base_url: str,
     stored: Optional[DeliveryVerification],
     open_intents: Sequence[PruneIntent],
@@ -1612,6 +1706,7 @@ def _audit(
             recognized=recognized,
             retention_hours=int(settings.housekeeping_local_retention_hours),
             now_ns=int(clock_ns()),
+            owned_deletions=owned_deletions,
         )
         for intent in open_intents:
             findings.append(f"an unfinished quarantine intent exists for {intent.path}")

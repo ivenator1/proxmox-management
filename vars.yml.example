@@ -147,6 +147,18 @@ housekeeping_backfill_budget_mb: 1024
 # Bare LXC ids apply fleet-wide; qualify cluster/ID for one cluster. Matches
 # matches_any() like the other exclusion lists.
 lxc_housekeeping_exclude_list: []
+#
+# The installer schedules an hourly fleet-housekeeping.timer that runs
+# `fleet-update --housekeeping-only`. Leave housekeeping_timer_enabled unset
+# (null) to keep the legacy behaviour where the timer follows
+# housekeeping_enabled; set it true to schedule maintenance while ordinary LXC
+# updates stay opted out (housekeeping_enabled: false), or false to always
+# disable the timer. Enabling the timer still requires housekeeping_loki_url.
+housekeeping_timer_enabled: null
+# Optional targets for the scheduled run, written as one `--limit` value: bare
+# ids or cluster-qualified "cluster/id". Empty keeps the legacy whole-fleet
+# schedule, e.g. [default/101, beta/102] limits maintenance to two guests.
+housekeeping_timer_targets: []
 
 # --- LXC TAG DISCOVERY ---
 lxc_tags:

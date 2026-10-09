@@ -7,6 +7,8 @@ required for unit tests. The state JSON output is verified via dump_for_ansible(
 from __future__ import annotations
 
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -3328,7 +3330,8 @@ def test_notify_phase_housekeeping_writes_isolated_history_and_skips_deadman(tmp
     latest = json.loads((child / "latest.json").read_text())
     assert latest["briefing"] == body
     assert calls["ping"] == []                              # never clears the update dead-man
-    assert len(calls["dispatch"]) == 1
+    # A routine changed maintenance tick (reclaimed bytes) is quiet.
+    assert calls["dispatch"] == []
 
 
 def test_maintenance_history_cannot_disturb_update_history(tmp_path, monkeypatch):
@@ -3376,3 +3379,188 @@ def test_maintenance_history_cannot_disturb_update_history(tmp_path, monkeypatch
     child_latest = json.loads((child / "latest.json").read_text())
     assert history_mod.count_updates(child_latest) == {"os": 0, "app": 0}
     assert history_mod.count_packages(child_latest) == 0
+
+
+# --------------------------------------------------------------------------- #
+# run_notify_phase — quiet maintenance policy against a real HTTP receiver
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingHTTP:
+    """A real local HTTP endpoint that records every request the driver makes.
+
+    It backs both the notifier URL and the dead-man URL so these tests assert on
+    actual outbound requests (and real persisted history) instead of forwarding
+    mock kwargs.
+    """
+
+    def __init__(self) -> None:
+        recorder = self
+        self.requests: List[Dict[str, Any]] = []
+
+        class _Handler(BaseHTTPRequestHandler):
+            def _reply(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def do_GET(self) -> None:  # noqa: N802 - http.server API
+                recorder.requests.append({"method": "GET", "path": self.path, "body": b""})
+                self._reply()
+
+            def do_POST(self) -> None:  # noqa: N802 - http.server API
+                length = int(self.headers.get("Content-Length") or 0)
+                recorder.requests.append(
+                    {"method": "POST", "path": self.path, "body": self.rfile.read(length)}
+                )
+                self._reply()
+
+            def log_message(self, *args: Any) -> None:  # noqa: D401 - silence
+                pass
+
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def base(self) -> str:
+        host, port = self._httpd.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def notifier(self) -> Dict[str, Any]:
+        return {"type": "webhook", "enabled": True, "url": f"{self.base}/notify"}
+
+    def close(self) -> None:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+
+
+@pytest.fixture
+def recording_http():
+    server = _RecordingHTTP()
+    try:
+        yield server
+    finally:
+        server.close()
+
+
+def _http_settings(server: "_RecordingHTTP", tmp_path: Path, **kw: Any) -> GlobalSettings:
+    return GlobalSettings(
+        notifiers=[server.notifier()],
+        fleet_history_dir=str(tmp_path),
+        fleet_deadmans_url=f"{server.base}/deadman",
+        **kw,
+    )
+
+
+def _posts(server: "_RecordingHTTP") -> List[Dict[str, Any]]:
+    return [r for r in server.requests if r["method"] == "POST"]
+
+
+def _gets(server: "_RecordingHTTP") -> List[Dict[str, Any]]:
+    return [r for r in server.requests if r["method"] == "GET"]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_maintenance_success_is_quiet_but_persisted(recording_http, tmp_path, dry_run):
+    """Successful maintenance and audits stay visible without routine notifications."""
+    settings = _http_settings(recording_http, tmp_path, fleet_dry_run=dry_run)
+    state = _notify_state(
+        fleet_changed=True,
+        fleet_lxc_data=[{
+            "node": "pve-01", "name": "npm", "id": "123",
+            "app": "", "os": "", "snap": False,
+            "housekeeping": {"status": "Cleaned", "bytes_reclaimed": 4096},
+        }],
+    )
+
+    body = run_notify_phase(settings=settings, state=state, housekeeping_only=True)
+
+    assert recording_http.requests == []        # no notifier request, no dead-man ping
+    latest = json.loads((tmp_path / "housekeeping" / "latest.json").read_text())
+    assert latest["briefing"] == body
+    assert latest["changed"] is True             # changed, yet deliberately quiet
+    assert not (tmp_path / "latest.json").exists()
+
+
+def test_maintenance_notifying_warning_still_notifies(recording_http, tmp_path):
+    settings = _http_settings(recording_http, tmp_path)
+    state = _notify_state(fleet_warning_log=[{
+        "host": "pve-01/123",
+        "task": "housekeeping",
+        "warning": "Loki unreachable; file pruning paused",
+        "notifying": True,
+    }])
+
+    run_notify_phase(settings=settings, state=state, housekeeping_only=True)
+
+    posts = _posts(recording_http)
+    assert len(posts) == 1
+    assert posts[0]["path"] == "/notify"
+    assert b"Attention Required" in posts[0]["body"]
+    assert _gets(recording_http) == []           # still never touches the dead-man
+    assert (tmp_path / "housekeeping" / "latest.json").exists()
+
+
+def test_maintenance_failure_notifies_without_deadman(recording_http, tmp_path):
+    settings = _http_settings(recording_http, tmp_path)
+
+    run_notify_phase(settings=settings, state=_notify_state(fleet_failed=True), housekeeping_only=True)
+
+    posts = _posts(recording_http)
+    assert len(posts) == 1
+    assert b"Failures Detected" in posts[0]["body"]
+    # A failed hourly tick must not clear or mask the update dead-man switch.
+    assert _gets(recording_http) == []
+
+
+def test_maintenance_force_notify_announces_uneventful_tick(recording_http, tmp_path):
+    settings = _http_settings(recording_http, tmp_path, force_notify=True)
+
+    run_notify_phase(settings=settings, state=_notify_state(), housekeeping_only=True)
+
+    assert len(_posts(recording_http)) == 1
+    assert _gets(recording_http) == []
+
+
+def test_ordinary_changed_fleet_still_notifies_and_pings_deadman(recording_http, tmp_path):
+    """The changed-triggers-notification behavior is preserved for update runs."""
+    settings = _http_settings(recording_http, tmp_path)
+
+    run_notify_phase(settings=settings, state=_notify_state(fleet_changed=True))
+
+    assert len(_posts(recording_http)) == 1
+    gets = _gets(recording_http)
+    assert len(gets) == 1 and gets[0]["path"] == "/deadman"
+    assert (tmp_path / "latest.json").exists()
+    assert not (tmp_path / "housekeeping").exists()
+
+
+def test_maintenance_does_not_consume_manual_reminders(recording_http, tmp_path):
+    settings = _http_settings(recording_http, tmp_path)
+    scan_notif.record_manual_results(
+        [{
+            "host": "firewall",
+            "adapter": "opnsense",
+            "current": "24.1",
+            "latest": "24.7",
+            "update_available": True,
+            "reboot_required": False,
+            "unreachable": False,
+            "error": "",
+        }],
+        history_dir=tmp_path,
+    )
+
+    # The maintenance tick must not dispatch the reminder nor advance its state.
+    run_notify_phase(settings=settings, state=_notify_state(), housekeeping_only=True)
+    assert recording_http.requests == []
+    assert "notified_fingerprint" not in scan_notif.load_state(tmp_path)["firewall"]
+
+    # The next ordinary run still announces it and only then advances the state.
+    run_notify_phase(settings=settings, state=_notify_state())
+    posts = _posts(recording_http)
+    assert len(posts) == 1
+    assert b"Manual Attention Required" in posts[0]["body"]
+    assert "notified_fingerprint" in scan_notif.load_state(tmp_path)["firewall"]
