@@ -2609,12 +2609,28 @@ def _prune_one(
 
         _ensure_quarantine_root(sysroot, log_root)
         if q_parent_fd is None:
-            q_parent_fd = _open_dir_optional(_join(sysroot, os.path.dirname(quarantine)))
-        if q_parent_fd is None:
-            raise HelperError(
-                "cannot open the quarantine directory",
-                detail={"quarantine_path": quarantine},
-            )
+            # The quarantine path preserves the source-relative directory, so a
+            # nested fanout needs its descendants created (root-only) beneath the
+            # quarantine root before the file can be renamed into place.  The
+            # pinned directory-fd/O_NOFOLLOW helper refuses symlinked or
+            # non-directory components rather than following them.
+            joined_parent = _join(sysroot, os.path.dirname(quarantine))
+            try:
+                q_parent_fd = _open_dir_path(joined_parent, create=True, mode=0o700)
+            except HelperError as exc:
+                raise HelperError(
+                    "cannot open the quarantine directory",
+                    detail={"quarantine_path": quarantine, "reason": str(exc)},
+                ) from exc
+            try:
+                os.fchmod(q_parent_fd, 0o700)
+            except OSError as exc:
+                os.close(q_parent_fd)
+                q_parent_fd = None
+                raise HelperError(
+                    f"cannot enforce quarantine directory permissions: {exc.strerror or exc}",
+                    detail={"quarantine_path": quarantine},
+                ) from exc
         before = _fs_used_bytes(root_joined)
         try:
             os.rename(name, q_name, src_dir_fd=parent_fd, dst_dir_fd=q_parent_fd)

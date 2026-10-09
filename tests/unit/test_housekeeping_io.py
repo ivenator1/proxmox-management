@@ -1257,6 +1257,67 @@ def test_prune_deletes_closed_archive_through_quarantine(guest: Path) -> None:
     assert list(quarantine_dir.iterdir()) == []
 
 
+def test_prune_creates_missing_nested_quarantine_descendants(guest: Path) -> None:
+    """A closed PBS UPID under its hex fanout is deleted even though the nested
+    quarantine parent (which preserves the source-relative directory) is absent.
+    """
+    _add_pbs(guest)
+    path = f"/var/log/proxmox-backup/tasks/CD/{PBS_UPID_IDLE}"
+    log = guest / path.lstrip("/")
+    spec = _prune_spec(guest, path, profile="pbs", log_kind="task")
+    quarantine = _quarantine_for(path)
+    nested_parent = (guest / quarantine.lstrip("/")).parent
+    assert not nested_parent.exists()
+
+    facts = hio.prune({"files": [spec]}, sysroot=str(guest))
+
+    entry = facts["files"][0]
+    assert entry["state"] == "done"
+    assert entry["detail"] == ""
+    assert facts["files_pruned"] == 1
+    assert not log.exists()
+    quarantine_root = guest / "var/log/proxmox-backup/tasks" / hio.QUARANTINE_DIRNAME
+    assert stat.S_IMODE(quarantine_root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(nested_parent.stat().st_mode) == 0o700
+    assert not any(p.is_file() for p in quarantine_root.rglob("*"))
+
+
+def test_prune_creates_nested_quarantine_parent_for_npm_archive(guest: Path) -> None:
+    """NPM rotated archives in a subdirectory get a nested quarantine parent."""
+    _mkdir(guest, "/data/logs/backend")
+    log = _write(guest, "/data/logs/backend/access.log.1", b"old backend\n")
+    spec = _prune_spec(guest, "/data/logs/backend/access.log.1")
+    nested_parent = (guest / _quarantine_for(spec["path"]).lstrip("/")).parent
+    assert not nested_parent.exists()
+
+    facts = hio.prune({"files": [spec]}, sysroot=str(guest))
+
+    assert facts["files"][0]["state"] == "done"
+    assert not log.exists()
+    assert stat.S_IMODE(nested_parent.stat().st_mode) == 0o700
+    assert not any(p.is_file() for p in nested_parent.rglob("*"))
+
+
+def test_prune_refuses_symlinked_nested_quarantine_ancestor(guest: Path) -> None:
+    """A symlink standing in for a required quarantine descendant is refused."""
+    _mkdir(guest, "/data/logs")
+    log = _write(guest, "/data/logs/access.log.1", b"keep me\n")
+    _mkdir(guest, "/data/logs/" + hio.QUARANTINE_DIRNAME, 0o700)
+    outside = _mkdir(guest, "/data/outside", 0o700)
+    (guest / "data/logs" / hio.QUARANTINE_DIRNAME / "sub").symlink_to(outside)
+    spec = _prune_spec(
+        guest,
+        "/data/logs/access.log.1",
+        quarantine=f"/data/logs/{hio.QUARANTINE_DIRNAME}/sub/access.log.1",
+    )
+
+    with pytest.raises(hio.HelperError):
+        hio.prune({"files": [spec]}, sysroot=str(guest))
+
+    assert log.exists()
+    assert list(outside.iterdir()) == []
+
+
 def test_prune_protects_current_control_and_active_files(guest: Path) -> None:
     _add_npm(guest)
     _add_pbs(guest)

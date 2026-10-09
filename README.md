@@ -189,6 +189,8 @@ Native policy reads are bounded and JSON-framed so transport trimming cannot cha
 
 Frozen inputs share bounded multi-range snapshot fetches: at most 64 ranges and 32 MiB raw data per tar, with a 64 KiB manifest limit. Every entry is validated against its exact source request before reading; each source retains its own raw digest and HTTP acknowledgement. Prefetched bytes are not archive coverage. Live-source prefix verification remains separate.
 
+**Quarantine and recovery:** approved closed files retain their source-relative path beneath a same-root `.fleet-housekeeping-quarantine` directory. Missing nested parents (including PBS task hex fanouts and nested NPM archives) are created with `0700` permissions through pinned directory descriptors; symlinked/non-directory ancestors are rejected. A failed prune transport keeps its durable intents for revalidation and recovery on a later maintenance run. Initial archive completion is not proof that file cleanup succeeded.
+
 Primitive execution uses transient Ansible Runner directories, removed after results are harvested on success or failure so large manifests cannot accumulate on a manager's `/tmp` tmpfs. API callers that explicitly provide `private_data_dir` retain their diagnostic artifacts. Durable housekeeping checkpoints and frozen-source spools are separate and are never removed by this cleanup. A Runner failure without task stderr reports its status and return code instead of an unrelated manifest tail.
 
 Capture creation and resume reject symlinked, foreign-owned, or group/other-accessible spool directories. An unsafe spool blocks import rather than resetting checkpoints or removing retained history.
