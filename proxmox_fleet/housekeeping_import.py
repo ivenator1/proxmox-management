@@ -46,6 +46,7 @@ from proxmox_fleet.housekeeping_checkpoint import (
     GuestKey,
     PendingBatch,
     ProgressDelta,
+    PruneIntent,
     SourceIdentity,
     SourceRecord,
 )
@@ -82,6 +83,8 @@ _MAX_RELEASE_BLOBS = 128
 
 DELIVERY_ARCHIVE = "archive"
 JOB_LABEL = "lxc-file"
+#: Typed failure code for a PBS task row an earlier build reassigned to another task.
+_TASK_REASSIGNED_CODE = "task-identity-reassigned"
 _APP_BY_PROFILE = {"npm": "nginxproxymanager", "pbs": "proxmox-backup"}
 _VALID_COMPRESSION = ("plain", "gzip", "zstd")
 _VALID_PROFILE = ("npm", "pbs")
@@ -919,9 +922,176 @@ def refreshed_identity(record: SourceRecord) -> SourceIdentity:
     )
 
 
+def _match_record(
+    by_inode: Mapping[Tuple[int, int], SourceRecord],
+    by_path: Mapping[str, SourceRecord],
+    by_id: Mapping[str, SourceRecord],
+    wire: Dict[str, Any],
+) -> Optional[SourceRecord]:
+    """Select the durable record that may own *wire*.
+
+    An inode match is only honoured for the same logical source: a different
+    PBS task UPID that re-used the device+inode is never selected as that task's
+    rename/append lineage.  The path map is consulted only for a compatible
+    record, so a row already rewritten to the impostor's path is rejected too.
+    """
+    record = by_inode.get((wire["device"], wire["inode"]))
+    if record is not None and not sources.identity_compatible(record, wire):
+        record = None
+    if record is None:
+        candidate = by_path.get(wire["path"])
+        if candidate is not None and sources.identity_compatible(candidate, wire):
+            record = candidate
+    if record is None:
+        candidate = by_id.get(base_source_id(wire["profile"], wire["log_kind"], wire["path"]))
+        if candidate is not None and sources.identity_compatible(candidate, wire):
+            record = candidate
+    return record
+
+
+def _matching_identity_capsule(
+    store: CheckpointStore,
+    key: GuestKey,
+    canonical: str,
+    record: SourceRecord,
+    provenance: sources.SourceProvenance,
+) -> Optional[PruneIntent]:
+    """The canonical intent capsule that proves this row's archived identity.
+
+    Archive-generation proof and deletion-completion proof are deliberately
+    separate: the capsule (a pending *or* done prune intent for the canonical
+    path) records the original device/inode/size/mtime/digest, and it is
+    accepted only when it lines up exactly with the row's own preserved,
+    acknowledged complete-provenance size and digest.  A pending capsule still
+    proves the archived identity — but never a completed deletion — so callers
+    must decide whether the file may be tombstoned; a pending intent is never
+    read as completion.  Nothing here mutates the intent.
+    """
+    for intent in store.prune_intents(key):
+        if intent.state not in ("pending", "done") or intent.path != canonical:
+            continue
+        if (intent.device, intent.inode) != (record.device, record.inode):
+            continue
+        if intent.digest is None or intent.digest != record.digest:
+            continue
+        if provenance.raw_sha256 not in (None, record.digest):
+            continue
+        if provenance.complete_size != intent.size:
+            continue
+        return intent
+    return None
+
+
+def _recover_reassigned_sources(store: CheckpointStore, key: GuestKey, state: "_ImportState") -> None:
+    """Repair PBS task rows this bug already rewrote to another task's path.
+
+    Restores the canonical path/identity and the original frozen/ACK provenance
+    (and clears the false coverage conflict) *only* from an exact canonical
+    capsule.  A ``done`` capsule additionally proves the owned deletion, so the
+    reclaimed file is re-tombstoned; a ``pending`` capsule proves only the
+    archived identity, so the row is restored without asserting deletion and
+    the intent state is left untouched.  Without a capsule the row is left
+    intact and the guest stays blocked; the impostor file is always archived
+    later under its own identity, never as this row's continuation.
+    """
+    for record in store.sources(key):
+        if record.profile != "pbs" or record.log_kind != "task":
+            continue
+        provenance = sources.SourceProvenance.parse(record.provenance)
+        canonical = provenance.canonical_path
+        if not canonical or canonical == record.path:
+            continue
+        if sources.same_logical_source(record.profile, record.log_kind, canonical, record.path):
+            continue
+        # A different task's path was written over this canonical task row.
+        if record.source_id != base_source_id(record.profile, record.log_kind, canonical):
+            state.failed = True
+            state.warnings.append(
+                f"housekeeping import: source {record.source_id[:12]} impersonated by another task "
+                f"({_TASK_REASSIGNED_CODE}); retained unresolved, deletion blocked"
+            )
+            continue
+        if record.digest is None or not record.acknowledged or not provenance.complete:
+            state.failed = True
+            state.warnings.append(
+                f"housekeeping import: source {record.source_id[:12]} reassigned without frozen coverage "
+                f"({_TASK_REASSIGNED_CODE}); retained unresolved, deletion blocked"
+            )
+            continue
+        intent = _matching_identity_capsule(store, key, canonical, record, provenance)
+        if intent is None:
+            state.failed = True
+            state.warnings.append(
+                f"housekeeping import: source {record.source_id[:12]} reassigned with no matching canonical "
+                f"capsule ({_TASK_REASSIGNED_CODE}); retained unresolved, deletion blocked"
+            )
+            continue
+        deleted = intent.state == "done"
+        _restore_reassigned_source(store, key, record, provenance, intent, deleted=deleted)
+        state.warnings.append(
+            f"housekeeping import: source {record.source_id[:12]} restored to its canonical task "
+            f"({_TASK_REASSIGNED_CODE}, reclaim {'proven' if deleted else 'pending'}); "
+            "the current file is archived under its own identity"
+        )
+
+
+def _restore_reassigned_source(
+    store: CheckpointStore,
+    key: GuestKey,
+    record: SourceRecord,
+    provenance: sources.SourceProvenance,
+    intent: PruneIntent,
+    *,
+    deleted: bool,
+) -> None:
+    """Return one reassigned row to its canonical frozen/ACK identity.
+
+    ``deleted`` is the deletion-completion proof (a ``done`` capsule): only then
+    is the reclaimed file re-tombstoned.  A pending capsule restores the archived
+    identity without asserting, or implying, any deletion.
+    """
+    restored = provenance.with_verification(
+        verified_raw_size=provenance.verified_raw_size, conflict=False
+    ).as_dict()
+    kept_aliases = [
+        alias
+        for alias in (record.aliases or [])
+        if isinstance(alias, dict)
+        and sources.same_logical_source(record.profile, record.log_kind, intent.path, str(alias.get("path", "")))
+    ]
+    identity = SourceIdentity(
+        path=intent.path,
+        device=intent.device,
+        inode=intent.inode,
+        size=intent.size,
+        mtime_ns=intent.mtime_ns,
+        # Physical allocation is not in the capsule. No current-file coverage
+        # is produced here; a current probe refreshes this conservative value.
+        allocated_bytes=0,
+        compression=record.compression,
+        profile=record.profile,
+        log_kind=record.log_kind,
+        is_active=False,
+    )
+    store.record_source(
+        key,
+        record.source_id,
+        identity,
+        provenance=restored,
+        aliases=kept_aliases,
+        in_initial_manifest=record.in_initial_manifest,
+        capture_id=record.capture_id,
+        blob_path=record.blob_path,
+        digest=record.digest,
+    )
+    if deleted:
+        store.mark_source_absent(key, record.source_id)
+
+
 def _plan_sources(state: _ImportState, wires: Sequence[Dict[str, Any]]) -> List[_FilePlan]:
     store = state.store
     key = state.key
+    _recover_reassigned_sources(store, key, state)
     intent = store.capture_intent(key)
     records = list(store.sources(key))
     by_inode: Dict[Tuple[int, int], SourceRecord] = {}
@@ -945,23 +1115,34 @@ def _plan_sources(state: _ImportState, wires: Sequence[Dict[str, Any]]) -> List[
             blob_by_source[blob.source_id] = blob
 
     manifest_inode: Dict[Tuple[int, int], str] = {}
-    manifest_path: Dict[str, str] = {}
     for sid, blob in blob_by_source.items():
         manifest_inode.setdefault((blob.device, blob.inode), sid)
-        manifest_path.setdefault(blob.source_path, sid)
 
     existing_ids = [record.source_id for record in records]
-    existing_id_set = set(existing_ids)
+    by_id = {record.source_id: record for record in records}
     current_paths = {wire["path"] for wire in wires}
     plans: List[_FilePlan] = []
     consumed: Set[str] = set()
     for wire in wires:
-        record = by_inode.get((wire["device"], wire["inode"])) or by_path.get(wire["path"])
+        record = _match_record(by_inode, by_path, by_id, wire)
         base_id: Optional[str] = None
         if record is not None:
             base_id = record.source_id
         else:
-            base_id = manifest_inode.get((wire["device"], wire["inode"])) or manifest_path.get(wire["path"])
+            # A frozen-manifest inode match must belong to the same logical
+            # source: a re-used inode never lends a different PBS task the
+            # manifest blob (and the frozen-prefix ACK) of another task.
+            base_id = manifest_inode.get((wire["device"], wire["inode"]))
+            if base_id is not None:
+                manifest_source = blob_by_source.get(base_id)
+                if (
+                    manifest_source is None
+                    or base_id != base_source_id(wire["profile"], wire["log_kind"], manifest_source.source_path)
+                    or not sources.same_logical_source(
+                        wire["profile"], wire["log_kind"], manifest_source.source_path, wire["path"]
+                    )
+                ):
+                    base_id = None
             if base_id is None:
                 base_id = base_source_id(wire["profile"], wire["log_kind"], wire["path"])
         blob = blob_by_source.get(base_id)
@@ -999,7 +1180,7 @@ def _plan_sources(state: _ImportState, wires: Sequence[Dict[str, Any]]) -> List[
             current_paths=current_paths,
         )
         consumed.add(plan.source_id)
-        if record is None and base_id not in existing_id_set:
+        if record is None and base_id not in by_id:
             plan.lineage_predecessor = sources.lineage_predecessor(records, wire)
         plans.append(plan)
 
@@ -1076,10 +1257,16 @@ def _prepare_live_input(executor: Executor, state: _ImportState, plan: _FilePlan
         )
         state.store.set_source_digest(state.key, record.source_id, digest)
         return True
-    except (HousekeepingStreamError, OSError):
+    except (HousekeepingStreamError, OSError) as exc:
+        # Bounded source id + typed code: enough to find the failing row without
+        # exposing any shell, credential or log content.
+        code = _bounded(getattr(exc, "code", None) or type(exc).__name__)
         state.failed = True
         state.stopped = True
-        state.warnings.append("housekeeping import: source prefix verification failed; retained without deletion")
+        state.warnings.append(
+            f"housekeeping import: source {plan.source_id[:12]} prefix verification failed "
+            f"({code}); retained without deletion"
+        )
         return False
 
 
@@ -1268,9 +1455,13 @@ def _import_source(
     except RemoteSourceError as exc:
         # Renamed/replaced/truncated inputs are reported for re-probe; unacknowledged
         # bytes are untouched and the run is blocked (never silently completed).
+        # The bounded source id + typed code make the failing row identifiable
+        # without leaking any log content.
         state.failed = True
         state.warnings.append(
-            f"housekeeping import: source conflict, re-probe needed ({_bounded(getattr(exc, 'code', 'error'))})"
+            "housekeeping import: source "
+            f"{plan.source_id[:12]} conflict, re-probe needed "
+            f"({_bounded(getattr(exc, 'code', 'error'))})"
         )
         return
     except (HousekeepingStreamError, OSError) as exc:
@@ -1625,6 +1816,7 @@ def _audit(store: CheckpointStore, key: GuestKey, wires: Sequence[Dict[str, Any]
     records = list(store.sources(key))
     by_inode: Dict[Tuple[int, int], SourceRecord] = {}
     by_path: Dict[str, SourceRecord] = {}
+    by_id = {record.source_id: record for record in records}
     record: Optional[SourceRecord]
     for record in records:
         by_inode.setdefault((record.device, record.inode), record)
@@ -1635,7 +1827,7 @@ def _audit(store: CheckpointStore, key: GuestKey, wires: Sequence[Dict[str, Any]
     covered: List[Dict[str, Any]] = []
     pending_findings = 0
     for wire in wires:
-        record = by_inode.get((wire["device"], wire["inode"])) or by_path.get(wire["path"])
+        record = _match_record(by_inode, by_path, by_id, wire)
         if record is None or not sources.prefix_complete_for_current(record, wire):
             pending_findings += 1
             continue

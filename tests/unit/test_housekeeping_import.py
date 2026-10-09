@@ -27,7 +27,12 @@ import zstandard
 from proxmox_fleet import housekeeping_import as hi
 from proxmox_fleet import housekeeping_io as hio
 from proxmox_fleet import housekeeping_sources as sources
-from proxmox_fleet.housekeeping_checkpoint import CheckpointStore, GuestKey
+from proxmox_fleet.housekeeping_checkpoint import (
+    CheckpointStore,
+    GuestKey,
+    PruneIntent,
+    SourceIdentity,
+)
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.runner import PrimitiveResult
 
@@ -1470,3 +1475,424 @@ def test_pending_body_and_tombstone_survive_crash_until_acknowledged(env):
         assert store.initial_manifest_state(KEY).acknowledged == 1
     finally:
         store.close()
+
+
+# --------------------------------------------------------------------------- #
+# PBS task logical identity vs. device+inode re-use
+# --------------------------------------------------------------------------- #
+
+PBS_TASK_ROOT = "/var/log/proxmox-backup/tasks"
+OLD_UPID = "UPID:pbs:000000E6:00001AD4:00000008:69EF5DD5:backup:ct-100:root@pam:"
+NEW_UPID = "UPID:pbs:000000F5:00003BD7:000004D2:6AC8D749:backup:ct-101:root@pam:"
+
+
+def _task_path(fanout: str, upid: str) -> str:
+    return f"{PBS_TASK_ROOT}/{fanout}/{upid}"
+
+
+def _reuse_inode(guest: Path, old_path: str, new_path: str, new_data: bytes) -> None:
+    """Recreate *new_path* on the exact inode *old_path* occupied."""
+    old = guest / old_path.lstrip("/")
+    new = guest / new_path.lstrip("/")
+    new.parent.mkdir(parents=True, exist_ok=True)
+    before = os.stat(old)
+    os.link(old, new)
+    os.unlink(old)
+    new.write_bytes(new_data)
+    after = os.stat(new)
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+
+
+def _archive_one(executor, store, url: str, guest: Path, path: str, key: GuestKey = KEY):
+    return hi.import_guest_logs(
+        executor, _settings(url), store, key, name="pbs-ct",
+        files=[_wire(guest, path, profile="pbs", log_kind="task")],
+        sleep=lambda _s: None,
+    )
+
+
+def _poison_reassigned(
+    guest: Path,
+    store: CheckpointStore,
+    *,
+    old_path: str,
+    old_id: str,
+    old_record,
+    new_path: str,
+    proof: str,
+) -> None:
+    """Reproduce the bug's rewrite of a canonical PBS task row onto a new task."""
+    st = os.stat(guest / new_path.lstrip("/"))
+    provenance = sources.SourceProvenance.parse(old_record.provenance)
+    buggy = SourceIdentity(
+        path=new_path,
+        device=int(st.st_dev),
+        inode=int(st.st_ino),
+        size=int(st.st_size),
+        mtime_ns=int(st.st_mtime_ns),
+        allocated_bytes=int(st.st_blocks) * 512,
+        compression="plain",
+        profile="pbs",
+        log_kind="task",
+        is_active=False,
+    )
+    alias = {
+        "path": new_path,
+        "device": int(st.st_dev),
+        "inode": int(st.st_ino),
+        "size": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns),
+    }
+    store.record_source(
+        KEY,
+        old_id,
+        buggy,
+        provenance=provenance.with_verification(
+            verified_raw_size=0, conflict=True
+        ).as_dict(),
+        aliases=[alias],
+        in_initial_manifest=old_record.in_initial_manifest,
+        capture_id=old_record.capture_id,
+        blob_path=old_record.blob_path,
+    )
+    digest = "0" * 64 if proof == "mismatch" else old_record.digest
+    intent = PruneIntent(
+        intent_id="poison-1",
+        key=KEY,
+        path=old_path,
+        quarantine_path="/var/tmp/fleet-housekeeping-quarantine/poison-1",
+        device=old_record.device,
+        inode=old_record.inode,
+        size=provenance.complete_size,
+        mtime_ns=old_record.mtime_ns,
+        source_id=old_id,
+        digest=digest,
+        state="pending",
+    )
+    store.record_prune_intent(intent)
+    if proof == "done":
+        store.resolve_prune_intent("poison-1", "done")
+
+
+@pytest.mark.parametrize("new_data", [b"unrelated-new-task\nsecond-line\n", b"old-task-alpha\nold-task-beta\n"])
+def test_distinct_pbs_task_reusing_inode_gets_independent_identity(env, new_data: bytes) -> None:
+    """A new task that re-used a reclaimed task's inode never borrows its ACK."""
+    guest, _spool, executor, store = env
+    old_path = _task_path("D4", OLD_UPID)
+    old_data = b"old-task-alpha\nold-task-beta\n"
+    new_path = _task_path("D7", NEW_UPID)
+    _write(guest, old_path, old_data)
+
+    with LokiServer() as server:
+        first = _archive_one(executor, store, server.url, guest, old_path)
+    assert first.failed is False
+    old_id = hi.base_source_id("pbs", "task", old_path)
+    old_record = store.source(KEY, old_id)
+    assert old_record is not None and old_record.acknowledged
+    assert old_record.digest == hashlib.sha256(old_data).hexdigest()
+    assert {row["path"] for row in first.covered_files} == {old_path}
+
+    # The old task is reclaimed, then a different task re-uses its inode.
+    _reuse_inode(guest, old_path, new_path, new_data)
+
+    with LokiServer() as second:
+        result = _archive_one(executor, store, second.url, guest, new_path)
+    assert result.failed is False
+
+    new_id = hi.base_source_id("pbs", "task", new_path)
+    assert new_id != old_id
+    new_record = store.source(KEY, new_id)
+    assert new_record is not None and new_record.acknowledged
+    assert new_record.digest == hashlib.sha256(new_data).hexdigest()
+
+    # The original canonical frozen/ACK record is retained, untouched.
+    retained = store.source(KEY, old_id)
+    assert retained.path == old_path
+    assert retained.digest == old_record.digest
+    assert sources.SourceProvenance.parse(retained.provenance).complete is True
+
+    # Only the new task is covered, on its own full-content fingerprint.
+    assert {row["path"] for row in result.covered_files} == {new_path}
+    assert result.covered_files[0]["sha256"] == hashlib.sha256(new_data).hexdigest()
+    # Its bytes are archived whole, from offset zero; the old prefix is not replayed.
+    assert _reconstruct(_iter_entries(second)) == new_data
+
+
+@pytest.mark.parametrize(("old_kind", "new_kind"), [("api", "task"), ("task", "api")])
+def test_reused_inode_cannot_cross_log_namespaces(env, old_kind: str, new_kind: str) -> None:
+    guest, _spool, executor, store = env
+    paths = {
+        "api": "/var/log/proxmox-backup/api/access.log.2",
+        "task": _task_path("D4", OLD_UPID),
+    }
+    old_path, new_path = paths[old_kind], paths[new_kind]
+    old_data, new_data = b"old namespace\n", b"independent new namespace\n"
+    _write(guest, old_path, old_data)
+    with LokiServer() as server:
+        first = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="pbs",
+            files=[_wire(guest, old_path, profile="pbs", log_kind=old_kind)],
+            sleep=lambda _s: None,
+        )
+    assert not first.failed
+    old_id = hi.base_source_id("pbs", old_kind, old_path)
+    old_record = store.source(KEY, old_id)
+    assert old_record is not None and old_record.acknowledged
+    _reuse_inode(guest, old_path, new_path, new_data)
+    with LokiServer() as server:
+        second = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="pbs",
+            files=[_wire(guest, new_path, profile="pbs", log_kind=new_kind)],
+            sleep=lambda _s: None,
+        )
+    assert not second.failed
+    new_id = hi.base_source_id("pbs", new_kind, new_path)
+    new_record = store.source(KEY, new_id)
+    assert new_record is not None and new_record.acknowledged
+    assert new_record.digest == hashlib.sha256(new_data).hexdigest()
+    assert _reconstruct(_iter_entries(server)) == new_data
+    retained = store.source(KEY, old_id)
+    assert retained.path == old_path
+    assert retained.digest == old_record.digest
+    assert {row["path"] for row in second.covered_files} == {new_path}
+
+
+def test_pbs_same_task_rename_and_append_stays_one_source(env):
+    """A legitimate same-UPID rename/append keeps lineage and is not replayed."""
+    guest, _spool, executor, store = env
+    path_a = _task_path("D4", OLD_UPID)
+    initial = b"task-line-one\n"
+    _write(guest, path_a, initial)
+    with LokiServer() as server:
+        first = _archive_one(executor, store, server.url, guest, path_a)
+    assert first.failed is False
+    source_id = hi.base_source_id("pbs", "task", path_a)
+
+    path_b = _task_path("E4", OLD_UPID)
+    (guest / path_b.lstrip("/")).parent.mkdir(parents=True, exist_ok=True)
+    os.rename(guest / path_a.lstrip("/"), guest / path_b.lstrip("/"))
+    with open(guest / path_b.lstrip("/"), "ab") as handle:
+        handle.write(b"task-line-two\n")
+
+    with LokiServer() as second:
+        result = _archive_one(executor, store, second.url, guest, path_b)
+    assert result.failed is False
+    records = [r for r in store.sources(KEY) if r.profile == "pbs" and r.log_kind == "task"]
+    assert len(records) == 1
+    assert records[0].source_id == source_id
+    # Only the appended tail is pushed; the acknowledged prefix is never replayed.
+    assert _reconstruct(_iter_entries(second)) == b"task-line-two\n"
+    assert {row["path"] for row in result.covered_files} == {path_b}
+    assert result.covered_files[0]["sha256"] == hashlib.sha256(initial + b"task-line-two\n").hexdigest()
+
+
+def test_pbs_same_task_prefix_mutation_blocks(env):
+    """A rewritten prefix on the same task path stays fail-closed."""
+    guest, _spool, executor, store = env
+    path = _task_path("D4", OLD_UPID)
+    _write(guest, path, b"alpha\nbeta\n")
+    with LokiServer() as server:
+        first = _archive_one(executor, store, server.url, guest, path)
+    assert first.failed is False
+    count = len(server.requests)
+
+    _write(guest, path, b"REWRITTEN-prefix\nnew-tail\n")
+    with LokiServer() as second:
+        result = _archive_one(executor, store, second.url, guest, path)
+    assert result.failed is True
+    assert result.covered_files == []
+    assert second.requests == [] and len(server.requests) == count
+
+
+def test_resumed_poisoned_task_row_is_restored_from_durable_proof(env):
+    """A row already rewritten to another task recovers only from exact proof."""
+    guest, _spool, executor, store = env
+    old_path = _task_path("D4", OLD_UPID)
+    old_data = b"old-task\n"
+    new_path = _task_path("D7", NEW_UPID)
+    new_data = b"different-task-bytes\nline-two\n"
+    _write(guest, old_path, old_data)
+    with LokiServer() as server:
+        first = _archive_one(executor, store, server.url, guest, old_path)
+    assert first.failed is False
+
+    old_id = hi.base_source_id("pbs", "task", old_path)
+    old_record = store.source(KEY, old_id)
+    assert old_record is not None and old_record.digest is not None
+    _reuse_inode(guest, old_path, new_path, new_data)
+    _poison_reassigned(
+        guest, store, old_path=old_path, old_id=old_id, old_record=old_record,
+        new_path=new_path, proof="done",
+    )
+    poisoned = store.source(KEY, old_id)
+    assert poisoned is not None
+    assert poisoned.path == new_path and poisoned.digest == old_record.digest
+    assert sources.SourceProvenance.parse(poisoned.provenance).coverage_conflict is True
+
+    with LokiServer() as second:
+        result = _archive_one(executor, store, second.url, guest, new_path)
+    assert result.failed is False
+
+    restored = store.source(KEY, old_id)
+    assert restored is not None
+    assert restored.path == old_path
+    assert restored.digest == old_record.digest
+    provenance = sources.SourceProvenance.parse(restored.provenance)
+    assert provenance.complete is True and provenance.coverage_conflict is False
+    assert restored.absent is True
+
+    new_id = hi.base_source_id("pbs", "task", new_path)
+    assert new_id != old_id
+    new_record = store.source(KEY, new_id)
+    assert new_record is not None and new_record.acknowledged
+    assert new_record.digest == hashlib.sha256(new_data).hexdigest()
+    assert {row["path"] for row in result.covered_files} == {new_path}
+    assert _reconstruct(_iter_entries(second)) == new_data
+
+
+def test_poisoned_task_row_pending_capsule_repairs_without_inferring_deletion(env):
+    """A pending capsule proves the archived identity but never a deletion."""
+    guest, _spool, executor, store = env
+    old_path = _task_path("D4", OLD_UPID)
+    new_path = _task_path("D7", NEW_UPID)
+    new_data = b"pending-proof-task\n"
+    _write(guest, old_path, b"old-task\n")
+    with LokiServer() as server:
+        first = _archive_one(executor, store, server.url, guest, old_path)
+    assert first.failed is False
+
+    old_id = hi.base_source_id("pbs", "task", old_path)
+    old_record = store.source(KEY, old_id)
+    assert old_record is not None and old_record.digest is not None
+    _reuse_inode(guest, old_path, new_path, new_data)
+    _poison_reassigned(
+        guest, store, old_path=old_path, old_id=old_id, old_record=old_record,
+        new_path=new_path, proof="pending",
+    )
+
+    with LokiServer() as second:
+        result = _archive_one(executor, store, second.url, guest, new_path)
+    assert result.failed is False  # reachable, not blocked
+
+    restored = store.source(KEY, old_id)
+    assert restored is not None
+    assert restored.path == old_path
+    assert restored.digest == old_record.digest
+    assert sources.SourceProvenance.parse(restored.provenance).complete is True
+    assert restored.absent is False  # pending proof never infers deletion
+    assert store.prune_intent("poison-1").state == "pending"  # intent untouched
+
+    new_id = hi.base_source_id("pbs", "task", new_path)
+    assert new_id != old_id
+    new_record = store.source(KEY, new_id)
+    assert new_record is not None and new_record.acknowledged
+    assert new_record.digest == hashlib.sha256(new_data).hexdigest()
+    assert _reconstruct(_iter_entries(second)) == new_data
+
+
+def test_poisoned_task_row_with_mismatching_proof_stays_blocked(env):
+    """A mismatching capsule is not proof: the row is never guessed at."""
+    guest, _spool, executor, store = env
+    old_path = _task_path("D4", OLD_UPID)
+    new_path = _task_path("D7", NEW_UPID)
+    new_data = b"cannot-trust-me\n"
+    _write(guest, old_path, b"old-task\n")
+    with LokiServer() as server:
+        first = _archive_one(executor, store, server.url, guest, old_path)
+    assert first.failed is False
+
+    old_id = hi.base_source_id("pbs", "task", old_path)
+    old_record = store.source(KEY, old_id)
+    assert old_record is not None and old_record.digest is not None
+    _reuse_inode(guest, old_path, new_path, new_data)
+    _poison_reassigned(
+        guest, store, old_path=old_path, old_id=old_id, old_record=old_record,
+        new_path=new_path, proof="mismatch",
+    )
+
+    with LokiServer() as second:
+        result = _archive_one(executor, store, second.url, guest, new_path)
+    assert result.failed is True
+    # The known row is not mutated on a guess; the new task is still archived
+    # under its own identity, from zero, on its own fingerprint.
+    untrusted = store.source(KEY, old_id)
+    assert untrusted is not None and untrusted.path == new_path
+    assert store.prune_intent("poison-1").state == "pending"
+    new_id = hi.base_source_id("pbs", "task", new_path)
+    new_record = store.source(KEY, new_id)
+    assert new_record is not None and new_record.acknowledged
+    assert new_record.digest == hashlib.sha256(new_data).hexdigest()
+    assert _reconstruct(_iter_entries(second)) == new_data
+    # An unrepairable row must not shadow the independently acknowledged task.
+    with LokiServer() as repeated:
+        resumed = _archive_one(executor, store, repeated.url, guest, new_path)
+    assert resumed.failed
+    assert repeated.requests == []
+    assert store.source(KEY, new_id).acknowledged
+    assert store.source(KEY, new_id).digest == hashlib.sha256(new_data).hexdigest()
+    audited = hi.import_guest_logs(
+        executor, _settings(repeated.url), store, KEY, name="pbs",
+        files=[_wire(guest, new_path, profile="pbs", log_kind="task")],
+        dry_run=True, sleep=lambda _s: None,
+    )
+    assert {row["path"] for row in audited.covered_files} == {new_path}
+
+
+def test_cross_cluster_task_identity_is_isolated(env):
+    """Identical node/LXC ids in another cluster keep independent task rows."""
+    guest, _spool, executor, store = env
+    path = _task_path("D4", OLD_UPID)
+    _write(guest, path, b"cluster-a task\n")
+    other = GuestKey("cluster-b", "node-1", "120")
+    with LokiServer() as server:
+        _archive_one(executor, store, server.url, guest, path)
+    with LokiServer() as second:
+        _archive_one(executor, store, second.url, guest, path, key=other)
+    source_id = hi.base_source_id("pbs", "task", path)
+    assert store.source(KEY, source_id) is not None
+    assert store.source(other, source_id) is not None
+    assert store.source(KEY, source_id).key == KEY
+    assert store.source(other, source_id).key == other
+
+
+@pytest.mark.parametrize(
+    ("suffix", "compression"),
+    [(".gz", "gzip"), (".zst", "zstd"), (".zstd", "zstd")],
+)
+def test_pbs_task_compression_preserves_logical_identity_without_replay(
+    env, suffix: str, compression: str,
+) -> None:
+    guest, _spool, executor, store = env
+    path = _task_path("D4", OLD_UPID)
+    payload = b"task started\ntask completed\n"
+    plain = _write(guest, path, payload)
+    with LokiServer() as server:
+        first = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="pbs",
+            files=[_wire(guest, path, profile="pbs", log_kind="task")],
+            sleep=lambda _s: None,
+        )
+    assert not first.failed
+    assert first.bytes_archived == len(payload)
+    old = next(record for record in store.sources(KEY) if record.path == path)
+    assert old.acknowledged
+    encoded = (
+        gzip.compress(payload) if compression == "gzip"
+        else zstandard.ZstdCompressor().compress(payload)
+    )
+    compressed_path = path + suffix
+    _write(guest, compressed_path, encoded)
+    plain.unlink()
+    with LokiServer() as server:
+        second = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="pbs",
+            files=[_wire(
+                guest, compressed_path, compression=compression, profile="pbs", log_kind="task",
+            )],
+            sleep=lambda _s: None,
+        )
+    assert not second.failed
+    assert server.requests == []
+    assert store.source(KEY, old.source_id).acknowledged
+    covered = next(item for item in second.covered_files if item["path"] == compressed_path)
+    assert covered["sha256"] == hashlib.sha256(encoded).hexdigest()

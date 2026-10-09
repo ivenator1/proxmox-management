@@ -12,7 +12,7 @@ import sys
 import threading
 import urllib.parse
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List
 
 import pytest
 
@@ -598,3 +598,60 @@ def test_crash_resume_boundary_keeps_gates_and_completes_remaining_batches(guest
     assert not store.open_prune_intents(KEY)
     assert all(not guest.path(item["path"]).exists() for item in covered)
     assert all(not warnings_for(second, item["path"]) for item in covered)
+
+
+@pytest.mark.parametrize("prior_rotation", [False, True])
+@pytest.mark.parametrize("reopen_moves_writer", [False, True])
+def test_rotation_requires_observed_writer_reopen(
+    tmp_path: Path, store: CheckpointStore, prior_rotation: bool, reopen_moves_writer: bool,
+) -> None:
+    """A successful signal is insufficient unless writes leave the rotated inode."""
+    current = "/data/logs/proxy_access.log"
+    rotated = "/data/logs/proxy_access.log-20261009T000000"
+
+    class WriterGuest(Guest):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.put(current, "" if prior_rotation else "before rotation\n")
+            if prior_rotation:
+                self.put(rotated, "before rotation\n")
+            self.writer = self.path(rotated if prior_rotation else current).open("ab")
+
+        def wire(self, name: str) -> Dict[str, Any]:
+            value = super().wire(name)
+            held = os.fstat(self.writer.fileno())
+            value["is_active"] = (value["device"], value["inode"]) == (held.st_dev, held.st_ino)
+            return value
+
+        def housekeeping_apply(self, lxc_id: str, *, command: str) -> PrimitiveResult:
+            parts = shlex.split(command)
+            if parts[0] == "logrotate" and not self.path(rotated).exists():
+                self.path(current).rename(self.path(rotated))
+                self.put(current, "")
+                return PrimitiveResult(rc=0)
+            if parts[:2] == ["systemctl", "kill"] and parts[-1] == "openresty.service":
+                if reopen_moves_writer:
+                    self.writer.close()
+                    self.writer = self.path(current).open("ab")
+                return PrimitiveResult(rc=0)
+            return super().housekeeping_apply(lxc_id, command=command)
+
+    root = tmp_path / "writer-guest"
+    root.mkdir()
+    guest = WriterGuest(root)
+    try:
+        with Loki(guest) as loki:
+            result = run(guest, store, loki)
+        guest.writer.write(b"after maintenance\n")
+        guest.writer.flush()
+        assert not guest.pruned
+        if reopen_moves_writer:
+            assert not result.failed
+            assert guest.path(current).read_bytes() == b"after maintenance\n"
+            assert guest.path(rotated).read_bytes() == b"before rotation\n"
+        else:
+            assert result.failed
+            assert guest.path(current).read_bytes() == b""
+            assert guest.path(rotated).read_bytes() == b"before rotation\nafter maintenance\n"
+    finally:
+        guest.writer.close()

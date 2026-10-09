@@ -32,6 +32,7 @@ from proxmox_fleet.housekeeping_io import (
     QUARANTINE_DIRNAME,
     REQUIRED_BINARIES,
 )
+from proxmox_fleet.housekeeping_sources import SourceProvenance, logical_identity
 from proxmox_fleet.models.state import HousekeepingSummary
 
 if TYPE_CHECKING:  # avoid a runtime executor/flow cycle; used for typing only
@@ -863,9 +864,20 @@ def run_housekeeping(
                         findings |= retained.findings
                         configured |= retained.changed
                     if not dry_run:
-                        present = {(wire["device"], wire["inode"]) for wire in files}
+                        present = {
+                            (
+                                wire["profile"], wire["log_kind"], wire["device"], wire["inode"],
+                                logical_identity(wire["profile"], wire["log_kind"], wire["path"]),
+                            )
+                            for wire in files
+                        }
                         for source in store.sources(key):
-                            if (source.device, source.inode) in present:
+                            canonical = SourceProvenance.parse(source.provenance).canonical_path or source.path
+                            identity = (
+                                source.profile, source.log_kind, source.device, source.inode,
+                                logical_identity(source.profile, source.log_kind, canonical),
+                            )
+                            if identity in present:
                                 if source.absent:
                                     store.clear_source_absent(key, source.source_id)
                             elif not source.absent:

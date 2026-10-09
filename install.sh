@@ -15,7 +15,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$REPO_DIR/.venv"
 PIP="$VENV/bin/pip"
-UNIT_DIR="/etc/systemd/system"
+UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"   # overridable for testing without touching the real systemd dir
 # Fallback when the venv/vars.yml don't exist yet (e.g. --uninstall after a
 # broken install); everywhere else the value comes from the package via
 # resolve_setting fleet_history_dir, so a custom dir in vars.yml is honored.
@@ -26,6 +26,9 @@ HOUSEKEEPING_SERVICE="fleet-housekeeping.service"
 HOUSEKEEPING_TIMER="fleet-housekeeping.timer"
 DASH_SERVICE="fleet-dashboard.service"
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"   # overridable for testing without systemd
+# The original invocation (flags/options), so --update can re-exec the freshly
+# pulled installer with exactly the same arguments after install.sh itself lands.
+SCRIPT_ARGS=("$@")
 
 info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33mWARNING:\033[0m %s\n' "$*" >&2; }
@@ -321,8 +324,32 @@ do_install() {
 # --- update ------------------------------------------------------------------
 
 do_update() {
+    # The installer is executed as a whole file, so shell functions are parsed
+    # before `git pull` runs: an install.sh updated by the pull would otherwise
+    # be ignored until the *next* invocation (the observed bug where new unit
+    # logic, e.g. the scoped --limit, never reached the installed service).
+    # Detect a content change in install.sh across the pull and re-exec the
+    # freshly pulled script with the original arguments, so the new logic runs
+    # in this very invocation. FLEET_INSTALLER_REEXEC guards against a re-exec
+    # loop: the re-executed script sees its own now-unchanged content and
+    # proceeds with a normal single-pass update.
+    local installer_before installer_after
+    installer_before=$(sha256sum "$REPO_DIR/install.sh" 2>/dev/null | awk '{print $1}') || true
+
     info "Pulling latest changes ($(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD))"
-    git -C "$REPO_DIR" pull --ff-only
+    # A failed pull must not continue into dependency/unit work against a
+    # half-updated tree — abort and leave the existing install untouched.
+    if ! git -C "$REPO_DIR" pull --ff-only; then
+        die "git pull failed — aborting update before installing anything"
+    fi
+
+    installer_after=$(sha256sum "$REPO_DIR/install.sh" 2>/dev/null | awk '{print $1}') || true
+    if [ "${FLEET_INSTALLER_REEXEC:-0}" != "1" ] \
+        && [ -n "$installer_before" ] && [ "$installer_before" != "$installer_after" ]; then
+        info "Install script changed during the pull — re-executing the updated installer"
+        FLEET_INSTALLER_REEXEC=1 exec "$REPO_DIR/install.sh" "${SCRIPT_ARGS[@]}"
+    fi
+
     install_python_deps
     write_units
     "$SYSTEMCTL" daemon-reload

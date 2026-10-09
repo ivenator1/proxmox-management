@@ -50,6 +50,7 @@ __all__ = [
     "npm_remaining_content",
     "npm_cutover_commands",
     "npm_logrotate_command",
+    "npm_reopen_command",
     "read_file_command",
     "write_file_command",
 ]
@@ -400,3 +401,8 @@ def npm_logrotate_command() -> str:
         f"logrotate --state {shlex.quote(NPM_LOGROTATE_STATE)} "
         f"{shlex.quote(NPM_LOGROTATE_MANAGED)}"
     )
+
+
+def npm_reopen_command() -> str:
+    """Signal the known OpenResty service, not a vendor's guessed PID file."""
+    return "systemctl kill --kill-who=main --signal=USR1 openresty.service"

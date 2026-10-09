@@ -30,11 +30,14 @@ __all__ = [
     "SourceProvenance",
     "current_coverage",
     "current_log_name",
+    "identity_compatible",
     "is_prefix_complete",
     "lineage_predecessor",
+    "logical_identity",
     "next_generation",
     "prefix_complete_for_current",
     "same_generation",
+    "same_logical_source",
 ]
 
 
@@ -206,6 +209,56 @@ def current_log_name(profile: str, log_kind: str, path: str) -> bool:
     return False
 
 
+def _plain_log_path(path: str) -> str:
+    for suffix in (".gz", ".zst", ".zstd"):
+        if path.endswith(suffix):
+            return path[:-len(suffix)]
+    return path
+
+
+def logical_identity(profile: str, log_kind: str, path: str) -> Optional[str]:
+    """The task identity embedded in a log's filename, when there is one.
+
+    A PBS task log's filename *is* its UPID, which names exactly one task:
+    re-using a device+inode for a *different* task is filesystem happenstance,
+    never archive lineage.  The fan-out directory is derived from the UPID, so
+    the basename stays stable across any legitimate rename of the same task.
+    Every other kind has no filename-embedded identity and returns ``None``.
+    """
+    if profile != "pbs" or log_kind != "task":
+        return None
+    return posixpath.basename(_plain_log_path(path))
+
+
+def same_logical_source(profile: str, log_kind: str, path_a: str, path_b: str) -> bool:
+    """True unless *path_a* carries an identity that *path_b* does not share.
+
+    Only the identity-bearing kinds can be unequal, so an NPM rotate or a plain
+    append keeps its previous behaviour while a different PBS task UPID can
+    never inherit another task's record.
+    """
+    identified = logical_identity(profile, log_kind, path_a)
+    if identified is None:
+        return True
+    return identified == logical_identity(profile, log_kind, path_b)
+
+
+def identity_compatible(record: SourceRecord, wire: Optional[Dict[str, Any]]) -> bool:
+    """True when *wire* may belong to *record*'s logical source.
+
+    Uses the record's *canonical* path from its durable provenance, so a record
+    that an earlier build already rewrote to another task's path is still
+    recognised as belonging to its original task and cannot be re-associated
+    with the impostor by the re-used device+inode.
+    """
+    if wire is None:
+        return True
+    if record.profile != wire["profile"] or record.log_kind != wire["log_kind"]:
+        return False
+    canonical = SourceProvenance.parse(record.provenance).canonical_path or record.path
+    return same_logical_source(record.profile, record.log_kind, canonical, str(wire["path"]))
+
+
 def current_coverage(
     record: Optional[SourceRecord], wire: Optional[Dict[str, Any]]
 ) -> Optional[CurrentCoverage]:
@@ -255,6 +308,8 @@ def same_generation(record: SourceRecord, wire: Optional[Dict[str, Any]], curren
     """True when *wire* is the same logical source (rename or append), not a reset."""
     if wire is None:
         return True
+    if not identity_compatible(record, wire):
+        return False
     if wire["compression"] != record.compression:
         return False
     if (record.device, record.inode) != (wire["device"], wire["inode"]):
@@ -274,7 +329,7 @@ def prefix_complete_for_current(record: SourceRecord, wire: Optional[Dict[str, A
     (``complete``/``complete_size``) must match the current identity's size, so a
     frozen prefix on a grown live file is never treated as complete.
     """
-    if wire is None or not is_prefix_complete(record):
+    if wire is None or not identity_compatible(record, wire) or not is_prefix_complete(record):
         return False
     provenance = SourceProvenance.parse(record.provenance)
     if (record.device, record.inode) != (wire["device"], wire["inode"]):
@@ -287,12 +342,8 @@ def lineage_predecessor(records: Sequence[SourceRecord], wire: Dict[str, Any]) -
     if wire["compression"] not in ("gzip", "zstd"):
         return None
     path = wire["path"]
-    predecessor_path = None
-    for suffix in (".gz", ".zst"):
-        if path.endswith(suffix):
-            predecessor_path = path[: -len(suffix)]
-            break
-    if predecessor_path is None:
+    predecessor_path = _plain_log_path(path)
+    if predecessor_path == path:
         return None
     for record in records:
         if (

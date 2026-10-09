@@ -1336,7 +1336,7 @@ def apply_guest_retention(
     npm_managed_content: Optional[str] = None
     if "npm" in recognized:
         npm_changed, npm_managed_content, npm_error = _apply_npm_cutover(
-            executor, key, probe, warnings
+            executor, key, probe
         )
         if npm_error is not None:
             return RetentionResult(
@@ -1565,11 +1565,34 @@ def _persist_verification(
     return None
 
 
+def _reopen_rotated_npm_writers(
+    executor: Executor, key: GuestKey, probe: Optional[HousekeepingProbe] = None,
+) -> Tuple[bool, Optional[str]]:
+    """Repair only observed stale writers; verify their fds actually moved."""
+    try:
+        before = probe if probe is not None else probe_housekeeping(executor, key.lxc_id)
+        if not before.is_running or before.is_template:
+            return False, "NPM writer state is unavailable for a stopped guest or template"
+        if _lingering_npm_writer(before.files) is None:
+            return False, None
+        error, _ = _apply(executor, key.lxc_id, native.npm_reopen_command())
+        if error is not None:
+            return False, f"OpenResty log reopen failed: {error}"
+        after = probe_housekeeping(executor, key.lxc_id)
+        if not after.is_running or after.is_template:
+            return False, "NPM guest state changed during log reopen"
+        lingering = _lingering_npm_writer(after.files)
+        if lingering is not None:
+            return False, f"OpenResty still has a rotated writable log ({lingering}); rotation paused"
+        return True, None
+    except Exception as exc:
+        return False, f"NPM writer state is unknown ({type(exc).__name__}); rotation paused"
+
+
 def _apply_npm_cutover(
     executor: Executor,
     key: GuestKey,
     probe: HousekeepingProbe,
-    warnings: List[str],
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     status, original, error = _read_guest_file(executor, key.lxc_id, native.NPM_LOGROTATE_ORIGINAL)
     if status == "error":
@@ -1613,18 +1636,16 @@ def _apply_npm_cutover(
             return changed, managed_content, f"NPM logrotate cutover failed: {error}"
         changed = True
 
-    lingering = _lingering_npm_writer(probe.files)
-    if lingering is not None:
-        warnings.append(
-            f"a rotated NPM file still has a writable fd ({lingering}); skipping the hourly "
-            "rotation this run so compression cannot discard a lingering writer's tail"
-        )
-        return changed, managed_content, None
+    reopened, error = _reopen_rotated_npm_writers(executor, key, probe)
+    changed |= reopened
+    if error is not None:
+        return changed, managed_content, error
 
     error, _ = _apply(executor, key.lxc_id, native.npm_logrotate_command())
     if error is not None:
         return changed, managed_content, f"NPM logrotate run failed: {error}"
-    return changed, managed_content, None
+    reopened, error = _reopen_rotated_npm_writers(executor, key)
+    return changed or reopened, managed_content, error
 
 
 def _audit(
@@ -1697,7 +1718,7 @@ def _audit(
             if parsed_managed.ambiguous or native.build_npm_managed_logrotate(parsed_managed.npm_blocks) != current_managed:
                 findings.append("managed NPM rotation directives require safe reconciliation")
         if _lingering_npm_writer(probe.files) is not None:
-            findings.append("a rotated NPM file still has a writable fd; rotation would be skipped")
+            findings.append("a rotated NPM writable log requires verified service-based reopen before rotation")
 
     if manifest_error is None and verified and ready and acl_error is None:
         candidates, _warnings = plan_prune_candidates(
