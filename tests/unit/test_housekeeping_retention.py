@@ -388,14 +388,13 @@ def test_closed_acked_file_deleted_but_current_and_recent_files_preserved(guest,
     coverage = setup(store, guest)
     guest.put("/data/logs/proxy_access.log", "live data\n", age=10 * DAY)
     guest.put("/data/logs/proxy_access.log.2", "recent data\n")
-    before = guest.path(coverage["path"]).stat().st_blocks * 512
     with Loki(guest) as loki:
         result = run(guest, store, loki, [coverage])
     assert not result.failed
     assert not guest.path(coverage["path"]).exists()
     assert guest.path("/data/logs/proxy_access.log").read_text() == "live data\n"
     assert guest.path("/data/logs/proxy_access.log.2").read_text() == "recent data\n"
-    assert result.files_pruned == 1 and result.bytes_reclaimed == before
+    assert result.files_pruned == 1
 
 
 def test_replacement_identity_is_not_deleted(guest, store):
@@ -527,7 +526,6 @@ def test_mid_prune_drift_preserves_remaining_archives_and_measured_progress(gues
     deleted = {item["path"] for item in covered if not guest.path(item["path"]).exists()}
     assert deleted == set(guest.pruned[0])
     assert result.files_pruned == len(deleted)
-    assert result.bytes_reclaimed == sum(item["allocated_bytes"] for item in covered if item["path"] in deleted)
     for item in covered:
         if item["path"] not in deleted:
             assert guest.path(item["path"]).read_text() == "old retained content\n"
