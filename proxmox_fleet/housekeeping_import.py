@@ -973,7 +973,12 @@ def _match_record(
     ):
         return candidate
     record = by_inode.get((wire["device"], wire["inode"]))
-    if record is not None and not sources.identity_compatible(record, wire):
+    # Compression changes raw identity. A reused inode must not bypass the
+    # filename-family predecessor's decoded-content proof.
+    if record is not None and (
+        record.compression != wire["compression"]
+        or not sources.identity_compatible(record, wire)
+    ):
         record = None
     if record is None:
         candidate = by_path.get(wire["path"])
@@ -1166,6 +1171,7 @@ def _plan_sources(state: _ImportState, wires: Sequence[Dict[str, Any]]) -> List[
                 manifest_source = blob_by_source.get(base_id)
                 if (
                     manifest_source is None
+                    or manifest_source.compression != wire["compression"]
                     or base_id != base_source_id(wire["profile"], wire["log_kind"], manifest_source.source_path)
                     or not sources.same_logical_source(
                         wire["profile"], wire["log_kind"], manifest_source.source_path, wire["path"]

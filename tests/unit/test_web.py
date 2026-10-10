@@ -10,6 +10,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -836,6 +837,33 @@ def _manager(tmp_path, code):
     return RunManager(tmp_path, command=[sys.executable, "-c", code])
 
 
+class _GatedWatcherManager(RunManager):
+    """RunManager whose watcher pauses after the child exits but before it
+    publishes ``rc``/``finished``, using threading.Events so a test can observe
+    the pending-state boundary deterministically instead of racing it.
+
+    ``proc.wait()`` inside :meth:`_watch` reaps the child, so the recorded pid
+    is already dead while the terminal meta is still unwritten. The original
+    watcher body is reused for publication (its own ``proc.wait()`` returns the
+    cached rc), so no production logic is duplicated here.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.child_exited = threading.Event()
+        self.release_terminal = threading.Event()
+        self.watcher_finished = threading.Event()
+
+    def _watch(self, run_id, proc):
+        try:
+            proc.wait()  # child exited; pid now dead, rc cached
+            self.child_exited.set()
+            self.release_terminal.wait(10.0)
+            super()._watch(run_id, proc)
+        finally:
+            self.watcher_finished.set()
+
+
 def test_runmanager_runs_and_records_rc(tmp_path):
     mgr = _manager(tmp_path, "print('alpha'); print('beta')")
     run_id = mgr.start(["--check"])
@@ -895,6 +923,93 @@ def test_runmanager_finalizes_orphaned_meta(tmp_path):
     assert meta["finished"] is not None
     assert meta["rc"] is None
     assert mgr.active_run() is None
+
+
+def test_runmanager_failed_watcher_start_leaves_a_finalizable_orphan(tmp_path, monkeypatch):
+    import subprocess
+
+    launched = []
+    real_popen = subprocess.Popen
+
+    def launch(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        launched.append(proc)
+        return proc
+
+    def fail_start(_thread):
+        raise RuntimeError("watcher unavailable")
+
+    mgr = _manager(tmp_path, "import sys; print('unwatched output'); sys.exit(17)")
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(subprocess, "Popen", launch)
+            patch.setattr(threading.Thread, "start", fail_start)
+            with pytest.raises(RuntimeError, match="watcher unavailable"):
+                mgr.start([])
+        assert launched[0].wait(timeout=10) == 17
+        meta = mgr.list_runs()[0]
+        assert meta["finished"] is not None
+        assert meta["rc"] is None  # No watcher observed the exit status.
+        assert mgr.active_run() is None
+        assert list(mgr.stream(meta["id"], sleep=lambda _: None)) == [
+            {"event": "line", "data": "unwatched output"},
+            {"event": "done", "data": ""},
+        ]
+    finally:
+        for proc in launched:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_runmanager_watched_dead_child_not_orphan_finalized(tmp_path):
+    """A live watcher owns its run between child exit and terminal publication.
+
+    The barrier in :class:`_GatedWatcherManager` pauses the watcher exactly on
+    that boundary: the child (rc 17) has been reaped, so ``read_meta`` would
+    see a dead pid, yet the terminal meta is not published. ``read_meta`` must
+    report the run as still pending (``finished`` None, ``rc`` None) rather
+    than falsely orphan-finalizing it with an unknown outcome. After release
+    the real nonzero rc and output must survive both consumers as exactly one
+    done event.
+    """
+    import asyncio
+
+    mgr = _GatedWatcherManager(
+        tmp_path,
+        command=[sys.executable, "-c", "import sys; print('child says bye'); sys.exit(17)"],
+    )
+    run_id = mgr.start([])
+    try:
+        assert mgr.child_exited.wait(10.0), "child process did not exit"
+        # pid is dead now, but the owning watcher has not published yet.
+        paused = mgr.read_meta(run_id)
+        assert paused["finished"] is None
+        assert paused["rc"] is None
+    finally:
+        mgr.release_terminal.set()
+        assert mgr.watcher_finished.wait(10.0), "watcher did not finish"
+
+    meta = _wait_finished(mgr, run_id)
+    assert meta["rc"] == 17
+    on_disk = json.loads(mgr._meta_path(run_id).read_text(encoding="utf-8"))
+    assert on_disk["finished"] is not None
+    assert on_disk["rc"] == 17
+
+    sync_events = list(mgr.stream(run_id, sleep=lambda s: None))
+    assert [e["data"] for e in sync_events if e["event"] == "line"] == ["child says bye"]
+    assert [e for e in sync_events if e["event"] == "done"] == [
+        {"event": "done", "data": "17"}
+    ]
+
+    async def _collect():
+        return [event async for event in mgr.astream(run_id, poll=0.01)]
+
+    async_events = asyncio.run(_collect())
+    assert async_events == sync_events
+    assert [e for e in async_events if e["event"] == "done"] == [
+        {"event": "done", "data": "17"}
+    ]
 
 
 def test_runmanager_stream_replays_lines_then_done(tmp_path):

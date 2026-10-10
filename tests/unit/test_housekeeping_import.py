@@ -601,6 +601,46 @@ def test_compression_uses_latest_generation_not_newer_absence_timestamp(env):
         ).hexdigest()
 
 
+def test_compression_reuses_verified_family_despite_foreign_inode_reuse(env):
+    guest, _spool, executor, store = env
+    path = "/data/logs/access.log.1"
+    foreign_path = "/data/logs/unrelated.log.1"
+    payload = b"already acknowledged application history\n"
+    plain = _write(guest, path, payload)
+    foreign = _write(guest, foreign_path, b"unrelated archived history\n")
+    with LokiServer() as server:
+        first = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct",
+            files=[_wire(guest, path), _wire(guest, foreign_path)],
+        )
+        assert not first.failed
+        predecessor = next(record for record in store.sources(KEY) if record.path == path)
+        # Reuse a real historical inode for new gzip bytes, without fabricating
+        # probe identities or relying on the filesystem allocator's timing.
+        encoded = gzip.compress(payload)
+        foreign.write_bytes(encoded)
+        compressed = path + ".gz"
+        foreign.rename(guest / compressed.lstrip("/"))
+        plain.unlink()
+        wire = _wire(guest, compressed, compression="gzip")
+        server.requests.clear()
+        successor = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct", files=[wire],
+        )
+        assert not successor.failed
+        assert server.requests == []
+        assert successor.bytes_archived == 0
+        assert successor.covered_files[0]["sha256"] == hashlib.sha256(encoded).hexdigest()
+        record = store.source(KEY, successor.covered_files[0]["source_id"])
+        assert record.provenance["lineage_of"] == predecessor.source_id
+        repeated = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct", files=[wire],
+        )
+        assert not repeated.failed
+        assert repeated.bytes_archived == 0
+        assert server.requests == []
+
+
 def test_replacement_and_truncation_are_fresh_generations(env):
     guest, _spool, executor, store = env
     _write(guest, "/data/logs/access.log.1", b"original\n")

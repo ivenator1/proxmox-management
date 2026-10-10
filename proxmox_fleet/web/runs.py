@@ -19,6 +19,7 @@ import json
 import os
 import subprocess  # nosec B404 - the dashboard's whole job is launching the CLI
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -68,7 +69,18 @@ class RunManager:
             sys.executable, "-u", "-m", "proxmox_fleet.cli",
         ]
         self.cwd = cwd or os.getcwd()
-        self._start_mutex = threading.Lock()
+        # Guards both start/active checks and every meta publication.  A
+        # re-entrant lock because ``start()`` (holding it) calls
+        # ``active_run()`` -> ``list_runs()`` -> ``read_meta()``, which take it
+        # again; watcher/reader serialisation relies on the same lock, so a
+        # plain Lock would self-deadlock.  Watcher threads only take it while
+        # publishing a terminal record or dropping their registration, never
+        # across ``proc.wait()``, so there is no lock-order cycle.
+        self._start_mutex = threading.RLock()
+        # Run ids owned by a live in-process watcher: their child may have
+        # exited before the watcher published the real rc, so an observer must
+        # not orphan-finalize them (that would race the watcher's own write).
+        self._watched: set[str] = set()
 
     # --- paths / meta -----------------------------------------------------
 
@@ -79,21 +91,49 @@ class RunManager:
         return self.runs_dir / f"{run_id}.log"
 
     def _write_meta(self, meta: Dict[str, Any]) -> None:
-        self._meta_path(str(meta["id"])).write_text(
-            json.dumps(meta, indent=4, sort_keys=True), encoding="utf-8",
-        )
+        """Atomically replace one run's meta record.
+
+        ``tempfile`` + ``os.replace`` in the same directory (the repository's
+        state-file convention) so a concurrent reader always parses a complete
+        JSON document instead of a truncated write.  The temp file is removed
+        if the replace never happened.
+        """
+        path = self._meta_path(str(meta["id"]))
+        text = json.dumps(meta, indent=4, sort_keys=True)
+        mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            os.chmod(tmp, mode)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def read_meta(self, run_id: str) -> Dict[str, Any]:
         """Read one run's meta record; finalizes it first if the child died
         without a watcher (e.g. the dashboard restarted mid-run): ``finished``
-        is set but ``rc`` stays None ("outcome unknown — see the log")."""
-        data = json.loads(self._meta_path(run_id).read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError(f"unexpected run meta for {run_id!r}: not a JSON object")
-        if data.get("finished") is None and not _pid_alive(int(data.get("pid", 0))):
-            data["finished"] = _ts_now()
-            self._write_meta(data)
-        return data
+        is set but ``rc`` stays None ("outcome unknown — see the log").
+
+        A run this manager still watches is never finalized here: its child may
+        already be dead while the watcher is about to publish the real rc, so
+        the record stays pending until that write lands."""
+        with self._start_mutex:
+            data = json.loads(self._meta_path(run_id).read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError(f"unexpected run meta for {run_id!r}: not a JSON object")
+            if (
+                data.get("finished") is None
+                and run_id not in self._watched
+                and not _pid_alive(int(data.get("pid", 0)))
+            ):
+                data["finished"] = _ts_now()
+                self._write_meta(data)
+            return data
 
     def list_runs(self, limit: int = 20) -> List[Dict[str, Any]]:
         """Newest-first meta records of dashboard-triggered runs.
@@ -161,20 +201,41 @@ class RunManager:
                     start_new_session=True,
                 )
             meta["pid"] = proc.pid
-            self._write_meta(meta)
+            # Claim local ownership *before* the initial record is visible:
+            # otherwise a reader could observe finished=None with the (possibly
+            # already dead) pid and orphan-finalize it as rc=None while this
+            # watcher is still about to publish the real exit code.
+            self._watched.add(run_id)
+            try:
+                self._write_meta(meta)
+            except BaseException:
+                self._watched.discard(run_id)
+                raise
 
             watcher = threading.Thread(
                 target=self._watch, args=(run_id, proc), daemon=True,
             )
-            watcher.start()
+            try:
+                watcher.start()
+            except BaseException:
+                self._watched.discard(run_id)
+                raise
             return run_id
 
     def _watch(self, run_id: str, proc: "subprocess.Popen[bytes]") -> None:
-        rc = proc.wait()
-        meta = json.loads(self._meta_path(run_id).read_text(encoding="utf-8"))
-        meta["rc"] = rc
-        meta["finished"] = _ts_now()
-        self._write_meta(meta)
+        try:
+            rc = proc.wait()
+            with self._start_mutex:
+                meta = json.loads(self._meta_path(run_id).read_text(encoding="utf-8"))
+                meta["rc"] = rc
+                meta["finished"] = _ts_now()
+                self._write_meta(meta)
+        finally:
+            # Ownership ends only once the terminal record is published (or the
+            # publish failed outright): after this a dead child with no
+            # finished stamp is a genuine orphan and readers may finalize it.
+            with self._start_mutex:
+                self._watched.discard(run_id)
 
     # --- streaming ----------------------------------------------------------
 

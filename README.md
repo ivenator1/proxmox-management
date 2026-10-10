@@ -199,6 +199,8 @@ Source lineage includes the profile/log-kind namespace. For PBS task logs it als
 
 NPM rotation recognizes the former inode even when the writer immediately recreates its live pathname. Archive lookups and compression lineage prefer the highest durable generation, not source-ID sort order or a refreshed tombstone timestamp. Reuse still requires the raw-prefix or decoded-content proof; unchanged archives do not create another upload generation. Packed archive entries retain their original canonical filename and source ID across verified renames.
 
+Compression starts a new raw identity: an inode previously used by a plain log cannot select a gzip/zstd source or attach its frozen blob. Compression reuse instead requires the filename-family predecessor's decoded-content proof, and deletion coverage uses the successor's verified compressed-byte digest.
+
 **Quarantine and recovery:** node-bound pruning runs in the PVE host's privilege context through a pinned, identity-checked guest root; it does not increase guest privileges. Approved closed files retain their source-relative path beneath a same-root `.fleet-housekeeping-quarantine` directory. Every private ancestor must have observed `0700` permissions and the guest root's host-translated UID/GID. Symlinked, non-directory, or foreign-owned ancestors are blocked. Initial archive completion is not proof that file cleanup succeeded.
 
 Recovery uses bounded 128-file batches with fresh policy, current retention age, permissions, Alloy and Loki authorization per batch; each helper operation still checks the individual inode, digest and writers. Ordered helper outcomes must match each request's full wire identity, not just its pathname. Earlier completed deletions remain durable when a later file blocks; blocked and unattempted intents stay pending. Process-enumeration failures remain blocking unless disappearance or a completely exited thread group is proved; a dead leader with surviving or uninspectable threads is not safe.
@@ -357,6 +359,7 @@ All previously-hardcoded timeouts and retry counts are overridable per environme
 ### 🖥️ Web Dashboard
 * `dashboard_host` / `dashboard_port`: Bind address and port for `fleet-dashboard` (default `0.0.0.0:8421`).
 * **Housekeeping history:** protected `/housekeeping` and `/housekeeping/{ref}` pages show the hourly maintenance runs (own namespace, `history_base="/housekeeping"`); the existing `/history` pages remain the update history. The run trigger has a **Housekeeping only** checkbox (`--housekeeping-only`, mutually exclusive with scan/alloy-only/phases).
+* **Live console completion:** dashboard run metadata is atomically published. A locally watched child stays pending until its actual exit status is recorded; a reader cannot finalize it prematurely with an unknown result. After a dashboard restart, genuinely orphaned runs still report `rc unknown`, never inferred success.
 * **Authentication:** All pages require login. Single `admin` account with password set during `install.sh`. Session-based auth via HTTP-only cookies (SQLite database in `fleet_history_dir/.fleet-users.db`). No configuration needed — password is prompted during installation.
 
 ## 🚀 Setup Instructions
