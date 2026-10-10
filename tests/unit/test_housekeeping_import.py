@@ -601,6 +601,86 @@ def test_compression_uses_latest_generation_not_newer_absence_timestamp(env):
         ).hexdigest()
 
 
+@pytest.mark.parametrize("poisoned", [False, True])
+def test_npm_live_inode_reuse_cannot_borrow_another_proxy_archive(env, poisoned):
+    guest, _spool, executor, store = env
+    old_path = "/data/logs/proxy-host-5_access.log-20261010T115315"
+    current = "/data/logs/proxy-host-3_access.log"
+    closed = current + "-20261010T130000"
+    old_data = b"acknowledged proxy five\n"
+    new_data = b"independent proxy three traffic\n" * 4
+    seed = "/data/logs/bootstrap.log.1"
+    _write(guest, seed, b"initial manifest seed\n")
+    with LokiServer() as server:
+        initial = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct",
+            files=[_wire(guest, seed)],
+        )
+        assert not initial.failed
+        _write(guest, old_path, old_data)
+        first = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct",
+            files=[_wire(guest, old_path)],
+        )
+        assert not first.failed
+        old_id = first.covered_files[0]["source_id"]
+        old_record = store.source(KEY, old_id)
+        assert not old_record.in_initial_manifest
+        compressed = old_path + ".gz"
+        _write(guest, compressed, gzip.compress(old_data))
+        compressed_first = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct",
+            files=[_wire(guest, old_path), _wire(guest, compressed, compression="gzip")],
+        )
+        assert not compressed_first.failed
+        assert compressed_first.bytes_archived == 0
+        _reuse_inode(guest, old_path, current, new_data)
+        live_wire = _wire(guest, current, is_active=True)
+        if poisoned:
+            # Persist exactly the earlier build's wrong-path/preserved-ACK row.
+            store.record_source(
+                KEY, old_id, SourceIdentity(**live_wire),
+                provenance=sources.SourceProvenance.parse(old_record.provenance).with_verification(
+                    verified_raw_size=len(old_data), conflict=True,
+                ).as_dict(),
+                aliases=[live_wire],
+                in_initial_manifest=old_record.in_initial_manifest,
+                capture_id=old_record.capture_id, blob_path=old_record.blob_path,
+            )
+        server.requests.clear()
+        wires = [_wire(guest, compressed, compression="gzip"), live_wire]
+        live = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct", files=wires,
+        )
+        assert not live.failed
+        assert server.requests == []
+        assert all(row["path"] != current for row in live.covered_files)
+        assert store.source(KEY, old_id).digest == old_record.digest
+        (guest / current.lstrip("/")).rename(guest / closed.lstrip("/"))
+        _write(guest, current, b"next live generation\n")
+        wires = [
+            _wire(guest, compressed, compression="gzip"),
+            _wire(guest, closed),
+            _wire(guest, current, is_active=True),
+        ]
+        archived = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct", files=wires,
+        )
+        assert not archived.failed
+        assert _reconstruct(_iter_entries(server)) == new_data
+        assert {entry["filename"] for entry in _iter_entries(server)} == {closed}
+        own = next(row for row in archived.covered_files if row["path"] == closed)
+        assert own["source_id"] != old_id
+        assert own["sha256"] == hashlib.sha256(new_data).hexdigest()
+        server.requests.clear()
+        repeated = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct", files=wires,
+        )
+        assert not repeated.failed
+        assert repeated.bytes_archived == 0
+        assert server.requests == []
+
+
 def test_compression_reuses_verified_family_despite_foreign_inode_reuse(env):
     guest, _spool, executor, store = env
     path = "/data/logs/access.log.1"

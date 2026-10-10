@@ -217,25 +217,27 @@ def _plain_log_path(path: str) -> str:
 
 
 def logical_identity(profile: str, log_kind: str, path: str) -> Optional[str]:
-    """The task identity embedded in a log's filename, when there is one.
+    """Filename identity: a PBS task UPID or an NPM log's rotation family.
 
-    A PBS task log's filename *is* its UPID, which names exactly one task:
-    re-using a device+inode for a *different* task is filesystem happenstance,
-    never archive lineage.  The fan-out directory is derived from the UPID, so
-    the basename stays stable across any legitimate rename of the same task.
-    Every other kind has no filename-embedded identity and returns ``None``.
+    Filesystem inode reuse never joins distinct tasks or NPM streams. Numeric,
+    timestamped and compressed NPM rotations retain their directory and base
+    ``.log`` name, so proxy-host-3 and proxy-host-5 cannot share coverage.
+    Other kinds have no filename-embedded identity and return ``None``.
     """
-    if profile != "pbs" or log_kind != "task":
-        return None
-    return posixpath.basename(_plain_log_path(path))
+    plain = _plain_log_path(path)
+    if profile == "pbs" and log_kind == "task":
+        return posixpath.basename(plain)
+    if profile == "npm" and log_kind == "application":
+        if plain.endswith(".log") or NPM_ARCHIVE_RE.match(posixpath.basename(plain)):
+            return plain[:plain.rfind(".log") + len(".log")]
+    return None
 
 
 def same_logical_source(profile: str, log_kind: str, path_a: str, path_b: str) -> bool:
     """True unless *path_a* carries an identity that *path_b* does not share.
 
-    Only the identity-bearing kinds can be unequal, so an NPM rotate or a plain
-    append keeps its previous behaviour while a different PBS task UPID can
-    never inherit another task's record.
+    Numeric/compressed rotations and appends stay in the same family; distinct
+    NPM streams and PBS task UPIDs cannot inherit each other's records.
     """
     identified = logical_identity(profile, log_kind, path_a)
     if identified is None:
@@ -247,9 +249,9 @@ def identity_compatible(record: SourceRecord, wire: Optional[Dict[str, Any]]) ->
     """True when *wire* may belong to *record*'s logical source.
 
     Uses the record's *canonical* path from its durable provenance, so a record
-    that an earlier build already rewrote to another task's path is still
-    recognised as belonging to its original task and cannot be re-associated
-    with the impostor by the re-used device+inode.
+    that an earlier build already rewrote to another task or log family's path
+    still belongs to its original source and cannot be re-associated with the
+    impostor by the reused device+inode.
     """
     if wire is None:
         return True
