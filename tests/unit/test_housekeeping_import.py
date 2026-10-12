@@ -681,6 +681,75 @@ def test_npm_live_inode_reuse_cannot_borrow_another_proxy_archive(env, poisoned)
         assert server.requests == []
 
 
+@pytest.mark.parametrize("initial_live,poisoned", [(False, False), (False, True), (True, False)])
+def test_timestamped_rotation_inode_reuse_gets_independent_archive(env, poisoned, initial_live):
+    guest, _spool, executor, store = env
+    current = "/data/logs/proxy-host-3_access.log"
+    old_path = current + "-20261012T131500"
+    new_path = current + "-20261012T151205"
+    old_data = b"acknowledged earlier rotation\n"
+    new_data = b"independent later rotation\n" * 4
+    seed = "/data/logs/bootstrap.log.1"
+    _write(guest, seed, b"initial manifest seed\n")
+    with LokiServer() as server:
+        initial_path = current if initial_live else seed
+        _write(guest, initial_path, old_data if initial_live else b"initial manifest seed\n")
+        initial = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct",
+            files=[_wire(guest, initial_path, is_active=initial_live)],
+        )
+        assert not initial.failed
+        if initial_live:
+            (guest / current.lstrip("/")).rename(guest / old_path.lstrip("/"))
+        else:
+            _write(guest, old_path, old_data)
+        first = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct",
+            files=[_wire(guest, old_path)],
+        )
+        assert not first.failed
+        old_id = first.covered_files[0]["source_id"]
+        old_record = store.source(KEY, old_id)
+        compressed = old_path + ".gz"
+        _write(guest, compressed, gzip.compress(old_data))
+        compressed_first = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct",
+            files=[_wire(guest, old_path), _wire(guest, compressed, compression="gzip")],
+        )
+        assert not compressed_first.failed
+        assert compressed_first.bytes_archived == 0
+        _reuse_inode(guest, old_path, new_path, new_data)
+        wire = _wire(guest, new_path)
+        if poisoned:
+            store.record_source(
+                KEY, old_id, SourceIdentity(**wire),
+                provenance=sources.SourceProvenance.parse(old_record.provenance).with_verification(
+                    verified_raw_size=len(old_data), conflict=True,
+                ).as_dict(),
+                aliases=[wire],
+                in_initial_manifest=old_record.in_initial_manifest,
+                capture_id=old_record.capture_id, blob_path=old_record.blob_path,
+            )
+        wires = [_wire(guest, compressed, compression="gzip"), wire]
+        server.requests.clear()
+        archived = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct", files=wires,
+        )
+        assert not archived.failed
+        assert _reconstruct(_iter_entries(server)) == new_data
+        own = next(row for row in archived.covered_files if row["path"] == new_path)
+        assert own["source_id"] != old_id
+        assert own["sha256"] == hashlib.sha256(new_data).hexdigest()
+        assert store.source(KEY, old_id).digest == old_record.digest
+        server.requests.clear()
+        repeated = hi.import_guest_logs(
+            executor, _settings(server.url), store, KEY, name="npm-ct", files=wires,
+        )
+        assert not repeated.failed
+        assert repeated.bytes_archived == 0
+        assert server.requests == []
+
+
 def test_compression_reuses_verified_family_despite_foreign_inode_reuse(env):
     guest, _spool, executor, store = env
     path = "/data/logs/access.log.1"

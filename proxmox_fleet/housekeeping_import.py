@@ -1176,6 +1176,10 @@ def _plan_sources(state: _ImportState, wires: Sequence[Dict[str, Any]]) -> List[
                     or not sources.same_logical_source(
                         wire["profile"], wire["log_kind"], manifest_source.source_path, wire["path"]
                     )
+                    or (
+                        base_id in by_id
+                        and not sources.identity_compatible(by_id[base_id], wire)
+                    )
                 ):
                     base_id = None
             if base_id is None:
