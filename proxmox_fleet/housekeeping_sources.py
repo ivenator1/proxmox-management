@@ -236,29 +236,42 @@ def logical_identity(profile: str, log_kind: str, path: str) -> Optional[str]:
 def same_logical_source(profile: str, log_kind: str, path_a: str, path_b: str) -> bool:
     """True unless *path_a* carries an identity that *path_b* does not share.
 
-    Numeric/compressed rotations and appends stay in the same family; distinct
-    NPM streams and PBS task UPIDs cannot inherit each other's records.
+    Numeric rotations and appends stay in the same family; distinct NPM streams
+    and PBS task UPIDs cannot inherit each other's records. Once an NPM file
+    has a timestamped archive name, only compression may change that name.
     """
     identified = logical_identity(profile, log_kind, path_a)
     if identified is None:
         return True
-    return identified == logical_identity(profile, log_kind, path_b)
+    if identified != logical_identity(profile, log_kind, path_b):
+        return False
+    plain = _plain_log_path(path_a)
+    if profile == "npm" and log_kind == "application" and plain.startswith(identified + "-"):
+        # Timestamped names identify immutable rotations, unlike numeric names
+        # that shift during native rotation. Their freed inodes may be reused
+        # by later rotations of the very same stream.
+        return plain == _plain_log_path(path_b)
+    return True
 
 
 def identity_compatible(record: SourceRecord, wire: Optional[Dict[str, Any]]) -> bool:
     """True when *wire* may belong to *record*'s logical source.
 
-    Uses the record's *canonical* path from its durable provenance, so a record
-    that an earlier build already rewrote to another task or log family's path
-    still belongs to its original source and cannot be re-associated with the
-    impostor by the reused device+inode.
+    Uses the record's *canonical* path from its durable provenance as well as
+    its observed path. This preserves an original task/archive identity even
+    after a buggy reassignment, and pins a captured live stream to its first
+    timestamped rotation once that rename has been observed.
     """
     if wire is None:
         return True
     if record.profile != wire["profile"] or record.log_kind != wire["log_kind"]:
         return False
     canonical = SourceProvenance.parse(record.provenance).canonical_path or record.path
-    return same_logical_source(record.profile, record.log_kind, canonical, str(wire["path"]))
+    path = str(wire["path"])
+    return (
+        same_logical_source(record.profile, record.log_kind, canonical, path)
+        and same_logical_source(record.profile, record.log_kind, record.path, path)
+    )
 
 
 def current_coverage(
