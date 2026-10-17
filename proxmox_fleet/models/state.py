@@ -128,6 +128,7 @@ class FleetState(BaseModel):
     warnings: List[WarningEntry] = Field(default_factory=list)
     changed: bool = False
     failed: bool = False
+    housekeeping_attempted: bool = Field(default=False, exclude=True)
 
     @classmethod
     def from_raw(cls, data: dict) -> "FleetState":

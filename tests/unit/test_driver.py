@@ -30,7 +30,7 @@ from proxmox_fleet.inventory import VmSpec
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import FleetState, WarningEntry
 from proxmox_fleet.runner import PrimitiveResult
-from tests.unit.test_housekeeping import CacheSpec, Guest, _base, _cache_dir, _measure
+from tests.unit.test_housekeeping import CacheSpec, Guest, LokiStub, _base, _cache_dir, _compliant, _measure
 
 
 def _ok(stdout: str = "", changed: bool = True, facts: Optional[Dict[str, Any]] = None) -> PrimitiveResult:
@@ -3119,11 +3119,63 @@ def test_run_lxc_phase_housekeeping_only_reclaims_real_caches_without_updates(tm
     # A blocked standalone maintenance run fails the phase and checkpoints durably.
     assert state.failed is True
     assert state.changed is True
+    assert state.housekeeping_attempted is True
+    assert "housekeeping_attempted" not in state.model_dump()
     assert (tmp_path / "history" / "housekeeping.sqlite3").exists()
     # No update/snapshot/reboot/package surface was touched, and the one-worker
     # maintenance pool serialised the two containers.
     assert harness.forbidden == []
     assert harness.peak == 1
+
+
+@pytest.mark.parametrize("eligible", [False, True])
+def test_housekeeping_idle_attempt_propagates_through_phase_and_fleet_without_export(
+    tmp_path, monkeypatch, eligible,
+):
+    inv = tmp_path / "hosts.ini"
+    inv.write_text("[proxmox_nodes]\npve-01 ansible_host=10.0.0.1\n", encoding="utf-8")
+    harness = _HousekeepingHarness(tmp_path)
+    harness.add_node("pve-01", ["101"])
+    harness.add_guest("pve-01", "101", "npm")
+    guest = harness.guest("pve-01", "101")
+    guest.cache_specs.clear()
+    guest.running = eligible
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", harness.factory)
+    exported = tmp_path / "phase-state.json"
+    assert FleetState().housekeeping_attempted is False
+    counter = tmp_path / "history" / "housekeeping-alert-state.json"
+    counter.write_text(json.dumps({"version": 1, "consecutive_failures": 11}))
+
+    with LokiStub() as stub:
+        settings = GlobalSettings(
+            fleet_history_dir=str(tmp_path / "history"),
+            housekeeping_enabled=True,
+            housekeeping_loki_url=stub.url,
+        )
+        base = _base(stub.url)
+        _compliant(guest, settings, base)
+        state = driver_mod.run_lxc_phase(
+            settings=settings, inventory_path=str(inv), state_output_path=str(exported),
+            housekeeping_only=True, alloy_config=base,
+        )
+        base_path = tmp_path / "guest.alloy"
+        base_path.write_text(base.content, encoding="utf-8")
+        settings.alloy_config_path = str(base_path)
+        assert run_fleet(
+            settings=settings, inventory_path=str(inv), housekeeping_only=True,
+        ) == 0
+
+    assert state.lxc == []
+    assert state.failed is False
+    assert state.housekeeping_attempted is eligible
+    assert (guest.probe_calls > 0) is eligible
+    assert "housekeeping_attempted" not in state.model_dump()
+    assert "housekeeping_attempted" not in json.loads(exported.read_text())
+    # The fleet must merge a successful idle attempt even though no guest record
+    # exists; a stopped-only run must not falsely clear the outage streak.
+    assert json.loads(counter.read_text()) == {
+        "version": 1, "consecutive_failures": 0 if eligible else 11,
+    }
 
 
 def test_run_lxc_phase_housekeeping_qualified_exclusion_leaves_other_cluster_untouched(tmp_path, monkeypatch):
@@ -3462,6 +3514,34 @@ def _gets(server: "_RecordingHTTP") -> List[Dict[str, Any]]:
     return [r for r in server.requests if r["method"] == "GET"]
 
 
+def _maintenance_failure_state(*, attempted: bool = True) -> FleetState:
+    state = _notify_state(
+        fleet_failed=True,
+        fleet_lxc_data=[
+            {
+                "node": "pve-01", "name": f"guest-{guest_id}", "id": str(guest_id),
+                "app": "", "os": "", "snap": False,
+                "housekeeping": {"status": "Blocked", "bytes_archived": 0},
+            }
+            for guest_id in (120, 121, 122)
+        ],
+        fleet_warning_log=[
+            {
+                "host": f"pve-01/{guest_id}",
+                "task": task,
+                "warning": "Loki /ready returned HTTP 503; file pruning paused",
+                "notifying": True,
+            }
+            for guest_id, task in zip((120, 121, 122), ("Housekeeping", "housekeeping", "HOUSEKEEPING"))
+        ],
+        fleet_error_log=[{
+            "host": "pve-01/120", "task": "Housekeeping", "error": "Archive unavailable",
+        }],
+    )
+    state.housekeeping_attempted = attempted
+    return state
+
+
 @pytest.mark.parametrize("dry_run", [False, True])
 def test_maintenance_success_is_quiet_but_persisted(recording_http, tmp_path, dry_run):
     """Successful maintenance and audits stay visible without routine notifications."""
@@ -3484,12 +3564,12 @@ def test_maintenance_success_is_quiet_but_persisted(recording_http, tmp_path, dr
     assert not (tmp_path / "latest.json").exists()
 
 
-def test_maintenance_notifying_warning_still_notifies(recording_http, tmp_path):
+def test_maintenance_non_housekeeping_warning_still_notifies(recording_http, tmp_path):
     settings = _http_settings(recording_http, tmp_path)
     state = _notify_state(fleet_warning_log=[{
         "host": "pve-01/123",
-        "task": "housekeeping",
-        "warning": "Loki unreachable; file pruning paused",
+        "task": "Alloy compliance",
+        "warning": "Alloy service is not active",
         "notifying": True,
     }])
 
@@ -3503,25 +3583,132 @@ def test_maintenance_notifying_warning_still_notifies(recording_http, tmp_path):
     assert (tmp_path / "housekeeping" / "latest.json").exists()
 
 
-def test_maintenance_failure_notifies_without_deadman(recording_http, tmp_path):
-    settings = _http_settings(recording_http, tmp_path)
+@pytest.mark.parametrize("history_enabled", [False, True])
+def test_maintenance_failure_alerts_after_twelve_runs_and_attempted_success_resets(
+    recording_http, tmp_path, history_enabled,
+):
+    counter = tmp_path / "housekeeping-alert-state.json"
+    for run_number in range(1, 14):
+        # Fresh settings and state model a new process each hour. Three failed
+        # guests still count as one run; even a pre-attempt failure must count.
+        state = _maintenance_failure_state(attempted=run_number != 7)
+        settings = _http_settings(recording_http, tmp_path, fleet_history_enabled=history_enabled)
+        body = run_notify_phase(settings=settings, state=state, housekeeping_only=True)
 
-    run_notify_phase(settings=settings, state=_notify_state(fleet_failed=True), housekeeping_only=True)
+        assert len(_posts(recording_http)) == max(0, run_number - 11)
+        assert _gets(recording_http) == []
+        assert state.failed is True
+        assert len(state.errors) == 1 and len(state.warnings) == 3
+        assert all(w.notifying for w in state.warnings)
+        assert "HTTP 503" in body
+        assert json.loads(counter.read_text()) == {
+            "version": 1, "consecutive_failures": run_number,
+        }
+        if history_enabled:
+            latest = json.loads((tmp_path / "housekeeping" / "latest.json").read_text())
+            assert latest["failed"] is True
+            assert len(latest["warnings"]) == 3
+            assert latest["briefing"] == body
+            assert "housekeeping_attempted" not in latest
+
+    for post in _posts(recording_http):
+        payload = json.loads(post["body"])
+        assert payload["failed"] is True
+        assert "Failures Detected" in payload["title"]
+        assert "HTTP 503" in payload["body"]
+
+    recovered = FleetState(housekeeping_attempted=True)
+    run_notify_phase(
+        settings=_http_settings(recording_http, tmp_path, fleet_history_enabled=history_enabled),
+        state=recovered, housekeeping_only=True,
+    )
+    assert json.loads(counter.read_text()) == {"version": 1, "consecutive_failures": 0}
+    run_notify_phase(
+        settings=_http_settings(recording_http, tmp_path, fleet_history_enabled=history_enabled),
+        state=_maintenance_failure_state(), housekeeping_only=True,
+    )
+    assert json.loads(counter.read_text()) == {"version": 1, "consecutive_failures": 1}
+    assert len(_posts(recording_http)) == 2
+    assert _gets(recording_http) == []
+    assert (tmp_path / "housekeeping" / "latest.json").exists() is history_enabled
+
+
+@pytest.mark.parametrize("dry_mode", ["check", "fleet_dry_run", "lxc_dry_run"])
+def test_maintenance_skips_and_dry_runs_do_not_advance_or_clear_failure_streak(
+    recording_http, tmp_path, dry_mode,
+):
+    counter = tmp_path / "housekeeping-alert-state.json"
+    counter.write_text(json.dumps({"version": 1, "consecutive_failures": 11}))
+    original = counter.read_bytes()
+    for dry_run, state in [
+        (False, FleetState()),
+        (False, _notify_state(fleet_lxc_data=[{
+            "node": "pve-01", "name": "stopped", "id": "120", "app": "", "os": "", "snap": False,
+        }])),
+        (True, FleetState(housekeeping_attempted=True)),
+        (True, _maintenance_failure_state()),
+    ]:
+        overrides = {dry_mode: dry_run} if dry_mode != "check" else {}
+        run_notify_phase(
+            settings=_http_settings(recording_http, tmp_path, **overrides),
+            state=state, check=dry_run if dry_mode == "check" else False, housekeeping_only=True,
+        )
+        assert counter.read_bytes() == original
+        assert recording_http.requests == []
+
+    run_notify_phase(
+        settings=_http_settings(recording_http, tmp_path),
+        state=_maintenance_failure_state(), housekeeping_only=True,
+    )
+    assert json.loads(counter.read_text()) == {"version": 1, "consecutive_failures": 12}
+    assert len(_posts(recording_http)) == 1
+    assert _gets(recording_http) == []
+
+
+def test_maintenance_unrelated_notifying_warning_bypasses_failure_streak(recording_http, tmp_path):
+    state = _maintenance_failure_state()
+    state.warnings.append(WarningEntry(
+        host="pve-01", task="disk space", warning="Root filesystem almost full", notifying=True,
+    ))
+    run_notify_phase(
+        settings=_http_settings(recording_http, tmp_path), state=state, housekeeping_only=True,
+    )
 
     posts = _posts(recording_http)
     assert len(posts) == 1
-    assert b"Failures Detected" in posts[0]["body"]
-    # A failed hourly tick must not clear or mask the update dead-man switch.
+    payload = json.loads(posts[0]["body"])
+    assert payload["failed"] is True
+    assert "Root filesystem almost full" in payload["body"]
     assert _gets(recording_http) == []
 
 
-def test_maintenance_force_notify_announces_uneventful_tick(recording_http, tmp_path):
+@pytest.mark.parametrize("failed", [False, True])
+def test_maintenance_force_notify_bypasses_failure_streak(recording_http, tmp_path, failed):
     settings = _http_settings(recording_http, tmp_path, force_notify=True)
 
-    run_notify_phase(settings=settings, state=_notify_state(), housekeeping_only=True)
+    state = _maintenance_failure_state() if failed else _notify_state()
+    run_notify_phase(settings=settings, state=state, housekeeping_only=True)
 
     assert len(_posts(recording_http)) == 1
     assert _gets(recording_http) == []
+    assert json.loads(_posts(recording_http)[0]["body"])["failed"] is failed
+
+
+def test_ordinary_failure_notifies_immediately_without_changing_maintenance_streak(recording_http, tmp_path):
+    counter = tmp_path / "housekeeping-alert-state.json"
+    counter.write_text(json.dumps({"version": 1, "consecutive_failures": 5}))
+    original = counter.read_bytes()
+
+    run_notify_phase(
+        settings=_http_settings(recording_http, tmp_path), state=_notify_state(fleet_failed=True),
+    )
+
+    posts = _posts(recording_http)
+    assert len(posts) == 1
+    assert json.loads(posts[0]["body"])["failed"] is True
+    assert b"Failures Detected" in posts[0]["body"]
+    assert len(_gets(recording_http)) == 1
+    assert counter.read_bytes() == original
 
 
 def test_ordinary_changed_fleet_still_notifies_and_pings_deadman(recording_http, tmp_path):

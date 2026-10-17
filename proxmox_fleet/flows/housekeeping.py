@@ -72,7 +72,7 @@ def run_lxc_housekeeping(
         desired_alloy=alloy_config,
         dry_run=dry_run,
     )
-    outcome = LxcFlowOutcome(changed=result.changed, failed=result.failed)
+    outcome = LxcFlowOutcome(changed=result.changed, failed=result.failed, housekeeping_attempted=True)
     for message in result.warnings:
         outcome.warnings.append(WarningEntry(
             host=f"{node}/{lxc_id}",

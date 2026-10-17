@@ -76,6 +76,7 @@ class LxcFlowOutcome:
     error: Optional[ErrorEntry] = None
     errors: List[ErrorEntry] = field(default_factory=list)
     warnings: List[WarningEntry] = field(default_factory=list)
+    housekeeping_attempted: bool = False
 
     @property
     def should_report(self) -> bool:

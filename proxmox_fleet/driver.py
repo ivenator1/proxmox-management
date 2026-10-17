@@ -29,6 +29,7 @@ from proxmox_fleet import (
     briefing,
     deps,
     history,
+    housekeeping_alerts,
     http,
     inventory,
     notifiers,
@@ -317,6 +318,8 @@ def _fold_outcome(state: FleetState, outcome: Any, bucket: List[Any]) -> None:
         state.changed = True
     if outcome.failed:
         state.failed = True
+    if getattr(outcome, "housekeeping_attempted", False):
+        state.housekeeping_attempted = True
     if outcome.error is not None:
         state.errors.append(outcome.error)
     state.errors.extend(getattr(outcome, "errors", []))
@@ -1083,12 +1086,30 @@ def run_notify_phase(
     consumed, and the update dead-man URL is not pinged: hourly maintenance must
     never mask a failed scheduled update. Routine maintenance is also quiet:
     ``changed`` (reclaimed caches, newly covered logs) is not a notification
-    trigger in this mode, so an uneventful tick sends nothing. Explicit
-    ``force_notify``, failures and notifying warnings still announce.
+    trigger in this mode, so an uneventful tick sends nothing. Automatic
+    housekeeping failure alerts begin with the twelfth consecutive failed run;
+    explicit ``force_notify`` and unrelated notifying warnings still announce.
 
     Returns the rendered briefing body (handy for tests / logging). Never raises
     — notification/history failures must not abort the run.
     """
+    allow_housekeeping_alerts = True
+    if housekeeping_only:
+        decision = housekeeping_alerts.record_run(
+            settings.fleet_history_dir,
+            failed=state.failed,
+            attempted=state.housekeeping_attempted,
+            dry_run=check or settings.fleet_dry_run or settings.lxc_dry_run,
+        )
+        allow_housekeeping_alerts = decision.allow_automatic
+        if decision.warning is not None:
+            state.warnings.append(WarningEntry(
+                host="localhost",
+                task="Housekeeping alert state",
+                warning=decision.warning,
+                notifying=False,
+            ))
+
     manual_decision: Optional[scan_notifications.ManualDecision] = None
     if settings.manual_update_notifications and not housekeeping_only:
         manual_state = scan_notifications.load_state(settings.fleet_history_dir)
@@ -1099,7 +1120,10 @@ def run_notify_phase(
         )
 
     manual_attention = bool(manual_decision and manual_decision.notify)
-    warning_attention = any(bool(w.notifying) for w in state.warnings)
+    warning_attention = any(
+        bool(w.notifying) and (allow_housekeeping_alerts or w.task.lower() != "housekeeping")
+        for w in state.warnings
+    )
     attention = manual_attention or warning_attention
     manual_section = manual_decision.body if manual_decision is not None else ""
     body = briefing.prepare_body(state, manual_section=manual_section)
@@ -1107,13 +1131,14 @@ def run_notify_phase(
 
     # Routine maintenance is quiet: a maintenance tick that merely reclaimed
     # caches or advanced log coverage sets ``changed`` but must not page anyone.
-    # Explicit force, failures and notifying warnings still announce, and
-    # ordinary update runs keep the legacy changed-triggers-notification behavior.
+    # Gate dispatch only: explicit force or unrelated warning alerts must retain
+    # truthful failure titles/colors/body, as must history and the exit status.
+    # Ordinary update runs retain their existing notification behavior.
     notify = briefing.should_notify(
         force_notify=settings.force_notify,
         dry_run=settings.fleet_dry_run and not housekeeping_only,
         changed=state.changed and not housekeeping_only,
-        failed=failed,
+        failed=failed and allow_housekeeping_alerts,
     ) or attention
     if notify:
         notifiers.dispatch(
@@ -1176,6 +1201,7 @@ def _merge_state(dst: FleetState, src: FleetState) -> None:
     dst.warnings.extend(src.warnings)
     dst.changed = dst.changed or src.changed
     dst.failed = dst.failed or src.failed
+    dst.housekeeping_attempted = dst.housekeeping_attempted or src.housekeeping_attempted
 
 
 def run_fleet(
