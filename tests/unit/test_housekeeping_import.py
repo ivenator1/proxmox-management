@@ -327,7 +327,7 @@ def test_capture_intent_committed_before_capture(env):
     assert seen == [True]
 
 
-def test_503_then_204_resumes_exact_body_and_gates_coverage(env):
+def test_503_then_204_resumes_exact_body_before_new_work_and_gates_coverage(env):
     guest, _spool, executor, store = env
     _write(guest, "/data/logs/access.log.1", b"alpha\nbeta\ngamma\n")
     wire = _wire(guest, "/data/logs/access.log.1")
@@ -345,18 +345,32 @@ def test_503_then_204_resumes_exact_body_and_gates_coverage(env):
     saved_body = pending.body
     # Not acknowledged -> the manifest gate still reports work remaining.
     assert store.initial_manifest_state(KEY).acknowledged == 0
+    # Fresh work sorts before the failed source, but durable pending bytes must
+    # be replayed first rather than being displaced by newly discovered logs.
+    _write(guest, "/data/logs/a-fresh.log.1", b"new rotation\n")
+    fresh_wire = _wire(guest, "/data/logs/a-fresh.log.1")
 
     with LokiServer() as server2:
         second = hi.import_guest_logs(
             executor, _settings(server2.url), store, KEY,
-            name="npm-ct", files=[wire], sleep=lambda _s: None,
+            name="npm-ct", files=[fresh_wire, wire], sleep=lambda _s: None,
         )
     assert second.failed is False
     assert second.pending is False
     assert server2.requests and server2.requests[0][1] == saved_body  # exact body resumed
+    entries = list(_iter_entries(server2))
+    assert [entry["filename"] for entry in entries] == [
+        "/data/logs/access.log.1",
+        "/data/logs/access.log.1",
+        "/data/logs/access.log.1",
+        "/data/logs/a-fresh.log.1",
+    ]
+    assert _reconstruct(entries) == b"alpha\nbeta\ngamma\nnew rotation\n"
     assert store.pending_batch(KEY) is None
     assert store.initial_manifest_state(KEY).acknowledged == 1
-    assert {entry["path"] for entry in second.covered_files} == {"/data/logs/access.log.1"}
+    assert {entry["path"] for entry in second.covered_files} == {
+        "/data/logs/access.log.1", "/data/logs/a-fresh.log.1",
+    }
 
 
 def test_immediate_4xx_blocks_without_disarding_bytes(env):

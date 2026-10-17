@@ -103,6 +103,7 @@ def test_stopped_or_template_guest_is_skipped_without_actions(history, guest, st
     assert out.record is None
     assert out.failed is False
     assert out.changed is False
+    assert out.housekeeping_attempted is False
     assert guest.introspect_calls == 1
     # The maintenance policy was never reached, so the guest (and any checkpoint)
     # is left completely alone.
@@ -136,6 +137,7 @@ def test_dry_run_creates_no_state_and_reclaims_nothing(history, guest, tmp_path)
     assert source.read_bytes() == before_source
     assert out.changed is False
     assert out.record is not None and out.record.housekeeping.status == "Audit"
+    assert out.housekeeping_attempted is True
 
 
 # --------------------------------------------------------------------------- #
@@ -160,6 +162,7 @@ def test_real_cache_clean_survives_blocked_archival(history, guest, tmp_path):
     # The cache reclamation is real and measured even though archival failed.
     assert _measure(yarn) == 0
     assert out.failed is True
+    assert out.housekeeping_attempted is True
     assert out.record is not None
     assert out.record.housekeeping.status == "Blocked"
     assert out.record.housekeeping.bytes_reclaimed == before
@@ -203,3 +206,5 @@ def test_compliant_guest_produces_no_record(history, guest):
     assert out.changed is False
     assert out.failed is False
     assert out.warnings == []
+    # Idle maintenance still ran: absence of a record must not hide recovery.
+    assert out.housekeeping_attempted is True
