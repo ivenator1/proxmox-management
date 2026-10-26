@@ -7,7 +7,10 @@
     _alloy_node_stage: "/tmp/fleet-alloy-{{ lxc_id }}.alloy"
     _alloy_guest_stage: /tmp/fleet-alloy-config.alloy
   tasks:
-    - name: "Install Alloy from Grafana stable apt repository in container"
+    # The ACL tools are part of this same initial-install action: scoped file
+    # ACLs need them, and a guest that already has Alloy must still get them
+    # without re-fetching the Grafana key/repository or reinstalling Alloy.
+    - name: "Install Alloy and the ACL prerequisite in container"
       ansible.builtin.command:
         argv:
           - pct
@@ -19,8 +22,12 @@
           - |
             set -euo pipefail
             export LC_ALL=C DEBIAN_FRONTEND=noninteractive
+            if [ -x /usr/bin/alloy ]; then
+              apt-get install -y acl
+              exit 0
+            fi
             apt-get update
-            apt-get install -y wget gpg
+            apt-get install -y wget gpg acl
             install -d -m 0755 /etc/apt/keyrings
             wget -q -O - https://apt.grafana.com/gpg.key \
               | gpg --dearmor --batch --yes -o /etc/apt/keyrings/grafana.gpg

@@ -1056,9 +1056,11 @@ def prepare_lxc_logging(
     config is deployed and re-verified for hash, access and service state.
 
     ``allow_install`` mirrors the ``--alloy-only`` installer behaviour: when
-    ``False`` a missing Alloy binary blocks (the recurring maintenance path must
-    never run APT); when ``True`` an install-only call may add it first, after
-    which the guest is re-probed rather than assuming access.
+    ``False`` a missing Alloy binary or missing ACL tools block (the recurring
+    maintenance path must never run APT); when ``True`` one install-only call
+    provisions the missing Alloy binary and/or the guest ``acl`` package needed
+    to measure selected file sources, after which the guest is re-probed rather
+    than assuming access.
 
     A ``dry_run`` performs no staging/validation-only/install/ACL/environment/
     live mutation and returns an ``Audit`` summary with findings.
@@ -1194,13 +1196,26 @@ def prepare_lxc_logging(
             findings.append(
                 f"guest OS {probe.os_type or 'unknown'!r} is not Debian/apt-based"
             )
-        if acl_needed:
-            if missing_tools:
+        if enforce_config and missing_tools and resolved.sources:
+            if resolved.unmeasurable:
                 findings.append(
                     f"required ACL tools missing ({', '.join(missing_tools)}); "
-                    "the guest needs the 'acl' package"
+                    "log source access is unmeasurable (collector prerequisite "
+                    "missing); --alloy-only would install the guest 'acl' package "
+                    "(dry run installs nothing)"
                 )
-            elif not probe.log_access_detail.get("alloy_user", False):
+            else:
+                findings.append(
+                    f"required ACL tools missing ({', '.join(missing_tools)}); "
+                    "--alloy-only would install the guest 'acl' package "
+                    "(dry run installs nothing)"
+                )
+        elif enforce_config and resolved.unmeasurable:
+            findings.append(
+                "log source access is unmeasurable (collector prerequisite missing)"
+            )
+        if acl_needed:
+            if not probe.log_access_detail.get("alloy_user", False):
                 findings.append(
                     "the 'alloy' user is absent from the guest; scoped read access "
                     "cannot be repaired"
@@ -1210,10 +1225,6 @@ def prepare_lxc_logging(
                     "Alloy lacks scoped read/traversal/default access to the "
                     "selected log sources"
                 )
-        if enforce_config and resolved.unmeasurable:
-            findings.append(
-                "log source access is unmeasurable (collector prerequisite missing)"
-            )
         if not env_supported:
             findings.append(
                 "custom desired journal source does not use "
@@ -1299,9 +1310,16 @@ def prepare_lxc_logging(
             effective_alloy=None,
         )
 
-    # Alloy must exist before its config can be checked.  Recurring maintenance
-    # (allow_install=False) never installs it implicitly; --alloy-only may.
-    if enforce_config and not alloy_state.binary_present:
+    # The explicit installer path (--alloy-only) is the single bootstrap action
+    # for a missing Alloy *and* for the guest ACL prerequisite: the same
+    # install-only step provisions both.  A helper without getfacl reports
+    # selected file sources as unmeasurable, so this must run before that hard
+    # block instead of keying off the resolved ACL repair state.  Recurring
+    # maintenance (allow_install=False) never installs either prerequisite.
+    needs_acl_tools = bool(
+        enforce_config and allow_install and resolved.sources and missing_tools
+    )
+    if enforce_config and (not alloy_state.binary_present or needs_acl_tools):
         if not allow_install:
             return _blocked(
                 "Alloy is not installed; install it (or run --alloy-only) before "
@@ -1320,7 +1338,8 @@ def prepare_lxc_logging(
         changed = True
         if install.failed or install.rc != 0:
             return _blocked(
-                f"Alloy installation failed: {_result_detail(install)}",
+                f"Alloy/ACL prerequisite installation failed: "
+                f"{_result_detail(install)}",
                 None,
                 warnings,
                 changed=changed,
@@ -1333,8 +1352,8 @@ def prepare_lxc_logging(
             resolved = validate_log_layout(selection, probe.logging)
         except Exception as exc:  # noqa: BLE001 - probe boundary
             return _blocked(
-                f"Alloy installed but the guest could not be re-probed: "
-                f"{_sanitize_finding(str(exc))}",
+                "Alloy/ACL prerequisites installed but the guest could not be "
+                f"re-probed: {_sanitize_finding(str(exc))}",
                 None,
                 warnings,
                 changed=changed,
@@ -1376,6 +1395,16 @@ def prepare_lxc_logging(
         missing_tools = [tool for tool in _ACL_TOOLS if not probe.binaries.get(tool)]
 
     if enforce_config and resolved.unmeasurable:
+        if missing_tools:
+            return _blocked(
+                f"required ACL tools missing ({', '.join(missing_tools)}); log "
+                "source access could not be measured for the Alloy user; run "
+                "--alloy-only to install the guest 'acl' package (recurring "
+                "maintenance never installs packages)",
+                None,
+                warnings,
+                changed=changed,
+            )
         return _blocked(
             "log source access could not be measured for the Alloy user; "
             "recurring maintenance does not install collector prerequisites",
@@ -1411,8 +1440,9 @@ def prepare_lxc_logging(
     if acl_needed:
         if missing_tools:
             return _blocked(
-                f"required ACL tools missing ({', '.join(missing_tools)}); install "
-                "the 'acl' package in the guest (recurring maintenance never installs packages)",
+                f"required ACL tools missing ({', '.join(missing_tools)}); run "
+                "--alloy-only to install the guest 'acl' package (recurring "
+                "maintenance never installs packages)",
                 None,
                 warnings,
                 changed=changed,

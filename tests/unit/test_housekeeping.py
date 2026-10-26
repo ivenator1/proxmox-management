@@ -900,6 +900,14 @@ class Guest:
             return PrimitiveResult(rc=1, failed=True, stderr="alloy deploy failed", facts={})
         if install:
             self.alloy_binary = True
+            # The install-only primitive provisions the guest 'acl' package in
+            # the same step, so subsequent probes can measure file access.
+            for tool in ("setfacl", "getfacl"):
+                if not self.binaries.get(tool):
+                    self.binaries[tool] = "/usr/bin/" + tool
+            for key, value in list(self.logging_source_status.items()):
+                if value == "unavailable":
+                    del self.logging_source_status[key]
         if configure:
             self.alloy_config_sha = hashlib.sha256(
                 desired_content.encode("utf-8")
@@ -1772,6 +1780,92 @@ def test_invalid_candidate_syntax_blocks_before_acl_or_environment(
     assert guest.acl_traverse == set()
     assert guest.acl_files == set()
     assert all(call["validate_only"] for call in guest.alloy_reconciles)
+
+
+def _acl_bootstrap_guest(guest: Guest, settings: GlobalSettings) -> None:
+    """Existing Alloy guest whose ACL tools are missing on the real helper."""
+    guest.script_id = "nginxproxymanager"
+    guest.binaries["setfacl"] = None
+    guest.binaries["getfacl"] = None
+    guest.access_ready = False
+    guest.logging_source_status = {"nginxproxymanager/application": "unavailable"}
+    guest.alloy_env_hash = hashlib.sha256(
+        housekeeping.journal_env_content(
+            settings.housekeeping_local_retention_hours
+        ).encode()
+    ).hexdigest()
+
+
+def test_explicit_alloy_setup_installs_missing_acl_tools_then_repairs_access(
+    history: Path, guest: Guest
+):
+    settings = _settings(history, url="http://127.0.0.1:9")
+    base = _base("http://127.0.0.1:9")
+    _acl_bootstrap_guest(guest, settings)
+
+    result = _prepare(guest, settings, base, allow_install=True)
+
+    assert result.summary is not None and result.summary.status == "Configured"
+    assert result.failed is False
+    assert result.effective_alloy is not None
+    # The install-only step restored the ACL prerequisite; the re-probe then
+    # observed the real (denied) access, which the scoped repair fixed.
+    assert guest.binaries["setfacl"] and guest.binaries["getfacl"]
+    assert guest.log_acl_calls == [{"roots": ("/data/logs",), "exact_files": ()}]
+    assert "/data/logs" in guest.acl_roots
+    assert guest.alloy_config_sha == result.effective_alloy.sha256
+    install_calls = [call for call in guest.alloy_reconciles if call["install"]]
+    assert len(install_calls) == 1
+    assert install_calls[0]["configure"] is False
+
+
+def test_recurring_preparation_never_installs_missing_acl_tools(
+    history: Path, guest: Guest
+):
+    settings = _settings(history, url="http://127.0.0.1:9")
+    base = _base("http://127.0.0.1:9")
+    _acl_bootstrap_guest(guest, settings)
+
+    result = _prepare(guest, settings, base, allow_install=False)
+
+    assert result.summary is not None and result.summary.status == "Blocked"
+    assert result.failed is True
+    assert result.effective_alloy is None
+    assert any(
+        "ACL tools missing" in warning and "--alloy-only" in warning
+        for warning in result.warnings
+    )
+    assert guest.alloy_reconciles == []
+    assert guest.log_acl_calls == []
+    assert guest.applied == []
+    assert guest.acl_roots == set()
+    assert guest.binaries["setfacl"] is None
+    assert guest.binaries["getfacl"] is None
+
+
+def test_explicit_alloy_setup_install_failure_blocks_before_acl_or_environment(
+    history: Path, guest: Guest
+):
+    settings = _settings(history, url="http://127.0.0.1:9")
+    base = _base("http://127.0.0.1:9")
+    _acl_bootstrap_guest(guest, settings)
+    guest.alloy_reconcile_failed = True
+
+    result = _prepare(guest, settings, base, allow_install=True)
+
+    assert result.summary is not None and result.summary.status == "Blocked"
+    assert result.failed is True
+    assert result.effective_alloy is None
+    assert any("installation failed" in warning for warning in result.warnings)
+    assert len(guest.alloy_reconciles) == 1
+    assert guest.alloy_reconciles[0]["install"] is True
+    assert guest.validation_calls == []
+    assert guest.log_acl_calls == []
+    assert guest.applied == []
+    assert guest.alloy_config_sha == ""
+    assert guest.acl_roots == set()
+    assert guest.binaries["setfacl"] is None
+    assert guest.binaries["getfacl"] is None
 
 
 def test_legacy_archive_eligibility_requires_default_complete_sources(
