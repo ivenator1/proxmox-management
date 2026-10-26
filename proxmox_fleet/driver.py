@@ -52,8 +52,18 @@ from proxmox_fleet.flows.lxc import LxcFlowOutcome, _discover_lxcs, run_lxc_upda
 from proxmox_fleet.flows.node import run_manager_update, run_node_update
 from proxmox_fleet.flows.remote import RemoteFlowOutcome, run_remote_update
 from proxmox_fleet.flows.vm import VmFlowOutcome, run_vm_update
+from proxmox_fleet.housekeeping_checkpoint import GuestKey
 from proxmox_fleet.inventory import HostSpec, RemoteHostSpec, VmSpec
+from proxmox_fleet.log_plugins import (
+    GuestLogOverrideIndex,
+    GuestOverrideError,
+    LogCatalogue,
+    LogPluginError,
+    index_guest_log_overrides,
+    load_log_catalogue,
+)
 from proxmox_fleet.models.config import CustomConfig
+from proxmox_fleet.models.log_plugins import GuestLogOverrideKey
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import (
     ErrorEntry,
@@ -118,6 +128,32 @@ CANARY_SKIP_STATUS = "SKIPPED (canary failed)"
 # Distinguishes "phase called directly; load once here" from "run_fleet already
 # tried to load and intentionally passed None after a manager-level warning".
 _ALLOY_CONFIG_UNSET = object()
+
+# ``None`` inside a phase means "run_fleet already tried and intentionally
+# passed the soft-failure result"; this sentinel means "direct call: load here".
+_LOG_CATALOGUE_UNSET = object()
+
+
+def _logging_requested(
+    settings: GlobalSettings, *, alloy_only: bool, housekeeping_only: bool
+) -> bool:
+    """Whether this run asked for a logging/housekeeping pass (hard catalogue)."""
+    return bool(
+        alloy_only
+        or housekeeping_only
+        or settings.alloy_enabled
+        or settings.housekeeping_enabled
+    )
+
+
+def _load_log_catalogue(settings: GlobalSettings) -> LogCatalogue:
+    """Load and validate the packaged plus optional local log catalogue once."""
+    local_dir = (
+        Path(settings.alloy_log_plugins_dir)
+        if settings.alloy_log_plugins_dir
+        else None
+    )
+    return load_log_catalogue(local_dir)
 
 
 def _load_alloy_config(settings: GlobalSettings) -> Tuple[Optional[Any], Optional[WarningEntry]]:
@@ -390,6 +426,7 @@ def run_lxc_phase(
     limit: Optional[Set[str]] = None,
     alloy_only: bool = False,
     alloy_config: Any = _ALLOY_CONFIG_UNSET,
+    catalogue: Any = _LOG_CATALOGUE_UNSET,
     housekeeping_only: bool = False,
 ) -> FleetState:
     """Run Phase 1 (LXC container updates) via the Python driver.
@@ -408,6 +445,14 @@ def run_lxc_phase(
     whole discovery, a bare id keeps just that container wherever it lives. A
     node is skipped before discovery when it isn't named and the limit holds no
     ids at all.
+
+    The declarative application-log catalogue is loaded once (run_fleet
+    preloads it for the whole run) and passed to every worker. When logging or
+    housekeeping is requested, a broken catalogue or an invalid/ambiguous
+    guest override raises ``SystemExit`` before any guest mutation; when it can
+    only serve optional diagnostics, the failure stays soft so unrelated OS
+    updates still run. Guest overrides are validated against the complete
+    discovered fleet before ``--limit`` narrows the worker set.
 
     Canary staging: container ids listed in ``settings.canary_hosts`` update
     first (across all nodes); the rest run only if no canary failed and the
@@ -436,6 +481,34 @@ def run_lxc_phase(
     elif alloy_config is _ALLOY_CONFIG_UNSET:
         alloy_config = None
 
+    # Load the declarative log catalogue once for this phase (run_fleet preloads
+    # it for the whole run). A requested logging/housekeeping pass must fail
+    # before any guest mutation when the catalogue is broken; when the catalogue
+    # could only serve optional disk diagnostics, an unrelated OS update keeps
+    # running with the generic fallback (``catalogue=None``).
+    logging_requested = _logging_requested(
+        settings, alloy_only=alloy_only, housekeeping_only=housekeeping_only
+    )
+    if catalogue is _LOG_CATALOGUE_UNSET:
+        try:
+            catalogue = _load_log_catalogue(settings)
+        except (LogPluginError, OSError) as exc:
+            if logging_requested:
+                raise SystemExit(f"log catalogue is invalid: {exc}") from exc
+            catalogue = None
+    elif catalogue is None and logging_requested:
+        raise SystemExit("log catalogue is unavailable for a logging/housekeeping run")
+
+    # Guest overrides only participate when a logging/housekeeping pass will
+    # actually select sources. Bare ids are resolved against the *complete*
+    # discovered fleet; --limit must never hide a collision (full keys are
+    # self-identifying).
+    overrides_active = logging_requested and bool(settings.alloy_log_overrides)
+    has_bare_override = overrides_active and any(
+        GuestLogOverrideKey.parse(key).is_bare
+        for key in settings.alloy_log_overrides
+    )
+
     limit_has_ids = limit is not None and any(token_is_id(token) for token in limit)
 
     # Discovery pass: resolve every node's managed container ids up-front so
@@ -445,14 +518,24 @@ def run_lxc_phase(
     # below (limit, canary, kuma map) resolves qualified tokens correctly.
     discovered: List[Tuple[str, str, str, List[str]]] = []
     unreachable_nodes: List[Tuple[str, str]] = []
+    # Every managed guest discovered this run (before --limit), used only to
+    # validate bare guest override ids against the full fleet.
+    full_discovered: List[GuestKey] = []
+    discovery_incomplete = False
     for node_info in nodes:
         node_name = node_info["name"]
         api_host = node_info["ansible_host"]
         node_cluster = node_info["cluster"]
 
         # Node not targeted and no container ids to look for anywhere → skip
-        # the discovery SSH round-trip entirely.
-        if limit is not None and node_name not in limit and not limit_has_ids:
+        # the discovery SSH round-trip entirely. A bare override id must still
+        # be validated against every node, so that shortcut is disabled then.
+        if (
+            limit is not None
+            and node_name not in limit
+            and not limit_has_ids
+            and not has_bare_override
+        ):
             continue
 
         # Discovery is read-only — never pass --check or pct list won't run remotely.
@@ -465,14 +548,23 @@ def run_lxc_phase(
         except UnreachableHostError:
             # The node never answered — decided after the loop (quorum gate).
             unreachable_nodes.append((node_name, node_cluster))
+            discovery_incomplete = True
             print(f"[{node_name}] WARNING: node unreachable — skipping its containers")
             continue
         except Exception as exc:  # noqa: BLE001
+            discovery_incomplete = True
             state.failed = True
             state.errors.append(ErrorEntry(
                 host=node_name, task="discover_lxcs", error=str(exc)[:300]
             ))
             continue
+
+        # Record the *full* eligible discovery before --limit narrows it; this
+        # is the only input used to prove a bare override id is unambiguous.
+        if overrides_active:
+            full_discovered.extend(
+                GuestKey(node_cluster, node_name, lxc_id) for lxc_id in lxc_ids
+            )
 
         if limit is not None and node_name not in limit:
             lxc_ids = [i for i in lxc_ids if limit_selects_id(limit, node_cluster, i)]
@@ -497,6 +589,29 @@ def run_lxc_phase(
 
         print(f"[{node_name}] found {len(lxc_ids)} managed LXC(s): {', '.join(lxc_ids) or 'none'}")
         discovered.append((node_name, api_host, node_cluster, lxc_ids))
+
+    # Validate every configured guest override before a single worker can
+    # mutate a guest. Bare ids require a complete fleet discovery: an
+    # unreachable node could hide a second guest with that id.
+    override_index: Optional[GuestLogOverrideIndex] = None
+    if overrides_active:
+        if has_bare_override and discovery_incomplete:
+            raise SystemExit(
+                "cannot verify bare alloy_log_overrides guest ids: fleet "
+                "discovery is incomplete"
+            )
+        try:
+            override_index = index_guest_log_overrides(
+                settings.alloy_log_overrides, discovered=full_discovered
+            )
+            if catalogue is not None and logging_requested:
+                # Unknown catalogue IDs are configuration errors, not a
+                # per-guest coverage finding: reject them before any worker.
+                for override in settings.alloy_log_overrides.values():
+                    for plugin_id in (*override.plugins, *override.disable_plugins):
+                        catalogue.plugin(plugin_id)
+        except (GuestOverrideError, LogPluginError) as exc:
+            raise SystemExit(f"invalid alloy_log_overrides: {exc}") from exc
 
     # A down node is tolerable while the cluster is still quorate: the other
     # nodes (and their snapshots) keep working, so record a warning instead of
@@ -541,21 +656,39 @@ def run_lxc_phase(
         # Concurrent per-container updates (lxc_continue_on_error is the default)
         def _run_one(lxc_id: str) -> LxcFlowOutcome:
             ex = RunnerExecutor(node_name, inventory=inventory_path, check=check)
+            override = (
+                override_index.for_guest(GuestKey(cluster, node_name, lxc_id))
+                if override_index is not None
+                else None
+            )
             if housekeeping_only:
                 return run_lxc_housekeeping(
                     node_name, lxc_id, ex, settings,
                     dry_run=dry_run, cluster=cluster, alloy_config=alloy_config,
+                    catalogue=catalogue, log_override=override,
                 )
             guest_alloy_config = alloy_config
             if (
                 not alloy_requested
                 or matches_any(settings.lxc_alloy_exclude_list, cluster, lxc_id)
+                # A housekeeping-excluded guest keeps its installed managed
+                # sources on ordinary updates: the later _enforce_alloy() must
+                # not rewrite them from the journal-only base, and no logging
+                # preparation runs. --alloy-only is an explicit logging action
+                # and still honors only the Alloy exclusion list.
+                or (
+                    not alloy_only
+                    and matches_any(
+                        settings.lxc_housekeeping_exclude_list, cluster, lxc_id
+                    )
+                )
             ):
                 guest_alloy_config = None
             return run_lxc_update(
                 node_name, lxc_id, ex, settings,
                 dry_run=dry_run, api_host=api_host, cluster=cluster,
                 alloy_config=guest_alloy_config, alloy_only=alloy_only,
+                catalogue=catalogue, log_override=override,
             )
 
         results = run_concurrent(
@@ -1289,13 +1422,29 @@ def run_fleet(
         if alloy_warning is not None:
             state.warnings.append(alloy_warning)
 
+    # Load the log catalogue once for the run and hand the immutable object to
+    # the LXC phase. A broken catalogue is fatal only when a logging or
+    # housekeeping pass was actually requested; otherwise it is retained as a
+    # soft failure so unrelated OS updates keep working.
+    catalogue: Optional[LogCatalogue] = None
+    if housekeeping_only or alloy_only or _phase_on("lxc"):
+        logging_requested = _logging_requested(
+            settings, alloy_only=alloy_only, housekeeping_only=housekeeping_only
+        )
+        try:
+            catalogue = _load_log_catalogue(settings)
+        except (LogPluginError, OSError) as exc:
+            if logging_requested:
+                raise SystemExit(f"log catalogue is invalid: {exc}") from exc
+            catalogue = None
+
     if housekeeping_only:
         # Managed-LXC maintenance only: discovery/quorum/exclusions plus notify
         # and (isolated) history. No updates, snapshots, reboots, VM/remote/node
         # or manager phases, canary soak or apt-proxy pre-flight.
         _merge_state(state, run_lxc_phase(
             settings=settings, inventory_path=inventory_path, check=check,
-            state_output_path=None, limit=limit,
+            state_output_path=None, limit=limit, catalogue=catalogue,
             alloy_config=desired_alloy, housekeeping_only=True))
         run_notify_phase(settings=settings, state=state, check=check, housekeeping_only=True)
         return 1 if state.failed else 0
@@ -1312,7 +1461,7 @@ def run_fleet(
         _merge_state(state, run_lxc_phase(
             settings=settings, inventory_path=inventory_path, check=check,
             state_output_path=None, limit=limit, alloy_only=alloy_only,
-            alloy_config=desired_alloy))
+            alloy_config=desired_alloy, catalogue=catalogue))
     if alloy_only or _phase_on("vm"):
         _merge_state(state, run_vm_phase(
             settings=settings, inventory_path=inventory_path, check=check,

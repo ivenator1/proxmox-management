@@ -116,16 +116,62 @@ lxc_alloy_exclude_list: []
 # VM exclusions are stable [proxmox_vms] inventory names, not collision-prone vmids.
 vm_alloy_exclude_list: []
 
+# --- APPLICATION-LOG CATALOGUE (managed LXCs) ---
+# Managed LXCs get live file sources from the packaged declarative manifests in
+# proxmox_fleet/log_catalogue/ (27 apps + 7 reusable dependencies; see the
+# README section "Application-log catalogue"). Each manifest declares its exact
+# community-script identity, journal units, layouts, optional includes and
+# optional disk-ratio metadata. Auto selection is the default: there is no
+# hostname/service-name guessing, and supported apps need no per-guest entry.
+# Manifests are data only (no shell commands, HCL, templates, downloads or
+# archive/deletion rights); a local file may not shadow a built-in id.
+# alloy_log_plugins_dir is optional and is strictly ADDITIVE to the packaged
+# manifests. Per-guest overrides are raw YAML and are not edited by the
+# dashboard's structured settings form. Includes are declared in the manifest
+# itself (for example firecrawl includes postgresql, rabbitmq and redis), never
+# in vars.yml.
+alloy_log_plugins_auto: true
+alloy_log_plugins_dir: null      # e.g. "/root/proxmox-management/log-plugins"
+alloy_log_overrides: {}
+# Override keys use the full THREE-segment "cluster/node/id" (a bare numeric id
+# is also accepted only when unambiguous fleet-wide; an ambiguous bare key is
+# rejected before any mutation). This is NOT the two-segment "cluster/id" form
+# used by --limit and housekeeping_timer_targets. Modes: auto (identity-based,
+# may adjust sources/locations/layouts), replace (only listed plugins; auto
+# ignored), extend (auto plus plugins, minus disable_plugins), disabled (base
+# journal config only, no other fields).
+# alloy_log_overrides:
+#   "default/pve01/135":
+#     mode: auto
+#     # locations replaces paths only within that source's own audited roots,
+#     # alternate roots or exact-file list; settings never widen access.
+#     locations:
+#       homepage/application:
+#         - /opt/homepage/.next/standalone/config/logs/homepage.log
+#   "default/pve01/128":
+#     mode: auto
+#     disable_sources:                 # owner/source or owner/dependency/source
+#       - firecrawl/redis/cache-service
+#   "default/pve01/109":
+#     mode: replace
+#     plugins: [prowlarr]              # explicit selection; auto identity ignored
+#   "default/pve01/118":
+#     mode: disabled                   # journal-only base, no file readers
+
 # Safe rollout after enabling/configuring:
 #   ./fleet-update.py --dry-run --alloy-only
 #   ./fleet-update.py --alloy-only --limit 101,media-vm
 #   ./fleet-update.py --alloy-only
 
 # --- LOG HOUSEKEEPING FOR MANAGED LXCs (opt-in) ---
-# Retains Nginx Proxy Manager (NPM) and Proxmox Backup Server (PBS) file logs in
-# Loki, keeps a short local buffer, and runs recurring cache cleanup. Ordinary
-# LXC runs opt in with housekeeping_enabled; `--housekeeping-only` requests the
-# same feature explicitly (no updates, snapshots or reboots).
+# Collects supported applications' live logs in Loki from the declarative
+# catalogue (journal units plus audited files); Nginx Proxy Manager (NPM) and
+# Proxmox Backup Server (PBS) additionally keep the acknowledged archive/import
+# path and gated local file pruning. Also runs recurring native cache cleanup
+# for the fixed allowlisted profiles APT, Yarn, npm, pnpm and Bun (no custom
+# paths or commands); only a successful native command advances the cadence.
+# Ordinary LXC runs opt in with housekeeping_enabled; `--housekeeping-only`
+# requests the same feature explicitly (no updates, snapshots or reboots).
 #
 # housekeeping_loki_url is the canonical base the manager appends
 # /loki/api/v1/... to — an absolute http(s) URL with no credentials, query or
@@ -134,15 +180,27 @@ vm_alloy_exclude_list: []
 # explicit --housekeeping-only run).
 housekeeping_enabled: false
 housekeeping_loki_url: ""        # e.g. "http://loki.example.lan:3100" (no trailing path)
-# Closed-file cutoff and the desired Alloy journal age limit (hours).
+# Closed-file retention cutoff for the NPM/PBS archive profiles (the desired
+# Alloy journal age limit is aligned separately). New live-only application
+# sources are never pruned by the fleet.
 housekeeping_local_retention_hours: 48
 # Fleet-owned journald drop-in bounds (MB): hard local budget and keep-free floor.
 housekeeping_journal_max_mb: 256
 housekeeping_journal_keep_free_mb: 512
-# Cache-cleanup cadence, independent of the hourly log tick.
+# Cache-cleanup cadence, independent of the hourly log tick. Tools and roots are
+# fixed (APT, Yarn, npm, pnpm, Bun). Bun uses only the freshly resolved binary's
+# native `bun pm cache prune --max-age 30` under /root/.bun/install/cache with
+# BUN_INSTALL_CACHE_DIR pinned, and only when a bounded `bun pm --help` probe
+# advertises prune plus --max-age. Per-entry age is max(atime, mtime); the
+# metadata probe opens directories with O_NOATIME so it does not refresh them.
+# links/, git clones and manifests are retained; `bun pm cache rm` and Bun
+# upgrades are never used, and an unsupported binary is skipped rather than
+# cleaned destructively. Busy/failed/unsupported results change neither files
+# nor cadence; only a successful native command advances it (same setting for
+# every tool).
 housekeeping_cache_interval_hours: 24
-# Max acknowledged archive payload per guest per run (MiB); import resumes on
-# later runs until every initial file prefix is acknowledged.
+# Max acknowledged archive payload per NPM/PBS guest per run (MiB); import
+# resumes on later runs until every initial file prefix is acknowledged.
 housekeeping_backfill_budget_mb: 1024
 # Bare LXC ids apply fleet-wide; qualify cluster/ID for one cluster. Matches
 # matches_any() like the other exclusion lists.
@@ -156,8 +214,12 @@ lxc_housekeeping_exclude_list: []
 # disable the timer. Enabling the timer still requires housekeeping_loki_url.
 housekeeping_timer_enabled: null
 # Optional targets for the scheduled run, written as one `--limit` value: bare
-# ids or cluster-qualified "cluster/id". Empty keeps the legacy whole-fleet
-# schedule, e.g. [default/101, beta/102] limits maintenance to two guests.
+# ids or the two-segment "cluster/id" form (this is NOT the three-segment
+# "cluster/node/id" override key used by alloy_log_overrides). Empty keeps the
+# legacy whole-fleet schedule, e.g. [default/101, beta/102]. Discovery is not
+# enrollment: after changing targets, rerun `install.sh --update` so the
+# service's generated ExecStart --limit is regenerated, then observe a natural
+# scheduled run reclaim a genuinely due cache before relying on it.
 housekeeping_timer_targets: []
 
 # --- LXC TAG DISCOVERY ---
@@ -179,6 +241,14 @@ lxc_continue_on_error: false
 # updater filters only that guard call from the fetched ct script stream; the
 # installed /usr/bin/update wrapper and upstream source are never modified.
 # Reported in the briefing's Warnings section, on --dry-run, and in --scan.
+# When this warning already fires, the run also appends one bounded read-only
+# breakdown of the guest's USED rootfs space (largest directories as shares of
+# used bytes, every mounted subtree excluded). It is diagnostic only: no new
+# alert/notification, periodic sweep, cleanup entitlement or scan/housekeeping
+# work. Expected-normal caps are generic 20% with a 256 MiB floor (/usr: 85%),
+# and a service manifest may override them under its own `disk_usage` metadata
+# (including relaxing an expected-normal high-data ratio), via
+# default_max_share_percent / min_directory_mb / path_max_share_percent.
 lxc_disk_warn_percent: 75
 lxc_disk_min_free_gb: 10
 

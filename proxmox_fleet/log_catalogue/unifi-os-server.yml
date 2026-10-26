@@ -1,0 +1,21 @@
+---
+schema_version: 1
+id: unifi-os-server
+display_name: Proxmox community script unifi-os-server
+community_script_ids:
+  - unifi-os-server
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: uosserver.service
+      - name: uosserver-updater.service
+    sources:
+      - id: application
+        app: unifi-os-server
+        log_kind: application
+        exact_files:
+          - /var/lib/uosserver/logs/uosserver.log
+          - /var/lib/uosserver/logs/uosserver-service.log
+          - /var/lib/uosserver/logs/uos-discovery-client.log
+          - /var/lib/uosserver/logs/updater-service.log

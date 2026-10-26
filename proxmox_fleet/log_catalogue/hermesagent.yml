@@ -1,0 +1,42 @@
+---
+schema_version: 1
+id: hermesagent
+display_name: Proxmox community script hermesagent
+community_script_ids:
+  - hermesagent
+journal_units:
+  - name: hermes-dashboard.service
+  - name: hermes-gateway.service
+  - name: hermes-dashboard.service
+    scope: user
+    user: hermes
+  - name: hermes-gateway.service
+    scope: user
+    user: hermes
+layouts:
+  - id: default
+    required_units: []
+    running_units_any:
+      - name: hermes-dashboard.service
+      - name: hermes-gateway.service
+      - name: hermes-dashboard.service
+        scope: user
+        user: hermes
+      - name: hermes-gateway.service
+        scope: user
+        user: hermes
+    service_user: hermes
+    sources:
+      - id: application
+        app: hermesagent
+        log_kind: application
+        exact_files:
+          - /home/hermes/.hermes/logs/agent.log
+          - /home/hermes/.hermes/logs/gui.log
+          - /home/hermes/.hermes/logs/gateway.log
+      - id: error
+        app: hermesagent
+        log_kind: error
+        exact_files:
+          - /home/hermes/.hermes/logs/errors.log
+        required: false

@@ -1416,6 +1416,47 @@ def test_settings_page_keeps_nested_cluster_credentials_raw_only(project):
     assert "pve_clusters" not in {row["name"] for row in rows}
 
 
+_OVERRIDE_VARS = """\
+# hand-written comment that must survive
+lxc_forks: 20
+canary_hosts: []
+alloy_log_overrides:
+  "135":
+    mode: replace
+    plugins: [homepage]
+    locations:
+      homepage/application: ["/opt/homepage/config/logs"]
+"""
+
+
+def test_settings_page_keeps_nested_log_overrides_raw_only(project):
+    """The nested per-guest override map has no structured form control (the
+    generic map widget would flatten each entry to ``135={'mode': ...}``), so
+    it stays raw-editor-only and survives an unrelated form save untouched."""
+    (project / "vars.yml").write_text(_OVERRIDE_VARS)
+    client = _project_client(project)
+
+    page = client.get("/settings").text
+    assert 'name="alloy_log_overrides"' not in page
+    assert 'class="setting-name">alloy_log_overrides' not in page
+    # Still hand-editable through the raw YAML editor on the same page.
+    assert "/opt/homepage/config/logs" in page
+
+    resp = client.post(
+        "/settings",
+        data={"lxc_forks": "7", "alloy_log_overrides": "135=replace"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    settings = GlobalSettings.load(str(project / "vars.yml"))
+    assert settings.lxc_forks == 7
+    override = settings.alloy_log_overrides["135"]
+    assert override.mode == "replace"
+    assert override.plugins == ["homepage"]
+    assert override.locations == {"homepage/application": ["/opt/homepage/config/logs"]}
+
+
 def test_settings_invalid_value_400(project):
     assert _project_client(project).post("/settings", data={"lxc_forks": "banana"}).status_code == 400
 

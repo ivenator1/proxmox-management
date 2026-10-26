@@ -1,0 +1,13 @@
+---
+schema_version: 1
+id: flaresolverr
+display_name: Proxmox community script flaresolverr
+community_script_ids:
+  - flaresolverr
+journal_units:
+  - name: flaresolverr.service
+layouts:
+  - id: default
+    required_units:
+      - name: flaresolverr.service
+    sources: []

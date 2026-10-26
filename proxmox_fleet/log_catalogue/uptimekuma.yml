@@ -1,0 +1,18 @@
+---
+schema_version: 1
+id: uptimekuma
+display_name: Proxmox community script uptimekuma
+community_script_ids:
+  - uptimekuma
+journal_units:
+  - name: uptime-kuma.service
+layouts:
+  - id: default
+    required_units:
+      - name: uptime-kuma.service
+    sources:
+      - id: error
+        app: uptimekuma
+        log_kind: error
+        exact_files:
+          - /opt/uptime-kuma/data/error.log

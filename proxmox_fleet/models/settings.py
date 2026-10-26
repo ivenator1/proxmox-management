@@ -20,6 +20,8 @@ from pydantic import (  # pyright: ignore[reportMissingImports]
     model_validator,
 )
 
+from proxmox_fleet.models.log_plugins import GuestLogOverride, GuestLogOverrideKey
+
 #: Shape of a ``--limit`` token: a bare host name/id or one cluster-qualified
 #: ``cluster/id`` segment. Mirrors ``web/app.py``'s ``_LIMIT_TOKEN_RE`` (the
 #: ``--limit`` tokenizer) so the installer can write ``housekeeping_timer_targets``
@@ -73,6 +75,13 @@ class GlobalSettings(BaseModel):
     alloy_config_path: str = "configs/guest.alloy"
     lxc_alloy_exclude_list: List[str] = Field(default_factory=list)
     vm_alloy_exclude_list: List[str] = Field(default_factory=list)
+    # Declarative application-log catalogue selection. Auto is the default;
+    # the optional local directory is additive to the packaged manifests.
+    alloy_log_plugins_auto: bool = True
+    alloy_log_plugins_dir: Optional[str] = None
+    # Typed per-guest overrides keyed by full cluster/node/id or a bare numeric
+    # id. Bare-key ambiguity is checked against full discovery by log_plugins.
+    alloy_log_overrides: Dict[str, GuestLogOverride] = Field(default_factory=dict)
 
     # Log housekeeping for managed LXCs: bounded, acknowledged import of
     # retained NPM/PBS file-log history into Loki plus short local retention
@@ -258,6 +267,51 @@ class GlobalSettings(BaseModel):
                     f"housekeeping_timer_targets entry {token!r} is not a valid "
                     "id/name token (use bare ids or cluster/id)"
                 )
+        return value
+
+    @field_validator("alloy_log_plugins_dir", mode="before")
+    @classmethod
+    def _normalize_log_plugins_dir(cls, value: Any) -> Any:
+        """Treat an unset/empty directory as None; reject control characters."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("alloy_log_plugins_dir must be a string or null")
+        if not value.strip():
+            return None
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+            raise ValueError("alloy_log_plugins_dir must not contain control characters")
+        return value
+
+    @field_validator("alloy_log_overrides", mode="before")
+    @classmethod
+    def _stringify_override_keys(cls, value: Any) -> Any:
+        """Coerce YAML numeric bare guest ids to string keys, rejecting collisions."""
+        if not isinstance(value, dict):
+            return value
+        normalized: Dict[str, Any] = {}
+        for key, item in value.items():
+            text = str(key)
+            if text in normalized:
+                raise ValueError(f"duplicate alloy_log_overrides key {text!r}")
+            normalized[text] = item
+        return normalized
+
+    @field_validator("alloy_log_overrides")
+    @classmethod
+    def _validate_override_keys(
+        cls, value: Dict[str, GuestLogOverride]
+    ) -> Dict[str, GuestLogOverride]:
+        """Reject malformed full/bare guest keys during settings loading.
+
+        Bare-id ambiguity needs the discovered fleet and is therefore rejected
+        by ``log_plugins.index_guest_log_overrides`` before guest mutation.
+        """
+        for key in value:
+            try:
+                GuestLogOverrideKey.parse(key)
+            except ValueError as exc:
+                raise ValueError(f"alloy_log_overrides key {key!r}: {exc}") from exc
         return value
 
     @field_validator("lxc_kuma_map", "vm_kuma_map", "remote_kuma_map", mode="before")

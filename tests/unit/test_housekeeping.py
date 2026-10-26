@@ -18,11 +18,14 @@ string or a mocked result producer.
 """
 from __future__ import annotations
 
+import copy
+import glob as glob_module
 import hashlib
 import http.server
 import json
 import os
 import re
+import shlex
 import sqlite3
 import stat
 import subprocess
@@ -38,9 +41,11 @@ from proxmox_fleet import housekeeping
 from proxmox_fleet import housekeeping_cache as hc
 from proxmox_fleet import housekeeping_import as hi
 from proxmox_fleet import housekeeping_io as hio
+from proxmox_fleet import log_plugins as lp
 from proxmox_fleet.alloy import DesiredAlloyConfig
 from proxmox_fleet.housekeeping_checkpoint import CheckpointStore, GuestKey
 from proxmox_fleet.housekeeping_io import REQUIRED_BINARIES
+from proxmox_fleet.models.log_plugins import GuestLogOverride
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.runner import PrimitiveResult
 
@@ -48,6 +53,28 @@ CLUSTER = "alpha"
 NODE = "pve"
 LXC = "120"
 NPM_ARCHIVE = "/data/logs/access.log.1"
+
+_CATALOGUE = None
+
+
+def _catalogue():
+    """Load the real packaged manifests once per test session."""
+    global _CATALOGUE
+    if _CATALOGUE is None:
+        _CATALOGUE = lp.load_log_catalogue()
+    return _CATALOGUE
+
+
+def _script_identity(guest: "Guest") -> Optional[str]:
+    """Explicit identity first, then the fixture's profile shorthand."""
+    if guest.script_id:
+        return guest.script_id
+    if "npm" in guest.profiles:
+        return "nginxproxymanager"
+    if "pbs" in guest.profiles:
+        return "proxmox-backup-server"
+    return None
+
 
 _TOKEN_RE = re.compile(r'\|= "([^"]+)"')
 _FILENAME_RE = re.compile(r'filename="([^"]+)"')
@@ -177,7 +204,34 @@ def _tool_for_command(command: str) -> Optional[str]:
     for tool, native in hc.CACHE_CLEAN_COMMANDS.items():
         if command == native:
             return tool
+    if command.startswith("LC_ALL=C BUN_INSTALL_CACHE_DIR=") and " pm cache prune --max-age 30" in command:
+        return "bun"
     return None
+
+
+def _bun_reclaimable(root: Optional[Path]) -> int:
+    """Mirror of the helper's conservative Bun reclaimable total."""
+    if root is None or not root.exists():
+        return 0
+    links = root / "links"
+    total = 0
+    seen = set()
+    for dirpath, _dirnames, filenames in os.walk(root):
+        current = Path(dirpath)
+        in_links = current == links or links in current.parents
+        for name in filenames:
+            try:
+                st = os.lstat(current / name)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or in_links:
+                continue
+            identity = (st.st_dev, st.st_ino)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            total += st.st_blocks * 512
+    return total
 
 
 @dataclass
@@ -194,6 +248,7 @@ _ABSENT_CACHE: Dict[str, CacheSpec] = {
     "yarn": CacheSpec("/usr/local/share/.cache/yarn/v6", None, "1.0.0", "tool"),
     "npm": CacheSpec("/root/.npm", None, "1.0.0", "tool"),
     "pnpm": CacheSpec("/root/.local/share/pnpm/store/v11", None, "1.0.0", "tool"),
+    "bun": CacheSpec("/root/.bun/install/cache", None, "1.4.4", "tool"),
 }
 
 
@@ -256,8 +311,22 @@ class Guest:
         self.npm_logrotate_hash = ""
         self.facts_override: Optional[Dict[str, Any]] = None
         self.probe_script: List[Dict[str, Any]] = []
+        self.script_id: Optional[str] = None
+        self.log_override: Optional[GuestLogOverride] = None
+        self.logging_facts: Optional[Dict[str, Any]] = None
+        self.logging_unit_status: Dict[str, str] = {}
+        self.logging_source_status: Dict[str, str] = {}
+        self.acl_traverse: set = set()
+        self.acl_roots: set = set()
+        self.acl_files: set = set()
+        self.log_acl_calls: List[Dict[str, Any]] = []
+        self.log_acl_result: Optional[PrimitiveResult] = None
+        self.fail_probe_calls: set = set()
+        self.validate_only_fails = False
+        self.validation_calls: List[str] = []
         # observability
         self.probe_calls = 0
+        self.logging_requests: List[Optional[Dict[str, Any]]] = []
         self.applied: List[str] = []
         self.capture_calls = 0
         self.snapshot_calls = 0
@@ -272,7 +341,7 @@ class Guest:
         for tool, spec in self.cache_specs.items():
             directory = spec.directory
             exists = directory is not None and directory.exists()
-            out[tool] = {
+            entry = {
                 "root": spec.resolved,
                 "resolved": spec.resolved,
                 "source": spec.source,
@@ -285,6 +354,13 @@ class Guest:
                 "error": None,
                 "root_owned": True,
             }
+            if tool == "bun":
+                entry["binary"] = "/usr/local/bin/bun"
+                entry["cache_prune_supported"] = True
+                entry["reclaimable_bytes"] = (
+                    _bun_reclaimable(directory) if exists else 0
+                )
+            out[tool] = entry
         return out
 
     def _evidence(self) -> Dict[str, Any]:
@@ -305,7 +381,261 @@ class Guest:
             },
         }
 
-    def facts(self) -> Dict[str, Any]:
+    def _prepared_root(self, root: str) -> bool:
+        return bool(self.access_ready or root in self.acl_roots)
+
+    def _unit_status(self, unit: Dict[str, Any]) -> str:
+        key = unit["key"]
+        if key in self.logging_unit_status:
+            return self.logging_unit_status[key]
+        if "*" in str(unit.get("name", "")):
+            return "inactive"
+        return "active"
+
+    def _unit_records(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        records: Dict[str, Any] = {}
+
+        def add(unit: Dict[str, Any]) -> None:
+            status = self._unit_status(unit)
+            records[unit["key"]] = {"status": status, "instances": {}}
+
+        for layout in entry.get("layouts", []):
+            for unit in (*layout.get("required_units", []), *layout.get("running_units_any", [])):
+                add(unit)
+        for unit in entry.get("journal_units", []):
+            records.setdefault(unit["key"], {"status": self._unit_status(unit), "instances": {}})
+        return records
+
+    def _root_record(self, root: str) -> Dict[str, Any]:
+        record: Dict[str, Any] = {
+            "exists": False,
+            "is_dir": False,
+            "is_symlink": False,
+            "device": None,
+            "blocked_ancestor": False,
+            "status": "missing_root",
+        }
+        joined = Path(self.guest_root) / root.lstrip("/")
+        try:
+            st = os.lstat(joined)
+        except FileNotFoundError:
+            return record
+        except OSError:
+            record.update(exists=True, status="failed")
+            return record
+        record["exists"] = True
+        record["is_symlink"] = stat.S_ISLNK(st.st_mode)
+        record["device"] = int(st.st_dev)
+        if record["is_symlink"]:
+            record["status"] = "failed"
+            return record
+        if not stat.S_ISDIR(st.st_mode):
+            record["status"] = "failed"
+            return record
+        record["is_dir"] = True
+        prepared = self._prepared_root(root)
+        record["status"] = "ok" if prepared else "denied"
+        record["access"] = {
+            "traversable": prepared,
+            "readable": prepared,
+            "default_acl": prepared,
+        }
+        return record
+
+    def _exact_record(self, path: str) -> Dict[str, Any]:
+        parent = path.rsplit("/", 1)[0] or "/"
+        parent_ok = self._prepared_root(parent) or parent in self.acl_traverse
+        record: Dict[str, Any] = {
+            "exists": False,
+            "is_symlink": False,
+            "device": None,
+            "inode": None,
+            "size": None,
+            "mtime_ns": None,
+            "same_device": True,
+            "parent_traversable": bool(parent_ok),
+            "status": "quiet" if parent_ok else "missing_root",
+        }
+        joined = Path(self.guest_root) / path.lstrip("/")
+        try:
+            st = os.lstat(joined)
+        except FileNotFoundError:
+            # A safe, existing parent proves the path can be granted traverse
+            # access even though the declared file is not there yet; only a
+            # missing parent/symlink is ``missing_root``.  Do not conflate the
+            # two: an absent optional sibling must not block repair.
+            try:
+                parent_stat = os.lstat(joined.parent)
+            except OSError:
+                return record
+            if not stat.S_ISDIR(parent_stat.st_mode):
+                return record
+            record["parent_traversable"] = bool(parent_ok)
+            record["status"] = "quiet" if parent_ok else "denied"
+            return record
+        except OSError:
+            record.update(exists=True, status="failed")
+            return record
+        record.update(
+            exists=True,
+            is_symlink=stat.S_ISLNK(st.st_mode),
+            device=int(st.st_dev),
+            inode=int(st.st_ino),
+            size=int(st.st_size),
+            mtime_ns=int(st.st_mtime_ns),
+            is_file=stat.S_ISREG(st.st_mode),
+        )
+        if record["is_symlink"] or not record["is_file"]:
+            record["status"] = "failed"
+            return record
+        readable = bool(self.access_ready or path in self.acl_files)
+        record["access"] = {"readable": readable}
+        if readable and parent_ok:
+            record["status"] = "ok"
+        else:
+            record["status"] = "denied"
+        return record
+
+    def _source_facts(
+        self, descriptor: Dict[str, Any], key: Optional[str] = None
+    ) -> Dict[str, Any]:
+        forced = self.logging_source_status.get(key) if key is not None else None
+        roots = list(descriptor.get("roots", []))
+        root_records = {root: self._root_record(root) for root in roots}
+        matches: List[Dict[str, Any]] = []
+        for pattern in descriptor.get("paths", []):
+            candidates = [
+                root
+                for root in roots
+                if pattern == root or pattern.startswith(root + "/")
+            ]
+            root = max(candidates, key=len) if candidates else None
+            status = root_records[root]["status"] if root else "missing_root"
+            files: List[Dict[str, Any]] = []
+            if status == "ok":
+                for match in glob_module.glob(
+                    self.guest_root + pattern, recursive=True
+                ):
+                    path = Path(match)
+                    if not path.is_file() or path.is_symlink():
+                        continue
+                    guest_path = "/" + str(path.relative_to(self.guest_root))
+                    if f"/{hio.QUARANTINE_DIRNAME}/" in guest_path:
+                        continue
+                    try:
+                        st = os.lstat(match)
+                    except OSError:
+                        continue
+                    files.append(
+                        {
+                            "path": guest_path,
+                            "device": int(st.st_dev),
+                            "inode": int(st.st_ino),
+                            "size": int(st.st_size),
+                            "mtime_ns": int(st.st_mtime_ns),
+                            "accessible": True,
+                        }
+                    )
+                status = "ok" if files else "quiet"
+            matches.append(
+                {
+                    "pattern": pattern,
+                    "matched": len(files),
+                    "skipped": 0,
+                    "truncated": False,
+                    "status": status,
+                    "files": files,
+                }
+            )
+        exact_records = {
+            path: self._exact_record(path)
+            for path in descriptor.get("exact_files", [])
+        }
+        statuses = [record["status"] for record in root_records.values()]
+        statuses += [match["status"] for match in matches]
+        statuses += [record["status"] for record in exact_records.values()]
+        if forced == "unavailable":
+            for record in root_records.values():
+                record["status"] = "unavailable"
+            for match in matches:
+                match["status"] = "unavailable"
+            for record in exact_records.values():
+                record["status"] = "unavailable"
+            statuses = ["unavailable"]
+        elif forced == "partial":
+            for record in root_records.values():
+                record["status"] = "partial"
+            for match in matches:
+                match["status"] = "partial"
+                match["truncated"] = True
+            for record in exact_records.values():
+                record["status"] = "partial"
+            statuses = ["partial"]
+        elif forced in {"denied", "failed"}:
+            for record in root_records.values():
+                record["status"] = forced
+            for match in matches:
+                match["status"] = forced
+            for record in exact_records.values():
+                record["status"] = forced
+            statuses = [forced]
+        if "failed" in statuses:
+            overall = "failed"
+        elif "unavailable" in statuses:
+            overall = "unavailable"
+        elif "partial" in statuses:
+            overall = "partial"
+        elif "denied" in statuses:
+            overall = "denied"
+        elif any(
+            record.get("exists") for record in root_records.values()
+        ) or any(record.get("exists") for record in exact_records.values()):
+            overall = "ok"
+        elif statuses and all(item == "quiet" for item in statuses):
+            overall = "quiet"
+        else:
+            overall = "missing_root"
+        return {
+            "status": overall,
+            "truncated": False,
+            "roots": root_records,
+            "exact_files": exact_records,
+            "matches": matches,
+        }
+
+    def _logging_facts(
+        self, request: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        if request is None:
+            return {"plugins": {}, "sources": {}}
+        if self.logging_facts is not None:
+            return copy.deepcopy(self.logging_facts)
+        if not self.running or self.template:
+            return {"plugins": {}, "sources": {}}
+        plugins: Dict[str, Any] = {}
+        for owner, entry in request.get("plugins", {}).items():
+            includes: Dict[str, Any] = {}
+            for dependency, dependency_entry in entry.get("includes", {}).items():
+                includes[dependency] = {
+                    "units": self._unit_records(dependency_entry)
+                }
+            plugins[owner] = {
+                "units": self._unit_records(entry),
+                "includes": includes,
+            }
+        sources: Dict[str, Any] = {}
+        for key, source_entry in request.get("sources", {}).items():
+            sources[key] = {
+                "layouts": {
+                    layout_id: self._source_facts(descriptor, key)
+                    for layout_id, descriptor in source_entry.get(
+                        "layouts", {}
+                    ).items()
+                }
+            }
+        return {"plugins": plugins, "sources": sources}
+
+    def facts(self, logging_request: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         binaries = dict(self.binaries)
         def policy_hash(name: str, fallback: str) -> str:
             path = Path(self.guest_root) / hio.POLICY_FILES[name].lstrip("/")
@@ -335,18 +665,27 @@ class Guest:
                 "npm_logrotate": policy_hash("npm_logrotate", self.npm_logrotate_hash),
             },
             "profile_evidence": self._evidence(),
+            "logging": self._logging_facts(logging_request),
         }
 
     # -- transport --------------------------------------------------------- #
 
-    def housekeeping_probe(self, lxc_id: str) -> PrimitiveResult:
+    def housekeeping_probe(
+        self,
+        lxc_id: str,
+        *,
+        logging_request: Optional[Dict[str, Any]] = None,
+    ) -> PrimitiveResult:
         self.probe_calls += 1
+        self.logging_requests.append(logging_request)
+        if self.probe_calls in self.fail_probe_calls:
+            return PrimitiveResult(rc=1, failed=True, stderr="probe failed")
         if self.probe_script:
             facts = self.probe_script.pop(0)
         elif self.facts_override is not None:
             facts = self.facts_override
         else:
-            facts = self.facts()
+            facts = self.facts(logging_request)
         return PrimitiveResult(rc=0, facts=facts)
 
     def housekeeping_apply(self, lxc_id: str, *, command: str) -> PrimitiveResult:
@@ -357,9 +696,15 @@ class Guest:
             if spec.rc == 0:
                 directory = spec.directory
                 if directory is not None:
+                    links = directory / "links"
                     for path in sorted(directory.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-                        if path.is_file():
-                            path.unlink()
+                        if not path.is_file() or path.is_symlink():
+                            continue
+                        if tool == "bun" and (
+                            path == links or links in path.parents
+                        ):
+                            continue
+                        path.unlink()
             return PrimitiveResult(
                 rc=spec.rc,
                 changed=spec.rc == 0,
@@ -368,7 +713,6 @@ class Guest:
                 facts={},
             )
         from proxmox_fleet import housekeeping_native as native
-        import shlex
         import sys
 
         parts = shlex.split(command)
@@ -381,6 +725,95 @@ class Guest:
             return PrimitiveResult(rc=process.returncode, failed=process.returncode != 0,
                                    stdout=process.stdout, stderr=process.stderr, facts={})
         return PrimitiveResult(rc=0, changed=True, facts={})
+
+    def housekeeping_log_acl(
+        self,
+        lxc_id: str,
+        *,
+        roots: Sequence[str] = (),
+        exact_files: Sequence[str] = (),
+    ) -> PrimitiveResult:
+        roots = tuple(roots)
+        exact_files = tuple(exact_files)
+        self.log_acl_calls.append(
+            {"roots": roots, "exact_files": exact_files}
+        )
+        if self.log_acl_result is not None:
+            return self.log_acl_result
+
+        def grant_ancestors(path: str) -> None:
+            current = path.rsplit("/", 1)[0]
+            while current and current != "/":
+                self.acl_traverse.add(current)
+                current = current.rsplit("/", 1)[0]
+
+        repaired_roots = 0
+        repaired_files = 0
+        skipped_missing = 0
+        changed = False
+        for root in roots:
+            grant_ancestors(root)
+            joined = Path(self.guest_root) / root.lstrip("/")
+            try:
+                observed = os.lstat(joined)
+            except FileNotFoundError:
+                skipped_missing += 1
+                continue
+            if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
+                return PrimitiveResult(
+                    rc=0,
+                    changed=changed,
+                    facts={
+                        "status": "failed",
+                        "changed": changed,
+                        "repaired_roots": repaired_roots,
+                        "repaired_files": repaired_files,
+                        "skipped_missing": skipped_missing,
+                        "error_count": 1,
+                        "reason": "declared log root is unsafe",
+                    },
+                )
+            self.acl_roots.add(root)
+            repaired_roots += 1
+            changed = True
+        for path in exact_files:
+            grant_ancestors(path)
+            joined = Path(self.guest_root) / path.lstrip("/")
+            try:
+                observed = os.lstat(joined)
+            except FileNotFoundError:
+                skipped_missing += 1
+                continue
+            if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
+                return PrimitiveResult(
+                    rc=0,
+                    changed=changed,
+                    facts={
+                        "status": "failed",
+                        "changed": changed,
+                        "repaired_roots": repaired_roots,
+                        "repaired_files": repaired_files,
+                        "skipped_missing": skipped_missing,
+                        "error_count": 1,
+                        "reason": "declared exact file is unsafe",
+                    },
+                )
+            self.acl_files.add(path)
+            repaired_files += 1
+            changed = True
+        return PrimitiveResult(
+            rc=0,
+            changed=changed,
+            facts={
+                "status": "complete",
+                "changed": changed,
+                "repaired_roots": repaired_roots,
+                "repaired_files": repaired_files,
+                "skipped_missing": skipped_missing,
+                "error_count": 0,
+                "reason": "",
+            },
+        )
 
     def housekeeping_capture(self, lxc_id: str, *, files: Sequence[Dict[str, Any]], capture_id: str) -> PrimitiveResult:
         self.capture_calls += 1
@@ -447,6 +880,7 @@ class Guest:
         configure: bool,
         add_journal_group: bool,
         repair_service: bool,
+        validate_only: bool = False,
     ) -> PrimitiveResult:
         self.alloy_reconciles.append(
             {
@@ -454,18 +888,33 @@ class Guest:
                 "configure": configure,
                 "add_journal_group": add_journal_group,
                 "repair_service": repair_service,
+                "validate_only": validate_only,
             }
         )
+        if validate_only:
+            self.validation_calls.append(desired_content)
+            if self.validate_only_fails:
+                return PrimitiveResult(rc=1, failed=True, stderr="invalid HCL", facts={})
+            return PrimitiveResult(rc=0, changed=False, facts={})
         if self.alloy_reconcile_failed:
             return PrimitiveResult(rc=1, failed=True, stderr="alloy deploy failed", facts={})
-        self.alloy_binary = True
-        self.alloy_config_sha = hashlib.sha256(desired_content.encode("utf-8")).hexdigest()
+        if install:
+            self.alloy_binary = True
+        if configure:
+            self.alloy_config_sha = hashlib.sha256(
+                desired_content.encode("utf-8")
+            ).hexdigest()
         return PrimitiveResult(rc=0, changed=True, facts={})
 
     # -- helpers ----------------------------------------------------------- #
 
     def cache_commands(self) -> List[str]:
-        return [command for command in self.applied if command in hc.CACHE_CLEAN_COMMANDS.values()]
+        return [
+            command
+            for command in self.applied
+            if command in hc.CACHE_CLEAN_COMMANDS.values()
+            or command.startswith("LC_ALL=C BUN_INSTALL_CACHE_DIR=")
+        ]
 
 
 # --------------------------------------------------------------------------- #
@@ -535,6 +984,9 @@ def _run(
         lxc_id=lxc_id,
         name="guest",
         desired_alloy=base,
+        catalogue=_catalogue(),
+        script_id=_script_identity(guest),
+        log_override=guest.log_override,
         dry_run=dry_run,
     )
 
@@ -548,6 +1000,30 @@ def _compliant(guest: Guest, settings: GlobalSettings, base: DesiredAlloyConfig)
     ).hexdigest()
 
 
+def _prepare(
+    guest: Guest,
+    settings: GlobalSettings,
+    base: DesiredAlloyConfig,
+    *,
+    dry_run: bool = False,
+    allow_install: bool = False,
+):
+    return housekeeping.prepare_lxc_logging(
+        guest,
+        settings,
+        node=NODE,
+        cluster=CLUSTER,
+        lxc_id=LXC,
+        name="guest",
+        base=base,
+        catalogue=_catalogue(),
+        script_id=_script_identity(guest),
+        log_override=guest.log_override,
+        dry_run=dry_run,
+        allow_install=allow_install,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Cluster-aware exclusions
 # --------------------------------------------------------------------------- #
@@ -555,7 +1031,9 @@ def _compliant(guest: Guest, settings: GlobalSettings, base: DesiredAlloyConfig)
 
 def test_general_exclusion_is_cluster_qualified(history: Path, guest: Guest):
     base = _base("http://127.0.0.1:9")
-    settings = _settings(history, exclude_list=["alpha/120"])
+    settings = _settings(
+        history, url="http://127.0.0.1:9", exclude_list=["alpha/120"]
+    )
 
     excluded = _run(guest, settings, base)
     assert guest.probe_calls == 0
@@ -564,10 +1042,13 @@ def test_general_exclusion_is_cluster_qualified(history: Path, guest: Guest):
     assert not (history / "housekeeping.sqlite3").exists()
 
     other = Guest(Path(guest.guest_root), Path(guest.spool))
-    other.probe_script = [other.facts()]
     matched = _run(other, settings, base, cluster="beta")
-    assert other.probe_calls == 1
-    assert matched.effective_alloy is base
+    assert other.probe_calls >= 2
+    assert matched.failed is False
+    # No recognized identity: the sanitized coverage finding is reported and
+    # no unverified config is enforced.
+    assert matched.effective_alloy is None
+    assert any("unsupported" in warning for warning in matched.warnings)
 
 
 def test_housekeeping_exclusion_list_skips_without_touching_the_guest(history: Path, guest: Guest):
@@ -577,6 +1058,7 @@ def test_housekeeping_exclusion_list_skips_without_touching_the_guest(history: P
     assert guest.probe_calls == 0
     assert guest.applied == []
     assert result.summary is None
+    assert result.effective_alloy is None
     assert not (history / "housekeeping.sqlite3").exists()
 
 
@@ -590,7 +1072,7 @@ def test_alloy_excluded_guest_warns_without_actions(history: Path, guest: Guest)
     assert guest.applied == []
     assert result.summary is None
     assert result.failed is False
-    assert result.effective_alloy is base
+    assert result.effective_alloy is None
     assert any("excluded from Alloy" in warning for warning in result.warnings)
 
 
@@ -614,7 +1096,7 @@ def test_stopped_and_template_guests_create_no_state(history: Path, guest: Guest
     assert result.summary is None
     assert result.failed is False
     assert result.changed is False
-    assert result.effective_alloy is base
+    assert result.effective_alloy is None
     assert not (history / "housekeeping.sqlite3").exists()
 
 
@@ -652,14 +1134,210 @@ def test_malformed_probe_fails_closed_without_mutation(history: Path, guest: Gue
 
     assert result.failed is True
     assert result.summary is not None and result.summary.status == "Blocked"
-    assert result.effective_alloy is base
+    assert result.effective_alloy is None
     assert guest.applied == []
     assert guest.capture_calls == 0
     assert not (history / "housekeeping.sqlite3").exists()
 
 
+def _logging_request_fixture() -> Dict[str, Any]:
+    return {
+        "plugins": {
+            "demoapp": {
+                "layouts": [
+                    {
+                        "id": "default",
+                        "required_units": [
+                            {
+                                "name": "demoapp.service",
+                                "scope": "system",
+                                "user": None,
+                                "key": "system:demoapp.service",
+                            }
+                        ],
+                        "running_units_any": [],
+                    }
+                ],
+                "journal_units": [],
+                "includes": {},
+            }
+        },
+        "sources": {
+            "demoapp/application": {
+                "layouts": {
+                    "default": {
+                        "roots": ["/var/log/demoapp"],
+                        "paths": ["/var/log/demoapp/*.log"],
+                        "exact_files": [],
+                        "exclude_paths": [],
+                    }
+                }
+            }
+        },
+    }
+
+
+def _logging_facts_fixture() -> Dict[str, Any]:
+    return {
+        "plugins": {
+            "demoapp": {
+                "units": {
+                    "system:demoapp.service": {
+                        "status": "active",
+                        "instances": {},
+                    }
+                },
+                "includes": {},
+            }
+        },
+        "sources": {
+            "demoapp/application": {
+                "layouts": {
+                    "default": {
+                        "status": "ok",
+                        "truncated": False,
+                        "roots": {
+                            "/var/log/demoapp": {
+                                "exists": True,
+                                "is_dir": True,
+                                "is_symlink": False,
+                                "device": 1,
+                                "blocked_ancestor": False,
+                                "status": "ok",
+                                "access": {
+                                    "traversable": True,
+                                    "readable": True,
+                                    "default_acl": True,
+                                },
+                            }
+                        },
+                        "exact_files": {},
+                        "matches": [
+                            {
+                                "pattern": "/var/log/demoapp/*.log",
+                                "matched": 1,
+                                "skipped": 0,
+                                "truncated": False,
+                                "status": "ok",
+                                "files": [
+                                    {
+                                        "path": "/var/log/demoapp/a.log",
+                                        "device": 1,
+                                        "inode": 2,
+                                        "size": 3,
+                                        "mtime_ns": 4,
+                                        "accessible": True,
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                }
+            }
+        },
+    }
+
+
+def test_probe_housekeeping_forwards_logging_request_and_types_evidence(
+    guest: Guest,
+) -> None:
+    request = _logging_request_fixture()
+    facts = guest.facts()
+    facts["logging"] = _logging_facts_fixture()
+    guest.facts_override = facts
+
+    probe = housekeeping.probe_housekeeping(
+        guest, "120", logging_request=request
+    )
+
+    assert guest.logging_requests == [request]
+    assert probe.logging == _logging_facts_fixture()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing_source", "extra_unit", "bad_status", "missing_bool", "bad_file"],
+)
+def test_probe_housekeeping_rejects_mismatched_logging_evidence(
+    guest: Guest, mutation: str
+) -> None:
+    request = _logging_request_fixture()
+    logging = _logging_facts_fixture()
+    if mutation == "missing_source":
+        logging["sources"] = {}
+    elif mutation == "extra_unit":
+        logging["plugins"]["demoapp"]["units"]["system:extra.service"] = {
+            "status": "active",
+            "instances": {},
+        }
+    elif mutation == "bad_status":
+        logging["plugins"]["demoapp"]["units"]["system:demoapp.service"][
+            "status"
+        ] = "running"
+    elif mutation == "missing_bool":
+        del logging["sources"]["demoapp/application"]["layouts"]["default"][
+            "truncated"
+        ]
+    elif mutation == "bad_file":
+        logging["sources"]["demoapp/application"]["layouts"]["default"]["matches"][
+            0
+        ]["files"][0]["device"] = "one"
+    facts = guest.facts()
+    facts["logging"] = logging
+    guest.facts_override = facts
+
+    with pytest.raises(housekeeping.HousekeepingError, match="logging"):
+        housekeeping.probe_housekeeping(guest, "120", logging_request=request)
+
+
+def test_probe_housekeeping_accepts_explicit_empty_logging_for_stopped_guest(
+    guest: Guest,
+) -> None:
+    guest.running = False
+    request = _logging_request_fixture()
+    facts = guest.facts()
+    guest.facts_override = facts
+
+    probe = housekeeping.probe_housekeeping(
+        guest, "120", logging_request=request
+    )
+
+    assert guest.logging_requests == [request]
+    assert probe.logging == {"plugins": {}, "sources": {}}
+
+    facts["logging"] = _logging_facts_fixture()
+    with pytest.raises(
+        housekeeping.HousekeepingError, match="stopped guest"
+    ):
+        housekeeping.probe_housekeeping(guest, "120", logging_request=request)
+
+
+def test_probe_housekeeping_rejects_unsolicited_logging_without_request(
+    guest: Guest,
+) -> None:
+    facts = guest.facts()
+    facts["logging"] = _logging_facts_fixture()
+    guest.facts_override = facts
+
+    with pytest.raises(
+        housekeeping.HousekeepingError, match="unsolicited logging"
+    ):
+        housekeeping.probe_housekeeping(guest, "120")
+
+
+def test_probe_housekeeping_requires_the_logging_map(guest: Guest) -> None:
+    facts = guest.facts()
+    facts.pop("logging")
+    guest.facts_override = facts
+
+    with pytest.raises(
+        housekeeping.HousekeepingError, match="incomplete facts"
+    ):
+        housekeeping.probe_housekeeping(guest, "120")
+
+
 def test_probe_transport_failure_is_blocked(history: Path, guest: Guest):
-    def boom(lxc_id: str) -> PrimitiveResult:  # pragma: no cover - injected
+    def boom(lxc_id: str, *, logging_request=None) -> PrimitiveResult:  # pragma: no cover - injected
         raise RuntimeError("ssh dropped")
 
     guest.housekeeping_probe = boom  # type: ignore[assignment]
@@ -670,7 +1348,7 @@ def test_probe_transport_failure_is_blocked(history: Path, guest: Guest):
 
     assert result.failed is True
     assert result.summary is not None and result.summary.status == "Blocked"
-    assert result.effective_alloy is base
+    assert result.effective_alloy is None
     assert not (history / "housekeeping.sqlite3").exists()
 
 
@@ -735,13 +1413,14 @@ def test_cache_reclamation_survives_missing_loki_url(history: Path, guest: Guest
     assert result.summary is not None and result.summary.status == "Blocked"
     assert result.summary.bytes_reclaimed == before
     assert any("Loki" in warning for warning in result.warnings)
-    assert result.effective_alloy is base
+    assert result.effective_alloy is None
 
 
 def test_cache_reclamation_survives_missing_alloy(history: Path, guest: Guest, tmp_path: Path):
     yarn = _cache_dir(tmp_path, "yarn")
     before = _measure(yarn)
     guest.cache_specs["yarn"] = CacheSpec("/usr/local/share/.cache/yarn/v6", yarn, "1.22.19")
+    guest.script_id = "nginxproxymanager"
     guest.alloy_binary = False
     with LokiStub() as stub:
         base = _base(stub.url)
@@ -753,7 +1432,7 @@ def test_cache_reclamation_survives_missing_alloy(history: Path, guest: Guest, t
     assert result.summary is not None and result.summary.status == "Blocked"
     assert result.summary.bytes_reclaimed == before
     assert any("Alloy is not installed" in warning for warning in result.warnings)
-    assert result.effective_alloy is base
+    assert result.effective_alloy is None
 
 
 # --------------------------------------------------------------------------- #
@@ -800,6 +1479,7 @@ def test_blocked_retention_gate_keeps_cache_metrics(history: Path, guest: Guest,
         base = _base(stub.url)
         settings = _settings(history, url=stub.url, housekeeping_enabled=True)
         _compliant(guest, settings, base)
+        guest.script_id = "nginxproxymanager"
         result = _run(guest, settings, base)
 
     # The retention deletion gate is closed (Loki not ready), but the cache
@@ -850,11 +1530,12 @@ def test_failed_configuration_is_blocked_not_configured(history: Path, guest: Gu
     # No inferred post-operation success, and no archival attempted after the
     # generation failed.
     assert guest.capture_calls == 0
-    assert result.effective_alloy is not None and "fleet_npm" in result.effective_alloy.content
+    assert result.effective_alloy is None
+    assert guest.validation_calls
 
 
 def test_prepare_probe_failure_keeps_the_desired_base(history: Path, guest: Guest):
-    guest.probe_script = [guest.facts(), {"guest": {"name": "guest"}}]
+    guest.fail_probe_calls = {2}
     with LokiStub() as stub:
         base = _base(stub.url)
         settings = _settings(history, url=stub.url, housekeeping_enabled=True)
@@ -862,19 +1543,18 @@ def test_prepare_probe_failure_keeps_the_desired_base(history: Path, guest: Gues
 
     assert result.failed is True
     assert result.summary is not None and result.summary.status == "Blocked"
-    # The logging preparation probe failed, but the base is still the effective
-    # config -- it must never be clobbered with None.
-    assert result.effective_alloy is base
+    # A failed preparation probe yields no verified config; the journal-only
+    # base is never substituted for rejected evidence.
+    assert result.effective_alloy is None
 
 
 def test_prepare_probe_failure_preserves_known_file_sources(history: Path, guest: Guest):
     guest.profiles = ["npm"]
-    guest.probe_script = [guest.facts(), {"guest": {"name": "guest"}}]
+    guest.fail_probe_calls = {2}
     with LokiStub() as stub:
         result = _run(guest, _settings(history, url=stub.url, housekeeping_enabled=True), _base(stub.url))
     assert result.failed
-    assert result.effective_alloy is not None
-    assert "fleet_npm" in result.effective_alloy.content
+    assert result.effective_alloy is None
     assert guest.capture_calls == 0
     assert guest.prune_calls == []
 
@@ -914,6 +1594,7 @@ def test_dry_run_creates_no_state_and_mutates_no_guest(history: Path, guest: Gue
 
 
 def test_repeated_idle_maintenance_stays_silent(history: Path, guest: Guest):
+    guest.log_override = GuestLogOverride(mode="disabled")
     with LokiStub() as stub:
         base = _base(stub.url)
         settings = _settings(history, url=stub.url, housekeeping_enabled=True)
@@ -927,6 +1608,7 @@ def test_repeated_idle_maintenance_stays_silent(history: Path, guest: Guest):
         assert result.failed is False
         assert result.changed is False
         assert result.warnings == []
+        assert result.effective_alloy is base
 
 
 def test_successful_cache_clean_records_durable_per_tool_cadence(history: Path, guest: Guest, tmp_path: Path):
@@ -969,3 +1651,190 @@ def test_missing_desired_alloy_blocks_without_touching_guest(history: Path, gues
     assert result.summary is not None and result.summary.status == "Blocked"
     assert result.effective_alloy is None
     assert guest.applied == []
+
+
+# --------------------------------------------------------------------------- #
+# Scoped ACL preparation: one typed helper request, safe missing paths
+# --------------------------------------------------------------------------- #
+
+
+def test_log_acl_repair_tolerates_absent_exact_siblings(history: Path, guest: Guest):
+    logs = Path(guest.guest_root) / "home/hermes/.hermes/logs"
+    logs.mkdir(parents=True)
+    (logs / "agent.log").write_text("agent\n")
+    (logs / "errors.log").write_text("error\n")
+    guest.script_id = "hermesagent"
+    guest.access_ready = False
+
+    result = _prepare(guest, _settings(history), _base("http://127.0.0.1:9"))
+
+    assert result.failed is False
+    assert result.summary is not None and result.summary.status == "Configured"
+    assert result.effective_alloy is not None
+    assert "fleet_" in result.effective_alloy.content
+    # The two absent optional-mode files are skipped, never fabricated as read.
+    assert guest.acl_files == {
+        "/home/hermes/.hermes/logs/agent.log",
+        "/home/hermes/.hermes/logs/errors.log",
+    }
+    assert "/home/hermes" in guest.acl_traverse
+    assert "/home/hermes/.hermes" in guest.acl_traverse
+    # No shell ACL command is ever passed through the action transport.
+    assert not any("setfacl" in command for command in guest.applied)
+
+
+def test_recreated_exact_file_is_repaired_on_next_maintenance(
+    history: Path, guest: Guest
+):
+    logs = Path(guest.guest_root) / "home/hermes/.hermes/logs"
+    logs.mkdir(parents=True)
+    agent = logs / "agent.log"
+    agent.write_text("agent\n")
+    guest.script_id = "hermesagent"
+    guest.access_ready = False
+
+    first = _prepare(guest, _settings(history), _base("http://127.0.0.1:9"))
+    assert first.failed is False
+    assert "/home/hermes/.hermes/logs/agent.log" in guest.acl_files
+
+    agent.unlink()
+    agent.write_text("recreated\n")
+    guest.acl_files.discard("/home/hermes/.hermes/logs/agent.log")
+
+    second = _prepare(guest, _settings(history), _base("http://127.0.0.1:9"))
+    assert second.failed is False
+    assert second.summary is not None and second.summary.status == "Configured"
+    assert second.effective_alloy is not None
+    assert "fleet_" in second.effective_alloy.content
+    assert guest.acl_files == {"/home/hermes/.hermes/logs/agent.log"}
+
+
+def test_missing_exact_parent_blocks_before_acl_repair(history: Path, guest: Guest):
+    guest.script_id = "uptimekuma"
+    guest.access_ready = False
+
+    result = _prepare(guest, _settings(history), _base("http://127.0.0.1:9"))
+
+    assert result.failed is True
+    assert result.summary is not None and result.summary.status == "Blocked"
+    assert result.effective_alloy is None
+    assert guest.log_acl_calls == []
+    assert guest.applied == []
+
+
+def test_exact_file_uptime_kuma_error_log_never_grants_sibling_database(
+    history: Path, guest: Guest
+):
+    data = Path(guest.guest_root) / "opt/uptime-kuma/data"
+    data.mkdir(parents=True)
+    error_log = data / "error.log"
+    error_log.write_bytes(b"boom\n")
+    error_log.chmod(0o600)
+    database = data / "kuma.db"
+    database.write_bytes(b"sqlite-secret")
+    database.chmod(0o600)
+    before_mode = stat.S_IMODE(database.stat().st_mode)
+    before_bytes = database.read_bytes()
+
+    guest.script_id = "uptimekuma"
+    guest.access_ready = False
+    base = _base("http://127.0.0.1:9")
+    result = _prepare(guest, _settings(history), base)
+
+    assert guest.acl_files == {"/opt/uptime-kuma/data/error.log"}
+    assert "/opt/uptime-kuma/data" in guest.acl_traverse
+    assert "/opt/uptime-kuma/data/kuma.db" not in guest.acl_files
+    # Only the declared exact file becomes readable for Alloy; its sibling
+    # database is never exposed.
+    assert "setfacl" not in "\n".join(guest.applied)
+    assert stat.S_IMODE(database.stat().st_mode) == before_mode
+    assert database.read_bytes() == before_bytes
+    assert result.failed is False
+    assert result.effective_alloy is not None
+    assert "fleet_" in result.effective_alloy.content
+
+
+def test_invalid_candidate_syntax_blocks_before_acl_or_environment(
+    history: Path, guest: Guest
+):
+    guest.profiles = ["npm"]
+    guest.access_ready = False
+    guest.validate_only_fails = True
+    result = _prepare(guest, _settings(history), _base("http://127.0.0.1:9"))
+
+    assert result.failed is True
+    assert result.summary is not None and result.summary.status == "Blocked"
+    assert result.effective_alloy is None
+    assert guest.validation_calls
+    assert guest.applied == []
+    assert guest.log_acl_calls == []
+    assert guest.acl_roots == set()
+    assert guest.acl_traverse == set()
+    assert guest.acl_files == set()
+    assert all(call["validate_only"] for call in guest.alloy_reconciles)
+
+
+def test_legacy_archive_eligibility_requires_default_complete_sources(
+    history: Path, guest: Guest
+):
+    guest.profiles = ["npm"]
+    selection = lp.select_log_plugins(
+        _catalogue(), script_id="nginxproxymanager", override=None, auto=True
+    )
+    request = lp.build_logging_request(selection)
+    logging = guest._logging_facts(request)
+    resolved = lp.validate_log_layout(selection, logging)
+    assert housekeeping.legacy_archive_profiles(selection, resolved) == frozenset({"npm"})
+
+    remapped = lp.select_log_plugins(
+        _catalogue(),
+        script_id="nginxproxymanager",
+        override=GuestLogOverride(
+            mode="replace",
+            plugins=["nginxproxymanager"],
+            locations={"nginxproxymanager/application": ["/data/logs/*.log"]},
+        ),
+        auto=True,
+    )
+    remapped_resolved = lp.validate_log_layout(
+        remapped, guest._logging_facts(lp.build_logging_request(remapped))
+    )
+    assert housekeeping.legacy_archive_profiles(remapped, remapped_resolved) == frozenset()
+
+    disabled = lp.select_log_plugins(
+        _catalogue(),
+        script_id="nginxproxymanager",
+        override=GuestLogOverride(
+            mode="replace",
+            plugins=["nginxproxymanager"],
+            disable_sources=["nginxproxymanager/application"],
+        ),
+        auto=True,
+    )
+    disabled_resolved = lp.validate_log_layout(
+        disabled, guest._logging_facts(lp.build_logging_request(disabled))
+    )
+    assert housekeeping.legacy_archive_profiles(disabled, disabled_resolved) == frozenset()
+
+
+def test_recognized_but_ineligible_legacy_profile_pauses_importer(
+    history: Path, guest: Guest
+):
+    source = Path(guest.guest_root) / NPM_ARCHIVE.lstrip("/")
+    source.write_bytes(b"old npm access line\n")
+    guest.profiles = ["npm"]
+    guest.files = [_wire(Path(guest.guest_root), NPM_ARCHIVE)]
+    guest.log_override = GuestLogOverride(mode="disabled")
+
+    with LokiStub() as stub:
+        base = _base(stub.url)
+        settings = _settings(history, url=stub.url, housekeeping_enabled=True)
+        _compliant(guest, settings, base)
+        result = _run(guest, settings, base)
+
+    assert guest.capture_calls == 0
+    assert guest.prune_calls == []
+    assert source.read_bytes() == b"old npm access line\n"
+    assert result.failed is False
+    assert any("archive work paused" in warning for warning in result.warnings)
+    assert result.effective_alloy is base

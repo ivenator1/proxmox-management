@@ -1,0 +1,21 @@
+---
+schema_version: 1
+id: plex
+display_name: Proxmox community script plex
+community_script_ids:
+  - plex
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: plexmediaserver.service
+    sources:
+      - id: application
+        app: plex
+        log_kind: application
+        allowed_roots:
+          - /var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Logs
+        paths:
+          - /var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Logs/*.log
+        exclude_paths:
+          - /var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Logs/*.[0-9]*.log

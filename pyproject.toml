@@ -51,6 +51,7 @@ include = ["proxmox_fleet*"]
 
 [tool.setuptools.package-data]
 "proxmox_fleet.web" = ["templates/*.html", "static/*"]
+"proxmox_fleet.log_catalogue" = ["*.yml", "*.yaml"]
 
 [tool.ruff]
 line-length = 120

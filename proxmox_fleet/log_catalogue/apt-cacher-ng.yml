@@ -1,0 +1,34 @@
+---
+schema_version: 1
+id: apt-cacher-ng
+display_name: Proxmox community script apt-cacher-ng
+community_script_ids:
+  - apt-cacher-ng
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: apt-cacher-ng.service
+    sources:
+      - id: access
+        app: apt-cacher-ng
+        log_kind: access
+        allowed_roots:
+          - /var/log/apt-cacher-ng
+        paths:
+          - /var/log/apt-cacher-ng/apt-cacher.log
+      - id: error
+        app: apt-cacher-ng
+        log_kind: error
+        allowed_roots:
+          - /var/log/apt-cacher-ng
+        paths:
+          - /var/log/apt-cacher-ng/apt-cacher.err
+      - id: debug
+        app: apt-cacher-ng
+        log_kind: debug
+        allowed_roots:
+          - /var/log/apt-cacher-ng
+        paths:
+          - /var/log/apt-cacher-ng/apt-cacher.dbg
+        required: false

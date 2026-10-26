@@ -1,7 +1,10 @@
 """Tests for proxmox_fleet.executor — RunnerExecutor, _merge_facts, snapshot_with_retry."""
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, cast
+
+import pytest
 
 import proxmox_fleet.executor as executor_mod
 from proxmox_fleet.executor import (
@@ -224,6 +227,37 @@ def test_alloy_reconcile_passes_content_as_ansible_data(monkeypatch):
     assert captured["extravars"]["alloy_config_content"] == "loki.write {}\n"
     assert captured["extravars"]["alloy_configure"] is True
     assert captured["extravars"]["alloy_repair_service"] is True
+    assert captured["check"] is False
+
+
+def test_alloy_reconcile_validate_only_rejects_unsafe_flags(monkeypatch):
+    calls = []
+
+    def fake_invoke(*args, **kwargs):
+        calls.append((args, kwargs))
+        return _pr()
+
+    monkeypatch.setattr(executor_mod, "invoke_primitive", fake_invoke)
+    ex = RunnerExecutor("pve-01")
+    base = {
+        "desired_content": "logging {}\n",
+        "install": False,
+        "configure": False,
+        "add_journal_group": False,
+        "repair_service": False,
+        "validate_only": True,
+    }
+    for overrides in (
+        {"lxc_id": None},
+        {"lxc_id": "101", "install": True},
+        {"lxc_id": "101", "add_journal_group": True},
+        {"lxc_id": "101", "repair_service": True},
+    ):
+        result = ex.alloy_reconcile(**{**base, **overrides})
+        assert result.failed is True
+        assert result.rc == 1
+        assert "validate_only" in result.stderr
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -379,3 +413,77 @@ def test_housekeeping_apply_rejects_non_numeric_id(monkeypatch):
     assert calls == []
 
 
+def test_housekeeping_probe_transports_the_selection_request(monkeypatch):
+    calls = []
+
+    def capture(primitive, **kwargs):
+        calls.append((primitive, kwargs))
+        return _pr()
+
+    monkeypatch.setattr(executor_mod, "invoke_primitive", capture)
+    executor = RunnerExecutor("pve-01")
+    request = {
+        "plugins": {"demoapp": {"layouts": []}},
+        "sources": {"demoapp/application": {"layouts": {}}},
+    }
+
+    executor.housekeeping_probe("120", logging_request=request)
+
+    primitive, kwargs = calls[0]
+    assert primitive == "lxc_housekeeping_probe"
+    payload = json.loads(kwargs["extravars"]["housekeeping_request_json"])
+    assert payload == {"logging": request}
+    assert kwargs["extravars"]["lxc_id"] == "120"
+
+    calls.clear()
+    executor.housekeeping_probe("120")
+    _primitive, kwargs = calls[0]
+    assert json.loads(kwargs["extravars"]["housekeeping_request_json"]) == {}
+
+
+@pytest.mark.parametrize(
+    "lxc_id, roots, exact_files",
+    [
+        ("12; rm -rf /", ("/data/logs",), ()),
+        ("120", ("../etc",), ()),
+        ("120", ("/",), ()),
+        ("120", (), ("/opt/demo/*.log",)),
+        ("120", (), ("relative/path.log",)),
+    ],
+)
+def test_housekeeping_log_acl_rejects_invalid_targets(
+    monkeypatch, lxc_id, roots, exact_files
+):
+    calls = []
+
+    def capture(primitive, **kwargs):
+        calls.append((primitive, kwargs))
+        return _pr()
+
+    monkeypatch.setattr(executor_mod, "invoke_primitive", capture)
+
+    result = RunnerExecutor("pve-01").housekeeping_log_acl(
+        lxc_id, roots=roots, exact_files=exact_files
+    )
+
+    assert result.failed is True
+    assert result.rc == 1
+    assert calls == []
+
+
+def test_lxc_disk_usage_rejects_more_than_32_extra_paths(monkeypatch):
+    calls = []
+
+    def capture(primitive, **kwargs):
+        calls.append((primitive, kwargs))
+        return _pr()
+
+    monkeypatch.setattr(executor_mod, "invoke_primitive", capture)
+
+    result = RunnerExecutor("pve-01").lxc_disk_usage(
+        "135", extra_paths=[f"/p{index}" for index in range(33)]
+    )
+
+    assert result.failed is True
+    assert result.rc == 1
+    assert calls == []

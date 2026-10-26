@@ -67,6 +67,28 @@ def parse_df_available_kb(stdout: str) -> Optional[int]:
     return None
 
 
+def parse_df_used_kb(stdout: str) -> Optional[int]:
+    """Extract used 1-KiB blocks from POSIX ``df -Pk`` output.
+
+    The data row is ``filesystem total used available capacity mount``: used
+    is ``columns[2]`` (``columns[1]`` is the filesystem size). Used is the
+    manager-side fallback denominator for the root-filesystem disk diagnostic
+    only when the helper could not measure it freshly. The value must be a
+    plain nonnegative integer; headers, garbage and negative or otherwise
+    non-numeric values fail closed with ``None``.
+    """
+    for line in stdout.splitlines():
+        columns = line.split()
+        if len(columns) >= 6 and re.fullmatch(r"\d{1,3}%", columns[4]):
+            if not re.fullmatch(r"\d+", columns[2]):
+                return None
+            try:
+                return int(columns[2])
+            except ValueError:
+                return None
+    return None
+
+
 def parse_os_release(stdout: str) -> dict:
     """Extract {id, version_id} from ``/etc/os-release`` contents.
 

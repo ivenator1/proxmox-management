@@ -716,6 +716,50 @@ def test_run_fleet_scan_end_to_end(tmp_path, monkeypatch):
     assert latest["lxc"]["pve-01/101"]["app"]["outdated"] is True
 
 
+def test_run_fleet_scan_never_enters_logging_or_housekeeping_mutation_paths(tmp_path, monkeypatch):
+    """--scan stays read-only: it never loads the log catalogue, prepares
+    Alloy, runs the housekeeping policy or enters the update flow."""
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[proxmox_nodes]\npve-01 ansible_host=10.0.0.1\n"
+        "[remote_hosts]\n[proxmox_vms]\n[custom_hosts]\n",
+        encoding="utf-8",
+    )
+    _patch_github(monkeypatch)
+
+    def _factory(host, **kw):
+        return ScriptedExecutor(
+            script={
+                "which apt-get": [_ok("apt")],
+                "dist-upgrade": [_ok(APT_SIM), _ok(APT_SIM)],
+                "cat ~/.sonarr": [_ok("4.0.17")],
+            },
+            introspect_facts=_INTROSPECT_RUNNING,
+        )
+
+    _patch_executors(monkeypatch, _factory)
+    monkeypatch.setattr(scan_mod, "_discover_lxcs", lambda ex, s, **kw: ["101"])
+
+    import proxmox_fleet.flows.lxc as lxc_mod
+    import proxmox_fleet.housekeeping as hk_mod
+    import proxmox_fleet.log_plugins as lp_mod
+
+    def _forbidden(*args, **kwargs):
+        pytest.fail("scan must not enter a logging/housekeeping mutation path")
+
+    monkeypatch.setattr(lp_mod, "load_log_catalogue", _forbidden)
+    monkeypatch.setattr(hk_mod, "prepare_lxc_logging", _forbidden)
+    monkeypatch.setattr(hk_mod, "run_housekeeping", _forbidden)
+    monkeypatch.setattr(lxc_mod, "run_lxc_update", _forbidden)
+
+    settings = GlobalSettings(fleet_history_dir=str(tmp_path / "hist"))
+    rc = scan_mod.run_fleet_scan(settings=settings, inventory_path=str(inv))
+
+    assert rc == 0
+    latest = json.loads((tmp_path / "hist" / "pending-latest.json").read_text())
+    assert latest["lxc"]["pve-01/101"]["name"] == "sonarr"
+
+
 def test_run_fleet_scan_same_id_on_two_clusters_keeps_both(tmp_path, monkeypatch):
     """Two clusters' LXC 101 must not overwrite each other in the snapshot."""
     inv = tmp_path / "hosts.ini"

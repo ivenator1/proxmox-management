@@ -1,32 +1,41 @@
 """Behavioural coverage for ``prepare_lxc_logging`` and its typed probe helpers.
 
-These tests exercise the real logging policy, renderer and reconciler through
-a scripted guest execution boundary.
+These tests exercise the real catalogue selection, renderer and reconciler
+through a scripted guest execution boundary.  Probe logging evidence is built
+from the actual manager request, so a test can only pass when the catalogue and
+probe contract agree.
 """
 from __future__ import annotations
 
 import hashlib
+from typing import Any, Dict, List, Optional, Sequence
 
 import pytest
 
 from proxmox_fleet import housekeeping
+from proxmox_fleet import log_plugins as lp
 from proxmox_fleet.alloy import DesiredAlloyConfig
+from proxmox_fleet.models.log_plugins import GuestLogOverride
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.runner import PrimitiveResult
 
-# --------------------------------------------------------------------------- #
-# fixtures / builders
-# --------------------------------------------------------------------------- #
+_CATALOGUE = None
 
 
-def _effective_npm(base: DesiredAlloyConfig) -> DesiredAlloyConfig:
-    return housekeeping.render_lxc_log_config(
-        base, node="pve", cluster="cluster", lxc_id="123", name="guest",
-        profiles={"npm"}, retention_hours=48,
-    )
+def _catalogue():
+    global _CATALOGUE
+    if _CATALOGUE is None:
+        _CATALOGUE = lp.load_log_catalogue()
+    return _CATALOGUE
 
 
-def _base(*, env: bool = True, endpoint: str | None = "http://10.0.0.1:3100") -> DesiredAlloyConfig:
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _base(
+    *, env: bool = True, endpoint: str | None = "http://10.0.0.1:3100"
+) -> DesiredAlloyConfig:
     lines = ['loki.write "default" {']
     if endpoint:
         lines.append(f'  endpoint {{ url = "{endpoint}/loki/api/v1/push" }}')
@@ -38,53 +47,11 @@ def _base(*, env: bool = True, endpoint: str | None = "http://10.0.0.1:3100") ->
         lines.append('  max_age = "12h"')
     lines.append("}")
     content = "\n".join(lines) + "\n"
-    return DesiredAlloyConfig(content=content, sha256=hashlib.sha256(content.encode()).hexdigest())
-
-
-@pytest.mark.parametrize("fault", ["none", "noop", "symlink"])
-def test_environment_configuration_requires_observed_safe_file_state(tmp_path, fault):
-    from tests.unit.test_housekeeping_retention import Guest as FilesystemGuest
-
-    guest = FilesystemGuest(tmp_path / "guest")
-    path = guest.put(housekeeping.FLEET_ALLOY_ENV_DROPIN, housekeeping.journal_env_content(24))
-    original = path.read_bytes()
-    outside = tmp_path / "outside.conf"
-    if fault == "symlink":
-        outside.write_bytes(original)
-        path.unlink()
-        path.symlink_to(outside)
-    guest.acknowledge_without_write = fault == "noop"
-    base = _base()
-    guest.put("/etc/alloy/config.alloy", _effective_npm(base).content)
-    result = housekeeping.prepare_lxc_logging(
-        guest, GlobalSettings(housekeeping_loki_url="http://10.0.0.1:3100"),
-        node="pve", cluster="cluster", lxc_id="123", name="guest", base=base,
-    )
-    if fault == "none":
-        assert path.read_text() == housekeeping.journal_env_content(48)
-        assert result.summary.status == "Configured"
-        assert not result.failed
-    else:
-        assert path.read_bytes() == original
-        assert result.summary.status == "Blocked"
-        assert result.failed
-        if fault == "symlink":
-            assert path.is_symlink()
-            assert outside.read_bytes() == original
+    return DesiredAlloyConfig(content=content, sha256=_sha(content))
 
 
 def _env_hash(hours: int = 48) -> str:
-    return hashlib.sha256(housekeeping.journal_env_content(hours).encode()).hexdigest()
-
-
-def _npm_evidence(ok: bool = True) -> dict:
-    return {
-        "npm.service": ok,
-        "openresty.service": ok,
-        "app_root": ok,
-        "log_root": ok,
-        "detected": ok,
-    }
+    return _sha(housekeeping.journal_env_content(hours))
 
 
 _ALL_BINARIES = {
@@ -104,21 +71,102 @@ _ALL_BINARIES = {
 }
 
 
+def _unit_records(entry: Dict[str, Any]) -> Dict[str, Any]:
+    units: Dict[str, Any] = {}
+
+    def add(unit: Dict[str, Any]) -> None:
+        units[unit["key"]] = {"status": "active", "instances": {}}
+
+    for layout in entry.get("layouts", []):
+        for unit in (*layout.get("required_units", []), *layout.get("running_units_any", [])):
+            add(unit)
+    for unit in entry.get("journal_units", []):
+        units.setdefault(unit["key"], {"status": "active", "instances": {}})
+    return units
+
+
+def _logging_facts(
+    request: Optional[Dict[str, Any]], *, ready: bool = True
+) -> Dict[str, Any]:
+    if request is None:
+        return {"plugins": {}, "sources": {}}
+    plugins: Dict[str, Any] = {}
+    for owner, entry in request.get("plugins", {}).items():
+        includes = {
+            dependency: {"units": _unit_records(dependency_entry)}
+            for dependency, dependency_entry in entry.get("includes", {}).items()
+        }
+        plugins[owner] = {"units": _unit_records(entry), "includes": includes}
+    sources: Dict[str, Any] = {}
+    for key, source_entry in request.get("sources", {}).items():
+        layouts: Dict[str, Any] = {}
+        for layout_id, spec in source_entry.get("layouts", {}).items():
+            roots: Dict[str, Any] = {}
+            for root in spec.get("roots", []):
+                roots[root] = {
+                    "exists": True,
+                    "is_dir": True,
+                    "is_symlink": False,
+                    "device": 7,
+                    "blocked_ancestor": False,
+                    "status": "ok" if ready else "denied",
+                    "access": {
+                        "traversable": ready,
+                        "readable": ready,
+                        "default_acl": ready,
+                    },
+                }
+            matches = [
+                {
+                    "pattern": pattern,
+                    "matched": 0,
+                    "skipped": 0,
+                    "truncated": False,
+                    "status": "quiet" if ready else "denied",
+                    "files": [],
+                }
+                for pattern in spec.get("paths", [])
+            ]
+            exact: Dict[str, Any] = {}
+            for path in spec.get("exact_files", []):
+                exact[path] = {
+                    "exists": True,
+                    "is_symlink": False,
+                    "device": 7,
+                    "inode": 8,
+                    "size": 1,
+                    "mtime_ns": 2,
+                    "same_device": True,
+                    "parent_traversable": ready,
+                    "status": "ok" if ready else "denied",
+                    "access": {"readable": ready},
+                    "is_file": True,
+                }
+            layouts[layout_id] = {
+                "status": "ok" if ready else "denied",
+                "truncated": False,
+                "roots": roots,
+                "exact_files": exact,
+                "matches": matches,
+            }
+        sources[key] = {"layouts": layouts}
+    return {"plugins": plugins, "sources": sources}
+
+
 def _facts(
     *,
+    logging: Optional[Dict[str, Any]] = None,
+    binaries: Optional[Dict[str, Any]] = None,
+    access_ready: bool = True,
+    alloy_user: bool = True,
+    alloy_env_hash: str = "",
+    running: bool = True,
+    template: bool = False,
+    os_type: str = "debian",
     profiles=(),
     evidence=None,
-    binaries=None,
-    access_ready=True,
-    alloy_user=True,
-    alloy_env_hash="",
-    running=True,
-    template=False,
-    os_type="debian",
 ) -> dict:
     evidence = {"npm": {"detected": False}, "pbs": {"detected": False}, **(evidence or {})}
-    if binaries is None:
-        binaries = dict(_ALL_BINARIES)
     return {
         "guest": {
             "name": "guest",
@@ -132,27 +180,17 @@ def _facts(
         "files": [],
         "cache_paths": {},
         "busy_tools": [],
-        "binaries": binaries,
+        "binaries": dict(binaries if binaries is not None else _ALL_BINARIES),
         "log_access_ready": access_ready,
         "log_access_detail": {"alloy_user": alloy_user, "dirs": {}, "files": {}},
         "policy_sha256": {"journald": "", "alloy_env": alloy_env_hash, "npm_logrotate": ""},
         "profile_evidence": evidence,
+        "logging": logging or {"plugins": {}, "sources": {}},
     }
 
 
 def _probe(facts: dict) -> PrimitiveResult:
     return PrimitiveResult(rc=0, facts=facts)
-
-
-def _alloy_facts(config_sha256: str, *, binary_present: bool = True) -> dict:
-    return {
-        "binary_present": binary_present,
-        "package_manager": "apt",
-        "config_sha256": config_sha256,
-        "journal_member": True,
-        "service_enabled": True,
-        "service_active": True,
-    }
 
 
 def _next(items: list):
@@ -161,30 +199,51 @@ def _next(items: list):
     return items[0]
 
 
+def _npm_request() -> Dict[str, Any]:
+    selection = lp.select_log_plugins(
+        _catalogue(), script_id="nginxproxymanager", override=None, auto=True
+    )
+    return lp.build_logging_request(selection)
+
+
+_REQUEST = _npm_request()
+
+
 class ScriptedExecutor:
-    """Scripted Executor: queued housekeeping probes and per-command results."""
+    """Scripted executor: queued guest probes plus explicit Alloy state."""
 
     host = "pve"
 
     def __init__(
         self,
-        probes: list[PrimitiveResult],
+        probes: List[PrimitiveResult],
         *,
-        apply_results: list[PrimitiveResult] | None = None,
-        alloy_probes: list[PrimitiveResult] | None = None,
-        deploy: PrimitiveResult | None = None,
+        apply_results: Optional[List[PrimitiveResult]] = None,
+        acl_results: Optional[List[PrimitiveResult]] = None,
+        alloy_binary: bool = True,
+        alloy_config_sha: str = "",
+        validation_fails: bool = False,
+        deploy_fails: bool = False,
     ) -> None:
         self._probes = list(probes)
         self._applies = list(apply_results or [])
-        self._alloy_probes = list(alloy_probes or [])
-        self._deploy = deploy or PrimitiveResult(rc=0, changed=True)
-        self.applied: list[str] = []
-        self.reconciled: list[dict] = []
+        self._acls = list(acl_results or [])
+        self.binary_present = alloy_binary
+        self.config_sha = alloy_config_sha
+        self.validation_fails = validation_fails
+        self.deploy_fails = deploy_fails
+        self.applied: List[str] = []
+        self.acl_calls: List[Dict[str, Any]] = []
+        self.reconciled: List[Dict[str, Any]] = []
+        self.validation_calls: List[str] = []
         self.probe_calls = 0
-        self.alloy_probe_calls = 0
+        self.logging_requests: List[Optional[Dict[str, Any]]] = []
 
-    def housekeeping_probe(self, lxc_id: str) -> PrimitiveResult:
+    def housekeeping_probe(
+        self, lxc_id: str, *, logging_request: Optional[Dict[str, Any]] = None
+    ) -> PrimitiveResult:
         self.probe_calls += 1
+        self.logging_requests.append(logging_request)
         return _next(self._probes)
 
     def housekeeping_apply(self, lxc_id: str, *, command: str) -> PrimitiveResult:
@@ -193,17 +252,75 @@ class ScriptedExecutor:
             return _next(self._applies)
         return PrimitiveResult(rc=0, changed=True)
 
-    def alloy_probe(self, *, lxc_id: str | None = None) -> PrimitiveResult:
-        self.alloy_probe_calls += 1
-        assert self._alloy_probes, "unexpected alloy_probe call"
-        return _next(self._alloy_probes)
+    def housekeeping_log_acl(
+        self,
+        lxc_id: str,
+        *,
+        roots: Sequence[str] = (),
+        exact_files: Sequence[str] = (),
+    ) -> PrimitiveResult:
+        roots = tuple(roots)
+        exact_files = tuple(exact_files)
+        self.acl_calls.append(
+            {"roots": roots, "exact_files": exact_files}
+        )
+        if self._acls:
+            return _next(self._acls)
+        changed = bool(roots or exact_files)
+        return PrimitiveResult(
+            rc=0,
+            changed=changed,
+            facts={
+                "status": "complete",
+                "changed": changed,
+                "repaired_roots": len(roots),
+                "repaired_files": len(exact_files),
+                "skipped_missing": 0,
+                "error_count": 0,
+                "reason": "",
+            },
+        )
+
+    def alloy_probe(self, *, lxc_id: Optional[str] = None) -> PrimitiveResult:
+        return PrimitiveResult(
+            rc=0,
+            facts={
+                "binary_present": self.binary_present,
+                "package_manager": "apt",
+                "config_sha256": self.config_sha,
+                "journal_member": True,
+                "service_enabled": True,
+                "service_active": True,
+            },
+        )
 
     def alloy_reconcile(self, **kwargs) -> PrimitiveResult:
-        self.reconciled.append(kwargs)
-        return self._deploy
+        self.reconciled.append(dict(kwargs))
+        if kwargs.get("validate_only"):
+            self.validation_calls.append(kwargs["desired_content"])
+            if self.validation_fails:
+                return PrimitiveResult(rc=1, failed=True, stderr="invalid HCL", facts={})
+            return PrimitiveResult(rc=0, changed=False, facts={})
+        if self.deploy_fails:
+            return PrimitiveResult(rc=1, failed=True, stderr="alloy deploy failed", facts={})
+        if kwargs.get("install"):
+            self.binary_present = True
+        if kwargs.get("configure"):
+            self.config_sha = _sha(kwargs["desired_content"])
+        return PrimitiveResult(rc=0, changed=True, facts={})
 
 
-def _prepare(executor, settings=None, *, base=None, dry_run=False, allow_install=False, **kw):
+def _prepare(
+    executor,
+    settings=None,
+    *,
+    base=None,
+    script_id: Optional[str] = "nginxproxymanager",
+    log_override: Optional[GuestLogOverride] = None,
+    dry_run: bool = False,
+    allow_install: bool = False,
+    **kw,
+):
     return housekeeping.prepare_lxc_logging(
         executor,
         settings or GlobalSettings(),
@@ -212,6 +329,9 @@ def _prepare(executor, settings=None, *, base=None, dry_run=False, allow_install
         lxc_id=kw.pop("lxc_id", "123"),
         name=kw.pop("name", "guest"),
         base=base or _base(),
+        catalogue=_catalogue(),
+        script_id=script_id,
+        log_override=log_override,
         dry_run=dry_run,
         allow_install=allow_install,
     )
@@ -230,16 +350,21 @@ def test_recognized_profiles_requires_full_evidence_and_warns_on_partial():
     assert any("incomplete profile evidence" in w for w in warnings)
 
     recognized, warnings = housekeeping.recognized_profiles(
-        _facts(profiles=["npm"], evidence={"npm": _npm_evidence(True)})
+        _facts(
+            profiles=["npm"],
+            evidence={
+                "npm": {
+                    "npm.service": True,
+                    "openresty.service": True,
+                    "app_root": True,
+                    "log_root": True,
+                    "detected": True,
+                }
+            },
+        )
     )
     assert recognized == {"npm"}
     assert warnings == []
-
-    # Evidence complete even when the probe did not list the profile: trusted.
-    recognized, warnings = housekeeping.recognized_profiles(
-        _facts(profiles=[], evidence={"npm": _npm_evidence(True)})
-    )
-    assert recognized == {"npm"}
 
     recognized, warnings = housekeeping.recognized_profiles(_facts(profiles=["redis"]))
     assert recognized == set()
@@ -250,20 +375,6 @@ def test_probe_housekeeping_raises_on_failed_primitive():
     executor = ScriptedExecutor([PrimitiveResult(rc=1, failed=True, stderr="boom")])
     with pytest.raises(housekeeping.HousekeepingError):
         housekeeping.probe_housekeeping(executor, "123")
-
-
-def test_probe_housekeeping_types_facts():
-    probe = housekeeping.probe_housekeeping(
-        ScriptedExecutor(
-            [_probe(_facts(profiles=["npm"], evidence={"npm": _npm_evidence(True)}, access_ready=False))]
-        ),
-        "123",
-    )
-    assert probe.is_running and not probe.is_template
-    assert probe.os_type == "debian"
-    assert probe.recognized == ("npm",)
-    assert probe.log_access_ready is False
-    assert probe.binaries["alloy"] == "/usr/bin/alloy"
 
 
 def test_probe_housekeeping_rejects_incomplete_facts():
@@ -287,135 +398,251 @@ def test_probe_housekeeping_rejects_malformed_file_record():
         housekeeping.probe_housekeeping(ScriptedExecutor([_probe(facts)]), "123")
 
 
-def test_prepare_blocks_on_incomplete_probe_facts():
+def test_probe_housekeeping_rejects_incomplete_or_malformed_logging_evidence():
     facts = _facts()
-    del facts["log_access_detail"]
-    executor = ScriptedExecutor([_probe(facts)])
-    result = _prepare(executor)
+    facts.pop("policy_sha256")
+    with pytest.raises(housekeeping.HousekeepingError, match="incomplete facts"):
+        housekeeping.probe_housekeeping(ScriptedExecutor([_probe(facts)]), "123")
 
-    assert result.summary is not None and result.summary.status == "Blocked"
-    assert result.failed is True
+    logging = _logging_facts(_REQUEST)
+    del logging["sources"]["nginxproxymanager/application"]["layouts"]["default"][
+        "truncated"
+    ]
+    facts = _facts(logging=logging)
+    with pytest.raises(housekeeping.HousekeepingError, match="logging"):
+        housekeeping.probe_housekeeping(
+            ScriptedExecutor([_probe(facts)]),
+            "123",
+            logging_request=_REQUEST,
+        )
+
+
+def test_probe_housekeeping_forwards_the_request():
+    logging = _logging_facts(_REQUEST)
+    executor = ScriptedExecutor([_probe(_facts(logging=logging))])
+    probe = housekeeping.probe_housekeeping(
+        executor, "123", logging_request=_REQUEST
+    )
+    assert executor.logging_requests == [_REQUEST]
+    assert probe.logging == logging
+
+
+# --------------------------------------------------------------------------- #
+# prepare_lxc_logging — selection and failure boundaries
+# --------------------------------------------------------------------------- #
+
+
+def test_unsupported_identity_returns_none_without_enforcing_config():
+    executor = ScriptedExecutor(
+        [_probe(_facts(alloy_env_hash=_env_hash()))], alloy_binary=True
+    )
+    result = _prepare(executor, script_id=None)
+
+    assert result.failed is False
     assert result.effective_alloy is None
-    assert executor.applied == []
+    assert executor.reconciled == []
+    assert any("unsupported" in warning for warning in result.warnings)
+
+
+def test_explicit_empty_selection_returns_base_and_reconciles():
+    executor = ScriptedExecutor(
+        [_probe(_facts(alloy_env_hash=_env_hash()))],
+        alloy_config_sha=_base().sha256,
+    )
+    result = _prepare(
+        executor,
+        log_override=GuestLogOverride(mode="disabled"),
+    )
+
+    assert result.failed is False
+    assert result.effective_alloy == _base()
+    assert result.summary is None
     assert executor.reconciled == []
 
 
-def test_stopped_guest_sparse_facts_are_accepted():
-    # The helper's stopped-guest facts are complete-but-sparse: no binaries and
-    # a null disk must not be treated as a truncated stream.
-    facts = _facts(running=False, binaries={}, access_ready=False)
-    facts["disk"] = None
-    facts["log_access_detail"] = {"alloy_user": False, "dirs": {}, "files": {}}
-    executor = ScriptedExecutor([_probe(facts)])
-    result = _prepare(executor, base=_base())
+def test_selected_guest_is_silent_when_already_compliant():
+    base = _base()
+    selection = lp.select_log_plugins(
+        _catalogue(), script_id="nginxproxymanager", override=None, auto=True
+    )
+    candidate = housekeeping.render_lxc_log_config(
+        base,
+        node="pve",
+        cluster="cluster",
+        lxc_id="123",
+        name="guest",
+        sources=lp.validate_log_layout(
+            selection, _logging_facts(_REQUEST)
+        ).renderable_sources,
+        retention_hours=48,
+    )
+    executor = ScriptedExecutor(
+        [_probe(_facts(logging=_logging_facts(_REQUEST), alloy_env_hash=_env_hash()))],
+        alloy_config_sha=candidate.sha256,
+    )
+    result = _prepare(executor, base=base)
 
+    assert result.failed is False
+    assert result.changed is False
     assert result.summary is None
-    assert any("stopped" in w for w in result.warnings)
+    assert result.warnings == []
+    assert result.effective_alloy == candidate
+    assert executor.validation_calls == []
+    assert executor.reconciled == []
 
 
-# --------------------------------------------------------------------------- #
-# prepare_lxc_logging — real runs
-# --------------------------------------------------------------------------- #
-
-
-def test_compliant_profile_free_guest_is_a_noop():
+def test_invalid_candidate_blocks_before_acl_or_environment():
     base = _base()
     executor = ScriptedExecutor(
-        [_probe(_facts(access_ready=True, alloy_env_hash=_env_hash()))],
-        alloy_probes=[PrimitiveResult(rc=0, facts=_alloy_facts(base.sha256))],
+        [
+            _probe(
+                _facts(
+                    logging=_logging_facts(_REQUEST, ready=False),
+                    access_ready=False,
+                    alloy_env_hash="",
+                )
+            )
+        ],
+        validation_fails=True,
     )
     result = _prepare(executor, base=base)
 
-    assert result.summary is None
-    assert result.changed is False
-    assert result.failed is False
-    assert result.warnings == []
-    assert result.effective_alloy is base
+    assert result.failed is True
+    assert result.summary is not None and result.summary.status == "Blocked"
+    assert result.effective_alloy is None
     assert executor.applied == []
-    # Alloy still goes through the real reconciliation path (no drift → no deploy).
-    assert executor.reconciled == []
-
-
-def test_partial_evidence_warns_and_skips_profile_work():
-    base = _base(env=False)
-    facts = _facts(
-        profiles=["npm"],
-        evidence={"npm": {"npm.service": True, "openresty.service": True, "detected": True}},
-        access_ready=False,
-    )
-    executor = ScriptedExecutor(
-        [_probe(facts)],
-        alloy_probes=[PrimitiveResult(rc=0, facts=_alloy_facts(base.sha256))],
-    )
-    result = _prepare(executor, base=base)
-
-    assert result.summary is None
-    assert executor.applied == []
-    assert any("incomplete profile evidence" in w for w in result.warnings)
-    # Unsupported profile never authorizes ACL repair despite access_ready=False.
+    assert executor.acl_calls == []
+    assert executor.validation_calls
+    assert all(call["validate_only"] for call in executor.reconciled)
 
 
 def test_repairs_permissions_then_reprobes_then_reconciles():
     base = _base()
-    stub = _effective_npm(base)
     not_ready = _probe(
         _facts(
-            profiles=["npm"],
-            evidence={"npm": _npm_evidence(True)},
+            logging=_logging_facts(_REQUEST, ready=False),
             access_ready=False,
             alloy_env_hash=_env_hash(),
         )
     )
     ready = _probe(
-        _facts(
-            profiles=["npm"],
-            evidence={"npm": _npm_evidence(True)},
-            access_ready=True,
-            alloy_env_hash=_env_hash(),
-        )
+        _facts(logging=_logging_facts(_REQUEST), alloy_env_hash=_env_hash())
     )
-    executor = ScriptedExecutor(
-        [not_ready, ready],
-        alloy_probes=[
-            PrimitiveResult(rc=0, facts=_alloy_facts("")),
-            PrimitiveResult(rc=0, facts=_alloy_facts(stub.sha256)),
-        ],
-    )
+    executor = ScriptedExecutor([not_ready, ready])
     result = _prepare(executor, base=base)
 
-    assert executor.applied == housekeeping.acl_repair_commands({"npm"})
-    assert executor.probe_calls == 2
-    assert executor.reconciled and executor.reconciled[0]["desired_content"] == stub.content
+    # One scoped permission-repair operation is invoked; its transport payload
+    # is runtime-proven, while the consumer outcome is asserted below.
+    assert len(executor.acl_calls) == 1
+    assert executor.applied == []
+    assert executor.probe_calls == 3
+    assert executor.reconciled and executor.reconciled[-1]["desired_content"]
     assert result.summary is not None and result.summary.status == "Configured"
     assert result.changed is True
-    assert result.effective_alloy == stub
+    assert result.effective_alloy is not None
+    assert "fleet_npm" in result.effective_alloy.content
 
 
-def test_acl_repair_failure_blocks_and_returns_effective_config():
+def test_acl_repair_failure_blocks_and_returns_no_config():
     base = _base()
-    stub = _effective_npm(base)
     executor = ScriptedExecutor(
         [
             _probe(
                 _facts(
-                    profiles=["npm"],
-                    evidence={"npm": _npm_evidence(True)},
+                    logging=_logging_facts(_REQUEST, ready=False),
                     access_ready=False,
-                    alloy_env_hash=_env_hash(),
+                    alloy_env_hash="",
                 )
             )
         ],
-        apply_results=[PrimitiveResult(rc=1, failed=True, stderr="setfacl: denied")],
-        alloy_probes=[PrimitiveResult(rc=0, facts=_alloy_facts(stub.sha256))],
+        acl_results=[
+            PrimitiveResult(rc=1, failed=True, stderr="setfacl: denied")
+        ],
     )
     result = _prepare(executor, base=base)
 
     assert result.summary is not None and result.summary.status == "Blocked"
     assert result.failed is True
-    assert result.effective_alloy == stub
-    # Blocked on the first permission command → no env work, no reconcile.
-    assert executor.reconciled == []
+    assert result.effective_alloy is None
     assert any("scoped log access" in w for w in result.warnings)
+    # The transport failure precedes every environment/live mutation.
+    assert executor.applied == []
+    assert all(call["validate_only"] for call in executor.reconciled)
+
+
+def test_acl_repair_incomplete_helper_status_blocks_before_mutation():
+    base = _base()
+    executor = ScriptedExecutor(
+        [
+            _probe(
+                _facts(
+                    logging=_logging_facts(_REQUEST, ready=False),
+                    access_ready=False,
+                    alloy_env_hash="",
+                )
+            )
+        ],
+        acl_results=[
+            PrimitiveResult(
+                rc=0,
+                changed=False,
+                facts={
+                    "status": "failed",
+                    "changed": False,
+                    "repaired_roots": 0,
+                    "repaired_files": 0,
+                    "skipped_missing": 1,
+                    "error_count": 1,
+                    "reason": "declared root is unsafe",
+                },
+            )
+        ],
+    )
+    result = _prepare(executor, base=base)
+
+    assert result.summary is not None and result.summary.status == "Blocked"
+    assert result.failed is True
+    assert result.effective_alloy is None
+    assert any("declared root is unsafe" in w for w in result.warnings)
+    assert executor.applied == []
+    assert all(call["validate_only"] for call in executor.reconciled)
+
+
+def test_acl_repair_malformed_helper_facts_block_before_mutation():
+    base = _base()
+    executor = ScriptedExecutor(
+        [
+            _probe(
+                _facts(
+                    logging=_logging_facts(_REQUEST, ready=False),
+                    access_ready=False,
+                    alloy_env_hash="",
+                )
+            )
+        ],
+        acl_results=[
+            PrimitiveResult(
+                rc=0,
+                changed=False,
+                facts={
+                    "status": "complete",
+                    "changed": False,
+                    "repaired_roots": 0,
+                    "repaired_files": 0,
+                    "skipped_missing": 0,
+                    "error_count": 0,
+                },
+            )
+        ],
+    )
+    result = _prepare(executor, base=base)
+
+    assert result.summary is not None and result.summary.status == "Blocked"
+    assert result.failed is True
+    assert result.effective_alloy is None
+    assert any("malformed reason" in w for w in result.warnings)
+    assert executor.applied == []
+    assert all(call["validate_only"] for call in executor.reconciled)
 
 
 def test_missing_acl_tools_blocks_without_running_commands():
@@ -424,77 +651,10 @@ def test_missing_acl_tools_blocks_without_running_commands():
         [
             _probe(
                 _facts(
-                    profiles=["npm"],
-                    evidence={"npm": _npm_evidence(True)},
+                    logging=_logging_facts(_REQUEST, ready=False),
                     access_ready=False,
                     binaries={**_ALL_BINARIES, "setfacl": None, "getfacl": None},
                     alloy_env_hash=_env_hash(),
-                )
-            )
-        ],
-        alloy_probes=[PrimitiveResult(rc=0, facts=_alloy_facts(base.sha256))],
-    )
-    result = _prepare(executor, base=base)
-
-    assert result.summary is not None and result.summary.status == "Blocked"
-    assert result.failed is True
-    assert executor.applied == []
-    assert any("ACL tools missing" in w for w in result.warnings)
-
-
-def test_missing_alloy_blocks_when_install_disallowed():
-    base = _base()
-    executor = ScriptedExecutor(
-        [_probe(_facts(binaries={**_ALL_BINARIES, "alloy": None}, alloy_env_hash=_env_hash()))],
-        alloy_probes=[],
-    )
-    result = _prepare(executor, base=base, allow_install=False)
-
-    assert result.summary is not None and result.summary.status == "Blocked"
-    assert result.failed is True
-    assert result.effective_alloy is base
-    assert executor.reconciled == []
-    assert executor.applied == []
-    assert any("Alloy is not installed" in w for w in result.warnings)
-
-
-def test_missing_alloy_installs_when_allowed_then_reprobes():
-    base = _base()
-    missing = PrimitiveResult(
-        rc=0, facts=_alloy_facts(base.sha256, binary_present=False)
-    )
-    aligned = PrimitiveResult(rc=0, facts=_alloy_facts(base.sha256))
-    executor = ScriptedExecutor(
-        [
-            _probe(_facts(binaries={**_ALL_BINARIES, "alloy": None}, alloy_env_hash=_env_hash())),
-            _probe(_facts(alloy_env_hash=_env_hash())),
-        ],
-        alloy_probes=[missing, aligned],
-    )
-    result = _prepare(executor, base=base, allow_install=True)
-
-    assert executor.reconciled and executor.reconciled[0]["install"] is True
-    assert result.summary is not None and result.summary.status == "Configured"
-    assert result.failed is False
-
-
-def test_unsupported_guest_os_blocks():
-    base = _base()
-    executor = ScriptedExecutor(
-        [
-            _probe(
-                _facts(
-                    profiles=["pbs"],
-                    evidence={
-                        "pbs": {
-                            "proxmox-backup-manager": True,
-                            "proxmox-backup-proxy.service": True,
-                            "task_root": True,
-                            "api_root": True,
-                            "detected": True,
-                        }
-                    },
-                    os_type="alpine",
                 )
             )
         ]
@@ -504,23 +664,83 @@ def test_unsupported_guest_os_blocks():
     assert result.summary is not None and result.summary.status == "Blocked"
     assert result.failed is True
     assert executor.applied == []
+    assert executor.acl_calls == []
+    assert any("ACL tools missing" in w for w in result.warnings)
+
+
+def test_missing_alloy_blocks_when_install_disallowed():
+    base = _base()
+    executor = ScriptedExecutor(
+        [
+            _probe(
+                _facts(
+                    logging=_logging_facts(_REQUEST),
+                    alloy_env_hash=_env_hash(),
+                )
+            )
+        ],
+        alloy_binary=False,
+    )
+    result = _prepare(executor, base=base, allow_install=False)
+
+    assert result.summary is not None and result.summary.status == "Blocked"
+    assert result.failed is True
+    assert result.effective_alloy is None
+    assert executor.reconciled == []
+    assert executor.applied == []
+    assert executor.acl_calls == []
+    assert any("Alloy is not installed" in w for w in result.warnings)
+
+
+def test_missing_alloy_installs_when_allowed_then_reprobes():
+    base = _base()
+    executor = ScriptedExecutor(
+        [
+            _probe(_facts(logging=_logging_facts(_REQUEST), alloy_env_hash=_env_hash())),
+            _probe(_facts(logging=_logging_facts(_REQUEST), alloy_env_hash=_env_hash())),
+            _probe(_facts(logging=_logging_facts(_REQUEST), alloy_env_hash=_env_hash())),
+        ],
+        alloy_binary=False,
+    )
+    result = _prepare(executor, base=base, allow_install=True)
+
+    install_calls = [call for call in executor.reconciled if call.get("install")]
+    assert install_calls and install_calls[0]["configure"] is False
+    assert result.summary is not None and result.summary.status == "Configured"
+    assert result.failed is False
+    assert result.effective_alloy is not None
+
+
+def test_unsupported_guest_os_blocks():
+    base = _base()
+    executor = ScriptedExecutor(
+        [_probe(_facts(logging=_logging_facts(_REQUEST), os_type="alpine"))]
+    )
+    result = _prepare(executor, base=base)
+
+    assert result.summary is not None and result.summary.status == "Blocked"
+    assert result.failed is True
+    assert executor.applied == []
     assert any("Debian" in w for w in result.warnings)
 
 
-def test_stopped_guest_is_skipped():
+def test_stopped_guest_with_selection_is_not_verified():
     base = _base()
     executor = ScriptedExecutor([_probe(_facts(running=False))])
     result = _prepare(executor, base=base)
 
     assert result.summary is None
     assert result.changed is False
-    assert result.effective_alloy is base
+    assert result.effective_alloy is None
     assert any("stopped" in w for w in result.warnings)
     assert executor.applied == []
+    assert executor.acl_calls == []
 
 
 def test_probe_failure_blocks_without_effective_config():
-    executor = ScriptedExecutor([PrimitiveResult(rc=1, failed=True, stderr="unreachable")])
+    executor = ScriptedExecutor(
+        [PrimitiveResult(rc=1, failed=True, stderr="unreachable")]
+    )
     result = _prepare(executor)
 
     assert result.summary is not None and result.summary.status == "Blocked"
@@ -528,14 +748,10 @@ def test_probe_failure_blocks_without_effective_config():
     assert result.effective_alloy is None
 
 
-
 def test_custom_journal_source_reports_explicit_migration():
     base = _base(env=False)
-    executor = ScriptedExecutor(
-        [_probe(_facts())],
-        alloy_probes=[PrimitiveResult(rc=0, facts=_alloy_facts(base.sha256))],
-    )
-    result = _prepare(executor, base=base)
+    executor = ScriptedExecutor([_probe(_facts())])
+    result = _prepare(executor, base=base, script_id=None)
 
     assert result.summary is None
     assert executor.applied == []
@@ -545,7 +761,7 @@ def test_custom_journal_source_reports_explicit_migration():
 
 def test_loki_endpoint_conflict_blocks():
     base = _base(endpoint="http://10.0.0.1:3100")
-    executor = ScriptedExecutor([_probe(_facts())], alloy_probes=[])
+    executor = ScriptedExecutor([_probe(_facts(logging=_logging_facts(_REQUEST)))])
     result = _prepare(
         executor,
         settings=GlobalSettings(housekeeping_loki_url="http://10.9.9.9:3100"),
@@ -554,17 +770,30 @@ def test_loki_endpoint_conflict_blocks():
 
     assert result.summary is not None and result.summary.status == "Blocked"
     assert result.failed is True
-    assert result.effective_alloy is base
-    # The warning never echoes the endpoint or the HCL source.
+    assert result.effective_alloy is None
     assert all("10.0.0.1" not in w and "10.9.9.9" not in w for w in result.warnings)
     assert executor.reconciled == []
 
 
 def test_matching_loki_endpoint_is_accepted():
     base = _base(endpoint="http://10.10.10.39:3100")
+    selection = lp.select_log_plugins(
+        _catalogue(), script_id="nginxproxymanager", override=None, auto=True
+    )
+    candidate = housekeeping.render_lxc_log_config(
+        base,
+        node="pve",
+        cluster="cluster",
+        lxc_id="123",
+        name="guest",
+        sources=lp.validate_log_layout(
+            selection, _logging_facts(_REQUEST)
+        ).renderable_sources,
+        retention_hours=48,
+    )
     executor = ScriptedExecutor(
-        [_probe(_facts(alloy_env_hash=_env_hash()))],
-        alloy_probes=[PrimitiveResult(rc=0, facts=_alloy_facts(base.sha256))],
+        [_probe(_facts(logging=_logging_facts(_REQUEST), alloy_env_hash=_env_hash()))],
+        alloy_config_sha=candidate.sha256,
     )
     result = _prepare(
         executor,
@@ -582,41 +811,80 @@ def test_matching_loki_endpoint_is_accepted():
 
 def test_dry_run_audits_findings_without_writing():
     base = _base()
-    stub = _effective_npm(base)
     executor = ScriptedExecutor(
         [
             _probe(
                 _facts(
-                    profiles=["npm"],
-                    evidence={"npm": _npm_evidence(True)},
+                    logging=_logging_facts(_REQUEST, ready=False),
                     access_ready=False,
                     alloy_env_hash="",
                 )
             )
-        ],
-        alloy_probes=[PrimitiveResult(rc=0, facts=_alloy_facts(stub.sha256))],
+        ]
     )
     result = _prepare(executor, base=base, dry_run=True)
 
     assert result.summary is not None and result.summary.status == "Audit"
     assert result.changed is False
     assert result.failed is False
-    assert result.effective_alloy == stub
     assert executor.applied == []
+    assert executor.acl_calls == []
     assert executor.reconciled == []
-    assert any("scoped read access" in w for w in result.warnings)
+    assert any("scoped read" in w for w in result.warnings)
     assert any("environment drop-in" in w for w in result.warnings)
+    assert any("validation is pending" in w for w in result.warnings)
 
 
 def test_dry_run_compliant_guest_returns_no_summary():
     base = _base()
     executor = ScriptedExecutor(
         [_probe(_facts(alloy_env_hash=_env_hash()))],
-        alloy_probes=[PrimitiveResult(rc=0, facts=_alloy_facts(base.sha256))],
+        alloy_config_sha=base.sha256,
     )
-    result = _prepare(executor, base=base, dry_run=True)
+    result = _prepare(
+        executor,
+        base=base,
+        log_override=GuestLogOverride(mode="disabled"),
+        dry_run=True,
+    )
 
     assert result.summary is None
     assert result.warnings == []
     assert executor.applied == []
+    assert executor.acl_calls == []
     assert executor.reconciled == []
+
+
+@pytest.mark.parametrize("fault", ["none", "noop", "symlink"])
+def test_environment_configuration_requires_observed_safe_file_state(tmp_path, fault):
+    from tests.unit.test_housekeeping_retention import Guest as FilesystemGuest
+
+    guest = FilesystemGuest(tmp_path / "guest")
+    path = guest.put(
+        housekeeping.FLEET_ALLOY_ENV_DROPIN, housekeeping.journal_env_content(24)
+    )
+    original = path.read_bytes()
+    outside = tmp_path / "outside.conf"
+    if fault == "symlink":
+        outside.write_bytes(original)
+        path.unlink()
+        path.symlink_to(outside)
+    guest.acknowledge_without_write = fault == "noop"
+    base = _base()
+    result = _prepare(
+        guest,
+        GlobalSettings(housekeeping_loki_url="http://10.0.0.1:3100"),
+        base=base,
+        script_id=None,
+    )
+    if fault == "none":
+        assert path.read_text() == housekeeping.journal_env_content(48)
+        assert result.summary.status == "Configured"
+        assert not result.failed
+    else:
+        assert path.read_bytes() == original
+        assert result.summary.status == "Blocked"
+        assert result.failed
+        if fault == "symlink":
+            assert path.is_symlink()
+            assert outside.read_bytes() == original

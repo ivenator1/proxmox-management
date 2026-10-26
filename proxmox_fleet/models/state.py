@@ -8,10 +8,12 @@ deserialises directly and the briefing renders identically.
 from __future__ import annotations
 
 import json
+import math
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class HousekeepingSummary(BaseModel):
@@ -30,6 +32,30 @@ class HousekeepingSummary(BaseModel):
     bytes_reclaimed: int = Field(default=0, ge=0)
     bytes_archived: int = Field(default=0, ge=0)
     files_pruned: int = Field(default=0, ge=0)
+
+
+_DISK_DETAIL_LIMIT = 160
+# Control/format/line-separator characters must never reach a rendered warning.
+_UNSAFE_TEXT_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+
+
+def _disk_count(value: object, field: str) -> int:
+    """Validate a bounded nonnegative integer element of a disk-usage record."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be a nonnegative integer")
+    if value < 0:
+        raise ValueError(f"{field} must be nonnegative")
+    return value
+
+
+def _disk_share(value: object, field: str) -> float:
+    """Validate a finite percentage in [0, 100] (booleans rejected)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a finite number between 0 and 100")
+    number = float(value)
+    if not math.isfinite(number) or not (0.0 <= number <= 100.0):
+        raise ValueError(f"{field} must be a finite number between 0 and 100")
+    return number
 
 
 class LxcRecord(BaseModel):
@@ -106,12 +132,102 @@ class ErrorEntry(BaseModel):
     error: str
 
 
+class DiskUsageEntry(BaseModel):
+    """One bounded root-filesystem consumer in a disk-usage insight.
+
+    ``allocated_bytes`` is allocated space (``st_blocks * 512``), never apparent
+    length or file contents. ``share_percent`` is a share of the guest's used
+    root-filesystem bytes, so it can never exceed 100. Metadata keeps the full
+    measured path; only the rendered warning clips/sanitizes it.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    path: str
+    allocated_bytes: int
+    share_percent: float
+    max_expected_share_percent: float
+    # "directory-other" is the residual of a parent after crediting retained
+    # descendants; "root-files" is the direct-files bucket below "/".
+    kind: Literal["directory", "directory-other", "root-files"] = "directory"
+
+    @field_validator("allocated_bytes", mode="before")
+    @classmethod
+    def _validate_allocated_bytes(cls, value: object) -> int:
+        return _disk_count(value, "allocated_bytes")
+
+    @field_validator("share_percent", mode="before")
+    @classmethod
+    def _validate_share(cls, value: object) -> float:
+        return _disk_share(value, "share_percent")
+
+    @field_validator("max_expected_share_percent", mode="before")
+    @classmethod
+    def _validate_expected_share(cls, value: object) -> float:
+        return _disk_share(value, "max_expected_share_percent")
+
+
+class DiskUsageInsight(BaseModel):
+    """Structured, bounded disk-usage enrichment attached to a disk warning."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    status: Literal["complete", "partial", "unavailable"]
+    # Defaults to None so exclude_none serialization (history/dashboard) cannot
+    # drop the key and then fail to reload an unavailable insight.
+    used_bytes: Optional[int] = None
+    entries: List[DiskUsageEntry] = Field(max_length=20)
+    omitted: int = 0
+    detail: str = ""
+
+    @field_validator("used_bytes", mode="before")
+    @classmethod
+    def _validate_used_bytes(cls, value: object) -> Optional[int]:
+        if value is None:
+            return None
+        return _disk_count(value, "used_bytes")
+
+    @field_validator("omitted", mode="before")
+    @classmethod
+    def _validate_omitted(cls, value: object) -> int:
+        return _disk_count(value, "omitted")
+
+    @field_validator("detail", mode="before")
+    @classmethod
+    def _validate_detail(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("detail must be a string")
+        if len(value) > _DISK_DETAIL_LIMIT:
+            raise ValueError(
+                f"detail must be at most {_DISK_DETAIL_LIMIT} characters"
+            )
+        if any(
+            unicodedata.category(char) in _UNSAFE_TEXT_CATEGORIES for char in value
+        ):
+            raise ValueError("detail must not contain control characters")
+        return value
+
+    def with_detail(self, detail: str) -> "DiskUsageInsight":
+        """Return a re-validated copy carrying ``detail``.
+
+        Pydantic's ``model_copy(update=...)`` skips validation, so callers that
+        append a policy finding must use this helper rather than bypassing the
+        bounded/sanitized detail contract.
+        """
+        return DiskUsageInsight.model_validate({**self.model_dump(), "detail": detail})
+
+
 class WarningEntry(BaseModel):
     model_config = ConfigDict(extra="allow")
     host: str
     task: str
     warning: str
     notifying: Optional[bool] = Field(default=None, exclude_if=lambda value: value is None)
+    # Structured disk-usage enrichment for the existing lack-of-space warning.
+    # Omitted entirely when None so legacy records keep their exact byte shape.
+    disk_usage: Optional[DiskUsageInsight] = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class FleetState(BaseModel):

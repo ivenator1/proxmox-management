@@ -1,0 +1,29 @@
+---
+schema_version: 1
+id: rabbitmq
+display_name: RabbitMQ
+kind: dependency
+community_script_ids: []
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: rabbitmq-server.service
+    sources:
+      - id: queue
+        app: rabbitmq
+        log_kind: queue
+        allowed_roots:
+          - /var/log/rabbitmq
+        paths:
+          - /var/log/rabbitmq/rabbit@*.log
+      - id: queue-startup
+        app: rabbitmq
+        log_kind: queue-startup
+        exact_files:
+          - /var/log/rabbitmq/rabbitmq-server.log
+      - id: queue-error
+        app: rabbitmq
+        log_kind: queue-error
+        exact_files:
+          - /var/log/rabbitmq/rabbitmq-server.error.log

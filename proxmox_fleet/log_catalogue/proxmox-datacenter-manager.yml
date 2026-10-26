@@ -1,0 +1,20 @@
+---
+schema_version: 1
+id: proxmox-datacenter-manager
+display_name: Proxmox community script proxmox-datacenter-manager
+community_script_ids:
+  - proxmox-datacenter-manager
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: proxmox-datacenter-api.service
+      - name: proxmox-datacenter-privileged-api.service
+    sources:
+      - id: tasks
+        app: proxmox-datacenter-manager
+        log_kind: tasks
+        allowed_roots:
+          - /var/log/proxmox-datacenter-manager/tasks
+        paths:
+          - /var/log/proxmox-datacenter-manager/tasks/[0-9A-F][0-9A-F]/UPID:*

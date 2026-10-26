@@ -305,7 +305,7 @@ def _activity_weeks(
 # only costs a masked input, never a leak.
 _SECRET_FIELD_RE = re.compile(r"(token|secret|pass|webhook|deadmans)", re.IGNORECASE)
 # Structured editing can't represent these faithfully — raw editor only.
-_RAW_ONLY_FIELDS = {"notifiers", "pve_clusters"}
+_RAW_ONLY_FIELDS = {"notifiers", "pve_clusters", "alloy_log_overrides"}
 
 
 def settings_form_fields(file_data: Mapping[str, Any]) -> List[Dict[str, Any]]:

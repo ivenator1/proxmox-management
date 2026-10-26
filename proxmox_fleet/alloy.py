@@ -11,43 +11,37 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Protocol, Set
+from typing import Any, Dict, Iterable, Optional, Protocol, Sequence
 
 from proxmox_fleet.housekeeping_io import QUARANTINE_DIRNAME
+from proxmox_fleet.log_plugins import ResolvedLogSource
+from proxmox_fleet.models.log_plugins import MultilineOptions, patterns_overlap
 from proxmox_fleet.runner import PrimitiveResult
 
 
 PLACEHOLDER_MARKER = "REPLACE_WITH_LOKI_ENDPOINT"
 
-# Reserved component names for the fleet-managed file-log pipeline rendered by
-# render_lxc_log_config().  A desired base config must never declare any of
-# these; the renderer refuses to append a second copy rather than silently
-# producing an invalid or ambiguous Alloy configuration.
+# Reserved component name for the fleet-managed file-log pipeline rendered by
+# render_lxc_log_config().  A desired base config must never declare this (or a
+# selected source component); the renderer refuses to append a second copy
+# rather than silently producing an invalid or ambiguous Alloy configuration.
 FLEET_PROCESS_COMPONENT = "fleet_file_pack"
-FLEET_NPM_SOURCE_COMPONENT = "fleet_npm"
-FLEET_PBS_TASKS_SOURCE_COMPONENT = "fleet_pbs_tasks"
-FLEET_PBS_API_SOURCE_COMPONENT = "fleet_pbs_api"
-RESERVED_COMPONENT_NAMES: frozenset[str] = frozenset(
-    {
-        FLEET_PROCESS_COMPONENT,
-        FLEET_NPM_SOURCE_COMPONENT,
-        FLEET_PBS_TASKS_SOURCE_COMPONENT,
-        FLEET_PBS_API_SOURCE_COMPONENT,
-    }
+RESERVED_COMPONENT_NAMES: frozenset[str] = frozenset({FLEET_PROCESS_COMPONENT})
+
+# Source statuses whose descriptor/layout evidence is safe to render.  Only
+# ``active``/``quiet`` may reach final deployment; ``acl-needed`` is additionally
+# accepted so a caller can validate candidate HCL before repairing scoped ACLs
+# (the caller still re-probes before replacing the live configuration).
+RENDERABLE_SOURCE_STATUSES: frozenset[str] = frozenset(
+    {"active", "quiet", "acl-needed"}
 )
 
-# Only these probe-reported profiles have a defined live file-source mapping.
-SUPPORTED_LOG_PROFILES: frozenset[str] = frozenset({"npm", "pbs"})
+_COMPONENT_NAME_RE = re.compile(r"^fleet_[a-z0-9][a-z0-9_]{0,63}$")
 
-# Exact live (non-archive) discovery globs.  Rotated/compressed archives are
-# handled by the acknowledged importer, never by these readers.
-NPM_LOG_ROOT = "/data/logs"
-PBS_TASKS_ROOT = "/var/log/proxmox-backup/tasks"
-NPM_LIVE_LOG_GLOB = f"{NPM_LOG_ROOT}/**/*.log"
-PBS_LIVE_TASKS_GLOB = f"{PBS_TASKS_ROOT}/[0-9A-F][0-9A-F]/UPID:*"
-PBS_LIVE_API_GLOBS = (
-    "/var/log/proxmox-backup/api/access.log",
-    "/var/log/proxmox-backup/api/auth.log",
+# Automatic quarantine exclusion emitted by the source resolver for every
+# managed directory root: ``<root>/**/<quarantine>/**``.
+_AUTO_QUARANTINE_RE = re.compile(
+    r"^/.+/\*\*/" + re.escape(QUARANTINE_DIRNAME) + r"/\*\*$"
 )
 
 
@@ -115,6 +109,7 @@ class AlloyExecutor(Protocol):
         configure: bool,
         add_journal_group: bool,
         repair_service: bool,
+        validate_only: bool = False,
     ) -> PrimitiveResult:
         ...
 
@@ -286,18 +281,130 @@ def _hcl_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _reserved_conflicts(content: str) -> list[str]:
-    """Return reserved fleet component names already present in the base HCL."""
+def _reserved_conflicts(content: str, names: Iterable[str]) -> list[str]:
+    """Return generated fleet component names already present in the base HCL."""
     return sorted(
         name
-        for name in RESERVED_COMPONENT_NAMES
+        for name in set(names)
         if re.search(rf"\b{re.escape(name)}\b", content)
     )
 
 
-def _quarantine_exclude(root: str) -> str:
-    """Glob that excludes every quarantine tree below a managed log root."""
-    return f"{root}/**/{QUARANTINE_DIRNAME}/**"
+def _as_path(value: object, label: str) -> str:
+    """Validate one absolute live source path/pattern before rendering it."""
+    if not isinstance(value, str) or not value.startswith("/") or value.startswith("//"):
+        raise AlloyConfigError(f"{label} must be an absolute normalized path")
+    if len(value.encode("utf-8")) > 4096:
+        raise AlloyConfigError(f"{label} is too long")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise AlloyConfigError(f"{label} must not contain control characters")
+    if "\\" in value or "://" in value:
+        raise AlloyConfigError(f"{label} must not contain backslashes or a URI")
+    return value
+
+
+def _is_literal(pattern: str) -> bool:
+    return not any(ch in pattern for ch in "*?[")
+
+
+def _literal_in_quarantine(path: str) -> bool:
+    return (
+        f"/{QUARANTINE_DIRNAME}/" in path
+        or path.endswith(f"/{QUARANTINE_DIRNAME}")
+    )
+
+
+def _exclusion_applies(pattern: str, exclude: str) -> bool:
+    """Whether an exclusion can affect one read path.
+
+    The catalog resolver appends a quarantine glob to every managed directory
+    root.  A purely literal (non-wildcard) read path outside a quarantine tree
+    can never be matched by that automatically generated glob, so it is omitted
+    to keep the rendered reader minimal.  Authored exclusions and every
+    wildcard path keep their exclusions unchanged.
+    """
+    if _is_literal(pattern) and _AUTO_QUARANTINE_RE.fullmatch(exclude):
+        return _literal_in_quarantine(pattern)
+    return True
+
+
+def _exclusion_field(pattern: str, exclude_paths: Sequence[str]) -> Optional[str]:
+    """Render `__path_exclude__` as one validated glob/brace union."""
+    applicable: list[str] = []
+    for raw in exclude_paths:
+        exclude = _as_path(raw, "source exclusion")
+        if "{" in exclude or "}" in exclude:
+            raise AlloyConfigError("source exclusions must not contain brace characters")
+        if _exclusion_applies(pattern, exclude) and exclude not in applicable:
+            applicable.append(exclude)
+    if not applicable:
+        return None
+    if len(applicable) == 1:
+        return applicable[0]
+    return "{" + ",".join(applicable) + "}"
+
+
+def _multiline_component(source: ResolvedLogSource) -> str:
+    """Bounded generated process name for one multiline source chain."""
+    digest = hashlib.sha256(source.key.encode("utf-8")).hexdigest()
+    return f"fleet_multiline_{digest[:24]}"
+
+
+def _validate_sources(
+    sources: Sequence[ResolvedLogSource],
+) -> tuple[list[ResolvedLogSource], list[str]]:
+    """Validate deployability, component uniqueness and path ownership."""
+    checked: list[ResolvedLogSource] = []
+    components: Dict[str, str] = {}
+    patterns: list[tuple[str, str]] = []
+    names: list[str] = sorted(RESERVED_COMPONENT_NAMES)
+    for source in sources:
+        if not isinstance(source, ResolvedLogSource):
+            raise AlloyConfigError("log sources must be resolved catalogue sources")
+        if source.status not in RENDERABLE_SOURCE_STATUSES:
+            raise AlloyConfigError(
+                f"source {source.key!r} is not deployable (status {source.status!r})"
+            )
+        if not isinstance(source.component, str) or not _COMPONENT_NAME_RE.match(
+            source.component
+        ):
+            raise AlloyConfigError(
+                f"source {source.key!r} has an invalid Alloy component name"
+            )
+        previous = components.get(source.component)
+        if previous is not None:
+            raise AlloyConfigError(
+                f"component {source.component!r} is claimed by both {previous!r} "
+                f"and {source.key!r}"
+            )
+        components[source.component] = source.key
+        names.append(source.component)
+        if not source.paths and not source.exact_files:
+            raise AlloyConfigError(f"source {source.key!r} declares no live paths")
+        for pattern in (*source.paths, *source.exact_files):
+            _as_path(pattern, f"source {source.key!r} path")
+            if "{" in pattern or "}" in pattern:
+                raise AlloyConfigError(
+                    f"source {source.key!r} paths must not contain brace characters"
+                )
+            patterns.append((source.key, pattern))
+        if source.multiline is not None:
+            names.append(_multiline_component(source))
+        checked.append(source)
+
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise AlloyConfigError(
+            "generated Alloy component name(s) conflict: " + ", ".join(duplicates)
+        )
+    for index, (first_key, first) in enumerate(patterns):
+        for second_key, second in patterns[index + 1 :]:
+            if patterns_overlap(first, second):
+                raise AlloyConfigError(
+                    f"source ownership conflict between {first_key!r} and "
+                    f"{second_key!r}: patterns overlap"
+                )
+    return checked, names
 
 
 def _fleet_target(
@@ -334,6 +441,7 @@ def _source_stanza(
     component: str,
     targets: list[list[tuple[str, str]]],
     retention_hours: int,
+    process_component: str = FLEET_PROCESS_COMPONENT,
 ) -> str:
     lines = [f'loki.source.file "{component}" {{', "  targets = ["]
     for target in targets:
@@ -342,7 +450,7 @@ def _source_stanza(
             lines.append(f"      {key} = {_hcl_string(value)},")
         lines.append("    },")
     lines.append("  ]")
-    lines.append(f"  forward_to = [loki.process.{FLEET_PROCESS_COMPONENT}.receiver]")
+    lines.append(f"  forward_to = [loki.process.{process_component}.receiver]")
     lines.append("  tail_from_end = false")
     lines.append('  on_positions_file_error = "restart_from_beginning"')
     lines.append("")
@@ -368,6 +476,47 @@ def _process_stanza() -> str:
     )
 
 
+def _multiline_stanza(component: str, options: MultilineOptions) -> str:
+    """Bounded per-source multiline stage feeding the shared pack process."""
+    return (
+        f'loki.process "{component}" {{\n'
+        f"  forward_to = [loki.process.{FLEET_PROCESS_COMPONENT}.receiver]\n"
+        "\n"
+        "  stage.multiline {\n"
+        f"    firstline = {_hcl_string(options.firstline)}\n"
+        f"    max_lines = {int(options.max_lines)}\n"
+        f'    max_wait_time = "{int(options.max_wait_seconds)}s"\n'
+        "  }\n"
+        "}"
+    )
+
+
+def _source_targets(
+    source: ResolvedLogSource,
+    *,
+    cluster: str,
+    node: str,
+    lxc_id: str,
+    name: str,
+) -> list[list[tuple[str, str]]]:
+    """One target map per declared path, then per exact file, in source order."""
+    targets: list[list[tuple[str, str]]] = []
+    for pattern in (*source.paths, *source.exact_files):
+        targets.append(
+            _fleet_target(
+                path=pattern,
+                exclude=_exclusion_field(pattern, source.exclude_paths),
+                app=source.app,
+                log_kind=source.log_kind,
+                cluster=cluster,
+                node=node,
+                lxc_id=lxc_id,
+                name=name,
+            )
+        )
+    return targets
+
+
 def render_lxc_log_config(
     base: DesiredAlloyConfig,
     *,
@@ -375,27 +524,25 @@ def render_lxc_log_config(
     cluster: str,
     lxc_id: str,
     name: str,
-    profiles: Set[str],
+    sources: Sequence[ResolvedLogSource],
     retention_hours: int,
 ) -> DesiredAlloyConfig:
     """Append fleet-managed live file sources to a guest's desired Alloy HCL.
 
     The base content, journal component names and storage path are preserved
-    verbatim; only the discovered-profile sources, the shared packing process
-    and the exact resulting content hash are added.  Unknown profiles and base
-    configs that already use a reserved component name are rejected before any
-    deployment.
+    verbatim; only the resolved source readers, the shared packing process, an
+    optional bounded multiline chain per source and the exact resulting content
+    hash are added.  Component/ownership conflicts and base configs that
+    already use a generated component name are rejected before deployment.
     """
-    wanted = set(profiles)
-    unknown = sorted(wanted - SUPPORTED_LOG_PROFILES)
-    if unknown:
-        raise AlloyConfigError("unsupported log profile(s): " + ", ".join(unknown))
-    if not wanted:
+    selected = tuple(sources)
+    if not selected:
         return base
     hours = int(retention_hours)
     if hours < 1:
         raise AlloyConfigError("retention_hours must be a positive integer")
-    conflicts = _reserved_conflicts(base.content)
+    checked, names = _validate_sources(selected)
+    conflicts = _reserved_conflicts(base.content, names)
     if conflicts:
         raise AlloyConfigError(
             "desired config already uses reserved fleet component name(s): "
@@ -403,60 +550,27 @@ def render_lxc_log_config(
         )
 
     blocks = [_process_stanza()]
-    if "npm" in wanted:
+    receivers: Dict[str, str] = {}
+    for source in checked:
+        if source.multiline is None:
+            continue
+        component = _multiline_component(source)
+        receivers[source.key] = component
+        blocks.append(_multiline_stanza(component, source.multiline))
+
+    for source in checked:
         blocks.append(
             _source_stanza(
-                FLEET_NPM_SOURCE_COMPONENT,
-                [
-                    _fleet_target(
-                        path=NPM_LIVE_LOG_GLOB,
-                        exclude=_quarantine_exclude(NPM_LOG_ROOT),
-                        app="nginxproxymanager",
-                        log_kind="application",
-                        cluster=cluster,
-                        node=node,
-                        lxc_id=lxc_id,
-                        name=name,
-                    )
-                ],
+                source.component,
+                _source_targets(
+                    source,
+                    cluster=cluster,
+                    node=node,
+                    lxc_id=lxc_id,
+                    name=name,
+                ),
                 hours,
-            )
-        )
-    if "pbs" in wanted:
-        blocks.append(
-            _source_stanza(
-                FLEET_PBS_TASKS_SOURCE_COMPONENT,
-                [
-                    _fleet_target(
-                        path=PBS_LIVE_TASKS_GLOB,
-                        exclude=_quarantine_exclude(PBS_TASKS_ROOT),
-                        app="proxmox-backup",
-                        log_kind="task",
-                        cluster=cluster,
-                        node=node,
-                        lxc_id=lxc_id,
-                        name=name,
-                    )
-                ],
-                hours,
-            )
-        )
-        blocks.append(
-            _source_stanza(
-                FLEET_PBS_API_SOURCE_COMPONENT,
-                [
-                    _fleet_target(
-                        path=api_path,
-                        app="proxmox-backup",
-                        log_kind="api",
-                        cluster=cluster,
-                        node=node,
-                        lxc_id=lxc_id,
-                        name=name,
-                    )
-                    for api_path in PBS_LIVE_API_GLOBS
-                ],
-                hours,
+                receivers.get(source.key, FLEET_PROCESS_COMPONENT),
             )
         )
 

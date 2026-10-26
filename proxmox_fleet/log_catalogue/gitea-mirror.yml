@@ -1,0 +1,16 @@
+---
+schema_version: 1
+id: gitea-mirror
+display_name: Proxmox community script gitea-mirror
+community_script_ids:
+  - gitea-mirror
+journal_units:
+  - name: gitea-mirror.service
+layouts:
+  - id: default
+    required_units:
+      - name: gitea-mirror.service
+    sources: []
+disk_usage:
+  path_max_share_percent:
+    /root/.bun/install/cache: 20.0

@@ -1,0 +1,13 @@
+---
+schema_version: 1
+id: openresty
+display_name: OpenResty
+kind: dependency
+community_script_ids: []
+journal_units:
+  - name: openresty.service
+layouts:
+  - id: default
+    required_units:
+      - name: openresty.service
+    sources: []

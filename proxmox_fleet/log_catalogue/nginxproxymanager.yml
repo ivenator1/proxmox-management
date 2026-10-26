@@ -1,0 +1,22 @@
+---
+schema_version: 1
+id: nginxproxymanager
+display_name: Proxmox community script nginxproxymanager
+community_script_ids:
+  - nginxproxymanager
+journal_units: []
+includes:
+  - openresty
+layouts:
+  - id: default
+    required_units:
+      - name: npm.service
+    sources:
+      - id: application
+        component: fleet_npm
+        app: nginxproxymanager
+        log_kind: application
+        allowed_roots:
+          - /data/logs
+        paths:
+          - /data/logs/**/*.log

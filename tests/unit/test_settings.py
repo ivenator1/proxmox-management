@@ -554,3 +554,120 @@ def test_housekeeping_timer_enabled_without_url_from_yaml_rejected(tmp_path):
     f.write_text("housekeeping_timer_enabled: true\n")
     with pytest.raises(ValidationError):
         GlobalSettings.load(f)
+
+
+# --- application-log plugin selection settings -------------------------------
+
+
+def test_log_plugin_settings_defaults():
+    s = GlobalSettings()
+    assert s.alloy_log_plugins_auto is True
+    assert s.alloy_log_plugins_dir is None
+    assert s.alloy_log_overrides == {}
+
+
+def test_log_plugin_settings_load_typed_overrides_and_stringify_keys(tmp_path):
+    f = tmp_path / "vars.yml"
+    f.write_text(
+        "alloy_log_plugins_auto: false\n"
+        'alloy_log_plugins_dir: ""\n'
+        "alloy_log_overrides:\n"
+        "  135:\n"
+        "    mode: replace\n"
+        "    plugins: [homepage]\n"
+        '  "default/pve01/120":\n'
+        "    mode: extend\n"
+        "    plugins: [proxmox-backup-server]\n"
+        "    disable_sources: ['nginxproxymanager/application']\n"
+        "    locations:\n"
+        "      proxmox-backup-server/tasks: ['/srv/pbs/tasks/**/*.log']\n"
+        "    layouts:\n"
+        '      proxmox-backup-server: default\n'
+    )
+    s = GlobalSettings.load(f)
+    assert s.alloy_log_plugins_auto is False
+    assert s.alloy_log_plugins_dir is None
+    assert sorted(s.alloy_log_overrides) == ["135", "default/pve01/120"]
+    explicit = s.alloy_log_overrides["135"]
+    assert explicit.mode == "replace"
+    assert explicit.plugins == ["homepage"]
+    full = s.alloy_log_overrides["default/pve01/120"]
+    assert full.mode == "extend"
+    assert full.disable_sources == ["nginxproxymanager/application"]
+    assert full.locations == {
+        "proxmox-backup-server/tasks": ["/srv/pbs/tasks/**/*.log"]
+    }
+    assert full.layouts == {"proxmox-backup-server": "default"}
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "default/135",  # two segments
+        "default/pve01/0135",  # noncanonical leading zero
+        "not-a-number",  # bare nonnumeric
+        "default/pve01/abc",  # nonnumeric guest
+        "a/b/c/d",  # too many segments
+        "",  # empty
+    ],
+)
+def test_log_override_guest_keys_are_validated_at_settings_load(key):
+    with pytest.raises(ValidationError):
+        GlobalSettings.model_validate({"alloy_log_overrides": {key: {"mode": "auto"}}})
+
+
+def test_log_override_key_coercion_collision_fails_closed():
+    with pytest.raises(ValidationError, match="duplicate alloy_log_overrides"):
+        GlobalSettings.model_validate(
+            {
+                "alloy_log_overrides": {
+                    135: {"mode": "disabled"},
+                    "135": {"mode": "disabled"},
+                }
+            }
+        )
+
+
+def test_log_override_extra_fields_and_contradictory_modes_fail_closed():
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        GlobalSettings.model_validate(
+            {
+                "alloy_log_overrides": {
+                    "default/pve01/135": {"mode": "auto", "typo": True}
+                }
+            }
+        )
+    with pytest.raises(ValidationError, match="must not carry explicit plugins"):
+        GlobalSettings.model_validate(
+            {
+                "alloy_log_overrides": {
+                    "135": {"mode": "auto", "plugins": ["homepage"]}
+                }
+            }
+        )
+    with pytest.raises(ValidationError, match="must not carry"):
+        GlobalSettings.model_validate(
+            {
+                "alloy_log_overrides": {
+                    "135": {"mode": "disabled", "plugins": ["homepage"]}
+                }
+            }
+        )
+    with pytest.raises(ValidationError):
+        GlobalSettings.model_validate(
+            {
+                "alloy_log_overrides": {
+                    "135": {
+                        "mode": "extend",
+                        "locations": {"homepage/application": ["/var/../etc/passwd"]},
+                    }
+                }
+            }
+        )
+
+
+def test_log_plugin_dir_rejects_control_characters():
+    with pytest.raises(ValidationError):
+        GlobalSettings.model_validate({"alloy_log_plugins_dir": "configs/\x00plugins"})
+    s = GlobalSettings.model_validate({"alloy_log_plugins_dir": "   "})
+    assert s.alloy_log_plugins_dir is None

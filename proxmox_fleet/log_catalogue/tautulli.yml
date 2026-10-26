@@ -1,0 +1,20 @@
+---
+schema_version: 1
+id: tautulli
+display_name: Proxmox community script tautulli
+community_script_ids:
+  - tautulli
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: tautulli.service
+    sources:
+      - id: application
+        app: tautulli
+        log_kind: application
+        exact_files:
+          - /opt/Tautulli/logs/tautulli.log
+          - /opt/Tautulli/logs/tautulli_api.log
+          - /opt/Tautulli/logs/plexapi.log
+          - /opt/Tautulli/logs/plex_websocket.log

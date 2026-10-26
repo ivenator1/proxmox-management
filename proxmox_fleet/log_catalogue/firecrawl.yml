@@ -1,0 +1,19 @@
+---
+schema_version: 1
+id: firecrawl
+display_name: Proxmox community script firecrawl
+community_script_ids:
+  - firecrawl
+journal_units:
+  - name: firecrawl.service
+  - name: firecrawl-playwright.service
+includes:
+  - postgresql
+  - rabbitmq
+  - redis
+layouts:
+  - id: default
+    required_units:
+      - name: firecrawl.service
+      - name: firecrawl-playwright.service
+    sources: []

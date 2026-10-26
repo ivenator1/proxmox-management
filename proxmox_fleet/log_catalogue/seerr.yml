@@ -1,0 +1,19 @@
+---
+schema_version: 1
+id: seerr
+display_name: Proxmox community script seerr
+community_script_ids:
+  - seerr
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: seerr.service
+    sources:
+      - id: application
+        app: seerr
+        log_kind: application
+        allowed_roots:
+          - /opt/seerr/config/logs
+        paths:
+          - /opt/seerr/config/logs/seerr-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].log

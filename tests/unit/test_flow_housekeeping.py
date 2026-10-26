@@ -18,6 +18,7 @@ import pytest
 
 from proxmox_fleet import housekeeping_import as hi
 from proxmox_fleet.flows import housekeeping as flow
+from proxmox_fleet.log_plugins import load_log_catalogue
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.runner import PrimitiveResult
 from tests.unit.test_housekeeping import (
@@ -34,6 +35,9 @@ from tests.unit.test_housekeeping import (
 LXC = "120"
 NODE = "pve-01"
 
+#: The immutable catalogue the driver loads once per run.
+CATALOGUE = load_log_catalogue()
+
 
 class FlowGuest(Guest):
     """Execution-layer guest adapter with the flow's ``introspect`` transport."""
@@ -41,6 +45,7 @@ class FlowGuest(Guest):
     def __init__(self, guest_root: Path, spool: Path, *, name: str = "npm") -> None:
         super().__init__(guest_root, spool)
         self.name = name
+        self.community_script_id: Optional[str] = None
         self.introspect_result: Optional[PrimitiveResult] = None
         self.introspect_calls = 0
 
@@ -52,7 +57,17 @@ class FlowGuest(Guest):
         if self.template:
             config += "template: 1\n"
         status = "status: running" if (self.running and not self.template) else "status: stopped"
-        return PrimitiveResult(rc=0, facts={"config_stdout": config, "status_stdout": status})
+        facts = {
+            "config_stdout": config,
+            "status_stdout": status,
+            "pull_rc": 0 if self.community_script_id else 1,
+            "script_stdout": (
+                f"source ct/{self.community_script_id}.sh"
+                if self.community_script_id
+                else ""
+            ),
+        }
+        return PrimitiveResult(rc=0, facts=facts)
 
 
 def _settings(history: Path, *, url: str = "", **overrides: Any) -> GlobalSettings:
@@ -83,7 +98,8 @@ def guest(tmp_path: Path, monkeypatch) -> FlowGuest:
 
 def _run(guest: FlowGuest, settings: GlobalSettings, base=None, *, dry_run: bool = False):
     return flow.run_lxc_housekeeping(
-        NODE, LXC, guest, settings, dry_run=dry_run, alloy_config=base
+        NODE, LXC, guest, settings, dry_run=dry_run, alloy_config=base,
+        catalogue=CATALOGUE, log_override=guest.log_override,
     )
 
 
@@ -148,6 +164,7 @@ def test_dry_run_creates_no_state_and_reclaims_nothing(history, guest, tmp_path)
 def test_real_cache_clean_survives_blocked_archival(history, guest, tmp_path):
     source = Path(guest.guest_root) / "data/logs/access.log.1"
     source.write_bytes(b"old npm access line\n")
+    guest.community_script_id = "nginxproxymanager"
     guest.profiles = ["npm"]
     guest.files = [_wire(Path(guest.guest_root), "/data/logs/access.log.1")]
     yarn = _cache_dir(tmp_path, "yarn")
@@ -205,6 +222,9 @@ def test_compliant_guest_produces_no_record(history, guest):
     assert out.record is None
     assert out.changed is False
     assert out.failed is False
-    assert out.warnings == []
+    # No community-script identity: the guest is left with its installed log
+    # sources and reports a sanitized coverage finding, never a false success.
+    assert any("unsupported" in w.warning for w in out.warnings)
+    assert all(not w.notifying for w in out.warnings)
     # Idle maintenance still ran: absence of a record must not hide recovery.
     assert out.housekeeping_attempted is True

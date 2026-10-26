@@ -10,7 +10,7 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import pytest
 import yaml
@@ -26,9 +26,17 @@ from proxmox_fleet.driver import (
     run_notify_phase,
 )
 from proxmox_fleet.flows.vm import VmFlowOutcome
+from proxmox_fleet.housekeeping_checkpoint import CheckpointStore, GuestKey
 from proxmox_fleet.inventory import VmSpec
+from proxmox_fleet.log_plugins import LogCatalogueError
+from proxmox_fleet.models.log_plugins import GuestLogOverride
 from proxmox_fleet.models.settings import GlobalSettings
-from proxmox_fleet.models.state import FleetState, WarningEntry
+from proxmox_fleet.models.state import (
+    DiskUsageEntry,
+    DiskUsageInsight,
+    FleetState,
+    WarningEntry,
+)
 from proxmox_fleet.runner import PrimitiveResult
 from tests.unit.test_housekeeping import CacheSpec, Guest, LokiStub, _base, _cache_dir, _compliant, _measure
 
@@ -914,6 +922,119 @@ def test_notify_phase_legacy_warning_does_not_dispatch_idle_run(tmp_path, monkey
     assert calls["ping"][0][1]["failed"] is False
 
 
+_DISK_GIB = 1024 ** 3
+
+
+def _disk_insight(*, status="complete", detail="", entries=None):
+    return DiskUsageInsight(
+        status=status,
+        used_bytes=20 * _DISK_GIB,
+        entries=(
+            entries
+            if entries is not None
+            else [
+                DiskUsageEntry(
+                    path="/var/log",
+                    allocated_bytes=14 * _DISK_GIB,
+                    share_percent=70.0,
+                    max_expected_share_percent=20.0,
+                )
+            ]
+        ),
+        detail=detail,
+    )
+
+
+def _disk_warning_entry(insight):
+    from proxmox_fleet.briefing import format_disk_usage_warning
+
+    base = (
+        "rootfs 77% full, 5.0 GiB free — apt can fail to unpack; keep at "
+        "least 10 GiB free"
+    )
+    return WarningEntry(
+        host="pve-01/135",
+        task="disk space",
+        warning=format_disk_usage_warning(base, insight),
+        disk_usage=insight,
+    )
+
+
+def test_notify_phase_disk_insight_alone_stays_idle(tmp_path, monkeypatch):
+    """Structured diagnostics never create their own notification trigger."""
+    calls = _patch_notifiers(monkeypatch)
+    state = _notify_state(fleet_warning_log=[_disk_warning_entry(_disk_insight())])
+
+    body = run_notify_phase(
+        settings=GlobalSettings(
+            discord_webhook="https://d/hook", fleet_history_dir=str(tmp_path)
+        ),
+        state=state,
+    )
+
+    assert calls["dispatch"] == []
+    # History still records the enriched warning; the priority block appears
+    # once even though the same warning would also be in the generic block.
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["briefing"] == body
+    assert body.count("/var/log") == 1
+    assert "70% of used" in body
+
+
+@pytest.mark.parametrize("trigger", ["failed", "changed", "forced"])
+def test_existing_dispatch_includes_the_disk_insight_once(tmp_path, monkeypatch, trigger):
+    """Once the existing gates already dispatch, the insight rides along."""
+    calls = _patch_notifiers(monkeypatch)
+    state_kw: Dict[str, Any] = {}
+    settings_kw: Dict[str, Any] = {
+        "discord_webhook": "https://d/hook",
+        "fleet_history_dir": str(tmp_path),
+    }
+    if trigger == "failed":
+        state_kw["fleet_failed"] = True
+    elif trigger == "changed":
+        state_kw["fleet_changed"] = True
+    else:
+        settings_kw["force_notify"] = True
+    state = _notify_state(
+        fleet_warning_log=[_disk_warning_entry(_disk_insight())], **state_kw
+    )
+
+    body = run_notify_phase(settings=GlobalSettings(**settings_kw), state=state)
+
+    assert len(calls["dispatch"]) == 1
+    assert "/var/log" in body
+    assert "70% of used" in body
+    assert body.count("/var/log") == 1
+    if trigger == "failed":
+        assert "Failures" in calls["dispatch"][0][1]["title"]
+
+
+def test_partial_disk_insight_is_labelled_incomplete_in_existing_dispatch(
+    tmp_path, monkeypatch
+):
+    calls = _patch_notifiers(monkeypatch)
+    state = _notify_state(
+        fleet_failed=True,
+        fleet_warning_log=[
+            _disk_warning_entry(
+                _disk_insight(status="partial", detail="scan incomplete")
+            )
+        ],
+    )
+
+    body = run_notify_phase(
+        settings=GlobalSettings(
+            discord_webhook="https://d/hook", fleet_history_dir=str(tmp_path)
+        ),
+        state=state,
+    )
+
+    assert len(calls["dispatch"]) == 1
+    assert "incomplete" in body
+    assert body.count("/var/log") == 1
+
+
 def test_notify_phase_suppressed_when_idle_but_history_still_written(tmp_path, monkeypatch):
     calls = _patch_notifiers(monkeypatch)
     state = _notify_state()  # nothing changed/failed
@@ -1096,6 +1217,7 @@ def _record_phases(monkeypatch):
                             "include_manager",
                             "alloy_only",
                             "alloy_config",
+                            "catalogue",
                         )
                         if k in kwargs
                     },
@@ -1549,6 +1671,395 @@ def test_lxc_phase_limit_by_container_id(tmp_path, monkeypatch):
     # discovered (we can't know which node holds 201 in advance).
     driver_mod.run_lxc_phase(settings=GlobalSettings(), inventory_path=str(p), state_output_path=None, limit={"201"})
     assert ran == ["pve-02/201"]
+
+
+# ---------------------------------------------------------------------------
+# Log catalogue load-once and guest-override preflight
+# ---------------------------------------------------------------------------
+
+
+def _log_phase_inventory(tmp_path: Path) -> str:
+    p = tmp_path / "hosts.ini"
+    p.write_text(
+        "[proxmox_nodes]\n"
+        "alpha-01 ansible_host=10.0.0.1 cluster=alpha\n"
+        "beta-01 ansible_host=10.0.0.2 cluster=beta\n",
+        encoding="utf-8",
+    )
+    return str(p)
+
+
+def _patch_log_discovery(monkeypatch, per_node=None) -> None:
+    ids = per_node if per_node is not None else {"alpha-01": ["101"], "beta-01": ["101"]}
+
+    def _fake_discover(ex, settings, **kw):
+        return list(ids[ex.host])
+
+    def _fake_executor(host, **kw):
+        ex = ScriptedExecutor()
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", _fake_discover)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+
+
+def _capture_lxc_updates(monkeypatch) -> List[Any]:
+    calls: List[Any] = []
+
+    def _fake_update(node_name, lxc_id, ex, settings, **kw):
+        from proxmox_fleet.flows.lxc import LxcFlowOutcome
+
+        calls.append((node_name, lxc_id, kw))
+        return LxcFlowOutcome()
+
+    monkeypatch.setattr(driver_mod, "run_lxc_update", _fake_update)
+    return calls
+
+
+def test_lxc_phase_loads_catalogue_once_and_threads_it_to_workers(tmp_path, monkeypatch):
+    inv = _log_phase_inventory(tmp_path)
+    _patch_log_discovery(monkeypatch)
+    calls = _capture_lxc_updates(monkeypatch)
+    catalogue = object()
+    loads: List[Any] = []
+    monkeypatch.setattr(
+        driver_mod, "_load_log_catalogue", lambda settings: loads.append(settings) or catalogue
+    )
+
+    state = driver_mod.run_lxc_phase(
+        settings=GlobalSettings(), inventory_path=inv, state_output_path=None
+    )
+
+    assert not state.failed
+    assert len(loads) == 1  # once per run, never per guest
+    assert len(calls) == 2
+    assert {kw["catalogue"] for _, _, kw in calls} == {catalogue}
+
+
+def test_lxc_phase_broken_catalogue_aborts_before_any_mutation_when_logging_requested(
+    tmp_path, monkeypatch
+):
+    inv = _log_phase_inventory(tmp_path)
+    discovered: List[str] = []
+    monkeypatch.setattr(
+        driver_mod,
+        "_discover_lxcs",
+        lambda ex, settings, **kw: discovered.append(ex.host) or ["101"],
+    )
+    calls = _capture_lxc_updates(monkeypatch)
+    monkeypatch.setattr(driver_mod, "_load_alloy_config", lambda settings: (None, None))
+
+    def _boom(settings):
+        raise LogCatalogueError("malformed packaged manifest")
+
+    monkeypatch.setattr(driver_mod, "_load_log_catalogue", _boom)
+
+    with pytest.raises(SystemExit, match="log catalogue"):
+        driver_mod.run_lxc_phase(
+            settings=GlobalSettings(alloy_enabled=True),
+            inventory_path=inv,
+            state_output_path=None,
+        )
+
+    # Even discovery has not started, let alone a guest mutation.
+    assert discovered == []
+    assert calls == []
+
+
+def test_lxc_phase_broken_catalogue_is_soft_when_logging_is_not_requested(
+    tmp_path, monkeypatch
+):
+    inv = _log_phase_inventory(tmp_path)
+    _patch_log_discovery(monkeypatch)
+    calls = _capture_lxc_updates(monkeypatch)
+
+    def _boom(settings):
+        raise LogCatalogueError("unreadable local directory")
+
+    monkeypatch.setattr(driver_mod, "_load_log_catalogue", _boom)
+
+    state = driver_mod.run_lxc_phase(
+        settings=GlobalSettings(), inventory_path=inv, state_output_path=None
+    )
+
+    # The unrelated OS/app update still ran, with no logging catalogue.
+    assert not state.failed
+    assert len(calls) == 2
+    assert {kw["catalogue"] for _, _, kw in calls} == {None}
+
+
+def test_lxc_phase_broken_catalogue_blocks_housekeeping_only(tmp_path, monkeypatch):
+    inv = _log_phase_inventory(tmp_path)
+    monkeypatch.setattr(driver_mod, "_load_alloy_config", lambda settings: (None, None))
+    monkeypatch.setattr(
+        driver_mod,
+        "_load_log_catalogue",
+        lambda settings: (_ for _ in ()).throw(LogCatalogueError("bad")),
+    )
+
+    with pytest.raises(SystemExit, match="log catalogue"):
+        driver_mod.run_lxc_phase(
+            settings=GlobalSettings(), inventory_path=inv, state_output_path=None,
+            housekeeping_only=True,
+        )
+
+
+def test_lxc_phase_ambiguous_bare_override_rejected_before_limit_hides_collision(
+    tmp_path, monkeypatch
+):
+    inv = _log_phase_inventory(tmp_path)
+    _patch_log_discovery(monkeypatch)
+    calls = _capture_lxc_updates(monkeypatch)
+    monkeypatch.setattr(driver_mod, "_load_alloy_config", lambda settings: (None, None))
+    settings = GlobalSettings(
+        alloy_enabled=True,
+        alloy_log_overrides={"101": GuestLogOverride(mode="disabled")},
+    )
+
+    with pytest.raises(SystemExit, match="ambiguous"):
+        driver_mod.run_lxc_phase(
+            settings=settings, inventory_path=inv, state_output_path=None,
+            limit={"alpha/101"},
+        )
+
+    assert calls == []
+
+
+def test_lxc_phase_bare_override_matching_no_discovered_guest_is_rejected(
+    tmp_path, monkeypatch
+):
+    inv = _log_phase_inventory(tmp_path)
+    _patch_log_discovery(monkeypatch, {"alpha-01": ["101"], "beta-01": ["201"]})
+    calls = _capture_lxc_updates(monkeypatch)
+    monkeypatch.setattr(driver_mod, "_load_alloy_config", lambda settings: (None, None))
+    settings = GlobalSettings(
+        alloy_enabled=True,
+        alloy_log_overrides={"999": GuestLogOverride(mode="disabled")},
+    )
+
+    with pytest.raises(SystemExit, match="matches no discovered"):
+        driver_mod.run_lxc_phase(
+            settings=settings, inventory_path=inv, state_output_path=None,
+            limit={"alpha-01"},
+        )
+
+    assert calls == []
+
+
+def test_lxc_phase_bare_override_requires_complete_fleet_discovery(tmp_path, monkeypatch):
+    from proxmox_fleet.runner import UnreachableHostError
+
+    inv = _log_phase_inventory(tmp_path)
+    calls = _capture_lxc_updates(monkeypatch)
+
+    def _fake_discover(ex, settings, **kw):
+        if ex.host == "alpha-01":
+            raise UnreachableHostError("node unreachable: no route")
+        return ["101"]
+
+    def _fake_executor(host, **kw):
+        ex = ScriptedExecutor()
+        ex.host = host
+        return ex
+
+    monkeypatch.setattr(driver_mod, "_discover_lxcs", _fake_discover)
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", _fake_executor)
+    monkeypatch.setattr(driver_mod, "_load_alloy_config", lambda settings: (None, None))
+    settings = GlobalSettings(
+        alloy_enabled=True,
+        alloy_log_overrides={"101": GuestLogOverride(mode="disabled")},
+    )
+
+    with pytest.raises(SystemExit, match="discovery is incomplete"):
+        driver_mod.run_lxc_phase(
+            settings=settings, inventory_path=inv, state_output_path=None
+        )
+
+    assert calls == []
+
+
+def test_alloy_only_full_override_key_beats_bare_key_in_guest_config(tmp_path, monkeypatch):
+    """A full cluster/node/id override wins over a bare id for the same guest:
+    alpha-01/101 receives Sonarr's live reader even though the bare ``101`` rule
+    is 'disabled', while beta-01/102 (a different id) is untouched."""
+    inv = _log_phase_inventory(tmp_path)
+    harness = _HousekeepingHarness(tmp_path)
+    harness.add_node("alpha-01", ["101"])
+    harness.add_node("beta-01", ["102"])
+    harness.add_guest("alpha-01", "101", "sonarr")
+    harness.add_guest("beta-01", "102", "other")
+    alpha = harness.guest("alpha-01", "101")
+    sonarr_logs = Path(alpha.guest_root) / "var/lib/sonarr/logs"
+    sonarr_logs.mkdir(parents=True, exist_ok=True)
+    (sonarr_logs / "sonarr.txt").write_text("sonarr log line\n")
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", harness.factory)
+    base = _base("http://127.0.0.1:9")
+    settings = GlobalSettings(alloy_log_overrides={
+        "101": GuestLogOverride(mode="disabled"),
+        # full keys are cluster/node/id (the node names differ from the clusters)
+        "alpha/alpha-01/101": GuestLogOverride(mode="replace", plugins=["sonarr"]),
+    })
+
+    state = driver_mod.run_lxc_phase(
+        settings=settings, inventory_path=inv, state_output_path=None,
+        alloy_only=True, alloy_config=base,
+    )
+
+    assert state.failed is False
+    deployed = Path(alpha.guest_root) / "etc/alloy/config.alloy"
+    assert deployed.is_file()
+    content = deployed.read_text()
+    # The deployed guest config carries Sonarr's live reader, not the journal
+    # base (which is what the bare 'disabled' rule alone would have produced).
+    assert content.startswith(base.content)
+    assert content != base.content
+    assert "loki.source.file" in content
+    assert "/var/lib/sonarr/logs/sonarr.txt" in content
+    assert 'app = "sonarr"' in content
+    # The real guest was configured (not merely a forwarded keyword check).
+    assert any(
+        call["configure"] and not call["validate_only"]
+        for call in alpha.alloy_reconciles
+    )
+    # The colliding-but-unique other guest id was not given a Sonarr reader.
+    beta = harness.guest("beta-01", "102")
+    assert not (Path(beta.guest_root) / "etc/alloy/config.alloy").exists()
+
+
+def test_lxc_phase_unknown_override_plugin_rejected_before_workers(tmp_path, monkeypatch):
+    inv = _log_phase_inventory(tmp_path)
+    _patch_log_discovery(monkeypatch)
+    calls = _capture_lxc_updates(monkeypatch)
+    monkeypatch.setattr(driver_mod, "_load_alloy_config", lambda settings: (None, None))
+    settings = GlobalSettings(
+        alloy_enabled=True,
+        alloy_log_overrides={
+            "alpha/alpha-01/101": GuestLogOverride(
+                mode="replace", plugins=["no-such-plugin"]
+            )
+        },
+    )
+
+    with pytest.raises(SystemExit, match="invalid alloy_log_overrides"):
+        driver_mod.run_lxc_phase(
+            settings=settings, inventory_path=inv, state_output_path=None
+        )
+
+    assert calls == []
+
+
+def test_lxc_phase_housekeeping_exclusion_leaves_alloy_config_unmanaged(tmp_path, monkeypatch):
+    """An excluded guest keeps its installed sources: no logging preparation or
+    later base-config reconciliation; other guests still get the managed base."""
+    inv = _log_phase_inventory(tmp_path)
+    _patch_log_discovery(monkeypatch)
+    calls = _capture_lxc_updates(monkeypatch)
+    base = object()
+    monkeypatch.setattr(driver_mod, "_load_alloy_config", lambda settings: (base, None))
+    settings = GlobalSettings(
+        alloy_enabled=True, lxc_housekeeping_exclude_list=["alpha/101"]
+    )
+
+    driver_mod.run_lxc_phase(
+        settings=settings, inventory_path=inv, state_output_path=None
+    )
+
+    applied = {(node, lxc_id): kw["alloy_config"] for node, lxc_id, kw in calls}
+    assert applied[("alpha-01", "101")] is None
+    assert applied[("beta-01", "101")] is base
+
+
+def test_lxc_phase_normal_logging_context_ignores_timer_scope(tmp_path, monkeypatch):
+    """An Alloy-managed ordinary run prepares logging for every eligible guest:
+    the paused/limited timer scope must not gate shared source preservation."""
+    inv = _log_phase_inventory(tmp_path)
+    _patch_log_discovery(monkeypatch)
+    calls = _capture_lxc_updates(monkeypatch)
+    base = object()
+    monkeypatch.setattr(driver_mod, "_load_alloy_config", lambda settings: (base, None))
+    settings = GlobalSettings(
+        alloy_enabled=True,
+        housekeeping_timer_enabled=True,
+        housekeeping_timer_targets=["alpha/999"],  # neither guest is a target
+        housekeeping_loki_url="http://127.0.0.1:9",
+    )
+
+    driver_mod.run_lxc_phase(
+        settings=settings, inventory_path=inv, state_output_path=None
+    )
+
+    assert {kw["alloy_config"] for _, _, kw in calls} == {base}
+
+
+def test_lxc_phase_guest_overrides_are_inert_when_logging_is_not_requested(
+    tmp_path, monkeypatch
+):
+    """An invalid override cannot fail an unrelated OS-only update: overrides
+    are resolved only when a logging/housekeeping pass will use them."""
+    inv = _log_phase_inventory(tmp_path)
+    _patch_log_discovery(monkeypatch)
+    calls = _capture_lxc_updates(monkeypatch)
+    settings = GlobalSettings(
+        alloy_log_overrides={"101": GuestLogOverride(mode="disabled")}
+    )
+
+    state = driver_mod.run_lxc_phase(
+        settings=settings, inventory_path=inv, state_output_path=None
+    )
+
+    assert not state.failed
+    assert len(calls) == 2
+    assert all(kw["log_override"] is None for _, _, kw in calls)
+
+
+def test_run_fleet_loads_catalogue_once_and_threads_it_to_the_lxc_phase(monkeypatch):
+    calls = _record_phases(monkeypatch)
+    catalogue = object()
+    loads: List[Any] = []
+    monkeypatch.setattr(
+        driver_mod, "_load_log_catalogue", lambda settings: loads.append(settings) or catalogue
+    )
+
+    rc = run_fleet(settings=GlobalSettings(apt_proxy_ip=""), inventory_path="x")
+
+    assert rc == 0
+    assert len(loads) == 1
+    lxc_calls = [call for call in calls if call[0] == "lxc"]
+    assert lxc_calls and lxc_calls[0][1]["catalogue"] is catalogue
+
+
+def test_run_fleet_broken_catalogue_fails_before_phases_when_logging_requested(monkeypatch):
+    calls = _record_phases(monkeypatch)
+    monkeypatch.setattr(driver_mod, "_load_alloy_config", lambda settings: (None, None))
+    monkeypatch.setattr(
+        driver_mod,
+        "_load_log_catalogue",
+        lambda settings: (_ for _ in ()).throw(LogCatalogueError("bad manifest")),
+    )
+
+    with pytest.raises(SystemExit, match="log catalogue"):
+        run_fleet(
+            settings=GlobalSettings(apt_proxy_ip="", alloy_enabled=True),
+            inventory_path="x",
+        )
+
+    assert calls == []
+
+
+def test_run_fleet_broken_catalogue_is_soft_without_logging_request(monkeypatch):
+    calls = _record_phases(monkeypatch)
+    monkeypatch.setattr(
+        driver_mod,
+        "_load_log_catalogue",
+        lambda settings: (_ for _ in ()).throw(LogCatalogueError("bad manifest")),
+    )
+
+    rc = run_fleet(settings=GlobalSettings(apt_proxy_ip=""), inventory_path="x")
+
+    assert rc == 0
+    lxc_calls = [call for call in calls if call[0] == "lxc"]
+    assert lxc_calls and lxc_calls[0][1]["catalogue"] is None
 
 
 # --- run_custom_phase — PVE snapshot wiring (v2) --------------------------------
@@ -3011,10 +3522,12 @@ class _HousekeepingNode:
 
     # -- maintenance primitives delegated to the real per-guest adapter ------ #
 
-    def housekeeping_probe(self, lxc_id: str) -> PrimitiveResult:
+    def housekeeping_probe(self, lxc_id: str, *, logging_request=None) -> PrimitiveResult:
         self.harness.probe_enter()
         try:
-            return self.guests[lxc_id].housekeeping_probe(lxc_id)
+            return self.guests[lxc_id].housekeeping_probe(
+                lxc_id, logging_request=logging_request
+            )
         finally:
             self.harness.probe_exit()
 
@@ -3030,11 +3543,32 @@ class _HousekeepingNode:
     def housekeeping_apply(self, lxc_id: str, *, command: str) -> PrimitiveResult:
         return self.guests[lxc_id].housekeeping_apply(lxc_id, command=command)
 
+    def housekeeping_log_acl(
+        self,
+        lxc_id: str,
+        *,
+        roots: Sequence[str] = (),
+        exact_files: Sequence[str] = (),
+    ) -> PrimitiveResult:
+        return self.guests[lxc_id].housekeeping_log_acl(
+            lxc_id, roots=roots, exact_files=exact_files
+        )
+
     def alloy_probe(self, *, lxc_id: Optional[str] = None) -> PrimitiveResult:
         return self.guests[lxc_id].alloy_probe(lxc_id=lxc_id)
 
     def alloy_reconcile(self, *, lxc_id: Optional[str] = None, **kw: Any) -> PrimitiveResult:
-        return self.guests[lxc_id].alloy_reconcile(lxc_id=lxc_id, **kw)
+        result = self.guests[lxc_id].alloy_reconcile(lxc_id=lxc_id, **kw)
+        if result.ok and kw.get("configure"):
+            # Mirror the real primitive: a configured deployment leaves the
+            # exact desired content in the guest, so tests can assert bytes.
+            deployed = (
+                Path(self.guests[lxc_id].guest_root)
+                / "etc/alloy/config.alloy"
+            )
+            deployed.parent.mkdir(parents=True, exist_ok=True)
+            deployed.write_text(kw["desired_content"])
+        return result
 
     # -- update-loop primitives that maintenance mode never reaches ---------- #
 
@@ -3280,6 +3814,108 @@ def test_run_lxc_phase_housekeeping_qualified_id_targets_only_that_node(tmp_path
     assert _measure(alpha_yarn) == 0
     assert _measure(beta_yarn) > 0
     assert [rec.node for rec in state.lxc] == ["alpha-01"]
+
+
+def _ct135_harness(tmp_path: Path, monkeypatch) -> Any:
+    """Three discoverable managed guests with 135's real pnpm cache root."""
+    inv = tmp_path / "hosts.ini"
+    inv.write_text(
+        "[proxmox_nodes]\npve-01 ansible_host=10.0.0.1\n", encoding="utf-8"
+    )
+    harness = _HousekeepingHarness(tmp_path)
+    harness.add_node("pve-01", ["120", "123", "135"])
+    yarn120 = harness.add_guest("pve-01", "120", "nginxproxymanager")
+    yarn123 = harness.add_guest("pve-01", "123", "proxmox-backup-server")
+    harness.add_guest("pve-01", "135", "homepage")
+    pnpm = _cache_dir(tmp_path, "pnpm-135")
+    guest135 = harness.guest("pve-01", "135")
+    guest135.cache_specs["pnpm"] = CacheSpec(
+        "/root/.local/share/pnpm/store/v11", pnpm, "10.0.0", "tool"
+    )
+    monkeypatch.setattr("proxmox_fleet.driver.RunnerExecutor", harness.factory)
+    return inv, harness, yarn120, yarn123, pnpm
+
+
+def test_scheduled_housekeeping_gap_leaves_135_untouched_then_prunes_when_enrolled(
+    tmp_path, monkeypatch
+):
+    """Reproduces the CT135 gap at the driver seam: discovery is not enrolment.
+    The timer-shaped limit skips 135 until it is added to targets/limit."""
+    inv, _harness, yarn120, yarn123, pnpm = _ct135_harness(tmp_path, monkeypatch)
+    base = _base("http://127.0.0.1:9")
+    settings = GlobalSettings(
+        fleet_history_dir=str(tmp_path / "history"),
+        housekeeping_enabled=False,
+        housekeeping_timer_enabled=True,
+        housekeeping_timer_targets=["default/120", "default/123"],
+        housekeeping_loki_url="http://127.0.0.1:9",
+    )
+
+    driver_mod.run_lxc_phase(
+        settings=settings, inventory_path=inv, state_output_path=None,
+        limit={"default/120", "default/123"}, housekeeping_only=True,
+        alloy_config=base,
+    )
+
+    assert _measure(yarn120) == 0
+    assert _measure(yarn123) == 0
+    assert _measure(pnpm) > 0  # CT135 was discovered but never selected
+    with CheckpointStore.for_history_dir(
+        tmp_path / "history", read_only=True
+    ) as store:
+        assert store.last_cache_clean(GuestKey("default", "pve-01", "135"), "pnpm") is None
+
+    enrolled = settings.model_copy(update={
+        "housekeeping_timer_targets": ["default/120", "default/123", "default/135"],
+    })
+    driver_mod.run_lxc_phase(
+        settings=enrolled, inventory_path=inv, state_output_path=None,
+        limit={"default/120", "default/123", "default/135"}, housekeeping_only=True,
+        alloy_config=base,
+    )
+
+    assert _measure(pnpm) == 0  # the due unreferenced store was pruned
+    with CheckpointStore.for_history_dir(
+        tmp_path / "history", read_only=True
+    ) as store:
+        assert store.last_cache_clean(GuestKey("default", "pve-01", "135"), "pnpm") is not None
+
+
+@pytest.mark.parametrize("failure", ["busy", "native-failure"])
+def test_scheduled_housekeeping_135_unsuccessful_pass_records_no_clean(
+    tmp_path, monkeypatch, failure
+):
+    """A selected-but-unavailable 135 cache is attempted (or refused) but never
+    falsely recorded as a successful cleanup."""
+    inv, harness, _yarn120, _yarn123, pnpm = _ct135_harness(tmp_path, monkeypatch)
+    guest = harness.guest("pve-01", "135")
+    if failure == "busy":
+        guest.busy_tools = ["pnpm"]
+    else:
+        guest.cache_specs["pnpm"].rc = 1
+    before = _measure(pnpm)
+    assert before > 0
+
+    settings = GlobalSettings(
+        fleet_history_dir=str(tmp_path / "history"),
+        housekeeping_enabled=False,
+        housekeeping_timer_enabled=True,
+        housekeeping_timer_targets=["default/135"],
+        housekeeping_loki_url="http://127.0.0.1:9",
+    )
+    driver_mod.run_lxc_phase(
+        settings=settings, inventory_path=inv, state_output_path=None,
+        limit={"default/135"}, housekeeping_only=True,
+        alloy_config=_base("http://127.0.0.1:9"),
+    )
+
+    assert _measure(pnpm) == before  # preserved, not pruned
+    if failure == "busy":
+        assert not any("pnpm" in command for command in guest.applied)
+    with CheckpointStore.for_history_dir(
+        tmp_path / "history", read_only=True
+    ) as store:
+        assert store.last_cache_clean(GuestKey("default", "pve-01", "135"), "pnpm") is None
 
 
 def test_run_lxc_phase_housekeeping_only_rejects_alloy_only_combination(tmp_path):

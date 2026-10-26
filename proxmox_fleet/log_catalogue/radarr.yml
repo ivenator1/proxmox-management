@@ -1,0 +1,19 @@
+---
+schema_version: 1
+id: radarr
+display_name: Proxmox community script radarr
+community_script_ids:
+  - radarr
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: radarr.service
+    sources:
+      - id: application
+        app: radarr
+        log_kind: application
+        allowed_roots:
+          - /var/lib/radarr/logs
+        paths:
+          - /var/lib/radarr/logs/radarr.txt

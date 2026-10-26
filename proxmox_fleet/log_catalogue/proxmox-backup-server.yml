@@ -1,0 +1,28 @@
+---
+schema_version: 1
+id: proxmox-backup-server
+display_name: Proxmox community script proxmox-backup-server
+community_script_ids:
+  - proxmox-backup-server
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: proxmox-backup.service
+      - name: proxmox-backup-proxy.service
+    sources:
+      - id: tasks
+        component: fleet_pbs_tasks
+        app: proxmox-backup
+        log_kind: task
+        allowed_roots:
+          - /var/log/proxmox-backup/tasks
+        paths:
+          - /var/log/proxmox-backup/tasks/[0-9A-F][0-9A-F]/UPID:*
+      - id: api
+        component: fleet_pbs_api
+        app: proxmox-backup
+        log_kind: api
+        exact_files:
+          - /var/log/proxmox-backup/api/access.log
+          - /var/log/proxmox-backup/api/auth.log

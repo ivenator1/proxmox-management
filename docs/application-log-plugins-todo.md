@@ -1,130 +1,269 @@
-# TODO: automatic application-log plugins
+# Application-log plugins, cache cleanup and disk diagnostics
 
-Status: implementation plan with user-confirmed scope; plugin system not implemented. Creating this document does not authorize a live logging rollout or broaden file-deletion permissions.
+Status: **implemented and locally verified; not deployed.** The catalogue/selection/renderer cutover, per-service manifests, typed settings overrides, Bun cache pruning and the bounded disk-usage enrichment are complete in this checkout and proven with disposable local fixtures and isolated native-binary runs. Production delivery, per-source Loki evidence, scheduled cache enrollment and CT121 rollout are **pending separate authorization**. Excluded guests stay excluded, and none of the remaining work broadens file deletion, archive or read permissions.
 
-## Goal and confirmed requirements
+Creating or updating this document authorizes nothing: no live logging rollout, no fleet package/OS work, no snapshots/reboots/starts of stopped guests, no firewall or permission widening and no cache deletion in a production guest.
 
-- [x] Record this implementation plan in the repository.
-- [x] Make supported applications work without manual plugin selection: identify the running app, select its log plugin, and reconcile the resulting Alloy configuration.
-- [x] Prefer the installed Proxmox community-script identity as the application identifier.
-- [x] Make adding another supported app require a declarative plugin file, not application-specific Python or Ansible changes.
-- [x] Allow explicit plugin selection, disabling and log-location overrides through a settings file.
-- [x] Keep collection, historical archive coverage and deletion authorization distinct.
+## Delivered scope and standing decisions
 
-"Automatic" means no per-guest configuration for a supported, normally installed community-script application once managed logging is enabled. Other installations require a settings override. It does not mean inventing paths for an unsupported app, bypassing exclusions, installing missing prerequisites during recurring maintenance, or silently modifying the firewall.
+- [x] **D1 — Community scripts only for automatic selection.** The only auto identifier is the installed `/usr/bin/update` script identity (`pull_rc` success + existing `lxc_parse.script_name_from_update()`). No hostname, running-service or path guess ever auto-selects a plugin; those probes only validate an already-selected manifest. `debian` (CT101) and an unresolved identity (CT102) therefore produce an unsupported finding, never a guessed app.
+- [x] **D2 — Live collection only for new apps.** New manifests get live file readers and journal evidence only. No new-app historical importer, local-retention tightening, native rotation change or file pruning. NPM/PBS archive/retention/deletion behavior is unchanged.
+- [x] **D3 — Whole standard installation, declared per file.** One app manifest plus auto-included dependency manifests (`includes`). Operators never select a dependency per guest, and dependency sources are resolved/qualified by the owning app.
+- [x] **D4 — Audited catalogue only.** 34 manifests cover the audited managed-LXC apps and their verified standard dependencies. Anything else is an explicit coverage finding; adding support is another YAML file, not Python/Ansible code.
+- [x] **D5 — Close the cache-scheduling gap and add safe Bun pruning.** Existing APT/Yarn/npm/pnpm commands and cadence are retained; `bun` is added with native `prune` only (never `pm cache rm`, never an upgrade, never a destructive fallback).
+- [x] **D6 — Enrich the existing low-space warning only.** Directory usage is diagnostic metadata on an already-existing LXC lack-of-space warning. It never creates a warning/notification, never deletes, never widens read access and never runs a periodic du sweep.
+- [x] **D7 — Local proof only.** Everything below was exercised with disposable local fixtures/namespaces and synthetic unit-state facts. No production guest, timer target, settings file or production cache was touched.
 
-## Existing implementation to reuse
+## Implementation map
 
-- `proxmox_fleet/lxc_parse.py::script_name_from_update()` extracts the script name from `/usr/bin/update`, supporting both legacy `ct/APP.sh` references and the newer `UPDATE_SCRIPT_NAME` wrapper. Do not add a second parser or execute the update script to identify an app.
-- `ansible/primitives/lxc_introspect.yml` and `proxmox_fleet/flows/lxc.py` already provide/read `script_stdout` and `pull_rc`. Logging-only currently returns before the normal app-detection section, so the shared identity resolver must also work in logging-only and housekeeping-only modes.
-- `proxmox_fleet/alloy.py` owns desired-content hashes, configuration validation, reconciliation and live file-source rendering. Its current `npm`/`pbs` mapping is hard-coded; migrate those mappings into plugin files without changing their established behavior.
-- `GlobalSettings.load()` reads `vars.yml` or the existing `--vars-file` selection. Put overrides in this typed settings interface rather than introducing a separate configuration-loading path.
-- `driver.run_fleet()` remains the orchestrator. Python owns selection and policy; Ansible remains a thin execution layer.
-- Existing archive/checkpoint/lineage/retention modules own acknowledgements and deletion safety. A plugin match is not evidence of archive completion or delivery health.
+| Path | Role |
+|---|---|
+| `proxmox_fleet/models/log_plugins.py` | Strict v1 manifest models (unknown fields forbidden), path/pattern/ownership validators, `GuestLogOverride`/key parsing, `DiskUsagePolicy`. |
+| `proxmox_fleet/log_plugins.py` | Catalogue load/validate, `community_script_identity`, `select_log_plugins`, `build_logging_request`, `resolve_disk_usage_policy`, `validate_log_layout`, probe-fact parsing, findings sanitisation. |
+| `proxmox_fleet/log_catalogue/*.yml` | 34 packaged manifests (27 apps, 7 reusable dependencies). |
+| `proxmox_fleet/models/settings.py` | `alloy_log_plugins_auto`, `alloy_log_plugins_dir`, `alloy_log_overrides` next to the existing Alloy keys. |
+| `proxmox_fleet/alloy.py` | `render_lxc_log_config(sources=...)`, desired-content hash, staged/validate-only reconciliation. |
+| `proxmox_fleet/housekeeping.py` | `probe_housekeeping`, `prepare_lxc_logging`, `run_housekeeping`, `legacy_archive_profiles`. |
+| `proxmox_fleet/executor.py` | `housekeeping_probe(lxc_id, logging_request=...)`, `housekeeping_log_acl(lxc_id, roots=..., exact_files=...)`, `lxc_disk_usage(lxc_id, extra_paths=...)`, `alloy_reconcile(..., validate_only=...)`. |
+| `proxmox_fleet/housekeeping_io.py` | Standalone stdlib helper: read-only unit/user/path probe, descriptor-anchored `logging_acl` repair, cache facts, `disk_usage` operation. |
+| `proxmox_fleet/housekeeping_cache.py`, `housekeeping_retention.py` | Native cache commands/cadence, archive eligibility restriction, deletion authorization. |
+| `proxmox_fleet/disk_usage.py` | Wire-fact validation, disjoint ratio filter and the single collector for the existing warning. |
+| `proxmox_fleet/models/state.py`, `briefing.py` | `DiskUsageEntry`/`DiskUsageInsight`, `format_disk_usage_warning`, bounded leading disk priority block. |
+| `proxmox_fleet/flows/lxc.py`, `driver.py` | Identity once per guest, catalogue/override plumbing, logging/disk wiring and pre-worker validation. |
+| `pyproject.toml` | `package-data` ships `proxmox_fleet.log_catalogue/*.yml|*.yaml`. |
 
-## User-confirmed scope decisions
+Data flow for one guest: introspect → `community_script_identity` → `select_log_plugins` (offline) → `build_logging_request` (declarative descriptors only) → read-only helper probe → `validate_log_layout` (exactly one layout per owner/dependency) → real-Alloy validation-only → descriptor-anchored `logging_acl` repair → journal-retention environment → live reconcile → re-probe hash/access/service state. Delivery remains `unverified` until records are actually observed in Loki.
 
-- [x] **D1 — Community scripts only:** automatically select only from a recognized installed community-script identity. If that identity is absent or unresolved, report the finding and require a settings override; do not fall back to service/process/path matching. Those probes validate an already selected plugin, not infer another app.
-- [x] **D2 — Live collection only for new apps:** no new-app historical archive importer, local-retention tightening or file deletion in this implementation. Existing NPM/PBS backfill and gated retention remain unchanged. Normal live-reader catch-up is not a declaration of complete historical archive coverage.
-- [x] **D3 — Whole community-script installation:** one plugin covers the primary app and the dependencies installed as part of that script's standard deployment, including databases. Use the display name `Proxmox community script [app]` and the verified primary community-script ID as its stable identity. Do not rename upstream scripts or require separate manual dependency-plugin selection. Verify sources against the actual installed layout; do not include unrelated services merely because they are running.
-- [x] **D4 — Audited installed apps first:** provide the initial catalogue for the audited installed managed-LXC apps and verified layouts, not the entire upstream catalogue. Unsupported apps remain explicit findings; adding support requires another manifest, not guessed paths.
+## Manifest schema (v1)
 
-## Implementation checklist
+### File placement and packaging
 
-### 1. Define the plugin-file interface and catalogue loader
+- One file per service: `proxmox_fleet/log_catalogue/<service-id>.yml` (`.yaml` accepted). The filename stem **must** equal `id`.
+- Shipped inside the wheel via `[tool.setuptools.package-data] "proxmox_fleet.log_catalogue" = ["*.yml", "*.yaml"]`; loading uses `importlib.resources`, so a non-editable install outside the checkout resolves the catalogue.
+- `alloy_log_plugins_dir` is an **additive** directory of extra manifests with the same schema. Duplicate plugin IDs, duplicate/conflicting script aliases, symlinked manifest files and cyclic/illegal includes fail loading. A local file cannot shadow a built-in ID, and the directory is not an executable-plugin mechanism.
 
-- [ ] Define a versioned, typed YAML schema for a plugin: stable ID, supported community-script IDs/aliases, installation/running-state evidence, source IDs, allowed roots, live file globs, exclusions and bounded supported parsing options.
-- [ ] Represent journal-only applications explicitly; do not create redundant file readers merely to claim a plugin exists.
-- [ ] Represent the primary app and its standard community-script-installed dependencies in one manifest. Use the display name `Proxmox community script [app]`; declare source requirements/optional layout variants from verified installations, not a second manual dependency selection.
-- [ ] Support packaged built-in manifests and a settings-selected local plugin directory. Verify package installation includes built-in data files.
-- [ ] Validate the catalogue once per run; reject unsupported versions, duplicate IDs, conflicting aliases, unsafe paths and invalid source definitions before guest mutations.
-- [ ] Treat plugin files as declarative data. No Python imports, shell commands, application upgrades, arbitrary HCL injection or runtime downloading/executing plugins.
-- [ ] Define safe path/variable substitution explicitly, if needed. Do not accept unrestricted template evaluation.
-- [ ] Keep component names stable and collision-free across plugins and shared sources; preserve Alloy positions when selection is unchanged.
-- [ ] Compute one effective desired configuration/hash from the base configuration, resolved plugins and overrides.
+### Top-level fields
 
-### 2. Detect running applications and select plugins automatically
+| Field | Type | Rules |
+|---|---|---|
+| `schema_version` | int | Exactly `1`. |
+| `id` | str | `^[a-z][a-z0-9-]{0,63}$`, equals the filename stem. |
+| `display_name` | str | ≤120 chars, no control characters. Apps use `Proxmox community script <id>`; dependencies use the real service name (CouchDB, OpenResty, PostgreSQL, RabbitMQ, Redis, Synapse Admin, Valkey). |
+| `kind` | `app` \| `dependency` | Default `app`. Dependencies must have empty `community_script_ids`/`includes` and are only reachable through an app's `includes` (or explicit manual selection). |
+| `community_script_ids` | list[str] | Exact installed script identities only (e.g. `nginxproxymanager`). Empty for dependencies and for the explicit-only manager manifest. Aliases are not display names. |
+| `journal_units` | list[`UnitEvidence`] | Journal coverage **metadata**: probed and reported, never a selection gate. Default `[]`. |
+| `includes` | list[str] | Bare dependency IDs, one level, app→dependency only. Missing/self/duplicate/cyclic references, app→app and dependency→dependency edges are rejected before any guest mutation (raw graph validated before the kind restriction so cycles get a precise error). |
+| `layouts` | list[`LogLayout`] | Nonempty. |
+| `disk_usage` | `DiskUsagePolicy` or null | Optional diagnostic ratio metadata; never an ACL, read-source or deletion grant. |
 
-- [ ] Reuse the existing read-only introspection facts and community-script parser in all relevant logging/maintenance entrypoints.
-- [ ] Resolve a plugin by its explicit community-script ID/alias, not fuzzy app names, hostname guesses or executable update-script evaluation.
-- [ ] Verify the selected plugin's running-app and layout evidence before applying access/configuration changes. Report stopped/missing/incompatible layouts; never start an app or container to obtain a match.
-- [ ] If community-script identity is absent or unresolved, produce an explicit finding and require a settings override. Do not implement automatic service/process/path or hostname fallback.
-- [ ] Resolve the whole standard app/dependency bundle through its primary script identity. Validate source ownership/layout deterministically; reject conflicting sources rather than inferring an extra app from an unrelated service.
-- [ ] Keep selection usable without GitHub access when local identity and the installed catalogue suffice. Optional upstream metadata enrichment must stay manager-side and must not be required for ordinary selection.
-- [ ] Report detection evidence, selected plugin/source IDs and the reason for selection, rejection or ambiguity without printing script contents, credentials or log bodies.
-- [ ] Re-evaluate identity/layout after drift; do not retain a stale plugin merely because it matched on a previous run.
+### `UnitEvidence`
 
-### 3. Add settings-file overrides
+`name` (bounded systemd unit name; at most one `*` instance glob such as `postgresql@*-main.service`), `scope: system|user` (default `system`), `user` (required exactly for user scope). User units are inspected through the existing passwd lookup and already-running user manager (`/run/user/UID`) with fixed argv; the manager never starts it or enables lingering, and an unreachable user manager is an evidence finding, not an empty service list.
 
-The settings below are planned capabilities, not currently supported configuration keys. Finalize their names/types during implementation.
+### `LogLayout`
 
-- [ ] Add an automatic-selection switch and local catalogue-directory setting adjacent to the existing Alloy settings.
-- [ ] Add a typed per-guest override map in `vars.yml` / `--vars-file`, keyed by cluster/node/guest identity. Reject ambiguous bare guest IDs across clusters rather than guessing.
-- [ ] Support explicit modes: `auto`, `replace`, `extend` and `disabled`. An absent override means auto; an explicit empty replacement must not fall back to auto.
-- [ ] Allow overrides to force a known plugin, add a known plugin, disable a plugin/source, and replace a declared source's log locations for a nonstandard installation.
-- [ ] Define precedence: existing fleet/Alloy exclusions first; explicit guest override next; automatic selection next; plugin defaults last. An override cannot bypass exclusions or safety checks.
-- [ ] Validate selected IDs, allowed roots, location substitutions and conflicting sources before deployment. A settings override must not authorize arbitrary reads, broad permission changes or deletion.
-- [ ] Preserve existing settings and secrets when editing configuration. Update `vars.yml.example` and README with credential-free examples after behavior is implemented and verified.
+`id`, optional `service_user`, `required_units` (all must be active), `running_units_any` (≥1 active when nonempty), `sources`. One layout must resolve per selected owner and per included dependency. A source-less layout still has to declare a real predicate. Every dependency and every owner without `includes` needs a primary running-state predicate in its chosen layout; an owner with `includes` may delegate that to a required include (`obsidian-livesync` → `couchdb`), and a bundle with no predicate at all is rejected.
 
-### 4. Use one shared collection/reconciliation implementation
+### `LogSource`
 
-- [ ] Extend the existing source renderer to consume resolved plugin data rather than one branch per application.
-- [ ] Use the same selection and effective hash in normal LXC runs, logging-only preparation and housekeeping-only runs. Later reconciliation must not restore a journal-only base over selected file sources.
-- [ ] Keep `--scan` read-only: it may report identity/selection/coverage findings, but must not repair permissions, deploy configuration, install packages or restart services.
-- [ ] Preserve the existing journal reader, endpoint, storage path and unrelated service overrides. Do not reset positions or create a second journal reader.
-- [ ] Reuse scoped access checks as the Alloy user. If repair is authorized, limit ACLs to validated source roots and required parents/default inheritance; never run Alloy as root or make files world-readable.
-- [ ] Missing ACL/runtime prerequisites block affected sources with useful diagnostics; recurring maintenance must not install packages automatically.
-- [ ] Preserve bounded labels and packed filename metadata. Do not index request/user/IP values, UPIDs, filenames or timestamps.
-- [ ] Observe post-operation configuration, read access and service health. Configuration command success is not proof that logs were delivered.
-- [ ] Verify natural or approved disposable log records from each enabled source in Loki; distinguish a quiet app, a missing file source, a permission failure and a network/delivery outage.
-- [ ] Handle supported rotation, new files/subdirectories, multiline/oversized records and restart/resume through the shared implementation, not app-specific forwarding wrappers.
+`id`, optional `component`, `app`, `log_kind`, `allowed_roots`, `alternate_roots`, `exact_files`, `paths`, `exclude_paths`, `required` (default true), `multiline` (null).
 
-### 5. Preserve archive and retention safety
+- Directory roots are dedicated log directories. `exact_files` exists for individually audited files whose parent also holds application data (Uptime Kuma `error.log`, manager logs, Tautulli/Hermes/Plex-family files).
+- Every `path` must be beneath an `allowed_roots` entry, beneath an explicitly selected `alternate_roots` entry, or exactly equal an `exact_files` entry. Exclusions must be beneath a declared root. At least one root or exact file is required for a file source.
+- New sources use `app = plugin.id` and `log_kind = source.id`; layout id `default`. Two include patterns whose literal prefixes are not disjoint (and shared concrete paths/device+inode after exclusions) are rejected rather than silently merged.
+- Labels/components: `component` is optional on **owner** sources — a manifest may pin a fixed Alloy component name (validated as `fleet_[a-z0-9_]…`, rejected if it is the renderer's reserved `fleet_file_pack`, and collision-blocked within a layout and across all plugins). Only the audited NPM/PBS sources currently pin one; every other source, including all included dependencies, gets the default `fleet_` + first 24 hex of `SHA256(full source key)`. Included dependency sources must not author a fixed component. An included dependency's resolved `app` label is the owning app ID and `log_kind` stays the bounded source ID; explicitly selected standalone dependencies use their own ID as owner. Legacy literals are frozen: NPM `app=nginxproxymanager`/`log_kind=application`/`fleet_npm`; PBS `app=proxmox-backup`, `log_kind=task`+`fleet_pbs_tasks`, `api`+`fleet_pbs_api`.
+- `MultilineOptions`: `firstline` (RE2-compatible, ≤256 chars), `max_lines` 1..1024 (default 128), `max_wait_seconds` 1..10 (default 3). Every shipped manifest is plain-line; a supplied rule is validated by real Alloy before deployment and rejected rather than downgraded.
+- Rejected before any guest mutation: relative/unnormalized paths, `..`, NUL/control characters, URIs, globs in roots/exact files, braces (exclusion unions must stay unambiguous), generic roots (`/`, `/var`, `/var/log`, `/opt`, `/home`, `/root`, `/usr`, …), `/proc|/sys|/dev|/etc|/boot`, credential material, `/root/.hermes`, qBittorrent `.config` data, symlink traversal/mount escapes, duplicate IDs/unit keys/source IDs/components and overlapping ownership.
+- Quarantine exclusions are injected automatically by the renderer; manifests cannot suppress them.
 
-- [ ] Make new-app plugins live collection-only: no new-app historical file importer, file-retention tightening, native file-rotation change or file-pruning operation. Preserve the existing fleet journald policy and NPM/PBS maintenance behavior unchanged.
-- [ ] Preserve NPM/PBS batch acknowledgement, complete frozen-prefix coverage and full current-file coverage as separate states.
-- [ ] Keep existing NPM/PBS bounded capture/import/checkpoint behavior and original bytes/provenance; retain unacknowledged input on errors or crashes.
-- [ ] Preserve the existing NPM/PBS central deletion authorization: current identity/digest, age, writer exclusions, complete archive coverage, matching verified configuration/delivery and filesystem permissions must all pass.
-- [ ] Keep final filesystem/quarantine checks as defense in depth. A plugin or override cannot turn a collection path/glob into a deletion entitlement.
-- [ ] Make existing NPM/PBS manifests preserve their exact current/live/archive/control exclusions and writer handling. Do not replay fully acknowledged history during migration.
-- [ ] Preserve finite-buffer/outage limitations and at-least-once archive semantics; do not claim lossless native copytruncate, exactly-once delivery or infinite outage retention.
-- [ ] Do not change central Loki retention, resize disks, prune PBS datastores, or introduce application/database/dependency cleanup.
+### `DiskUsagePolicy`
 
-### 6. Author and validate the initial catalogue
+`default_max_share_percent` (finite, >0 and ≤100), `min_directory_mb` (≥0, `None` distinct from explicit `0`), `path_max_share_percent` (≤32 merged prefixes, depth 1..16, ≤512 UTF-8 bytes each, normalized absolute directories, no `/`, no globs/URIs). Longest prefix wins; prefixes deeper than 3 become bounded extra measured paths rather than wider traversal scope. Ratios are shares of **used** root-filesystem bytes, so they never depend on capacity.
 
-- [ ] Record and complete the supported-app/source matrix for the audited installed managed-LXC applications, including each script's standard installed dependencies.
-- [ ] Migrate NPM and PBS into plugin files with behavioral equivalence and no legacy parallel mapping/shim.
-- [ ] Cover verified gaps from the audit: Plex; Sonarr/Radarr/Prowlarr; qBittorrent; Seerr; Tautulli; APT cache; CouchDB/Obsidian LiveSync; Synapse; Hermes; UniFi OS; PDM; manager CLI logs; and the standard community-script-installed dependency/error sources. Non-community installations require overrides, and excluded guests remain excluded.
-- [ ] Verify community-script IDs and aliases from actual supported installations; do not treat the above display names as already validated script IDs.
-- [ ] Include Technitium manifests for its verified log layout. Separately verify network reachability: selecting a plugin will not fix the observed VLAN-to-Loki connectivity failure.
-- [ ] Classify existing journal-only apps accurately; avoid collecting duplicate file mirrors without an explicit reason.
-- [ ] Document unsupported container-in-container/private runtime layouts as coverage findings until their actual sources and access are verified.
-- [ ] Preserve the current managed-LXC scope and exclusions. VM/node/manual-appliance expansion requires a separate explicit scope decision; do not include them silently.
+Merging when several roots apply: root-explicit default/floor replace the generic values (maximum wins among roots); included dependencies contribute path caps only; root-explicit caps override included/generic caps and tie by maximum; more than 32 merged prefixes makes only disk-policy resolution invalid (generic policy), never the guest update.
 
-### 7. Prove behavior before rollout
+## Shipped catalogue (34 manifests)
 
-- [ ] Add deterministic consumer-visible regressions for legacy/current community wrappers, unresolved names, aliases, no metadata, contradictory evidence, stopped apps and ambiguous matches.
-- [ ] Cover auto/replace/extend/disabled precedence, empty replacement, custom locations, invalid plugin IDs, duplicate sources, cluster collisions and excluded guests.
-- [ ] Cover missing optional files versus failed enumeration/read access; no-profile findings must not masquerade as successful app-log coverage.
-- [ ] Exercise ordinary update, logging-only and housekeeping-only paths to prove selection cannot be overwritten later and scans do not mutate anything.
-- [ ] Exercise the real renderer/access/collector behavior against disposable files: append, rotation, fresh inherited permissions, multiline/oversized data, restart, configuration drift and outage recovery.
-- [ ] Preserve the existing NPM/PBS crash/resume, archive lineage and deletion regressions during migration. Prove new-app sources cannot authorize archive import or deletion. Do not test wiring, command-string copies or mock echoes instead of behavior.
-- [ ] Acceptance: add one plugin file and a normally installed matching guest; without application-specific code changes or per-guest settings, the correct sources are selected and their actual records arrive in Loki.
-- [ ] Acceptance: a nonstandard installation can select/adjust that same plugin through the existing settings file; the effective configuration and delivered records reflect the override.
-- [ ] Acceptance: unknown or conflicting detection produces a precise unsupported/ambiguous finding, no guessed source changes, and no deletion.
-- [ ] Acceptance: a community script that installs an app plus a database automatically selects one correctly named plugin and delivers both verified live source sets, without an additional dependency selection.
-- [ ] Acceptance: an app without recognized community-script identity does not auto-match by its hostname or running service; an explicit settings override is required.
-- [ ] Run focused regressions, the affected existing suite and relevant typing/lint/security/primitive checks after implementation; record actual results, not planned checks as successes.
+27 apps + 7 dependencies (`couchdb`, `openresty`, `postgresql`, `rabbitmq`, `redis`, `synapse-admin`, `valkey`). All file sources below are live-only readers; "journal-only" means the app's stdout/stderr already go to the shared journal reader and the manifest only declares unit evidence (no second reader).
 
-### 8. Documentation and controlled deployment
+| Manifest | Kind | Script identity | Required / any-of units | Live sources (source ID → path) |
+|---|---|---|---|---|
+| `nginxproxymanager` | app | `nginxproxymanager` | `npm.service` | `application` → `/data/logs/**/*.log` (unified glob incl. Certbot; `fleet_npm`, `app=nginxproxymanager`, `log_kind=application`); includes `openresty` |
+| `proxmox-backup-server` | app | `proxmox-backup-server` | `proxmox-backup.service`, `proxmox-backup-proxy.service` | `tasks` → `/var/log/proxmox-backup/tasks/[0-9A-F][0-9A-F]/UPID:*`; `api` → exact `api/access.log`, `api/auth.log` (legacy labels/`fleet_pbs_*`) |
+| `plex` | app | `plex` | `plexmediaserver.service` | `application` → `<…>/Plex Media Server/Logs/*.log`, excluding `*.[0-9]*.log` |
+| `sonarr` | app | `sonarr` | `sonarr.service` | `application` → `/var/lib/sonarr/logs/sonarr.txt` (no debug/trace mirror, no numbered archive) |
+| `radarr` | app | `radarr` | `radarr.service` | `application` → `/var/lib/radarr/logs/radarr.txt` |
+| `prowlarr` | app | `prowlarr` | `prowlarr.service` | `application` → `/var/lib/prowlarr/logs/prowlarr.txt` |
+| `qbittorrent` | app | `qbittorrent` | `qbittorrent-nox.service` | `application` → `/root/.local/share/qBittorrent/logs/qbittorrent.log` (0600; deep traverse-only ancestors) |
+| `seerr` | app | `seerr` | `seerr.service` | `application` → `/opt/seerr/config/logs/seerr-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].log` (no `seerr.log` alias, no JSON mirrors) |
+| `tautulli` | app | `tautulli` | `tautulli.service` | `application` → exact `tautulli.log`, `tautulli_api.log`, `plexapi.log`, `plex_websocket.log` |
+| `apt-cacher-ng` | app | `apt-cacher-ng` | `apt-cacher-ng.service` | `access` → `apt-cacher.log`; `error` → `apt-cacher.err`; optional `debug` → `apt-cacher.dbg` |
+| `obsidian-livesync` | app | `obsidian-livesync` | `couchdb.service` (delegated) | none (`sources: []`); includes `couchdb` |
+| `elementsynapse` | app | `elementsynapse` | `matrix-synapse.service` | `application` → `/var/log/matrix-synapse/homeserver.log`; includes evidence-only `synapse-admin` |
+| `hermesagent` | app | `hermesagent` | any-of system/user `hermes-dashboard.service`, `hermes-gateway.service` | exact `/home/hermes/.hermes/logs/{agent,gui,gateway}.log`; optional `error` → `errors.log`; `service_user: hermes` |
+| `technitiumdns` | app | `technitiumdns` | `technitium.service` | `application` → `/var/log/technitium/dns/YYYY-MM-DD.log` (0600) |
+| `proxmox-datacenter-manager` | app | `proxmox-datacenter-manager` | `proxmox-datacenter-api.service`, `proxmox-datacenter-privileged-api.service` | `tasks` → `…/tasks/[0-9A-F][0-9A-F]/UPID:*` (no `active`/lock/archive/index) |
+| `firecrawl` | app | `firecrawl` | `firecrawl.service`, `firecrawl-playwright.service` | none (journal-only); includes `postgresql`, `rabbitmq`, `redis` |
+| `uptimekuma` | app | `uptimekuma` | `uptime-kuma.service` | `error` → exact `/opt/uptime-kuma/data/error.log` (never its database) |
+| `grafana` | app | `grafana` | `grafana-server.service` | `application` → `/var/log/grafana/grafana.log` |
+| `homepage` | app | `homepage` | `homepage.service` | `application` → `/opt/homepage/config/logs/homepage.log`; audited alternate root `/opt/homepage/.next/standalone/config/logs` is reachable only through a `locations` override (default selection reads the canonical copy) |
+| `gitea-mirror` | app | `gitea-mirror` | `gitea-mirror.service` | journal-only; disk caps `/root/.bun/install/cache` at 20% |
+| `dashy` | app | `dashy` | `dashy.service` | journal-only |
+| `flaresolverr` | app | `flaresolverr` | `flaresolverr.service` | journal-only |
+| `forgejo` | app | `forgejo` | `forgejo.service` | journal-only |
+| `byparr` | app | `byparr` | `byparr.service` | journal-only |
+| `searxng` | app | `searxng` | `searxng.service` | journal-only; includes `valkey` |
+| `unifi-os-server` | app | `unifi-os-server` | `uosserver.service`, `uosserver-updater.service` | `application` → exact `/var/lib/uosserver/logs/{uosserver,uosserver-service,uos-discovery-client,updater-service}.log` (guest excluded) |
+| `fleet-manager` | app | none (explicit-only) | any-of `fleet-dashboard.service`, `fleet-scan.service`, `fleet-housekeeping.service` | optional `application` → root `/var/log/fleet-update` + exact `/var/log/fleet-update.log`, `/var/log/ansible-fleet-update.log` + `dashboard-runs/*.log` |
+| `couchdb` | dependency | — | `couchdb.service` | `database` → `/var/log/couchdb/couchdb.log` |
+| `openresty` | dependency | — | `openresty.service` | none (journal evidence only) |
+| `postgresql` | dependency | — | `postgresql@17-main.service` | `database` → exact `/var/log/postgresql/postgresql-17-main.log` |
+| `rabbitmq` | dependency | — | `rabbitmq-server.service` | `queue` → `/var/log/rabbitmq/rabbit@*.log`; `queue-startup` → exact `rabbitmq-server.log`; `queue-error` → exact `rabbitmq-server.error.log` |
+| `redis` | dependency | — | `redis-server.service` | `cache-service` → exact `/var/log/redis/redis-server.log` |
+| `synapse-admin` | dependency | — | `synapse-admin.service` | none (journal evidence only) |
+| `valkey` | dependency | — | `valkey-server.service` | `database` → exact `/var/log/valkey/valkey-server.log` |
 
-- [ ] Document the plugin schema, authoring/selection procedure, override precedence, supported catalogue, coverage limits and troubleshooting in existing repository documentation after runtime proof.
-- [ ] Record collection/delivery findings without turning routine unchanged runs into notification noise or changing notification policy implicitly.
-- [ ] Commit/publish implementation and deploy CT121 through its own `bash install.sh --update`, under the existing fleet lock; preserve real inventory/settings/configuration. Do not use ad hoc source transfer as the deployment mechanism.
-- [ ] Stage dry-run/read-only selection and a bounded pilot before fleet application. Respect existing capacity/resource gates and shared import limits.
-- [ ] Leave missing network/access/capacity prerequisites explicit; do not widen firewall access or permissions merely to obtain a green report.
-- [ ] Never run fleet OS/app upgrades, snapshots, reboots or stopped-container starts as part of this logging rollout.
+Additional manifest metadata: `homepage` caps `/root/.npm` and `/root/.local/share/pnpm/store` at 20% so package caches can be named without duplicating parent totals; `gitea-mirror` caps `/root/.bun/install/cache` at 20%. `plex` logs are owned by uid 999/gid 990, so the ACL repair — not a chown — provides the collector's access.
 
-## Completion criteria
+### Authoring another service
 
-The implementation is complete only when the confirmed D1-D4 scope is proven end-to-end: community-script-only automatic selection, the whole standard app/dependency bundle, safe running-state/layout checks, deterministic settings overrides, file-only extensibility, actual live Loki delivery for the audited managed-LXC catalogue, and unchanged NPM/PBS archive/deletion guarantees. New-app historical import and retention/deletion are out of scope. A manifest catalogue alone, passing unit tests alone or an active Alloy process alone does not satisfy this checklist.
+1. Create `proxmox_fleet/log_catalogue/<service-id>.yml` (or a file of the same name in `alloy_log_plugins_dir`) with `schema_version: 1`, the verified `community_script_ids`, layouts with real unit predicates and audited roots/exact files.
+2. Reuse an existing dependency ID through `includes`; never copy a dependency's sources into the app file, and never add a second reader for journal-only stdout/stderr.
+3. Add optional `disk_usage.path_max_share_percent` only for audited, deep cache/data directories.
+4. No Python, Ansible, HCL or settings change is required. The catalogue is loaded and validated on the next logging/housekeeping run, before any guest mutation.
+
+## Selection and settings
+
+Implemented keys (adjacent to the existing Alloy keys in `vars.yml` / `--vars-file`):
+
+```yaml
+alloy_log_plugins_auto: true          # default
+alloy_log_plugins_dir: ""             # unused by default; additive local manifests
+alloy_log_overrides: {}               # typed, strict; unknown fields fail load
+```
+
+The dashboard keeps `alloy_log_overrides` in the raw-YAML editor (`_RAW_ONLY_FIELDS`); there is no nested override form.
+
+```yaml
+alloy_log_overrides:
+  default/pve01/120:                  # full cluster/node/id key
+    mode: extend                      # auto selection + additions, minus disables
+    disable_sources:
+      - proxmox-backup-server/api     # disable one selected PBS source
+  default/pve01/135:
+    mode: replace
+    plugins: [homepage]               # complete explicit selection
+    locations:
+      homepage/application:           # within homepage's own audited alternate root
+        - /opt/homepage/.next/standalone/config/logs/homepage.log
+```
+
+Every `disable_sources`/`locations` key must name a source that belongs to a root
+selected for **that same guest** (`owner/source`, or `owner/dependency/source` for an
+included collector); a source from another app is rejected rather than silently
+applied.
+
+- **Key shapes must not be conflated.** Guest override keys are 3-segment `cluster/node/id` (or a bare numeric ID). CLI `--limit` and `housekeeping_timer_targets` use the existing 2-segment `cluster/ID`, bare ID or inventory node-name shape.
+- **Guest key resolution.** Full keys are self-identifying and win over the same guest's bare key. A bare numeric key is accepted only when exactly one discovered eligible guest has that ID; ambiguity (including one hidden by `--limit`) fails before any worker. Bare keys require complete fleet discovery: an unreachable node aborts rather than guessing.
+- **Modes.** `auto` (default, must not carry `plugins`), `replace` (`plugins` is the complete set; `plugins: []` is intentionally empty), `extend` (automatic selection + `plugins` − `disable_plugins`), `disabled` (no additions; selections empty, journal-only base enforced).
+- **Precedence.** Fleet/Alloy/housekeeping exclusions → explicit guest override → auto switch + script identity → manifest defaults. `alloy_log_plugins_auto: false` disables automatic selection only; an explicit `replace`/`extend` still works.
+- **Narrowing is bounded.** `disable_sources` removes a selected source by `owner/source` or `owner/dependency/source` key; an included collector is disabled through its qualified key (`disable_plugins` on an app cannot remove an included dependency). `locations` replaces paths **inside that source's own** allowed roots/alternate roots/exact-file scope; an empty list disables the source; widening beyond that scope is rejected. `layouts` keys are a root ID or `owner/dependency`. Unknown IDs, incompatible requests, malformed keys and disabled-mode additions fail settings/catalogue validation before mutation.
+- **Failure behavior.** Malformed typed override data fails `GlobalSettings.load()` on every run (no raw-dict bypass). Catalogue/override errors that matter to logging fail fast before mutation. When logging/housekeeping is not requested, a broken catalogue is reduced to "no catalogue" so unrelated OS updates keep working; the optional disk diagnostic then resolves the generic policy and reports `service profiles unavailable; generic disk thresholds`.
+- **Exclusions are authoritative.** `exclude_list`, `lxc_alloy_exclude_list`, `lxc_housekeeping_exclude_list` still filter discovery/phases; a guest override can never re-enable an excluded guest. Logging preparation, and therefore any later Alloy enforcement, is skipped for housekeeping-excluded guests so the installed managed readers are not rewritten from the journal-only base.
+
+## One effective configuration
+
+- `alloy.render_lxc_log_config()` takes resolved sources instead of profile names. The base/journal content, endpoint, storage/positions, filename packing, bounded labels and legacy component names are preserved byte-for-byte; new sources use the generic renderer plus an optional bounded multiline stage feeding the shared pack process. `SUPPORTED_LOG_PROFILES` and the hard-coded NPM/PBS branch are gone; `profiles=` is not accepted.
+- Desired content and its SHA256 are built once per verified selection/override and that exact `DesiredAlloyConfig` is carried into later enforcement. A failed second probe never re-authorises the journal-only base, and an old running config is never used as current selection evidence.
+- Ordering is deterministic: selected owners by ID, each owner's own sources in manifest order, then includes lexically by ID. PBS stays `tasks` before `api` with `access.log` before `auth.log`; the default NPM/PBS effective HCL and hash are unchanged.
+- **Path → probe → validate → repair → deploy.** Selection is offline; the read-only helper probe (`housekeeping_probe(..., logging_request=...)`) returns unit/user/path/stat/glob facts and file identities for every requested source. `validate_log_layout` chooses exactly one layout and classifies each source `active`, `quiet`, `inactive`, `acl-needed`, `unmeasurable`, `partial` or `blocked`. Missing requested evidence fails closed. Absent declared exact files are classified from a successful no-follow parent open: `quiet` (configurable until it appears) when the Alloy user can traverse that parent, `denied` — a repairable ACL-needed finding, not a mapping failure — when it cannot. A parent that could not be opened, or a genuinely missing/unsafe one, yields `missing_root`/`unavailable`; a required source whose missing root is not merely an ACL denial fails the bundle instead of claiming quiet coverage.
+- **Real-Alloy syntax gate before mutation.** Candidate HCL is validated with `alloy validate` (extravars `alloy_validate_only`) *before* any ACL, environment drop-in or live replacement. `validate_only` is rejected together with `lxc_id=None` or install/journal-group/service-repair flags, and the primitive guards every live task behind `not alloy_validate_only`. The live path keeps its own final staged validation.
+- **ACL scope is descriptor-anchored.** Access is granted by the shared helper's `logging_acl` operation, reached through `Executor`/`RunnerExecutor.housekeeping_log_acl(lxc_id, roots=..., exact_files=...)` — the same probe primitive, with a manager-built `{"roots": [...], "exact_files": [...]}` request of catalogue paths only. Because `setfacl`/`getfacl` have no descriptor API, every mutation names an inherited descriptor as `/proc/self/fd/N` with `pass_fds`, so the child acts on the verified inode that was opened `O_PATH|O_NOFOLLOW`, never on a pathname the application account could swap for a symlink between measurement and repair. Batches are bounded to 64 descriptors, ≤256 roots, ≤256 exact files, ≤512 targets, ≤300 s, with bounded tool time/output. Ancestors up to (not including) `/` get traverse-only `alloy:x`; a dedicated root gets read plus an inheritable default (`u:alloy:rX,d:u:alloy:r-x`, files inside `rX`) walking without following symlinks, on the root's own device only, pruning the quarantine tree and every nested mount; an exact file gets `u:alloy:r` on that inode only, never a recursive/default grant on its app-data parent (an Uptime Kuma `error.log` sibling database stays unreadable to Alloy). Genuinely absent declared files are skipped safely and are repaired on a later pass once they appear; unsafe, ambiguous, mount-crossing or unmeasurable targets fail the whole result (`status: complete|failed` with `changed`, `repaired_roots`, `repaired_files`, `skipped_missing`, `error_count`, bounded `reason`) rather than being silently ignored, and callers require `complete` plus a successful transport before any environment or live-config change. `setfacl`/`getfacl` presence and the `alloy` account are checked first; no `chmod`, `chown`, root-owned Alloy, world-readable file or app-data ownership change is ever issued, and no caller command text is executed.
+- **Re-probe.** After repair/reconcile the effective hash, Alloy-user access and service state are re-checked. None of that proves Loki delivery.
+- **Dry-run** performs no staging/validation-only/install/ACL/environment/live mutation and reports "candidate Alloy syntax validation is pending (dry run)".
+- **Entrypoints.** `run_lxc_update` threads `catalogue`/`script_id`/`log_override` through normal runs, `--alloy-only`, `--housekeeping-only` and `run_lxc_housekeeping`. Normal runs prepare logging for an eligible guest with a desired Alloy config even when `housekeeping_enabled` is false and the guest is not a timer target (otherwise routine reconciliation would erase selected readers); only `housekeeping_enabled`/`--housekeeping-only` opts into archive/retention/cache. `--alloy-only` on a stopped guest or template returns before `pct_start` and never starts it; the installer capability is kept only for that explicit mode, while recurring maintenance never installs packages.
+- **`--scan`** remains read-only: it invokes no logging preparation, ACL repair, deployment, cache cleanup, archive import or prune.
+- **Archive eligibility is narrowed, never granted.** `apply_guest_retention()`/`_authorize_deletion()` receive an immutable `archive_profiles` set intersected with recognized probe evidence, so an internal re-probe cannot re-authorize a disabled source. `npm` requires the default complete enabled `nginxproxymanager/application`; `pbs` requires both default `proxmox-backup-server/tasks` and `/api`. Any disable/relocation/layout change makes that whole legacy profile ineligible: the guest-wide importer and pending batches stay paused with checkpoints/input untouched, while separately gated journald policy still runs. New-app sources never enter capture/import/prune, and the archive enum stays `{'npm','pbs'}`.
+- **Reporting.** Selection/source IDs, layout choice and reason/evidence appear as sanitised per-guest stdout diagnostics; coverage failures use the existing `WarningEntry`/`HousekeepingSummary` `Audit`/`Blocked` statuses. No filenames, UPIDs, IPs, request/user values, credentials or log bodies are printed. Unknown/quiet findings never claim complete coverage, and notification gates/goldens are unchanged.
+
+## Cache cleanup (APT, Yarn, npm, pnpm, Bun)
+
+| Tool | Native command | Allowlisted root | Cadence |
+|---|---|---|---|
+| apt | `LC_ALL=C apt-get clean` | `/var/cache/apt/archives` | 24 h |
+| yarn | `yarn cache clean` | `/usr/local/share/.cache/yarn` or `/root/.cache/yarn` | 24 h |
+| npm | `npm cache clean --force` | `/root/.npm` | 24 h |
+| pnpm | `pnpm store prune` | `/root/.local/share/pnpm/store` | 24 h |
+| bun | `<validated bun> pm cache prune --max-age 30` | `/root/.bun/install/cache` | 24 h |
+
+- Commands run only in ordinary housekeeping-opted-in runs and `--housekeeping-only`, never in logging-only or scan. Existing fleet/housekeeping/Alloy exclusions apply; a Loki outage does not gate cache cleanup.
+- Only a successful native action advances `cache_clean` (reusing `CheckpointStore` with the free-text tool column; no schema migration), even when measured reclaim is zero. Empty/absent/not-due/busy/unsupported/dry-run results preserve cadence and files and are never recorded as cleanups.
+- **Bun specifics.** The binary comes from the existing fixed-directory resolver plus a fresh probe (never `$PATH`, never settings); the action pins `BUN_INSTALL_CACHE_DIR=/root/.bun/install/cache` and `LC_ALL=C` with every manager-constructed value quoted. Support is detected only from bounded (≤16 KiB, ANSI/whitespace-normalised) `bun pm --help` output containing an anchored `bun pm cache prune` command **and** a `--max-age` flag; malformed/old/error help is unsupported and preserves the cache. `bun pm cache prune --dry-run` is never used for detection, Bun is never upgraded, and `bun pm cache rm` is never used because it breaks linked projects. Directory metadata is opened with `O_NOATIME` so a cache entry's age stays `max(atime, mtime)` and probing does not refresh it.
+- **Bun accounting.** `allocated_bytes` keeps working for presence/due checks; `reclaimable_bytes` is the unique regular-file `st_blocks*512` total for `st_nlink == 1` files outside the retained `links/` subtree, and Bun's reported reclaim is the fresh before/after delta (dry-run potential uses the same conservative value). Retained hardlink bytes are never claimed as physically freed. Malformed/missing measurements fail closed.
+- **Bun busy classification.** Package/build activity blocks (`install`/`add`/`update`/`remove`/`link`/`unlink`/`patch`, `pm` mutations, `x`/`bunx`, `build`, `run build|install|rebuild`, and all unrecognised flags-first/package shapes); a genuine runtime is recognised by a `.js/.ts/.mjs/.cjs/.tsx/.jsx` entrypoint or `run start`/`run <entrypoint>`, so CT122's `.mjs` process is not permanently self-blocked. Only a lone help/version invocation (a single `-h`/`--help`/`-v`/`-V`/`--version`/`--revision`/`help` token) and the read-only `bun pm cache` / `bun pm cache path` query are idle — a later flag never exempts a mutation or build (`bun install -v` and `bun run build --help` still hold the gate). Dependency symlinks may resolve anywhere strictly beneath the preserved `<cache>/links/` subtree; references into the rest of the cache block pruning. `.bun` joins the existing dependency-link scan locations. `links/`, git clones and manifests are never removed.
+- **CT135 configured gap (ground truth).** The operator ran `pnpm store prune` manually on 2026-10-21. Cache cleanup existed (commit `dcb1d47`, 2026-10-08) and the manager deployed latest on 2026-10-17, so missing code was not the cause. Production had `housekeeping_enabled: false`, `housekeeping_timer_enabled: true` and `housekeeping_timer_targets: [default/120, default/123]`; the installed `ExecStart` was `fleet-update --housekeeping-only --limit default/120,default/123`, and 2026-10-20..23 journals show only `[pve01] found 2 managed LXC(s): 120, 123`. The SQLite cache table holds CT120/APT and CT123/APT+npm+Yarn rows and no CT135 row. This is an enrollment/scope gap, not a pnpm safety rejection: the cleaner was never reached. The local regression at the real driver seam proves the failure and the fix (below); production enrollment remains an authorized rollout action.
+
+## Disk-usage enrichment of the existing low-space warning
+
+- **Trigger is unchanged.** `disk_warning` still warns at `>= lxc_disk_warn_percent` (75) with `< lxc_disk_min_free_gb` (10 GiB) free; unknown available bytes keep the percentage warning. Only inside that existing branch — after housekeeping's df refresh — is one insight requested and appended to the same `WarningEntry(task='disk space')`. It never sets `notifying`/`changed`/`failed`, never creates a second warning, never triggers a scan/sweep/snapshot/start, never changes permissions and never deletes. A reclaimed cache that clears the warning suppresses the diagnostic; healthy or high-percentage-with-ample-free guests do no diagnostic work.
+- **Measurement is read-only and bounded.** `Executor.lxc_disk_usage(extra_paths=...)` reuses the housekeeping probe staging with `housekeeping_operation=disk_usage` and an absolute 20 s node-helper deadline shared across pct status/config, the guest call and teardown (old operations keep their defaults). The helper requires a running guest and `_pct_guest_call`; a missing pct/Python/stopped guest yields `unavailable`, never a node-wide scan or guest start. A guest root that cannot be opened or whose identity/mount cannot be verified returns `unavailable` promptly instead of degrading to a weaker walk. `extra_paths` is the sorted set of resolved policy prefixes deeper than 3 (≤32, depth ≤16).
+- **Mount and race safety.** Mountinfo field 5 is decoded including octal escapes; every descendant mountpoint (file or directory, any type/device: NFS/CIFS, tmpfs, separate volumes and same-device binds) is pruned before opening, and `st_dev` is enforced as well. Traversal anchors on directory descriptors (`O_PATH|O_NOFOLLOW`, `fstat`, `/proc/self/fdinfo` `mnt_id` checked against the root descriptor) so a symlink or mount swapped in mid-walk is never traversed, and the root descriptor's device/inode/mount identity is re-verified after the no-follow reopen. Missing mountinfo/`mnt_id`/`O_PATH` means unavailable — never a weaker `st_dev`-only fallback. Symlinked content outside the fixture/root is excluded.
+- **Accounting.** Metadata only: unique `(device, inode)` with `st_blocks*512`; hardlinks counted once with explicit first-path attribution; contents are never read and no atime is changed. Traversal is bounded to 200 000 entries / 15 s in a forked worker with a bounded pipe, ≤1 Hz progress snapshots plus a final one, ≤1000 wire rows (root/ancestors/reserved deep paths included, with up to 129 reserved rows planned before ordinary ones), ≤1 MiB serialized output, a physical directory-depth cap of 128 and a manager-wide semaphore of 2 collectors. Deadline expiry terminates the worker, then `SIGKILL` after a bounded grace, using nonblocking reaping; a blocked kernel I/O may linger but a runnable scan never continues. The last snapshot is returned as `partial`; no snapshot is `unavailable`.
+- **Wire facts.** `status: complete|partial|unavailable`, `root_used_bytes` (fresh root `_fs_used_bytes` at scan start), `root_device`, `directories[{path,depth,allocated_bytes,direct_bytes}]`, `visited_entries`, `excluded_mounts`, `error_count`, `reason`. Deep paths are only accepted when they exactly match a requested extra path; malformed/oversized/unsolicited data becomes unavailable without clearing the original warning. Permission/enumeration errors are `partial`, never zero/normal.
+- **Ratio filter.** `collect_lxc_disk_insight` prefers the fresh `root_used_bytes` denominator and falls back to validated `df -Pk` `Used` KiB × 1024; zero/unknown denominators give an unavailable ratio. A directory is retained only when `allocated_bytes >= floor` **and** its share strictly exceeds its longest-prefix cap. Shares are of used bytes — `/var/log` at 14 GiB of 20 GiB used reports 70% regardless of capacity, and a mounted multi-terabyte share contributes neither bytes nor candidates.
+- **Disjoint output.** Bottom-up collapse: if an eligible parent's eligible child frontier covers ≥70% of it, report the more specific frontier; otherwise keep the parent and suppress descendants. A qualifying requested deep path takes precedence (a 22% pnpm store under a 40%/20% parent is reported alone; under an 80% parent it reports the store at 22% plus `directory-other` 58%; under a coarse 30% ancestor it reports the store at 22% plus `other contents` 8% — the true residual, never the ancestor's whole 30%). Ancestor residuals become `kind='directory-other'` ("other contents under PATH"), the direct-files bucket is `kind='root-files'` ("files directly under /"), and `/` is never reported as 100% of itself. Results are sorted by share/bytes then path/kind, at most 20 retained for history and 3 displayed; partial results are labelled incomplete and are never read as "nothing oversized".
+- **Policy resolution.** `resolve_disk_usage_policy(catalogue, script_id=..., override=..., auto=...)` runs independently of Alloy/Loki state and always returns concrete default/floor values: generic 20% share, 256 MiB floor and `/usr` 85% (an operator-overridable OS-noise heuristic). Sanitised findings: `no recognized service profile; generic disk thresholds`, `service profiles unavailable; generic disk thresholds`, `service profile selection invalid; generic thresholds`; explicit `auto=false`/`disabled` with no manual root intentionally uses the generic policy with no error. A policy finding is appended to the same warning's detail, and an unavailable catalogue/policy never fails an unrelated update.
+- **State and rendering.** `WarningEntry.disk_usage` carries a bounded `DiskUsageInsight` (`used_bytes` nullable, ≤20 entries, ≤160-char sanitised detail); old records stay key-free. `format_disk_usage_warning` preserves the original prefix verbatim, appends compact clauses such as `` `/var/log`: 14.0GiB (70% of used; limit 20%) ``, shows at most 3 entries, clips display paths at 80 chars, sanitises control characters/backticks and keeps the whole warning ≤512 characters with no trailing newline. Enriched warnings render once in a leading bounded (`≤1600` char, with an omitted count) **⚠️ Disk space** block ahead of node/error sections and are removed from the later generic warning block, so a long error body cannot hide them behind the 4000-character truncation. Full structured data stays in state/history. Legacy formatting is byte-identical when no `disk_usage` field is present, and an idle disk-warning-only run still dispatches nothing.
+
+## Coverage blockers and limits
+
+- **Excluded guests stay excluded:** `exclude_list [103, 104, 121, 111]`, `lxc_alloy_exclude_list [129]`, `lxc_housekeeping_exclude_list []`, `os_only_lxc_list [128]` as recorded in production. The `searxng` (104), `unifi-os-server` (111) and `fleet-manager` (121) manifests are catalogue evidence/explicit-only entries; they are not live enrollment, and a guest override cannot bypass the exclusion.
+- **Technitium 125/126:** both guests' TCP connections to Loki port 3100 timed out during the audit. The manifest is complete; delivery is blocked on external network repair, not on plugin configuration. They stay out of any expansion target list until bounded delivery proof passes.
+- **UniFi OS:** host live files are declared from observed metadata; nested/private podman runtime and database sources are **unverified** and not claimed. No container-runtime access or firewall change is part of this work.
+- **CT101/CT102:** custom `debian`/unresolved identities never auto-match; they produce unsupported findings.
+- **Delivery is unverified until observed.** Configuration hash, ACL success and an active Alloy/component do not prove Loki arrival. Quiet, missing, denied, unreadable and unreachable are distinct; a quiet source under a valid root is not a delivery success and does not claim complete coverage.
+- **Finite limits, no losslessness claim.** Loki rejects a 256 KiB packed line (a ~200 KiB single record was accepted in the isolated run), so oversized records cannot be guaranteed lossless. Delivery is at-least-once with finite buffers; no exactly-once, lossless copytruncate or infinite outage retention is claimed.
+- **No deletion widening.** New-app sources never gain archive import, native file rotation or prune capability. Manifests are not deletion entitlements; capture/import/checkpoint/provenance and the final filesystem/quarantine checks remain authoritative.
+- **Scope.** Managed-LXC only. VMs, nodes and manual appliances are unchanged (`alloy_reconcile` VM behavior is untouched, with no VM validate-only support).
+
+## Local verification evidence
+
+All of the following used disposable local fixtures/namespaces and synthetic unit-state/guest-transport facts. No production guest was contacted, no production cache was pruned (only native caches inside disposable fixtures), no wheel was installed over the checkout and no fleet command ran.
+
+- **Behavioural regressions** cover: real YAML loading/selection; legacy/current wrappers, absent/unresolved identities and aliases; offline selection; stopped/contradictory/ambiguous layouts; schema/version/unknown-field/duplicate/unsafe-path/credential/symlink rejections; auto/replace/extend/disabled precedence, empty replacement, `auto=false`, empty locations, rejected widening, disabled sources and layouts overrides; bare-key ambiguity under `--limit` and full-key precedence; synthetic app+dependency bundles with owner-qualified keys/components, a second app reusing the same dependency, manual standalone dependency selection, cycle/missing/duplicate/non-dependency include rejection, evidence-only includes (`openresty`, `synapse-admin`), journal-only apps and an inactive optional journal unit; NPM/PBS effective HCL ordering/hash and archive-profile ineligibility through retention's internal re-probes with preserved pending batches; ACL regressions for deep qBittorrent-style ancestors and a 0600 `error.log` sibling database through the descriptor helper, plus invalid manager targets issuing no RPC and unsafe/missing parents failing closed; rejected candidate syntax causing no ACL/env/live mutation; scans and logging-only runs performing no cache/prune work.
+- **CT135 reproduction at the real driver seam** (`tests/unit/test_driver.py::_HousekeepingHarness` with real temp pnpm files and SQLite): with `housekeeping_enabled: false`, `housekeeping_timer_enabled: true` and targets `[default/120, default/123]`, a `--housekeeping-only` run with that limit reclaims eligible 120/123 caches while CT135's files and `cache_clean` row stay untouched; the identical code with `default/135` added to targets/limit prunes a due unreferenced entry and only then records `pnpm` `last_success_ns` for `default/pve01/135`; a busy/failed 135 pass records no success. `tests/unit/test_install_script.py::test_unchanged_installer_applies_changed_scope` proves the regenerated installed `ExecStart` argv contains the added guest.
+- **Bun regressions** use real temp caches plus SQLite: due/success/measured reclaim, successful zero reclaim, cadence, failed/unsupported/busy/dry-run preserving cadence and files, missing/empty roots idle, custom/symlink/non-root-owned/dependency-linked roots preserved, malformed/old/misleading help not claiming support, path change before action aborting, runtime-not-self-blocking versus package/build blocking, a lone help/version invocation idle while a later flag never exempts a build or mutation (`bun build -- -v`, verbose install still busy), `links/` and runnable dependencies preserved, and retained hardlink bytes not reported as freed.
+- **Disk diagnostics** are covered with real filesystems and wire fixtures: 20 GiB used with `/var` 90%, `/var/log` 70%, `/var/cache` 5% yields the disjoint `/var/log` culprit only; capacity changes do not alter shares; strict ratio boundary, floor, explicit zero floor, prefix overrides, `/usr` 85%, inherited caps, root-files bucket, unknown/zero denominators, >100%/child-above-parent inconsistency, complete-empty vs partial-empty, malformed facts, deterministic top limits and formatting budgets; deep policy caps become sorted/deduplicated `extra_paths`; a depth-5 pnpm store at 22% under 40%/20% caps is named without the parent while an 80% parent yields `other contents` 58% + store 22% and a coarse 30% ancestor yields `other contents` 8% + store 22%; nested extra paths, ordinary 70% collapse, a missing root producing a prompt `unavailable` rather than a weaker scan, the full 1000-row/32-requested-path/1 MiB budget, sparse files, hardlinks, deeper-than-3 aggregation, symlinks, root metadata failures, permission errors and the physical/entry/row/deadline caps; mount fixtures cover NFS/CIFS, file mounts, escaped paths, same-device binds, `/mnt` vs `/mntdata`, missing table/fd mount id and a mount appearing after the initial table; the 20 s budget is shared across pct status/config/guest call while old operations keep their timeouts; the enriched warning survives a >4000-character error body, appears once, keeps full structured history and leaves legacy goldens byte-identical for inputs without `disk_usage`.
+- **Isolated native-binary smoke** (private namespaces, real Alloy 1.21.2, Loki 3.7.9, Bun 1.4.4, disposable ports/storage) proved: `alloy validate` of the rendered config before start; primary-app + included-dependency records arriving with expected bounded labels and packed filename; rotation with rename+create, new subdirectory under a default ACL as a dedicated non-root collector user, an optional source appearing, a custom multiline source, restart with unchanged positions, configuration drift rejection, and a bounded Loki outage/recovery. No duplicate readers were observed. A ~200 KiB record was accepted; a packed 256 KiB line was rejected by Loki's limit — reported as a limitation, not a lossless guarantee. An override to an audited alternate location and one manifest-only added plugin were exercised through the same code path with no application-specific Python.
+- **Native ACL proof (descriptor-anchored repair).** With a real Alloy collector running as a non-root, uid-999-style owner, the actual `logging_acl` path granted access to a present source while an absent sibling log stayed uneditable/absent; Hermes' 0700 home and `.hermes` parents were traversable for the collector with future `gui`/`gateway` files still configurable, a recreated 0600 file became readable, and a sibling database stayed unreadable. A symlinked ancestor was never followed, file and directory binds plus the quarantine tree were excluded, the default ACL applied only as intended, and a deterministic FD-swap attempt left private fixture state unchanged. Non-root, non-world-readable and non-chowned invariants held throughout.
+- **Primitive-level ACL proof** through the real `RunnerExecutor` → Ansible primitive → `pct` → guest helper: a valid target file was repaired while its sibling stayed unreadable; an invalid manager-constructed target produced **zero RPC**; an unsafe symlink target returned `status: failed` with private state unchanged; a missing parent returned `complete` with the file counted in `skipped_missing` and no file created. A candidate through the real primitive plus actual `alloy validate` left the live configuration inode unchanged and performed no install, journal-group or service action.
+- **Native Bun smoke** in a disposable root namespace pruned old disposable cache entries at `--max-age 30` while fresh entries, `links/`, git/manifest fixtures, a symlinked runnable dependency and a hardlinked dependency survived with preserved cadence and unrefreshed atimes; cadence advanced only on success and no retained hardlink bytes were reported freed. Busy classification under the actual binary marked `bun build -- -v` as both `bun` and `build`, and a verbose install was classified as not-idle (verified through an OS argv fixture rather than a command string), so no action ran.
+- **Disk helper smoke** ran the real helper CLI inside a still-live private mount namespace (`--operation disk_usage --lxc-id 135 --sysroot … --mountinfo … --request …`): a 262 429-byte helper stream parsed with local allocated totals matching explicit-mount-excluded `du`, the deep pnpm store appeared as its own row, same-`st_dev` directory/file binds and symlinked content were excluded, re-running with both bind entries removed from the fixture table still excluded them via real fd `mnt_id` checks, and the blocked-worker deadline produced a bounded partial/unavailable result with no continuing runnable scanner. The full CLI + RPC path also returned `unavailable` promptly for a missing root and produced `other contents` 8% + store 22% for the nested 30%/22% fixture. Its facts were fed through the real ratio filter/formatter and the existing notification decision (compact culprit present when notifying; idle state still dispatches nothing).
+- **Real primitive path for disk/alloy:** the disk proof also ran through `RunnerExecutor` → Ansible primitive → streamed helper output in the private namespace. The validate-only run through the real primitive and actual `alloy validate` preserved the fixture's live configuration inode, content and mode and performed no install, journal-group or service action. That environment supplies **synthetic systemctl facts**: no real systemd ran, so this proves the validation/guard path, not live unit-state behavior on a host.
+
+### Verification gates
+
+- [x] **Package-wheel proof (local packaging gate):** in a disposable image containing only `pyproject.toml`, `README.md` and the package, `pip wheel --no-deps --no-build-isolation .` followed by a clean `--target` install was loaded with CWD outside the checkout and only the install target on `PYTHONPATH`. With an empty ambient path the import fails, so there is no editable/global fallback, and every module, helper and resource origin resolved under the target. The final wheel is identical to the checkout: all 34 shipped YAML files are byte-identical (27 apps, 7 dependencies, 26 script aliases), the installed helper is 262 429 bytes with SHA256 `0c291df0bd1e860770d60f00e1fa3659e11276b1eb6d210140101fd9dfb8de61`, it advertises `logging_acl` and `disk_usage` operations, and no obsolete `acl_repair_commands` path is installed. Include, auto, explicit-only, standalone-dependency and disk-policy resolution were exercised from the installed copy. This proves packaging only, not production delivery.
+- [x] **Static, syntax and YAML analysis (current tree):** mypy (63 files) and Ruff clean; Bandit medium-and-above reports 0 findings; all 24 primitive syntax checks pass; ansible-lint reports 0 failures with 16 warnings; all repository YAML including the 34 manifests lints with 0 errors (13 example-format warnings). These are local results only.
+- [x] **Focused post-review suite:** 1457 passed with one Starlette/httpx deprecation warning (152.54 s), covering the original focused set plus the executor/state/web additions.
+- [x] **Full post-review unit suite (authoritative):** 2475 passed in 254.08 s with two warnings: the existing observed Starlette/httpx deprecation warning, and an additional `aiosqlite` background-thread `RuntimeError: Event loop is closed` during `test_web_auth::test_login_sets_cookie_and_grants_access`. Both are recorded exactly as observed; this run is not described as warning-free.
+- [x] **Operator-facing examples:** the separate documentation work updated README configuration text and `vars.yml.example`; each of the four documented YAML examples loads through `GlobalSettings` and resolves the intended selection. This document remains the authoritative schema/selection reference.
+
+## Remaining operational acceptance (separately authorized)
+
+Nothing below has been performed. Each item needs its own authorization; none is implied by this document.
+
+- [ ] Record production settings and the original `housekeeping_timer_enabled` value from CT121 `/root/proxmox-management` before any change; never copy local inventory/settings over production.
+- [ ] Deploy through CT121's own `bash install.sh --update` under `acquire_run_lock(fleet_history_dir)` with `housekeeping_timer_enabled: false` temporarily (the installer reconciles/starts the timer), then restore the recorded decision. No ad-hoc source transfer.
+- [ ] Dry-run the target IDs, then run the live logging-only pilot for CT120/PBS, CT123/NPM, CT109 (new file source) and CT128 (dependency bundle), and observe actual guest Alloy hash/read permissions/service state.
+- [ ] Observe genuine records in Loki per enabled source (read-only metric queries with bounded selectors, e.g. `count_over_time({job="lxc-file",cluster="default",node="pve01",guest_id="109",app="prowlarr"}[10m])`), distinguishing quiet from missing/denied/unreachable. Approved disposable records only if natural output cannot prove it; never write test messages into production app logs or databases without approval.
+- [ ] Keep the original timer targets `[default/120, default/123]` until both legacy pilot sources pass, then set the temporary scheduled cache pilot `[default/120, default/123, default/122, default/135]`, re-run the installer to regenerate the hard-coded `--limit`, and confirm with `systemctl show fleet-housekeeping.service --property=ExecStart`.
+- [ ] Prove **natural scheduled** coverage: the next hourly journal discovery selects 135 and 122, CT135/pnpm and CT122/bun gain native-success timestamps with measured outcomes, and the caches were genuinely due/nonempty/eligible. A manual `pnpm store prune` or a direct CLI maintenance invocation is explicitly **not** substitutes for scheduled evidence.
+- [ ] Confirm exclusions and private/unsupported findings are preserved, 125/126 remain blocked out of the target list, and nothing claims complete catalogue delivery.
+- [ ] Expand to the explicit supported/reachable target list `default/105, default/106, default/107, default/108, default/109, default/112, default/113, default/114, default/115, default/116, default/117, default/118, default/119, default/120, default/122, default/123, default/124, default/127, default/128, default/130, default/131, default/132, default/133, default/135, default/136, default/137` only after the pilot evidence — never an empty whole-fleet list while 125/126 remain blocked. Set `housekeeping_timer_targets: []` to restore automatic whole-managed-fleet discovery/exclusions only after 125/126 connect and their bounded delivery proof passes.
+- [ ] Opportunistically verify disk enrichment on a guest that already shows the low-space warning; never fill a production disk or force a separate alert.
+- [ ] Run no fleet OS/app upgrades, snapshots, reboots or stopped-container starts as part of logging/cache/disk rollout, and do not widen firewall rules or permissions to obtain green checks.
+
+## Out of scope
+
+New-app historical import, local retention tightening, native file rotation changes, file deletion, database/dependency cleanup, container-runtime access for UniFi, VM/node/appliance coverage, new CLI flags, new notification triggers/an alert-state migration, Loki retention changes, disk resizing and PBS datastore pruning.

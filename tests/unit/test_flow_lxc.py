@@ -8,13 +8,20 @@ import importlib
 import time
 import hashlib
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Sequence, cast
 
 import pytest
 
 from proxmox_fleet import housekeeping_import as hi
+from proxmox_fleet import housekeeping_native as native
 from proxmox_fleet import http as http_mod
-from proxmox_fleet.flows.lxc import _discover_lxcs, _os_update_cmd, run_lxc_update
+from proxmox_fleet.flows.lxc import (
+    _discover_lxcs,
+    _os_update_cmd,
+    disk_warning,
+    run_lxc_update,
+)
+from proxmox_fleet.models.log_plugins import GuestLogOverride
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.models.state import HousekeepingSummary
 from proxmox_fleet.runner import PrimitiveResult
@@ -24,6 +31,7 @@ from tests.unit.test_housekeeping import (
     LokiStub,
     _base,
     _cache_dir,
+    _compliant,
     _measure,
 )
 
@@ -59,6 +67,12 @@ _INTROSPECT_NO_SCRIPT = {
     "pull_rc": 1,
     "script_stdout": "",
 }
+# The maintenance/logging fixtures use NPM's real community-script identity so
+# catalogue selection is exercised end-to-end (its /data/logs root exists in
+# the temporary guest root); the flow no longer selects by hostname.
+_INTROSPECT_NPM = dict(
+    _INTROSPECT_WITH_SCRIPT, script_stdout="source ct/nginxproxymanager.sh"
+)
 
 
 class ScriptedLxcExecutor:
@@ -91,6 +105,13 @@ class ScriptedLxcExecutor:
         self.rollback_called = False
         self.app_update_kwargs: dict = {}
         self.snapshot_api_params: list = []
+        self.disk_usage_calls: list = []
+        # Default: diagnostics unavailable. Tests that assert a rendered
+        # breakdown replace this with a helper-shaped fact snapshot.
+        self._disk_usage_result = PrimitiveResult(
+            rc=1, changed=False, stdout="", stderr="disk usage unavailable", failed=True,
+            facts={},
+        )
 
         self._introspect_facts = introspect_facts if introspect_facts is not None else dict(_INTROSPECT_NO_SCRIPT)
         self._lxc_os_result = lxc_os_result
@@ -196,6 +217,12 @@ class ScriptedLxcExecutor:
         self.commands.append(f"alloy_reconcile:{kwargs.get('lxc_id')}")
         return self.default
 
+    def lxc_disk_usage(self, lxc_id, *, extra_paths=()):
+        # Records the manager-resolved deep counters, not a command string:
+        # the real coordinator/filter consumes the returned helper facts.
+        self.disk_usage_calls.append((lxc_id, tuple(extra_paths)))
+        return self._disk_usage_result
+
 
 def _settings(**overrides):
     """Build a minimal GlobalSettings for tests."""
@@ -241,10 +268,22 @@ def test_alloy_reconciliation_runs_after_snapshot_before_packages(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
     monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
     alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+    hk_mod = importlib.import_module("proxmox_fleet.housekeeping")
+    catalogue = importlib.import_module("proxmox_fleet.log_plugins").load_log_catalogue()
     desired = alloy_mod.DesiredAlloyConfig(content="config\n", sha256="hash")
     ex = _exec_normal()
+    prepared_with: dict = {}
+
+    def prepare(executor, settings, **kwargs):
+        prepared_with.update(kwargs)
+        # A verified, unchanged selection: the exact desired object must be the
+        # one later enforced, never a re-render from a later probe.
+        return hk_mod.HousekeepingResult(effective_alloy=desired)
+
+    monkeypatch.setattr(hk_mod, "prepare_lxc_logging", prepare)
 
     def reconcile(executor, config, **kwargs):
+        assert config is desired
         assert ex.snapshots_created == ["101"]
         assert not any("dist-upgrade" in command for command in ex.commands)
         ex.commands.append("alloy-reconcile")
@@ -252,8 +291,14 @@ def test_alloy_reconciliation_runs_after_snapshot_before_packages(monkeypatch):
 
     monkeypatch.setattr(alloy_mod, "reconcile_alloy", reconcile)
     out = run_lxc_update(
-        "pve-01", "101", ex, _settings(), api_host="192.168.1.10", alloy_config=desired
+        "pve-01", "101", ex, _settings(), api_host="192.168.1.10",
+        alloy_config=desired, catalogue=catalogue,
     )
+    # The identity was extracted once from introspection and handed to the
+    # shared selection; no hostname/service inference happened.
+    assert prepared_with["script_id"] == "sonarr"
+    assert prepared_with["catalogue"] is catalogue
+    assert prepared_with["log_override"] is None
     assert out.record is not None
     assert out.record.alloy == "Configured"
     alloy_index = ex.commands.index("alloy-reconcile")
@@ -267,7 +312,9 @@ def test_alloy_only_uses_logging_preparation_and_skips_update_work(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
     alloy_mod = importlib.import_module("proxmox_fleet.alloy")
     hk_mod = importlib.import_module("proxmox_fleet.housekeeping")
+    catalogue = importlib.import_module("proxmox_fleet.log_plugins").load_log_catalogue()
     desired = alloy_mod.DesiredAlloyConfig(content="config\n", sha256="hash")
+    override = GuestLogOverride(mode="disabled")
     captured: dict = {}
 
     def fake_prepare(executor, settings, **kwargs):
@@ -290,11 +337,16 @@ def test_alloy_only_uses_logging_preparation_and_skips_update_work(monkeypatch):
         api_host="192.168.1.10",
         alloy_config=desired,
         alloy_only=True,
+        catalogue=catalogue,
+        log_override=override,
     )
     # allow_install=True preserves the mode's existing installer behaviour.
     assert captured["allow_install"] is True
     assert captured["base"] is desired
     assert captured["dry_run"] is False
+    assert captured["catalogue"] is catalogue
+    assert captured["script_id"] is None  # no update script -> no identity guess
+    assert captured["log_override"] is override
     assert out.changed is True
     assert out.record is not None and out.record.housekeeping.status == "Configured"
     assert ex.snapshots_created == []
@@ -305,15 +357,72 @@ def test_alloy_only_uses_logging_preparation_and_skips_update_work(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_alloy_only_stopped_guest_returns_before_pct_start(monkeypatch, dry_run):
+    """A stopped guest is never started for a logging-only audit."""
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+    hk_mod = importlib.import_module("proxmox_fleet.housekeeping")
+    desired = alloy_mod.DesiredAlloyConfig(content="config\n", sha256="hash")
+
+    def _forbidden(*args, **kwargs):  # pragma: no cover - would fail the test
+        raise AssertionError("logging preparation must not run for a stopped guest")
+
+    monkeypatch.setattr(hk_mod, "prepare_lxc_logging", _forbidden)
+    ex = ScriptedLxcExecutor(introspect_facts={
+        "config_stdout": PCT_CONFIG_RUNNING,
+        "status_stdout": PCT_STATUS_STOPPED,
+        "pull_rc": 0,
+        "script_stdout": "source ct/sonarr.sh",
+    })
+
+    out = run_lxc_update(
+        "pve-01", "101", ex, _settings(), dry_run=dry_run,
+        api_host="192.168.1.10", alloy_config=desired, alloy_only=True,
+    )
+
+    assert out.record is None
+    assert out.changed is False and out.failed is False
+    assert not any(command.startswith("pct start") for command in ex.commands)
+    assert ex.snapshots_created == []
+    assert not any(command.startswith("alloy_") for command in ex.commands)
+
+
+def test_alloy_only_template_guest_returns_before_any_guest_work(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+    hk_mod = importlib.import_module("proxmox_fleet.housekeeping")
+    desired = alloy_mod.DesiredAlloyConfig(content="config\n", sha256="hash")
+
+    def _forbidden(*args, **kwargs):  # pragma: no cover - would fail the test
+        raise AssertionError("logging preparation must not run for a template")
+
+    monkeypatch.setattr(hk_mod, "prepare_lxc_logging", _forbidden)
+    facts = dict(_INTROSPECT_WITH_SCRIPT, config_stdout=PCT_CONFIG_TEMPLATE)
+    out = run_lxc_update(
+        "pve-01", "101", ScriptedLxcExecutor(introspect_facts=facts), _settings(),
+        alloy_config=desired, alloy_only=True,
+    )
+
+    assert out.record is None
+    assert out.changed is False and out.failed is False
+
+
 def test_alloy_status_is_cleared_after_later_snapshot_rollback(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
     monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
     alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+    hk_mod = importlib.import_module("proxmox_fleet.housekeeping")
     desired = alloy_mod.DesiredAlloyConfig(content="config\n", sha256="hash")
     monkeypatch.setattr(
         alloy_mod,
         "reconcile_alloy",
         lambda *args, **kwargs: alloy_mod.AlloyResult(status="Configured", changed=True),
+    )
+    monkeypatch.setattr(
+        hk_mod,
+        "prepare_lxc_logging",
+        lambda *args, **kwargs: hk_mod.HousekeepingResult(effective_alloy=desired),
     )
     ex = _exec_normal()
 
@@ -322,10 +431,38 @@ def test_alloy_status_is_cleared_after_later_snapshot_rollback(monkeypatch):
 
     ex.lxc_os_update = fail_os
     out = run_lxc_update(
-        "pve-01", "101", ex, _settings(), api_host="192.168.1.10", alloy_config=desired
+        "pve-01", "101", ex, _settings(), api_host="192.168.1.10",
+        alloy_config=desired, catalogue=_log_catalogue(),
     )
     assert out.failed is True
     assert ex.rollback_called is True
+    assert out.record is not None and out.record.alloy is None
+
+
+def test_housekeeping_exclusion_preserves_installed_alloy_config(monkeypatch):
+    """A housekeeping-excluded guest is neither prepared nor reconciled from the
+    journal-only base; its installed managed readers are left untouched."""
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(http_mod, "request", lambda url, **kw: http_mod.HttpResponse(200, ""))
+    alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+    hk_mod = importlib.import_module("proxmox_fleet.housekeeping")
+    desired = alloy_mod.DesiredAlloyConfig(content="config\n", sha256="hash")
+
+    def _forbidden(*args, **kwargs):  # pragma: no cover - would fail the test
+        raise AssertionError("excluded guest must not enter logging/alloy mutation")
+
+    monkeypatch.setattr(hk_mod, "prepare_lxc_logging", _forbidden)
+    monkeypatch.setattr(hk_mod, "run_housekeeping", _forbidden)
+    monkeypatch.setattr(alloy_mod, "reconcile_alloy", _forbidden)
+    ex = _exec_normal()
+
+    out = run_lxc_update(
+        "pve-01", "101", ex, _settings(lxc_housekeeping_exclude_list=["101"]),
+        api_host="192.168.1.10", alloy_config=desired, catalogue=_log_catalogue(),
+    )
+
+    assert out.failed is False
+    assert not any(command.startswith("alloy_") for command in ex.commands)
     assert out.record is not None and out.record.alloy is None
 
 
@@ -1173,6 +1310,66 @@ DF_90_PERCENT_20_GIB_FREE = (
     "Filesystem     1024-blocks      Used Available Capacity Mounted on\n"
     "/dev/rbd20        209715200 188743680  20971520      90% /\n"
 )
+_GIB = 1024 ** 3
+# 20 GiB used on a 26 GiB rootfs: 77% used with 5 GiB free — the existing
+# low-space warning fires (>=75% and <10 GiB free).
+DIAG_DF_20GIB_USED = (
+    "Filesystem     1024-blocks      Used Available Capacity Mounted on\n"
+    "/dev/rbd17        27262976  20971520   5242880      77% /\n"
+)
+
+
+def _disk_usage_facts(directories, *, used_bytes=20 * _GIB, status="complete",
+                      reason=""):
+    """Raw helper snapshot: exactly what Executor.lxc_disk_usage returns."""
+    return {
+        "status": status,
+        "root_used_bytes": used_bytes,
+        "root_device": 64769,
+        "directories": [
+            {
+                "path": path,
+                "depth": depth,
+                "allocated_bytes": allocated,
+                "direct_bytes": direct,
+            }
+            for path, depth, allocated, direct in directories
+        ],
+        "visited_entries": 2048,
+        "excluded_mounts": 2,
+        "error_count": 0,
+        "reason": reason,
+    }
+
+
+def _disk_directories_with_deep_store():
+    """20 GiB used: /var/log 70%, a deep pnpm store 21%, /usr under its cap."""
+    mib = 1024 * 1024
+    return [
+        ("/", 0, 20480 * mib, 922 * mib),
+        ("/var", 1, 14438 * mib, 102 * mib),
+        ("/var/log", 2, 14336 * mib, 14336 * mib),
+        ("/usr", 1, 614 * mib, 614 * mib),
+        ("/root", 1, 4506 * mib, 205 * mib),
+        ("/root/.local", 2, 4301 * mib, 0),
+        ("/root/.local/share", 3, 4301 * mib, 0),
+        ("/root/.local/share/pnpm/store", 5, 4301 * mib, 4301 * mib),
+    ]
+
+
+def _disk_directories_generic():
+    """The same denominator with only depth<=3 aggregates (no extra_paths)."""
+    mib = 1024 * 1024
+    return [
+        # Root direct files stay under the generic 20% share (no root-files
+        # bucket); the denominator comes from root_used_bytes, not this row.
+        ("/", 0, 16076 * mib, 1024 * mib),
+        ("/var", 1, 14438 * mib, 102 * mib),
+        ("/var/log", 2, 14336 * mib, 14336 * mib),
+        ("/usr", 1, 614 * mib, 614 * mib),
+    ]
+
+
 # Verbatim /etc/os-release from CT 123 (nginxproxymanager).
 OS_RELEASE_BOOKWORM = (
     'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\n'
@@ -1233,6 +1430,7 @@ def test_large_rootfs_uses_absolute_free_space_and_bypasses_upstream_guard(monke
     out = run_lxc_update("pve-01", "130", ex, settings, api_host="192.168.1.10")
 
     assert [w for w in out.warnings if w.task == "disk space"] == []
+    assert ex.disk_usage_calls == []  # high percent + ample free: no scan
     assert ex.app_update_kwargs["lxc_bypass_storage_guard"] is True
 
 
@@ -1298,6 +1496,7 @@ def test_disk_warning_silent_below_threshold(monkeypatch):
     ex = _exec_with_health(df=DF_52_PERCENT, os_release=OS_RELEASE_TRIXIE)
     out = run_lxc_update("pve-01", "105", ex, _settings(), api_host="192.168.1.10")
     assert [w for w in out.warnings if w.task == "disk space"] == []
+    assert ex.disk_usage_calls == []
 
 
 def test_disk_threshold_is_configurable(monkeypatch):
@@ -1344,6 +1543,10 @@ def test_health_warnings_are_emitted_on_the_dry_run_path(monkeypatch):
                          api_host="192.168.1.10")
 
     assert sorted(w.task for w in out.warnings) == ["container OS", "disk space"]
+    disk = next(w for w in out.warnings if w.task == "disk space")
+    # Read-only dry-run may enrich an already-existing warning, once.
+    assert ex.disk_usage_calls == [("123", ())]
+    assert disk.disk_usage is not None
     assert ex.snapshots_created == []  # still a dry run
 
 
@@ -1357,6 +1560,156 @@ def test_health_warnings_survive_a_failing_update(monkeypatch):
 
     assert out.failed is True
     assert [w.task for w in out.warnings] == ["disk space"]
+
+
+def test_disk_warning_gets_one_bounded_breakdown_from_the_resolved_policy(monkeypatch):
+    """The existing low-space warning carries one real helper-derived breakdown.
+
+    The fake executor returns a raw helper snapshot; the real coordinator and
+    ratio filter (not an echo/string fixture) turn it into the consumer list,
+    and the deep pnpm-store counter requested comes from the homepage policy.
+    """
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DIAG_DF_20GIB_USED, os_release=OS_RELEASE_TRIXIE)
+    ex._introspect_facts["script_stdout"] = "source ct/homepage.sh"
+    ex._disk_usage_result = PrimitiveResult(
+        rc=0, stdout="", stderr="", changed=False, failed=False,
+        facts=_disk_usage_facts(_disk_directories_with_deep_store()),
+    )
+
+    out = run_lxc_update(
+        "pve-01", "135", ex, _settings(), api_host="192.168.1.10",
+        catalogue=_log_catalogue(),
+    )
+
+    # Exactly one measurement, with the deep audited cache prefix resolved.
+    assert ex.disk_usage_calls == [("135", ("/root/.local/share/pnpm/store",))]
+    disk = [w for w in out.warnings if w.task == "disk space"]
+    assert len(disk) == 1
+    entry = disk[0]
+    assert entry.notifying is None  # diagnostics never create a notification
+    assert entry.disk_usage is not None
+    assert entry.disk_usage.status == "complete"
+    assert entry.disk_usage.used_bytes == 20 * _GIB
+    # /var collapses into its qualifying child, /usr is under its cap, and the
+    # deep store is reported instead of its overlapping ancestor.
+    assert [e.path for e in entry.disk_usage.entries] == [
+        "/var/log",
+        "/root/.local/share/pnpm/store",
+    ]
+    # The requested deep cache is the culprit itself, not an "other contents"
+    # residual of one of its ancestors.
+    assert [e.kind for e in entry.disk_usage.entries] == ["directory", "directory"]
+    assert entry.warning.startswith(
+        disk_warning(ex._introspect_facts, 75, 10) or ""
+    )
+    assert entry.warning.count("/var/log") == 1
+    assert "70% of used" in entry.warning
+    assert "/root/.local/share/pnpm/store" in entry.warning
+    assert "21% of used" in entry.warning
+    assert "/usr" not in entry.warning
+    assert len(entry.warning) <= 512
+    assert out.failed is False
+
+
+def test_disk_warning_without_identity_uses_generic_policy(monkeypatch):
+    """No recognized community-script identity: generic thresholds still apply."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DIAG_DF_20GIB_USED, os_release=OS_RELEASE_TRIXIE)
+    ex._introspect_facts["pull_rc"] = 1
+    ex._introspect_facts["script_stdout"] = ""
+    ex._disk_usage_result = PrimitiveResult(
+        rc=0, stdout="", stderr="", changed=False, failed=False,
+        facts=_disk_usage_facts(_disk_directories_generic()),
+    )
+
+    out = run_lxc_update(
+        "pve-01", "105", ex, _settings(), api_host="192.168.1.10",
+        catalogue=_log_catalogue(),
+    )
+
+    assert ex.disk_usage_calls == [("105", ())]  # no service-specific prefixes
+    entry = next(w for w in out.warnings if w.task == "disk space")
+    assert entry.disk_usage is not None
+    assert [e.path for e in entry.disk_usage.entries] == ["/var/log"]
+    assert "no recognized service profile" in entry.disk_usage.detail
+    assert entry.warning.startswith("rootfs 77% full")
+    assert "/var/log" in entry.warning and "70% of used" in entry.warning
+    assert "no recognized service profile" in entry.warning
+    assert len(entry.warning) <= 512
+    assert out.failed is False
+
+
+def test_disk_warning_with_auto_selection_off_uses_generic_policy(monkeypatch):
+    """Disk diagnostics reuse plugin selection independently of Alloy output."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DIAG_DF_20GIB_USED, os_release=OS_RELEASE_TRIXIE)
+    ex._introspect_facts["script_stdout"] = "source ct/homepage.sh"
+    ex._disk_usage_result = PrimitiveResult(
+        rc=0, stdout="", stderr="", changed=False, failed=False,
+        facts=_disk_usage_facts(_disk_directories_generic()),
+    )
+
+    out = run_lxc_update(
+        "pve-01", "135", ex,
+        _settings(alloy_log_plugins_auto=False),
+        api_host="192.168.1.10", catalogue=_log_catalogue(),
+    )
+
+    assert ex.disk_usage_calls == [("135", ())]  # no auto-resolved deep caps
+    entry = next(w for w in out.warnings if w.task == "disk space")
+    assert entry.disk_usage is not None
+    assert [e.path for e in entry.disk_usage.entries] == ["/var/log"]
+    # An intentional empty selection is not a policy error/finding.
+    assert "generic thresholds" not in entry.disk_usage.detail
+    assert out.failed is False
+
+
+def test_disk_diagnostic_failure_keeps_the_original_warning_and_update(monkeypatch):
+    """An unavailable helper preserves the original warning and never fails."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DIAG_DF_20GIB_USED, os_release=OS_RELEASE_TRIXIE)
+
+    out = run_lxc_update(
+        "pve-01", "105", ex, _settings(), api_host="192.168.1.10",
+        catalogue=_log_catalogue(),
+    )
+
+    assert ex.disk_usage_calls == [("105", ())]
+    entry = next(w for w in out.warnings if w.task == "disk space")
+    assert entry.warning.startswith(
+        disk_warning(ex._introspect_facts, 75, 10) or ""
+    )
+    assert entry.disk_usage is not None
+    assert entry.disk_usage.status == "unavailable"
+    assert out.failed is False
+
+
+def test_disk_policy_failure_keeps_the_original_warning_and_update(monkeypatch):
+    """A broken optional diagnostics path is fail-open, not a failed update."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_mod, "request",
+                        lambda url, **kw: http_mod.HttpResponse(200, CT_SCRIPT_TRIXIE))
+    ex = _exec_with_health(df=DIAG_DF_20GIB_USED, os_release=OS_RELEASE_TRIXIE)
+
+    out = run_lxc_update(
+        "pve-01", "105", ex, _settings(), api_host="192.168.1.10",
+        catalogue=cast(Any, object()),  # unusable optional catalogue
+    )
+
+    assert ex.disk_usage_calls == []  # policy resolution failed before measuring
+    entry = next(w for w in out.warnings if w.task == "disk space")
+    assert entry.warning == disk_warning(ex._introspect_facts, 75, 10)
+    assert entry.disk_usage is None
+    assert out.failed is False
 
 
 def test_no_warnings_when_container_was_not_running_at_introspect(monkeypatch):
@@ -1552,8 +1905,8 @@ class HousekeepingPolicyExecutor(ScriptedLxcExecutor):
         self._yarn_dir = yarn_dir
         self.cache_empty_at_snapshot = None
 
-    def housekeeping_probe(self, lxc_id):
-        return self.hk.housekeeping_probe(lxc_id)
+    def housekeeping_probe(self, lxc_id, *, logging_request=None):
+        return self.hk.housekeeping_probe(lxc_id, logging_request=logging_request)
 
     def housekeeping_capture(self, lxc_id, *, files, capture_id):
         return self.hk.housekeeping_capture(lxc_id, files=files, capture_id=capture_id)
@@ -1566,6 +1919,17 @@ class HousekeepingPolicyExecutor(ScriptedLxcExecutor):
 
     def housekeeping_apply(self, lxc_id, *, command):
         return self.hk.housekeeping_apply(lxc_id, command=command)
+
+    def housekeeping_log_acl(
+        self,
+        lxc_id: str,
+        *,
+        roots: Sequence[str] = (),
+        exact_files: Sequence[str] = (),
+    ) -> PrimitiveResult:
+        return self.hk.housekeeping_log_acl(
+            lxc_id, roots=roots, exact_files=exact_files
+        )
 
     def alloy_probe(self, *, lxc_id=None):
         deployed = Path(self.hk.guest_root) / "etc/alloy/config.alloy"
@@ -1638,13 +2002,18 @@ def _upkeep_settings(history, url="", **overrides):
     return GlobalSettings.model_validate(values)
 
 
+def _log_catalogue():
+    """The packaged catalogue, as the driver loads it once per run."""
+    return importlib.import_module("proxmox_fleet.log_plugins").load_log_catalogue()
+
+
 def _upkeep_executor(tmp_path, monkeypatch, *, yarn=None, introspect_facts=None):
     guest = _policy_guest(tmp_path, monkeypatch)
     if yarn is not None:
         guest.cache_specs["yarn"] = CacheSpec("/usr/local/share/.cache/yarn/v6", yarn, "1.22.19")
     ex = HousekeepingPolicyExecutor(
         introspect_facts=(
-            introspect_facts if introspect_facts is not None else _INTROSPECT_WITH_SCRIPT
+            introspect_facts if introspect_facts is not None else _INTROSPECT_NPM
         ),
         script=_ordinary_script(),
         lxc_os_result=_ok(stdout="2 upgraded, 0 newly installed"),
@@ -1677,10 +2046,13 @@ def test_ordinary_housekeeping_cleans_cache_before_snapshot_and_refreshes_disk(m
         ex, guest = _upkeep_executor(
             tmp_path, monkeypatch, yarn=yarn,
             introspect_facts=dict(
-                _INTROSPECT_WITH_SCRIPT, df_stdout=_DF_FULL, boot_df_stdout=_DF_FULL
+                _INTROSPECT_NPM, df_stdout=_DF_FULL, boot_df_stdout=_DF_FULL
             ),
         )
-        out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10", alloy_config=base)
+        out = run_lxc_update(
+            "pve-01", "101", ex, settings, api_host="192.168.1.10",
+            alloy_config=base, catalogue=_log_catalogue(),
+        )
 
     assert guest.probe_calls > 0
     # Real reclamation, measured from the temporary cache directory.
@@ -1692,47 +2064,83 @@ def test_ordinary_housekeeping_cleans_cache_before_snapshot_and_refreshes_disk(m
     assert out.record is not None and out.record.housekeeping is not None
     assert out.record.housekeeping.bytes_reclaimed == before
     # The post-cleanup df refresh suppressed the warning the stale 99%/1-GiB
-    # reading would have produced.
+    # reading would have produced, so no diagnostics RPC ran.
     assert not any(w.task == "disk space" for w in out.warnings)
+    assert ex.disk_usage_calls == []
     assert out.failed is False
 
 
-def test_ordinary_housekeeping_feeds_generated_alloy_config_to_enforcement(monkeypatch, tmp_path):
+#: A real NPM guest has the community script's native logrotate policy; without
+#: it retention correctly refuses to guess writer mechanisms and blocks.
+_NATIVE_NPM_LOGROTATE = """\
+/var/log/unrelated.log {
+    weekly
+    rotate 4
+}
+/data/logs/*_access.log /data/logs/*/access.log {
+    weekly
+    rotate 4
+    compress
+    sharedscripts
+    postrotate
+        kill -USR1 $(cat /run/nginx/nginx.pid)
+    endscript
+}
+"""
+
+
+def test_ordinary_housekeeping_keeps_generated_alloy_config(monkeypatch, tmp_path):
+    """Ordinary housekeeping deploys the selected live source config, keeps it
+    after the update's later Alloy step, and reports a successful pass -- a
+    journal-only base fallback would replace every generated file component."""
     monkeypatch.setattr(time, "sleep", lambda s: None)
     _stub_github(monkeypatch)
-    alloy_mod = importlib.import_module("proxmox_fleet.alloy")
 
     with LokiStub() as stub:
         base = _base(stub.url)
         settings = _upkeep_settings(tmp_path, url=stub.url)
         ex, guest = _upkeep_executor(tmp_path, monkeypatch)
-        guest.profiles = ["npm"]                 # recognized -> live file sources rendered
+        guest.profiles = ["npm"]                 # legacy archive profile recognized
+        policy = Path(guest.guest_root) / native.NPM_LOGROTATE_ORIGINAL.lstrip("/")
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        policy.write_text(_NATIVE_NPM_LOGROTATE)
+        _compliant(guest, settings, base)
         out = run_lxc_update(
             "pve-01", "101", ex, settings, api_host="192.168.1.10",
-            cluster="alpha", alloy_config=base,
+            cluster="alpha", alloy_config=base, catalogue=_log_catalogue(),
         )
 
-    expected = alloy_mod.render_lxc_log_config(
-        base,
-        node="pve-01", cluster="alpha", lxc_id="101", name="sonarr",
-        profiles={"npm"}, retention_hours=settings.housekeeping_local_retention_hours,
-    )
-    assert "fleet_npm" in expected.content
-    assert expected.sha256 != base.sha256
-    # The deployed Alloy content is the generated config with live file sources,
-    # never the journal-only base -- a later reconcile must not clobber them.
-    assert (Path(guest.guest_root) / "etc/alloy/config.alloy").read_text() == expected.content
+    # The consumer outcome is successful, not a silently-blocked preparation.
+    assert out.failed is False
+    assert out.record is not None
+    assert out.record.housekeeping is not None
+    assert out.record.housekeeping.status != "Blocked"
+    assert not any(w.notifying for w in out.warnings)
+
+    deployed = (Path(guest.guest_root) / "etc/alloy/config.alloy").read_text()
+    # The exact bytes on the guest are the generated extension of the base,
+    # not the journal-only base.
+    assert deployed.startswith(base.content)
+    assert "fleet_npm" in deployed
+    assert "/data/logs/**/*.log" in deployed
+    assert deployed != base.content
+    assert hashlib.sha256(deployed.encode("utf-8")).hexdigest() != base.sha256
+    # The generated component survived the whole update (a late base
+    # reconciliation would have removed it again).
+    assert deployed.count("loki.source.file") >= 1
     assert out.record is not None
 
 
 @pytest.mark.parametrize("timer_enabled", [True, False])
 @pytest.mark.parametrize("scope", ["selected", "unselected", "all"])
-def test_scheduled_logging_survives_ordinary_update_without_fleet_housekeeping(
+def test_normal_update_prepares_logging_without_housekeeping_optin(
     monkeypatch, tmp_path, scope, timer_enabled
 ):
+    """Alloy-managed guests keep their managed file sources on ordinary runs,
+    even with housekeeping disabled and the guest outside the timer scope.
+    Only the housekeeping opt-in adds cache/archive/retention work."""
     monkeypatch.setattr(time, "sleep", lambda s: None)
     _stub_github(monkeypatch)
-    alloy_mod = importlib.import_module("proxmox_fleet.alloy")
     yarn = _cache_dir(tmp_path, "yarn")
     cache_before = {p.relative_to(yarn): p.read_bytes() for p in yarn.rglob("*") if p.is_file()}
     with LokiStub() as stub:
@@ -1745,23 +2153,20 @@ def test_scheduled_logging_survives_ordinary_update_without_fleet_housekeeping(
             ),
         )
         ex, guest = _upkeep_executor(tmp_path, monkeypatch, yarn=yarn)
-        guest.profiles = ["npm"]
-        expected = alloy_mod.render_lxc_log_config(
-            base, node="pve-01", cluster="alpha", lxc_id="101", name="sonarr",
-            profiles={"npm"}, retention_hours=48,
-        ) if scope == "selected" or (scope == "all" and timer_enabled) else base
         root = Path(guest.guest_root)
         deployed = root / "etc/alloy/config.alloy"
         deployed.parent.mkdir(parents=True, exist_ok=True)
-        deployed.write_text(expected.content)
+        deployed.write_text(base.content)  # installed journal-only base
         archive = root / "data/logs/proxy_access.log.1"
         archive.write_text("retained archive\n")
         outcome = run_lxc_update(
             "pve-01", "101", ex, settings, api_host="192.168.1.10",
-            cluster="alpha", alloy_config=base,
+            cluster="alpha", alloy_config=base, catalogue=_log_catalogue(),
         )
     assert not outcome.failed
-    assert deployed.read_text() == expected.content
+    content = deployed.read_text()
+    assert content != base.content
+    assert "fleet_npm" in content
     assert archive.read_text() == "retained archive\n"
     assert {p.relative_to(yarn): p.read_bytes() for p in yarn.rglob("*") if p.is_file()} == cache_before
     assert not (tmp_path / "housekeeping.sqlite3").exists()
@@ -1780,8 +2185,18 @@ def test_ordinary_housekeeping_logging_failure_leaves_update_unfailed(monkeypatc
         settings = _upkeep_settings(tmp_path, url=stub.url)
         ex, guest = _upkeep_executor(tmp_path, monkeypatch, yarn=yarn)
         guest.alloy_binary = False               # logging preparation must block
-        out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10", alloy_config=base)
+        installed = base.content + '# installed managed readers\n'
+        deployed = Path(guest.guest_root) / "etc/alloy/config.alloy"
+        deployed.parent.mkdir(parents=True, exist_ok=True)
+        deployed.write_text(installed)
+        out = run_lxc_update(
+            "pve-01", "101", ex, settings, api_host="192.168.1.10",
+            alloy_config=base, catalogue=_log_catalogue(),
+        )
 
+    # A rejected candidate never falls back to the journal-only base: the
+    # installed managed readers survive.
+    assert deployed.read_text() == installed
     # The cache reclamation is real; the logging failure is only a warning and
     # never fails the update or rolls it back.
     assert _measure(yarn) == 0
@@ -1812,7 +2227,10 @@ def test_housekeeping_summary_survives_update_rescue(monkeypatch, tmp_path):
             raise RuntimeError("hard package failure")
 
         ex.lxc_os_update = fail_os
-        out = run_lxc_update("pve-01", "101", ex, settings, api_host="192.168.1.10", alloy_config=base)
+        out = run_lxc_update(
+            "pve-01", "101", ex, settings, api_host="192.168.1.10",
+            alloy_config=base, catalogue=_log_catalogue(),
+        )
 
     assert out.failed is True
     assert ex.rollback_called is True
@@ -1822,6 +2240,140 @@ def test_housekeeping_summary_survives_update_rescue(monkeypatch, tmp_path):
     assert out.record is not None
     assert out.record.housekeeping is not None
     assert out.record.housekeeping.bytes_reclaimed == before
+
+
+def _isolated_policy_guest(tmp_path: Path, monkeypatch, label: str) -> Guest:
+    root = tmp_path / label
+    (root / "data" / "logs").mkdir(parents=True)
+    spool = tmp_path / f"{label}-spool"
+    monkeypatch.setattr(hi, "SPOOL_ROOT", str(spool))
+    guest = Guest(root, spool)
+    guest.name = "sonarr"
+    return guest
+
+
+def _policy_executor_for(guest: Guest) -> "HousekeepingPolicyExecutor":
+    return HousekeepingPolicyExecutor(
+        introspect_facts=_INTROSPECT_NPM,
+        script=_ordinary_script(),
+        lxc_os_result=_ok(stdout="2 upgraded, 0 newly installed"),
+        post_update_facts={"dpkg_hash_after": "hash_before  -\n", "version_after": "1.1"},
+        hk_guest=guest,
+    )
+
+
+def test_logging_desired_config_is_identical_across_update_alloy_and_housekeeping(
+    monkeypatch, tmp_path
+):
+    """The three entry paths carry one selection forward: normal update,
+    --alloy-only and housekeeping-only must deploy byte-identical HCL for the
+    same guest state, with no late journal-base re-render."""
+    from proxmox_fleet.flows import housekeeping as housekeeping_flow
+
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    _stub_github(monkeypatch)
+    catalogue = _log_catalogue()
+
+    with LokiStub() as stub:
+        base = _base(stub.url)
+        normal_guest = _isolated_policy_guest(tmp_path, monkeypatch, "normal")
+        normal_guest.access_ready = False
+        normal_ex = _policy_executor_for(normal_guest)
+        normal = run_lxc_update(
+            "pve-01", "101", normal_ex, _upkeep_settings(tmp_path),
+            api_host="192.168.1.10", alloy_config=base, catalogue=catalogue,
+        )
+        assert normal.failed is False
+
+        alloy_guest = _isolated_policy_guest(tmp_path, monkeypatch, "alloy")
+        alloy_guest.access_ready = False
+        alloy_ex = _policy_executor_for(alloy_guest)
+        alloy = run_lxc_update(
+            "pve-01", "101", alloy_ex, _upkeep_settings(tmp_path),
+            api_host="192.168.1.10", alloy_config=base, catalogue=catalogue,
+            alloy_only=True,
+        )
+        assert alloy.failed is False
+
+        hk_guest = _isolated_policy_guest(tmp_path, monkeypatch, "housekeeping")
+        hk_guest.access_ready = False
+        hk_settings = _upkeep_settings(tmp_path, url=stub.url)
+        _compliant(hk_guest, hk_settings, base)
+        housekeeping = housekeeping_flow.run_lxc_housekeeping(
+            "pve-01", "101", _policy_executor_for(hk_guest),
+            hk_settings, alloy_config=base, catalogue=catalogue,
+        )
+        assert not any(w.notifying for w in housekeeping.warnings)
+
+    for guest in (normal_guest, alloy_guest, hk_guest):
+        assert guest.acl_roots == {"/data/logs"}
+
+    contents = [
+        (Path(guest.guest_root) / "etc/alloy/config.alloy").read_text()
+        for guest in (normal_guest, alloy_guest, hk_guest)
+    ]
+    assert contents[0] == contents[1] == contents[2]
+    assert "fleet_npm" in contents[0]
+    assert contents[0] != base.content
+    assert len({hashlib.sha256(text.encode("utf-8")).hexdigest() for text in contents}) == 1
+
+
+def test_unknown_identity_leaves_installed_alloy_config_untouched(monkeypatch, tmp_path):
+    """No community-script identity is an unsupported finding, not an implicit
+    journal-only deployment: the installed managed readers survive an update."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    _stub_github(monkeypatch)
+    alloy_mod = importlib.import_module("proxmox_fleet.alloy")
+    base = _base("http://127.0.0.1:9")
+    installed = base.content + '# previously managed file sources\n'
+    guest = _isolated_policy_guest(tmp_path, monkeypatch, "unknown")
+    deployed = Path(guest.guest_root) / "etc/alloy/config.alloy"
+    deployed.parent.mkdir(parents=True, exist_ok=True)
+    deployed.write_text(installed)
+
+    def _forbidden(*args, **kwargs):  # pragma: no cover - would fail the test
+        raise AssertionError("unsupported identity must not reconcile Alloy")
+
+    monkeypatch.setattr(alloy_mod, "reconcile_alloy", _forbidden)
+    ex = HousekeepingPolicyExecutor(
+        introspect_facts=_INTROSPECT_NO_SCRIPT,
+        script=_ordinary_script(),
+        lxc_os_result=_ok(stdout="2 upgraded, 0 newly installed"),
+        post_update_facts={"dpkg_hash_after": "hash_before  -\n", "version_after": "1.1"},
+        hk_guest=guest,
+    )
+
+    out = run_lxc_update(
+        "pve-01", "101", ex, _upkeep_settings(tmp_path),
+        api_host="192.168.1.10", alloy_config=base, catalogue=_log_catalogue(),
+    )
+
+    assert out.failed is False
+    assert deployed.read_text() == installed
+    assert any("unsupported" in w.warning for w in out.warnings)
+    assert all(not w.notifying for w in out.warnings)
+
+
+def test_intentional_empty_selection_enforces_base_and_removes_readers(monkeypatch, tmp_path):
+    """auto=false with no additions is an explicit empty selection: the base
+    journal config is enforced (managed readers intentionally removed)."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    _stub_github(monkeypatch)
+    base = _base("http://127.0.0.1:9")
+    guest = _isolated_policy_guest(tmp_path, monkeypatch, "empty")
+    deployed = Path(guest.guest_root) / "etc/alloy/config.alloy"
+    deployed.parent.mkdir(parents=True, exist_ok=True)
+    deployed.write_text(base.content + '# old generated sources\n')
+
+    out = run_lxc_update(
+        "pve-01", "101", _policy_executor_for(guest),
+        _upkeep_settings(tmp_path, alloy_log_plugins_auto=False),
+        api_host="192.168.1.10", alloy_config=base, catalogue=_log_catalogue(),
+    )
+
+    assert out.failed is False
+    assert deployed.read_text() == base.content
+    assert not any("unsupported" in w.warning for w in out.warnings)
 
 
 def test_housekeeping_disabled_never_runs_maintenance(monkeypatch, tmp_path):
