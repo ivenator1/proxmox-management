@@ -1,0 +1,19 @@
+---
+schema_version: 1
+id: prowlarr
+display_name: Proxmox community script prowlarr
+community_script_ids:
+  - prowlarr
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: prowlarr.service
+    sources:
+      - id: application
+        app: prowlarr
+        log_kind: application
+        allowed_roots:
+          - /var/lib/prowlarr/logs
+        paths:
+          - /var/lib/prowlarr/logs/prowlarr.txt

@@ -18,8 +18,9 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 * **Controlled Parallelism:** Updates LXCs across multiple nodes simultaneously to save time, while rebooting physical nodes sequentially to maintain Cluster Quorum and HA stability.
 * **Apt-Proxy Awareness:** Optimized for environments using `apt-cacher-ng`; automatically waits for the proxy service to be online before allowing subsequent nodes to start updates.
 * **Tag-Based Discovery:** Processes LXCs tagged `community-script` or `proxmox-helper-scripts`, plus explicitly configured OS-only containers.
-* **Automatic Alloy Compliance:** Optional desired-state enforcement installs Grafana Alloy from its official apt repository, validates/deploys the guest config, grants journal access, and repairs the service on every managed LXC/VM. `--alloy-only` audits or migrates guests without regular updates or snapshots.
-* **Opt-In Log Housekeeping:** When enabled, managed LXCs get NPM/PBS file-log retention in Loki: a 48-hour (size-capped) local buffer, acknowledged import of all pre-existing file-log history *before* anything is pruned, scoped Alloy file sources, and recurring APT/Yarn/npm/pnpm cache cleanup. `--housekeeping-only` performs that maintenance with no updates, snapshots or reboots, and writes to its own history namespace.
+* **Automatic Alloy Compliance:** Optional desired-state enforcement installs Grafana Alloy from its official apt repository, validates/deploys the guest config, grants journal access (plus scoped file access for selected log sources), and repairs the service on every managed LXC/VM. Managed LXCs additionally get declarative application-log file sources from the packaged catalogue (`proxmox_fleet/log_catalogue/`), auto-selected from the installed community-script identity. `--alloy-only` audits or migrates guests without regular updates or snapshots.
+* **Opt-In Log Housekeeping:** When enabled, managed LXCs get application-log collection in Loki from those per-service manifests: scoped Alloy file readers with scoped `alloy` ACLs, fleet-owned journald caps, and recurring APT/Yarn/npm/pnpm/Bun cache cleanup. Only Nginx Proxy Manager and Proxmox Backup Server keep the acknowledged historical import/archive path and gated 48-hour local file retention; other applications are live-collection only and are never pruned by the fleet. `--housekeeping-only` performs that maintenance with no updates, snapshots or reboots, and writes to its own history namespace.
+* **Bounded Disk Insights:** When the existing low-space warning already fires, the briefing names the largest root-filesystem consumers as shares of the guest's *used* space, excluding every mounted subtree. It is diagnostic only — no new alert, no periodic sweep, and no cleanup entitlement.
 * **Multi-Host Support:** Handles LXC containers, QEMU VMs, non-Proxmox remote hosts, and config-driven custom systems in a single run.
 * **Flexible Backup Strategy:** Choose per-run between lightweight snapshots, full `vzdump` backups (including PBS), both, or none.
 * **Snapshot-Lock Retry:** Transient Proxmox task locks (`CT is locked`) are retried automatically (up to 3 times, 15 s apart by default) before a snapshot failure is recorded as a non-fatal warning.
@@ -35,7 +36,7 @@ The Proxmox Cluster Orchestrator moves maintenance from a manual process to a Ti
 * **Manual-Update Monitoring:** TrueNAS SCALE and OPNsense appliances are *tracked, never auto-updated* — the six-hour `--scan` runs fixed read-only vendor checks, over SSH by default (`midclt` for TrueNAS, `opnsense-version` + `opnsense-update -c` for OPNsense) or optionally over the appliance REST API (`manual_adapter=opnsense_api` / `truenas_scale_api` with per-host `api_url`/`api_key`/`api_secret`/`verify_ssl`). Scans refresh dashboard/reminder state without notifying; due manual attention piggybacks on the next normal fleet briefing. Applying the update always stays a manual GUI action on the appliance.
 * **Run History & Replay:** Every run persists a JSON record to `fleet_history_dir`; `--history [N]` tables recent runs and `--history-show latest` replays a stored briefing.
 * **Fleet Run Lock:** A fleet-wide `flock` guarantees the dashboard trigger, the systemd timer, cron, and manual shell runs can never mutate the fleet concurrently.
-* **Web Dashboard:** Optional `fleet-dashboard` web UI (`pip install -e '.[web]'`, or via `install.sh`) — session-based login (admin account, password set during install), pending updates across the fleet (agentless, PatchMon-style, including community-script app versions), browsable run history with per-host drill-down (plus a separate `/housekeeping` maintenance-history namespace), a run trigger with live console output (SSE), an inventory & enrollment page (add hosts to `hosts.ini`, generate/push/test SSH keys from the browser — no manual `ssh-copy-id` needed), and a comment-preserving `vars.yml` settings editor. Triggered runs launch the CLI as a detached subprocess under the shared fleet run lock.
+* **Web Dashboard:** Optional `fleet-dashboard` web UI (`pip install -e '.[web]'`, or via `install.sh`) — session-based login (admin account, password set during install), pending updates across the fleet (agentless, PatchMon-style, including community-script app versions), browsable run history with per-host drill-down (plus a separate `/housekeeping` maintenance-history namespace), a run trigger with live console output (SSE), an inventory & enrollment page (add hosts to `hosts.ini`, generate/push/test SSH keys from the browser — no manual `ssh-copy-id` needed), and a comment-preserving `vars.yml` settings editor (fields that the structured form cannot represent — `notifiers`, `pve_clusters` and `alloy_log_overrides` — are edited as raw YAML there; per-guest log overrides therefore never need a dashboard code path). Triggered runs launch the CLI as a detached subprocess under the shared fleet run lock.
 * **One-Shot Installer:** `./install.sh` sets up the venv, all dependencies, and reboot-persistent systemd units for the dashboard, the scan timer, and (when enabled) the hourly housekeeping timer; `--update` and `--uninstall` round-trip it.
 
 ## 🐍 Python Control Plane
@@ -66,7 +67,8 @@ pytest tests/unit/ -v
 `driver.run_fleet()` runs the pre-flight apt-proxy check then every phase in order
 (remote → custom → lxc → vm → node + manager → briefing), threading one `FleetState`
 through and dispatching the Discord/ntfy briefing at the end. The decision logic
-lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
+lives in `status.py`/`changes.py`/`deps.py`/`window.py`, application-log
+selection in `log_plugins.py`, bounded low-space diagnostics in `disk_usage.py`, the per-host flows in
 `flows/*.py`, manager-local IO in `http.py`, and the byte-parity briefing in
 `briefing.py`. See `docs/migration-roadmap.md` for the completed migration history.
 
@@ -76,7 +78,7 @@ lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
 * **API Token:** A Proxmox API Token for `root@pam` with "Privilege Separation" unchecked.
 * **proxmoxer ≥ 2.3:** required by the `community.proxmox` collection (2.x); installed into the project venv together with `ansible-core` (step 2 / `install.sh`).
 * **Uptime Kuma:** A Public Status Page (e.g. slug: `proxmox-sg1`) containing the monitors to be validated.
-* **Guest `acl` (only for log housekeeping):** the targeted NPM/PBS guests need the `acl` package installed **once** during initial setup so scoped read/traverse ACLs can be granted to the `alloy` user. Recurring maintenance never installs packages — if `setfacl`/`getfacl` is missing or access cannot be repaired, that profile is reported `Blocked` and its file logs are retained.
+* **Guest `acl` (only for file-based log collection):** every guest whose selected log profile reads files — the audited application and dependency manifests, including the legacy NPM/PBS sources — needs the `acl` package installed **once** during initial setup so scoped read/traverse ACLs can be granted to the `alloy` user. Recurring maintenance never installs packages — if `setfacl`/`getfacl` is missing or access cannot be repaired, that profile is reported `Blocked` and its file logs are retained.
 
 ## 📂 Project Structure
 ```text
@@ -100,7 +102,10 @@ lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
 │   ├── housekeeping_native.py      # Guarded native policy writes and logrotate parsing
 │   ├── housekeeping_retention.py   # Delivery verification and centralized deletion authorization
 │   ├── housekeeping_import.py / housekeeping_checkpoint.py   # Loki acknowledgement, capture and resume
-│   ├── housekeeping_cache.py       # Fixed native cache profiles and successful-clean cadence
+│   ├── housekeeping_cache.py       # Fixed native cache profiles (APT/Yarn/npm/pnpm/Bun) and successful-clean cadence
+│   ├── log_plugins.py              # Catalogue loading/selection, typed guest overrides, include resolution, disk-policy resolution
+│   ├── log_catalogue/              # Packaged declarative service manifests (27 apps + 7 reusable dependencies)
+│   ├── disk_usage.py               # Strict read-only disk-fact parsing and bounded used-space culprit filtering
 │   ├── status.py / changes.py       # Decision trees + change detection
 │   ├── briefing.py / notifiers.py / history.py   # Phase 4 (briefing/notify/history)
 │   ├── scan.py / lock.py            # Read-only pending-updates scan (incl. manual-update state refresh) + fleet-wide run lock
@@ -108,11 +113,11 @@ lives in `status.py`/`changes.py`/`deps.py`/`window.py`, the per-host flows in
 │   ├── manual_updates.py            # Read-only adapter checks: SSH (midclt / opnsense-update -c) + REST-API (*_api) variants
 │   ├── web/                         # fleet-dashboard FastAPI app ('.[web]' extra): pages, run trigger,
 │   │                                # inventory enrollment, SSH key setup, vars.yml settings editor
-│   └── models/                      # Pydantic schemas (config, state, settings)
+│   └── models/                      # Pydantic schemas (config, state, settings, log_plugins)
 ├── ansible/primitives/             # Single-purpose Ansible execution primitives (no logic); includes batched read primitives (lxc_introspect, lxc_post_update)
 ├── configs/                         # custom_update config files (gitignored; *.example committed)
 ├── config_templates/                # Full commented custom_update schema (custom_system.yml.example)
-├── docs/                            # migration-roadmap.md, FEATURE_ROADMAP.md
+├── docs/                            # migration-roadmap.md, FEATURE_ROADMAP.md, application-log-plugins-todo.md
 ├── tests/
 │   ├── requirements.txt             # pytest, pyyaml, web deps for test_web
 │   └── unit/                        # pytest tests — no Ansible or PVE required
@@ -144,7 +149,47 @@ cp configs/guest.alloy.example configs/guest.alloy
 # Edit configs/guest.alloy and replace REPLACE_WITH_LOKI_ENDPOINT.
 ```
 
-Then set `alloy_enabled: true` in `vars.yml`. Add any log receiver or guest with a purpose-specific Alloy config to `lxc_alloy_exclude_list`; use bare IDs fleet-wide or `cluster/ID` for one cluster. `vm_alloy_exclude_list` uses VM inventory names. The example's journal `max_age` defaults to `48h` and can be aligned by the housekeeping retention drop-in; do not add a second journal reader. When log housekeeping is enabled, the per-guest desired config is extended with fleet-managed file sources (the base journal pipeline and stored positions are preserved); `--alloy-only` prepares those sources but runs no cache cleanup or file pruning.
+Then set `alloy_enabled: true` in `vars.yml`. Add any log receiver or guest with a purpose-specific Alloy config to `lxc_alloy_exclude_list`; use bare IDs fleet-wide or `cluster/ID` for one cluster. `vm_alloy_exclude_list` uses VM inventory names. The example's journal `max_age` defaults to `48h` and can be aligned by the housekeeping retention drop-in; do not add a second journal reader.
+
+#### Application-log catalogue (auto and manual selection)
+Managed LXCs get live file sources from declarative YAML manifests in `proxmox_fleet/log_catalogue/` (27 application profiles plus 7 reusable dependency services). Each file declares one stable service ID (the filename stem), its exact community-script identity/aliases, journal-unit evidence, one or more layouts (required/running systemd predicates plus file sources), optional `includes` of reusable dependency services, and optional disk-ratio expectations. Dependencies such as `postgresql`, `rabbitmq`, `redis`, `couchdb`, `valkey`, `openresty` and `synapse-admin` are included by bare ID only when the app's standard installation ships them; includes are one level deep, with app-to-app and dependency-to-dependency edges rejected. Journal-only apps declare unit evidence and no file source; journal-unit entries are coverage evidence, while only layout required/running predicates gate selection (so an optional or normally inactive unit does not block an otherwise valid layout). Manifests contain no shell commands, HCL, templates, downloads or archive/deletion directives. The loader validates the whole graph once per run — unsupported schema versions, duplicate IDs/aliases/components, missing/cyclic includes, unsafe or overlapping roots — before any guest mutation.
+
+Auto selection is the default (`alloy_log_plugins_auto: true`): the guest's installed `/usr/bin/update` script identity selects its profile. There is no hostname, process, service-name or directory-size guessing, and an unidentified app is reported as an unsupported coverage finding while its installed Alloy configuration is left unchanged — select it explicitly to collect its files. A guest with `housekeeping_enabled: false` but a managed Alloy config still gets logging-only preparation on ordinary runs, so installed readers are not erased; it gets no archive, retention or cache work until housekeeping is enabled. `lxc_housekeeping_exclude_list` guests are skipped without rewriting their installed sources.
+
+Manual selection uses typed `alloy_log_overrides` entries. Keys are a full `cluster/node/id` (for example `default/pve01/135`) or a bare numeric id that is unambiguous across the whole discovered fleet — an ambiguous bare key is rejected before any mutation, even under `--limit`, and a full key wins over a bare key for the same guest. This differs deliberately from `--limit` and `housekeeping_timer_targets`, which use the shorter, at-most-two-segment form (bare id or `cluster/id`). Modes:
+
+* `auto` (default) — identity-based selection; may carry source/location/layout adjustments.
+* `replace` — read exactly `plugins` (an empty list means intentionally none; `auto` is ignored).
+* `extend` — automatic selection plus `plugins`, minus `disable_plugins`.
+* `disabled` — no application file readers at all (base journal config only); no other fields.
+
+`disable_plugins` removes a selected root, but an included dependency must be disabled through its qualified sources rather than as a whole plugin (source-less journal-only includes have no source to disable and remain evidence probes). `disable_sources` takes owner-qualified keys: `owner/source` for a root's own source or `owner/dependency/source` for an included one. `locations` maps the same keys to replacement paths confined to that source's own declared `allowed_roots`, audited `alternate_roots` or exact-file list — settings can never widen a root. `layouts` maps a root ID or `owner/dependency` to one of that profile's packaged layout IDs (currently `default`); it is not a raw HCL hook. Unknown IDs, incompatible source keys and out-of-scope locations fail validation.
+
+```yaml
+# vars.yml — no credentials. Override keys are the three-segment form.
+alloy_log_plugins_auto: true
+alloy_log_overrides:
+  "default/pve01/135":
+    mode: auto
+    locations:                              # same plugin, audited alternate root only
+      homepage/application:
+        - /opt/homepage/.next/standalone/config/logs/homepage.log
+  "default/pve01/128":
+    mode: auto
+    disable_sources:                        # qualified included-dependency source
+      - firecrawl/redis/cache-service
+  "default/pve01/109":
+    mode: replace
+    plugins: [prowlarr]                     # only this profile; auto identity ignored
+  "default/pve01/118":
+    mode: disabled                          # journal-only base, no file readers
+```
+
+New services are added by another manifest file, not application-specific Python or Ansible. Packaged manifests may be edited/versioned, but upgrades can replace them; `alloy_log_plugins_dir` is an optional **additive** local directory for extra service IDs whose stem does not collide with a built-in ID — a local file may not silently shadow a packaged profile. Overrides are raw YAML settings: the dashboard's structured settings form does not edit them, so use `vars.yml` directly (or its comment-preserving raw editor). Excluded guests and any override on them remain excluded.
+
+Every candidate HCL string uses the existing escaping path and is validated by the real Alloy binary before any ACL, environment or live-config change. A rejected candidate or stopped/mismatched layout blocks without ACL/environment/live replacement; a missing Alloy binary blocks recurring maintenance, while `--alloy-only` may install it first and re-probe. A dry run reports pending syntax validation instead of staging, installing or repairing. Scoped ACL repair grants traverse-only `alloy:x` on each ancestor up to (but not including) `/`, read/inherit only on dedicated log roots, and read-only on individually audited exact files — never recursive access to an application data directory, another user's home, a database, or world-readable modes. Optional sources whose audited root exists but whose file is not yet present remain configured and quiet; failed enumeration or an unreadable file is never quiet, and an access denial is repaired and re-probed before it can count as configured.
+
+Delivery is not proven by a matching hash, healthy service or successful ACL repair: it requires actual records in Loki for that source (query examples below). The implementation has been exercised against real Alloy/Loki/Bun binaries in an isolated disposable environment; that is not production delivery proof, and this repository change performs no production rollout. Bounds stay explicit: packed records around 200 KiB were accepted in isolated proof, while a 256 KiB line was rejected by Loki's 256 KB limit — local buffering and at-least-once transport are finite, not lossless. See [`docs/application-log-plugins-todo.md`](docs/application-log-plugins-todo.md) for the support matrix, schema details and per-source evidence.
 
 Audit first, then migrate:
 
@@ -157,13 +202,20 @@ Audit first, then migrate:
 Alloy-only mode honors limits, exclusions, VM maintenance windows, and `--force-window`, but takes no snapshots and skips package/app updates, reboots, and Kuma workload checks. A missing/placeholder desired config or unresolved guest drift produces an amber attention notification while the run remains successful (`rc=0`, successful dead-man ping). Once every guest reports compliant, retire the separate `install-alloy-guests.yml` rollout.
 
 ### 🗄️ Log Housekeeping for Managed LXCs (opt-in)
-An opt-in LXC maintenance feature that retains Nginx Proxy Manager (NPM) and Proxmox Backup Server (PBS) file logs in Loki, keeps a short local buffer, and runs recurring cache cleanup. Ordinary LXC runs opt in with `housekeeping_enabled: true` (housekeeping runs before disk warnings, snapshots, and updates so cache reclamation can prevent a storage refusal); `--housekeeping-only` requests the same feature with no update work at all. Enabled settings require `housekeeping_loki_url`: an absolute `http(s)` base with no credentials, query, or fragment. Explicit maintenance without a configured endpoint can still clean eligible caches, but reports blocked logging and never authorizes log deletion. The manager appends `/loki/api/v1/...` itself.
+An opt-in LXC maintenance feature that collects managed LXCs' live application logs in Loki from the declarative catalogue (journal units plus audited log files), keeps fleet-owned journald caps, and runs recurring cache cleanup. Nginx Proxy Manager (NPM) and Proxmox Backup Server (PBS) additionally keep their acknowledged historical import/archive path and gated local file pruning; every other profile is live-collection only. Ordinary LXC runs opt in with `housekeeping_enabled: true` (housekeeping runs before disk warnings, snapshots, and updates so cache reclamation can prevent a storage refusal); `--housekeeping-only` requests the same feature with no update work at all. Enabled settings require `housekeeping_loki_url`: an absolute `http(s)` base with no credentials, query, or fragment. Explicit maintenance without a configured endpoint can still clean eligible caches, but reports blocked logging and never authorizes log deletion. The manager appends `/loki/api/v1/...` itself.
+
+**Archive scope:** only the fixed `npm` and `pbs` archive profiles exist. `npm` stays eligible only while its default complete enabled `nginxproxymanager/application` source is selected; `pbs` only while both default `proxmox-backup-server/tasks` and `/api` sources are selected. Disabling or remapping either legacy source makes that whole profile ineligible: the guest-wide importer and its pending batches pause, and existing checkpoints/inputs are preserved untouched until the profile is restored. New application IDs are never accepted by capture/import/native-rotation/prune paths, and a matched plugin, healthy Alloy reader or successful ACL repair never authorizes file deletion on its own.
 
 The hourly schedule can be enabled independently: `housekeeping_timer_enabled: null` (default) follows `housekeeping_enabled`; explicit `true` enables scheduled maintenance while ordinary fleet housekeeping can remain off, and explicit `false` disables the timer. `housekeeping_timer_targets` selects the scheduled CLI targets (IDs, `cluster/ID`, or inventory node names). An empty list means **whole fleet when enabled**, not disabled. For a staged rollout, leave `housekeeping_enabled: false` and configure only the proved guests as timer targets. Ordinary updates preserve explicitly selected guests' live file sources even while the timer is paused, through logging-only preparation without archival, retention or cache cleanup. An enabled timer with no explicit targets preserves logging fleet-wide; a paused timer with no targets does not.
 
+**Scheduled scope is enrollment, not discovery.** The installed hourly service hard-codes the `--limit` it was generated with, so adding a guest to discovery does not enroll it. A verified production case left Homepage CT135 without pnpm cleanup even on current code: ordinary `housekeeping_enabled` was false and the timer targeted only `default/120,default/123`. To enroll a guest, add it to `housekeeping_timer_targets` (bare or two-segment `cluster/ID` form) and rerun `install.sh --update` so the service's `--limit` is regenerated, then observe a natural scheduled run reclaim its genuinely due cache — a manual `pnpm store prune` or a direct CLI maintenance call is not scheduled-coverage proof. That production change remains a separate, explicitly authorized rollout; this repository change does not modify the installed timer, targets, settings, exclusions or guest configuration.
+
 ```bash
 # Audit intended actions first, then apply — limited to the log guests:
+# (--check reports pending candidate syntax validation; it never stages,
+# installs Alloy, or repairs ACLs.)
 ./fleet-update.py --housekeeping-only --check --limit 120,123
+./fleet-update.py --housekeeping-only --check --limit 109,128   # new-profile audit
 ./fleet-update.py --housekeeping-only --limit 120,123
 ./fleet-update.py --housekeeping-only --check      # fleet-wide audit
 ./fleet-update.py --housekeeping-only              # fleet-wide apply
@@ -173,15 +225,15 @@ The hourly schedule can be enabled independently: `housekeeping_timer_enabled: n
 
 Policy (`vars.yml` → `housekeeping_*`):
 
-* **48 h local retention:** files older than `housekeeping_local_retention_hours` are pruned only after their full current content has acknowledged Loki coverage, their identity/digest is unchanged, no writer/task is active, current permissions and owned policy hashes match, Alloy is healthy with the expected configuration, and Loki readiness currently passes against the verified delivery endpoint. A batch acknowledgement is not frozen-prefix completion; frozen-prefix completion is not current-file coverage. Every initial file prefix must be acknowledged before any file-log pruning begins; until then the run reports `Backfill pending` and resumes on later runs within `housekeeping_backfill_budget_mb` per guest per run.
+* **48 h local file retention (NPM/PBS archive profiles only):** files older than `housekeeping_local_retention_hours` are pruned only after their full current content has acknowledged Loki coverage, their identity/digest is unchanged, no writer/task is active, current permissions and owned policy hashes match, Alloy is healthy with the expected configuration, and Loki readiness currently passes against the verified delivery endpoint. A batch acknowledgement is not frozen-prefix completion; frozen-prefix completion is not current-file coverage. Every initial file prefix must be acknowledged before any file-log pruning begins; until then the run reports `Backfill pending` and resumes on later runs within `housekeeping_backfill_budget_mb` per guest per run.
 * **Hard journald caps:** a fleet-owned drop-in sets `SystemMaxUse`/`SystemKeepFree`/`MaxRetentionSec` from the settings and restarts journald only on drift. `.journal` files are never deleted by hand.
 * **Cache cleanup** runs at most every `housekeeping_cache_interval_hours` (24 h), independently of Loki/backfill health.
 
-**Cache cleanup** uses only fixed allowlisted roots and each native tool's own command — `apt-get clean`, `yarn cache clean`, `npm cache clean --force`, `pnpm store prune` — for APT `/var/cache/apt/archives`; Yarn `/usr/local/share/.cache/yarn` or `/root/.cache/yarn`; npm `/root/.npm`; pnpm `/root/.local/share/pnpm/store`. It never runs autoremove, never deletes browser caches, application dependencies/databases, unsupported or configured roots, and never touches PBS datastores. Busy package/build activity or a failed command leaves that tool's successful cadence unchanged; missing cache directories are simply idle.
+**Cache cleanup** uses only fixed allowlisted roots and each native tool's own command — `apt-get clean`, `yarn cache clean`, `npm cache clean --force`, `pnpm store prune`, and Bun's `bun pm cache prune --max-age 30` — for APT `/var/cache/apt/archives`; Yarn `/usr/local/share/.cache/yarn` or `/root/.cache/yarn`; npm `/root/.npm`; pnpm `/root/.local/share/pnpm/store`; Bun `/root/.bun/install/cache`. Bun is pruned only when the freshly resolved binary's bounded help output advertises the prune command and `--max-age`; the manager runs that validated absolute binary with the cache root pinned in the action environment, and never upgrades Bun or falls back to `bun pm cache rm` (which would break linked projects). It never runs autoremove, never deletes browser caches, application dependencies/build output/databases, unsupported or configured roots, `links/`, git clones or manifests, and never touches PBS datastores. Package/build activity blocks a tool, while a positively identified runtime entrypoint (for example a long-running `.mjs` service) does not permanently self-block pruning. Only a successful native command advances that tool's success cadence (default 24 h) — even with zero measured reclaim; a busy skip, unsupported binary or failure leaves the cadence and files untouched, and missing/empty cache roots stay idle. Bun's reclaim figure is the conservative before/after delta of freeable bytes (unique regular files outside `links/`), so retained hardlinked or linked bytes are never reported as freed.
 
-**Deployment prerequisites (initial only, never recurring):** the affected NPM/PBS guests need the `acl` package so scoped read/traverse ACLs can be granted to the `alloy` user during initial setup — install it once per targeted guest while APT is idle. Recurring maintenance never installs packages: if `setfacl`/`getfacl` is missing, or log access cannot be repaired, that profile reports `Blocked` (and, in standalone mode, the run fails) while its file logs are retained.
+**Deployment prerequisites (initial only, never recurring):** guests selected for file-based collection need the `acl` package so scoped read/traverse ACLs can be granted to the `alloy` user during initial setup — install it once per targeted guest while APT is idle. Recurring maintenance never installs packages: if `setfacl`/`getfacl` is missing, or log access cannot be repaired, that profile reports `Blocked` (and, in standalone mode, the run fails) while its file logs are retained.
 
-Permission verification checks effective access as the `alloy` user and separately requires an inherited named-user ACL with an effective read/traverse mask on every managed log directory. A successful permission-repair command alone never authorizes archival or retention.
+Permission verification checks effective access as the `alloy` user and separately requires an inherited named-user ACL with an effective read/traverse mask on every dedicated managed log root, plus the scoped read ACL on each individually audited exact file (whose parent directories get traverse-only grants, never recursive read). A successful permission-repair command alone never authorizes archival or retention.
 
 Native policy reads are bounded and JSON-framed so transport trimming cannot change line endings, file identity hashes, or the original-rule backup. Logrotate cutover retains the existing writer mechanisms and unrelated policy bytes.
 
@@ -223,15 +275,21 @@ Primitive execution uses transient Ansible Runner directories, removed after res
 
 Capture creation and resume reject symlinked, foreign-owned, or group/other-accessible spool directories. An unsafe spool blocks import rather than resetting checkpoints or removing retained history.
 
-**Querying live vs. archive:** each file source emits two labelled streams — the live Alloy reader (`delivery="live"`, immediate visibility) and the acknowledged importer (`delivery="archive"`, the authoritative retained history). Query them separately to avoid double-counting. Lines are packed JSON, so `| unpack` restores the original log line from `_entry` and exposes `filename`:
+**Querying live vs. archive:** each file source emits a live Alloy reader stream (`delivery="live"`, immediate visibility); only the NPM and PBS archive profiles also emit the acknowledged importer stream (`delivery="archive"`, the authoritative retained history). Query them separately to avoid double-counting. Lines are packed JSON, so `| unpack` restores the original log line from `_entry` and exposes `filename`:
 
 ```logql
-# Live NPM application logs, original log line restored:
-{job="lxc-file", delivery="live", app="nginxproxymanager"} | unpack | line_format "{{.filename}}: {{._entry}}"
+# Live application logs (any selected profile), original log line restored:
+{job="lxc-file", delivery="live", app="prowlarr"} | unpack | line_format "{{.filename}}: {{._entry}}"
 
-# Archived history for one container (survives rotation):
+# Live dependency source: the resolved app label stays the owning profile ID,
+# so use its full source key in per-source tooling and app="firecrawl" here.
+{job="lxc-file", delivery="live", guest_id="128", app="firecrawl", log_kind="cache-service"} | unpack
+
+# Archived history for one container (NPM/PBS profiles only; survives rotation):
 {job="lxc-file", delivery="archive", guest_id="123", app="nginxproxymanager"} | unpack | filename=~"/data/logs/.*"
 ```
+
+A quiet query result is not delivery proof: a source with no observed record remains delivery-unverified even when its Alloy hash, permissions and service state are correct. Conversely, failed enumeration, denied access and an unreachable endpoint are distinct findings, never "quiet".
 
 ### 🔄 Backup Strategy
 * `lxc_backup_strategy`: `snapshot` (default) | `vzdump` | `both` | `none`
@@ -243,6 +301,17 @@ Capture creation and resume reject symlinked, foreign-owned, or group/other-acce
 * `lxc_unattended`: Sets `PHS_SILENT=1` inside containers to suppress interactive prompts.
 * `lxc_disk_warn_percent` / `lxc_disk_min_free_gb`: Disk safety uses both utilization and absolute free space (defaults: 75% and 10 GiB). Large roots with ample free space may pass the community-script 80% guard; genuinely constrained roots remain blocked.
 * `lxc_backup_strategy` / `lxc_auto_reboot` / `lxc_continue_on_error`: See `vars.yml.example` for defaults.
+
+### Low-Space Directory Insights
+When the existing low-space warning already fires (percentage at/above `lxc_disk_warn_percent` **and** less than `lxc_disk_min_free_gb` free; an unknown available-bytes reading keeps the percentage warning), the LXC flow appends one bounded directory breakdown to that same warning. Healthy guests — and guests whose cache reclamation cleared the warning at the post-cleanup refresh — do no diagnostic work. It creates no second warning, no periodic `du` sweep, and no `--scan`/housekeeping-only activity; an idle disk-warning-only state still sends zero notifications.
+
+* **Used-space denominator, not capacity:** each share is allocated bytes over the guest's *used root-filesystem* bytes (a fresh measured root value, falling back to the validated `df` Used figure). `/var/log` consuming 14 GiB of 20 GiB used reports 70% regardless of disk size. A zero/unknown denominator gives an unavailable ratio, while inconsistent totals (measured bytes above the used denominator or a child above its ancestor) return a partial "shares unavailable" result instead of fabricated percentages.
+* **Every mounted subtree is excluded:** the helper walks inside the guest's mount namespace and prunes all descendant mountpoints before opening them — NFS/CIFS, tmpfs, separate local volumes and same-device bind mounts (file or directory) — verifying the root mount through `mountinfo` and open-descriptor mount IDs. Symlinks are never followed. A multi-terabyte network share therefore contributes neither bytes nor a candidate.
+* **Metadata only, bounded:** allocated `st_blocks` are counted once per (device, inode), with no content reads, filenames, atime changes or cleanup. Aggregation covers the full tree but reports depth ≤ 3 plus explicitly requested audited deep prefixes (for example a pnpm store; at most 32, depth 16). Hard limits are 200,000 inspected entries / 15 s worker / 20 s absolute node deadline, two concurrent collectors, at most 1,000 rows and a 1 MiB snapshot; exceeding them returns a partial or unavailable result.
+* **Expected-normal filtering:** a directory is reported only when it is at least the minimum size and its share strictly exceeds its longest-prefix expected cap. Generic fallbacks are 20% of used space, a 256 MiB floor, and a `/usr`: 85% OS-noise heuristic. A selected service profile can declare `disk_usage.default_max_share_percent`, `min_directory_mb` and `path_max_share_percent`; root-explicit default/floor values replace the generic pair, included services contribute caps (maximum at equal paths), and the deepest matching prefix wins. A declared expected-normal subtree measured within its own cap is not reported, though its specifically oversized descendants stay eligible. Packaged examples name Homepage's `/root/.npm` and `/root/.local/share/pnpm/store` at 20% and gitea-mirror's `/root/.bun/install/cache` at 20%.
+* **Disjoint, de-duplicated consumers:** nested eligible paths collapse bottom-up, so a 22% pnpm store below a 40% parent is named alone rather than the parent plus the store again; when the parent still has independently oversized bytes, only the residual is emitted as "other contents under PATH". Direct files in `/` appear as "files directly under /"; `/` is never reported as 100% of itself. At most 20 entries are kept in structured history and 3 are shown in the notification.
+* **Honest degradation:** `complete`, `partial` and `unavailable` are distinct. A partial scan is labelled incomplete and an empty partial result never means "nothing oversized"; malformed, failed or timed-out measurements preserve the original plain warning and never fail the update. Enriched warnings render in a leading, bounded disk block (≤1,600 characters) so a long error log cannot hide them; warnings without an insight keep their byte-identical legacy formatting.
+* **No entitlement:** the breakdown grants no ACL, read scope, deletion or cleanup. It is diagnostic metadata only, and this repository change performs no production rollout. Disk-threshold selection reuses the same identity/override roots but does not require Alloy, Loki or running sources; a missing/unrecognized identity, invalid selection or unavailable catalogue falls back to the generic thresholds with a finding rather than failing an unrelated update.
 
 ### 🛡️ Management & Exclusions
 * `manager_lxc_id`: The VMID of the Manager LXC itself. The node hosting this container is never rebooted automatically.
@@ -532,13 +601,15 @@ flags, and a built-in `--help`. Run it from the project root.
 ```bash
 ./fleet-update.py --housekeeping-only --check            # audit log/cache maintenance, no changes
 ./fleet-update.py --housekeeping-only --check --limit 120,123
+./fleet-update.py --housekeeping-only --check --limit 109,128   # new-profile audit
 ./fleet-update.py --housekeeping-only --limit 120,123    # apply for just these guests
 ./fleet-update.py --housekeeping-only                    # all eligible managed LXCs
 ```
-Log import requires `housekeeping_loki_url`; the feature is normally switched on
+Log collection requires `housekeeping_loki_url`; the feature is normally switched on
 with `housekeeping_enabled: true`. No updates, snapshots, reboots or stopped-container
 starts are performed. Cache cleanup runs independently of import health, while
-file pruning waits for full acknowledged coverage and verified live delivery.
+NPM/PBS file pruning waits for full acknowledged coverage and verified live delivery.
+Other catalogue profiles are live-collection only and are never pruned.
 
 ### Pending-Updates Scan & Run History
 ```bash
@@ -630,7 +701,8 @@ The orchestrator sends one consolidated embed per run:
 * **App status per container:** `Updated: X → Y` (version changed), `UPDATED` (packages changed, no version file), `OK` (nothing changed), `NO SCRIPT` (no community-script update binary), `FAILED`.
 * **OS status per container:** `Updated (N upgraded)` (with package count), `OK`, `SKIPPED` (in `os_update_exclude_list`), `FAILED`.
 * **Alloy status per guest:** `Installed`, `Configured`, or `Service repaired` appears only when remediation changed the guest; compliant guests stay silent.
-* **Housekeeping line per guest:** `Housekeeping: <status> (<reclaimed> reclaimed; <archived> archived)` appears only when a housekeeping summary exists (statuses `Configured`, `Cleaned`, `Backfill pending`, `Blocked`, `Audit`). A housekeeping failure never changes OS/app update status or update counts; standalone maintenance still fails on blocked operations.
+* **Housekeeping line per guest:** `Housekeeping: <status> (<reclaimed> reclaimed; <archived> archived)` appears only when a housekeeping summary exists (statuses `Configured`, `Cleaned`, `Backfill pending`, `Blocked`, `Audit`). A housekeeping failure never changes OS/app update status or update counts; standalone maintenance still fails on blocked operations. Unsupported identities and quiet/denied/missing source findings stay diagnostic and never claim complete coverage.
+* **Disk insight:** an already-existing low-space warning may list up to three oversized consumers with their share of used space and expected limit, in a leading bounded block; a partial/unavailable breakdown is labelled as such. This enriches a warning only — it never triggers a notification by itself.
 * **Quiet maintenance:** routine successful housekeeping-only runs and audits do not send notifications. Failures, notifying warnings and `--force-notify` still do. The complete maintenance result remains in the protected `/housekeeping` history and per-host timeline, without changing update history or dead-man monitoring.
 * **Remote Hosts section:** Listed separately (not tied to a PVE node).
 * **Error Log:** Structured entries showing which host failed, which task failed, and the first 300 characters of stderr.

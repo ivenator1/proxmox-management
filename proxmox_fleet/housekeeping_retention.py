@@ -41,7 +41,18 @@ import urllib.error
 import urllib.parse
 import uuid
 from dataclasses import dataclass, field
-from typing import AbstractSet, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import (
+    AbstractSet,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 from urllib.parse import urlsplit
 
 from proxmox_fleet import http as _http
@@ -111,6 +122,29 @@ _SUPPORTED_OS: frozenset = frozenset({"debian", "ubuntu"})
 _VALID_COMPRESSION = frozenset({"plain", "gzip", "zstd"})
 _VALID_PROFILE = frozenset({"npm", "pbs"})
 _VALID_LOG_KIND = frozenset({"application", "task", "api", "task_index"})
+
+
+def _eligible_archive_profiles(
+    recognized: Iterable[str], archive_profiles: Iterable[str]
+) -> Set[str]:
+    """Legacy archive profiles allowed by both live evidence and the caller.
+
+    ``archive_profiles`` is an immutable caller-owned restriction derived from
+    the resolved logging selection, never a manifest entitlement.  Intersecting
+    every fresh probe with it (and with the fixed archive enum) means a late
+    re-probe can never re-authorize a disabled or remapped legacy source, and
+    non-archive/new-application profile strings can never authorize a file
+    action.
+    """
+    return set(recognized) & set(archive_profiles) & set(_VALID_PROFILE)
+
+
+def _ineligible_archive_warning(profile: str) -> str:
+    return (
+        f"legacy archive profile {profile!r} is outside the selected logging scope; "
+        "file markers, native rotation, quarantine recovery and pruning are paused"
+    )
+
 
 #: The exact detail old builds wrote for a prune whose original path was
 #: missing.  Only this deliberately recorded conflict may be re-observed; every
@@ -680,20 +714,30 @@ def _recovery_spec(
     key: GuestKey,
     intent: PruneIntent,
     warnings: List[str],
+    *,
+    archive_profiles: frozenset[str],
 ) -> Optional[Tuple[PruneIntent, Dict[str, Any]]]:
     """Independent re-observation proof for an unresolved intent.
 
     Returns the wire spec (carrying ``recovery: true``) only when the durable
     source still proves *complete* acknowledged coverage of the exact recorded
     identity in its own canonical namespace, and the recorded quarantine path
-    is the canonical one for the intent's allowlisted path.  Anything unproven
-    (missing record, incomplete/frozen prefix, coverage conflict, identity
-    drift, protected name, foreign quarantine path) is refused: the helper must
-    never be told this is a recovery it may resolve as an absence.
+    is the canonical one for the intent's allowlisted path.  The durable
+    source's legacy profile must also remain inside the caller's immutable
+    archive restriction: disabling or remapping that source can never turn a
+    fresh probe into recovery authority.  Anything unproven (ineligible
+    profile, missing record, incomplete/frozen prefix, coverage conflict,
+    identity drift, protected name, foreign quarantine path) is refused: the
+    helper must never be told this is a recovery it may resolve as an absence.
     """
     record = store.source(key, intent.source_id) if intent.source_id else None
     if record is None:
         warnings.append("unresolved prune intent has no durable source record; retained")
+        return None
+    if record.profile not in _VALID_PROFILE or record.profile not in archive_profiles:
+        warnings.append(
+            f"unresolved prune intent profile {record.profile!r} is not eligible; retained"
+        )
         return None
     provenance = SourceProvenance.parse(record.provenance)
     canonical = provenance.canonical_path or record.path
@@ -1057,7 +1101,9 @@ def _emit_and_query_markers(
         journal_ok=journal_ok,
         file_ok=all(file_ok.values()),
         journal_ns=emitted_ns if journal_ok else None,
-        file_ns=emitted_ns if file_ok and all(file_ok.values()) else None,
+        # A journal-only verification must never persist a file-marker proof:
+        # enabling a legacy archive profile later has to require a real marker.
+        file_ns=emitted_ns if file_markers and all(file_ok.values()) else None,
         warnings=local,
     )
 
@@ -1162,14 +1208,21 @@ def _authorize_deletion(
     probe: HousekeepingProbe,
     required_hashes: Dict[str, str],
     *,
+    archive_profiles: frozenset[str],
     covered_files: Sequence[Dict[str, Any]] = (),
     owned_deletions: AbstractSet[_OwnedDeletion] = frozenset(),
     now_ns: int,
 ) -> _DeletionAuthorization:
-    """One fail-closed policy decision; the helper still checks filesystem races."""
+    """One fail-closed policy decision; the helper still checks filesystem races.
+
+    ``archive_profiles`` is the caller's immutable legacy-archive restriction.
+    Every probe here (including internal fresh re-probes) is intersected with
+    it before ACL/delivery/candidate decisions, so a late re-probe can never
+    re-authorize a disabled or remapped source.
+    """
     if not probe.is_running or probe.is_template or probe.os_type not in _SUPPORTED_OS:
         return _DeletionAuthorization(blocked="guest is not an eligible running Debian guest")
-    recognized = set(probe.recognized)
+    recognized = _eligible_archive_profiles(probe.recognized, archive_profiles)
     if recognized and not probe.log_access_ready:
         return _DeletionAuthorization(blocked="scoped live-log permissions are not verified")
     if _endpoint_conflict(settings, effective_alloy) is not None:
@@ -1251,6 +1304,7 @@ def apply_guest_retention(
     probe: HousekeepingProbe,
     effective_alloy: DesiredAlloyConfig,
     *,
+    archive_profiles: frozenset[str],
     covered_files: Sequence[Dict[str, Any]],
     dry_run: bool = False,
     sleep: Callable[[float], None] = time.sleep,
@@ -1258,12 +1312,23 @@ def apply_guest_retention(
 ) -> RetentionResult:
     """Tighten local retention and prune acknowledged closed file logs.
 
+    ``archive_profiles`` is the required immutable legacy-archive eligibility
+    derived from the resolved default-complete logging selection.  It further
+    restricts every live/fresh probe's recognized profiles for file markers,
+    NPM rotation, quarantine recovery and pruning; an empty set leaves only the
+    independently gated journald policy/vacuum work.  A profile that is
+    recognized by the probe but absent from this set is never pruned, and its
+    pending quarantine intents stay untouched for a later authorized run.
+
     Returns explicit findings; nothing is tightened, vacuumed or pruned until
     the initial manifest is fully acknowledged, the endpoint is confirmed ready
     and a matching real delivery verification exists.  A dry run only reports
     what it would do and never emits markers, writes policy, vacuums, prunes or
     mutates the checkpoint.
     """
+    # Freeze once for the entire run so no caller-side or re-probe-side change
+    # can widen the restriction while batches/retention steps are in flight.
+    archive_profiles = frozenset(archive_profiles)
     warnings: List[str] = list(probe.warnings)
     if not probe.is_running or probe.is_template:
         return RetentionResult(
@@ -1273,6 +1338,9 @@ def apply_guest_retention(
         )
 
     recognized = set(probe.recognized)
+    eligible = _eligible_archive_profiles(recognized, archive_profiles)
+    for profile in sorted(recognized - eligible):
+        warnings.append(_ineligible_archive_warning(profile))
     name = probe.name or key.lxc_id
 
     try:
@@ -1312,7 +1380,7 @@ def apply_guest_retention(
     )
     manifest_error = _manifest_gate(manifest)
     acl_error: Optional[str] = None
-    if recognized:
+    if eligible:
         if not probe.log_access_ready:
             acl_error = (
                 "Alloy lacks confirmed scoped read access to the managed log trees; "
@@ -1329,7 +1397,7 @@ def apply_guest_retention(
             settings=settings,
             key=key,
             name=name,
-            recognized=recognized,
+            recognized=eligible,
             probe=probe,
             effective_alloy=effective_alloy,
             covered_files=covered_files,
@@ -1380,7 +1448,7 @@ def apply_guest_retention(
         stored,
         effective_alloy_sha256=effective_alloy.sha256,
         policy_hashes=hashes,
-        recognized=recognized,
+        recognized=eligible,
     )
     outcome: Optional[_VerificationOutcome] = None
     if not reused:
@@ -1389,7 +1457,7 @@ def apply_guest_retention(
             settings,
             key,
             name,
-            recognized,
+            eligible,
             base_url,
             retention_hours=int(settings.housekeeping_local_retention_hours),
             probe_files=probe.files,
@@ -1440,7 +1508,7 @@ def apply_guest_retention(
 
     # -- NPM hourly rotation cutover ---------------------------------------- #
     npm_managed_content: Optional[str] = None
-    if "npm" in recognized:
+    if "npm" in eligible:
         npm_changed, npm_managed_content, npm_error = _apply_npm_cutover(
             executor, key
         )
@@ -1464,6 +1532,7 @@ def apply_guest_retention(
             ]), failed=True,
         )
     current_hashes = filter_policy_hashes(probe_for_prune.policy_sha256)
+    fresh_eligible = _eligible_archive_profiles(probe_for_prune.recognized, archive_profiles)
     required_hashes = {
         "journald": desired_journald,
         "alloy_env": _sha256_text(journal_env_content(settings.housekeeping_local_retention_hours)),
@@ -1476,7 +1545,7 @@ def apply_guest_retention(
         ]), failed=True)
     if outcome is None and current_hashes != hashes:
         outcome = _emit_and_query_markers(
-            executor, settings, key, name, recognized, base_url,
+            executor, settings, key, name, fresh_eligible, base_url,
             retention_hours=int(settings.housekeeping_local_retention_hours),
             probe_files=probe_for_prune.files, sleep=sleep, clock_ns=clock_ns,
             warnings=warnings,
@@ -1492,15 +1561,16 @@ def apply_guest_retention(
             return RetentionResult(changed=changed, warnings=_dedup(warnings + [persist_error]), failed=True)
     if not verification_reused(
         store.delivery_verification(key), effective_alloy_sha256=effective_alloy.sha256,
-        policy_hashes=current_hashes, recognized=recognized,
-    ) or (recognized and not probe_for_prune.log_access_ready):
+        policy_hashes=current_hashes, recognized=fresh_eligible,
+    ) or (fresh_eligible and not probe_for_prune.log_access_ready):
         return RetentionResult(changed=changed, warnings=_dedup(warnings + [
             "current delivery verification or scoped permissions do not match; deletion paused"
         ]), failed=True)
 
     for command in native.journal_vacuum_commands(settings):
         authorization = _authorize_deletion(
-            executor, store, key, settings, effective_alloy, probe_for_prune, required_hashes, now_ns=int(clock_ns())
+            executor, store, key, settings, effective_alloy, probe_for_prune, required_hashes,
+            archive_profiles=archive_profiles, now_ns=int(clock_ns()),
         )
         if authorization.blocked is not None:
             return RetentionResult(changed=changed, warnings=_dedup(warnings + [
@@ -1519,8 +1589,9 @@ def apply_guest_retention(
         ]), failed=True)
     bytes_reclaimed += max(probe.journal_bytes - after_vacuum.journal_bytes, 0)
     changed |= bytes_reclaimed > 0
+    after_eligible = _eligible_archive_profiles(after_vacuum.recognized, archive_profiles)
     if current_hashes != filter_policy_hashes(after_vacuum.policy_sha256) or (
-        recognized and not after_vacuum.log_access_ready
+        after_eligible and not after_vacuum.log_access_ready
     ):
         return RetentionResult(changed=changed, bytes_reclaimed=bytes_reclaimed,
             warnings=_dedup(warnings + ["policy or scoped permissions changed during vacuum; file pruning paused"]),
@@ -1528,6 +1599,7 @@ def apply_guest_retention(
     probe_for_prune = after_vacuum
     authorization = _authorize_deletion(
         executor, store, key, settings, effective_alloy, probe_for_prune, required_hashes,
+        archive_profiles=archive_profiles,
         covered_files=covered_files, owned_deletions=owned_deletions, now_ns=int(clock_ns()),
     )
     if authorization.blocked is not None:
@@ -1547,6 +1619,21 @@ def apply_guest_retention(
         chunk = open_intents[offset:offset + 128]
         recovery_batch: List[Tuple[PruneIntent, Dict[str, Any]]] = []
         for intent in chunk:
+            record = store.source(key, intent.source_id) if intent.source_id else None
+            intent_profile: Optional[str] = record.profile if record is not None else None
+            if intent_profile is not None and (
+                intent_profile not in _VALID_PROFILE
+                or intent_profile not in archive_profiles
+            ):
+                # A disabled/remapped legacy source is ineligible for every file
+                # action.  Keep the intent (and any quarantine) untouched so a
+                # later authorized selection can still recover it; never let a
+                # fresh probe substitute for the immutable restriction.
+                new_warnings.append(
+                    f"recovery of {intent.path} is paused until its legacy archive "
+                    f"profile {intent_profile!r} is eligible again"
+                )
+                continue
             if intent.mtime_ns >= cutoff_ns:
                 # Current retention no longer covers this file (e.g. the window
                 # was lengthened).  Keep the intent and any quarantine for a
@@ -1557,7 +1644,9 @@ def apply_guest_retention(
                     f"{int(settings.housekeeping_local_retention_hours)}h retention cutoff"
                 )
                 continue
-            spec_pair = _recovery_spec(store, key, intent, new_warnings)
+            spec_pair = _recovery_spec(
+                store, key, intent, new_warnings, archive_profiles=archive_profiles
+            )
             if spec_pair is None:
                 if intent.state == "pending":
                     # An in-flight intent we cannot prove must fail closed: a
@@ -1587,6 +1676,7 @@ def apply_guest_retention(
             )
         recovery_gate = _authorize_deletion(
             executor, store, key, settings, effective_alloy, current_probe, required_hashes,
+            archive_profiles=archive_profiles,
             owned_deletions=owned_deletions, now_ns=int(clock_ns()),
         )
         if recovery_gate.blocked is not None:
@@ -1622,6 +1712,7 @@ def apply_guest_retention(
             ]), failed=True)
     authorization = _authorize_deletion(
         executor, store, key, settings, effective_alloy, probe_for_prune, required_hashes,
+        archive_profiles=archive_profiles,
         covered_files=covered_files, owned_deletions=owned_deletions, now_ns=int(clock_ns()),
     )
     if authorization.blocked is not None:
@@ -1641,6 +1732,7 @@ def apply_guest_retention(
                 ]), failed=True)
         batch_gate = _authorize_deletion(
             executor, store, key, settings, effective_alloy, current_probe, required_hashes,
+            archive_profiles=archive_profiles,
             covered_files=candidates[offset:offset + 128], owned_deletions=owned_deletions,
             now_ns=int(clock_ns()),
         )

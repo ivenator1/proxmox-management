@@ -1,0 +1,15 @@
+---
+schema_version: 1
+id: searxng
+display_name: Proxmox community script searxng
+community_script_ids:
+  - searxng
+journal_units:
+  - name: searxng.service
+includes:
+  - valkey
+layouts:
+  - id: default
+    required_units:
+      - name: searxng.service
+    sources: []

@@ -1,0 +1,19 @@
+---
+schema_version: 1
+id: sonarr
+display_name: Proxmox community script sonarr
+community_script_ids:
+  - sonarr
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: sonarr.service
+    sources:
+      - id: application
+        app: sonarr
+        log_kind: application
+        allowed_roots:
+          - /var/lib/sonarr/logs
+        paths:
+          - /var/lib/sonarr/logs/sonarr.txt

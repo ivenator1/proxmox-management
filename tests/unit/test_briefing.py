@@ -16,12 +16,17 @@ import pytest
 from proxmox_fleet.briefing import (
     briefing_title,
     discord_color,
+    format_disk_usage_warning,
     ntfy_title,
     prepare_body,
     render_briefing,
     should_notify,
 )
-from proxmox_fleet.models.state import FleetState
+from proxmox_fleet.models.state import (
+    DiskUsageEntry,
+    DiskUsageInsight,
+    FleetState,
+)
 
 GOLDEN_PATH = pathlib.Path(__file__).parent / "data" / "briefing_golden.json"
 
@@ -321,6 +326,203 @@ def test_prepare_body_truncates_to_4000():
     assert len(body) <= 4000
     assert body.endswith("\n...")
 
+
+# --------------------------------------------------------------------------- #
+# Disk-space insight: compact formatter + leading priority block
+# --------------------------------------------------------------------------- #
+
+def _disk_entry(
+    path="/var/log",
+    allocated_bytes=14 * 1024**3,
+    share_percent=70.0,
+    max_expected_share_percent=20.0,
+    kind="directory",
+):
+    return DiskUsageEntry(
+        path=path,
+        allocated_bytes=allocated_bytes,
+        share_percent=share_percent,
+        max_expected_share_percent=max_expected_share_percent,
+        kind=kind,
+    )
+
+
+def _disk_insight(status="complete", *, used_bytes=20 * 1024**3, entries=None,
+                  omitted=0, detail=""):
+    return DiskUsageInsight(
+        status=status,
+        used_bytes=used_bytes,
+        entries=[_disk_entry()] if entries is None else entries,
+        omitted=omitted,
+        detail=detail,
+    )
+
+
+def _enriched_warning(base="LXC 135 disk space low: 91% used (2.0 GiB free)", *,
+                      host="pve-01/135", task="disk space", insight=None):
+    insight = insight or _disk_insight()
+    return dict(
+        host=host,
+        task=task,
+        warning=format_disk_usage_warning(base, insight),
+        disk_usage=insight.model_dump(),
+    )
+
+
+def test_disk_usage_warning_appends_numeric_oversized_entries_only():
+    base = "LXC 135 disk space low: 91% used (2.0 GiB free)"
+    # The ratio filter upstream supplies only qualifying consumers; the
+    # formatter must not invent small entries of its own.
+    insight = _disk_insight(entries=[_disk_entry("/var/log", 14 * 1024**3, 70.0)])
+    text = format_disk_usage_warning(base, insight)
+    assert text.startswith(base)
+    assert "`/var/log`: 14.0 GiB (70% of used; limit 20%)" in text
+    assert "/var/cache" not in text
+    assert len(text) <= 512
+    assert not text.endswith("\n")
+    # The structured insight keeps every measured entry; display filtered only.
+    assert [entry.path for entry in insight.entries] == ["/var/log"]
+
+
+def test_disk_usage_warning_shows_at_most_three_entries_and_omitted_count():
+    entries = [_disk_entry(f"/var/log/app{index}", 1024**3, 10.0) for index in range(5)]
+    insight = _disk_insight(entries=entries)
+    text = format_disk_usage_warning("Disk space low", insight)
+    assert text.count("`/var/log/app") == 3
+    assert "more oversized director" in text
+    assert len(text) <= 512
+    assert len(insight.entries) == 5
+
+
+def test_disk_usage_warning_sanitizes_and_clips_display_paths():
+    dirty_path = "/var/log/" + "x" * 100 + "`\n" + "tail"
+    insight = _disk_insight(entries=[_disk_entry(dirty_path, 2 * 1024**3, 40.0)])
+    text = format_disk_usage_warning("Disk space low", insight)
+    assert "\n" not in text
+    assert dirty_path not in text
+    assert text.count("`") == 2       # exactly the code span around the label
+    assert "…" in text
+    assert len(text) <= 512
+    assert insight.entries[0].path == dirty_path
+
+
+def test_disk_usage_warning_labels_residual_and_root_file_kinds():
+    insight = _disk_insight(entries=[
+        _disk_entry("/var", 6 * 1024**3, 30.0, kind="directory-other"),
+        _disk_entry("/", 2 * 1024**3, 10.0, kind="root-files"),
+    ])
+    text = format_disk_usage_warning("Disk space low", insight)
+    assert "`other contents under /var`" in text
+    assert "`files directly under /`" in text
+
+
+def test_disk_usage_warning_partial_is_labelled_incomplete():
+    text = format_disk_usage_warning(
+        "Disk space low",
+        _disk_insight(status="partial", entries=[_disk_entry()]),
+    )
+    assert "incomplete" in text
+    assert "no dominant" not in text
+
+
+def test_disk_usage_warning_unavailable_uses_bounded_reason_without_entries():
+    insight = _disk_insight(
+        status="unavailable",
+        used_bytes=None,
+        entries=[_disk_entry()],
+        detail="mount table missing",
+    )
+    text = format_disk_usage_warning("Disk space low", insight)
+    assert "unavailable" in text
+    assert "mount table missing" in text
+    assert "/var/log" not in text
+    assert len(text) <= 512
+    assert not text.endswith("\n")
+
+
+def test_disk_usage_warning_quiet_complete_scan_has_short_note():
+    text = format_disk_usage_warning("Disk space low", _disk_insight(entries=[]))
+    assert "no dominant" in text
+
+
+def test_disk_usage_warning_includes_policy_detail_without_second_warning():
+    text = format_disk_usage_warning(
+        "Disk space low",
+        _disk_insight(entries=[], detail="generic disk thresholds"),
+    )
+    assert "generic disk thresholds" in text
+    assert text.count("Disk space low") == 1
+
+
+def test_disk_usage_warning_total_budget_with_long_paths():
+    entries = [
+        _disk_entry("/var/" + "z" * 70 + str(index), 5 * 1024**3, 25.0)
+        for index in range(3)
+    ]
+    text = format_disk_usage_warning("Disk space low", _disk_insight(entries=entries))
+    assert len(text) <= 512
+    assert text.startswith("Disk space low")
+    assert not text.endswith("\n")
+    assert text.count(" of used; limit ") <= 3
+
+
+def test_enriched_warning_priority_block_precedes_errors_and_survives_truncation():
+    warning = _enriched_warning()
+    state = _state(
+        fleet_error_log=[dict(host="pve-01/lxc-135", task="App update", error="E" * 5000)],
+        fleet_warning_log=[
+            warning,
+            dict(host="pve-01/lxc-120", task="Snapshot 120", warning="snapshot failed"),
+        ],
+    )
+    before = state.model_dump()
+    out = render_briefing(state)
+
+    assert out.startswith("**⚠️ Disk space**")
+    assert out.index("**⚠️ Disk space**") < out.index("**Error Log:**")
+    assert out.count("`/var/log`") == 1
+    assert "**⚠️ Warnings**" in out
+    assert "snapshot failed" in out
+
+    body = prepare_body(state)
+    assert body.startswith("**⚠️ Disk space**")
+    assert "`/var/log`" in body
+    assert len(body) <= 4000
+
+    # Rendering must not mutate state or drop unabridged metadata.
+    assert state.model_dump() == before
+    assert state.warnings[0].disk_usage.entries[0].path == "/var/log"
+    assert state.warnings[0].disk_usage.entries[0].allocated_bytes == 14 * 1024**3
+
+
+def test_disk_only_warning_has_no_generic_warnings_heading():
+    out = render_briefing(_state(fleet_warning_log=[_enriched_warning()]))
+    assert out.startswith("**⚠️ Disk space**")
+    assert "**⚠️ Warnings**" not in out
+    assert out.count("LXC 135 disk space low") == 1
+
+
+def test_legacy_warning_without_disk_usage_keeps_historical_bytes():
+    out = render_briefing(_state(fleet_warning_log=[dict(host="y", task="u", warning="w")]))
+    assert out == "\n\n**⚠️ Warnings**\n- **y** at `u`: w"
+    assert "**⚠️ Disk space**" not in out
+
+
+def test_disk_priority_block_is_bounded_and_reports_history_count():
+    warnings = [
+        _enriched_warning(
+            base="LXC %d disk space low: %s" % (index, "x" * 430),
+            host=f"pve-01/{index}",
+        )
+        for index in range(6)
+    ]
+    state = _state(fleet_warning_log=warnings)
+    out = render_briefing(state)
+    assert len(out) <= 1600
+    assert out.startswith("**⚠️ Disk space**")
+    assert "more disk warning" in out
+    assert out.count("disk space low") <= 3
+    assert len(state.warnings) == 6
 
 # --------------------------------------------------------------------------- #
 # GOLDEN parity test — render_briefing == captured discord_briefing.j2 bytes

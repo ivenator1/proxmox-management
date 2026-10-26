@@ -1,0 +1,14 @@
+---
+schema_version: 1
+id: obsidian-livesync
+display_name: Proxmox community script obsidian-livesync
+community_script_ids:
+  - obsidian-livesync
+journal_units: []
+includes:
+  - couchdb
+layouts:
+  - id: default
+    required_units:
+      - name: couchdb.service
+    sources: []

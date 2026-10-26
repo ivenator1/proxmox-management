@@ -1,0 +1,19 @@
+---
+schema_version: 1
+id: technitiumdns
+display_name: Proxmox community script technitiumdns
+community_script_ids:
+  - technitiumdns
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: technitium.service
+    sources:
+      - id: application
+        app: technitiumdns
+        log_kind: application
+        allowed_roots:
+          - /var/log/technitium/dns
+        paths:
+          - /var/log/technitium/dns/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].log

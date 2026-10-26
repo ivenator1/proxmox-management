@@ -12,7 +12,7 @@ import sys
 import threading
 import urllib.parse
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 import pytest
 
@@ -27,6 +27,10 @@ from proxmox_fleet.runner import PrimitiveResult
 KEY = GuestKey("cluster", "node", "123")
 NOW = 1_800_000_000_000_000_000
 DAY = 86_400_000_000_000
+#: Explicit default-complete legacy manifests used by retention tests.  Every
+#: test passes an eligibility value; no production signature defaults to this.
+LEGACY_ARCHIVE_PROFILES = frozenset({"npm", "pbs"})
+
 TASK = "/var/log/proxmox-backup/tasks/AB/UPID:node:00000001:00000002:00000003:verify:root@pam:"
 NATIVE = """# unrelated policy must survive byte-for-byte
 /var/log/unrelated.log {
@@ -78,6 +82,7 @@ class Guest:
         self.vacuum_bytes = None
         self.journal: List[str] = []
         self.native_stdout: List[str] = []
+        self.native_writes: List[str] = []
         self.pruned: List[List[str]] = []
         self.prune_calls = 0
         self.prune_fail_at = None
@@ -127,7 +132,7 @@ class Guest:
                     result.append(self.wire("/" + str(path.relative_to(self.root))))
         return result
 
-    def housekeeping_probe(self, lxc_id):
+    def housekeeping_probe(self, lxc_id, *, logging_request=None):
         if self.before_probe:
             self.before_probe(self)
         if self.probe_failure_after_write and self.path(native.JOURNALD_DROPIN).exists():
@@ -148,7 +153,8 @@ class Guest:
                      journal_bytes=self.journal_bytes, profiles=sorted(self.profiles), files=self.files(),
                      cache_paths={}, busy_tools=[], binaries=binaries,
                      log_access_ready=self.access, log_access_detail=dict(alloy_user=True, dirs={}, files={}),
-                     policy_sha256=hashes, profile_evidence=evidence)
+                     policy_sha256=hashes, profile_evidence=evidence,
+                     logging={"plugins": {}, "sources": {}})
         return PrimitiveResult(rc=0, facts=facts)
 
     def housekeeping_apply(self, lxc_id, *, command):
@@ -164,6 +170,8 @@ class Guest:
                 return PrimitiveResult(rc=0)
             if program == native._WRITE_PROGRAM and self.acknowledge_without_write:
                 return PrimitiveResult(rc=0)
+            if program == native._WRITE_PROGRAM:
+                self.native_writes.append(parts[3])
             mapped = [sys.executable, "-c", program, str(self.path(parts[3])), *parts[4:]]
             result = subprocess.run(mapped, capture_output=True, text=True, check=False)
             if program == retention._NATIVE_LOG_PROGRAM:
@@ -192,6 +200,28 @@ class Guest:
         if self.after_prune:
             self.after_prune(self)
         return PrimitiveResult(rc=0, facts=result)
+
+    def housekeeping_log_acl(
+        self,
+        lxc_id: str,
+        *,
+        roots: Sequence[str] = (),
+        exact_files: Sequence[str] = (),
+    ) -> PrimitiveResult:
+        changed = bool(tuple(roots) or tuple(exact_files))
+        return PrimitiveResult(
+            rc=0,
+            changed=changed,
+            facts={
+                "status": "complete",
+                "changed": changed,
+                "repaired_roots": len(tuple(roots)),
+                "repaired_files": len(tuple(exact_files)),
+                "skipped_missing": 0,
+                "error_count": 0,
+                "reason": "",
+            },
+        )
 
     def alloy_probe(self, *, lxc_id=None):
         configuration = self.path("/etc/alloy/config.alloy")
@@ -303,7 +333,11 @@ def setup(store, guest, name="/data/logs/proxy_access.log.1", *, acknowledge=Tru
     return {**wire, "source_id": name, "sha256": digest}
 
 
-def run(guest, store, loki, covered=(), *, dry_run=False, retention_hours=48):
+def run(
+    guest, store, loki, covered=(), *,
+    archive_profiles: frozenset[str] = LEGACY_ARCHIVE_PROFILES,
+    dry_run=False, retention_hours=48,
+):
     settings = GlobalSettings(
         housekeeping_enabled=True,
         housekeeping_loki_url=loki.url,
@@ -312,13 +346,20 @@ def run(guest, store, loki, covered=(), *, dry_run=False, retention_hours=48):
     content = ('loki.write "default" { endpoint { url = "' + loki.url + '/loki/api/v1/push" } }\n'
                'loki.source.journal "journal" { max_age = coalesce(sys.env("FLEET_JOURNAL_MAX_AGE"), "48h") }\n')
     base = DesiredAlloyConfig(content=content, sha256=sha(content.encode()))
-    effective = housekeeping.render_lxc_log_config(base, node=KEY.node, cluster=KEY.cluster,
-        lxc_id=KEY.lxc_id, name="guest", profiles=guest.profiles, retention_hours=retention_hours)
+    # Retention policy consumes the resolved selection, not renderer internals;
+    # file-source rendering/content ordering is covered by test_alloy.py.
+    effective = housekeeping.render_lxc_log_config(
+        base, node=KEY.node, cluster=KEY.cluster, lxc_id=KEY.lxc_id,
+        name="guest", sources=(), retention_hours=retention_hours,
+    )
     if not guest.path("/etc/alloy/config.alloy").exists() and not dry_run:
         guest.put("/etc/alloy/config.alloy", effective.content)
     probe = housekeeping.probe_housekeeping(guest, KEY.lxc_id)
-    return retention.apply_guest_retention(guest, settings, store, KEY, probe, effective,
-        covered_files=list(covered), dry_run=dry_run, sleep=lambda _: None, clock_ns=lambda: NOW)
+    return retention.apply_guest_retention(
+        guest, settings, store, KEY, probe, effective,
+        archive_profiles=archive_profiles,
+        covered_files=list(covered), dry_run=dry_run, sleep=lambda _: None, clock_ns=lambda: NOW,
+    )
 
 
 @pytest.fixture
@@ -389,6 +430,109 @@ def test_deletion_is_fail_closed_at_each_authorization_seam(guest, store, fault)
     assert not guest.pruned
     if fault != "initial":
         assert result.failed
+
+
+@pytest.mark.parametrize(
+    ("profiles", "path", "archive_profiles"),
+    [
+        (("npm",), "/data/logs/proxy_access.log.1", frozenset()),
+        (("npm",), "/data/logs/proxy_access.log.1", frozenset({"pbs"})),
+        (("npm",), "/data/logs/proxy_access.log.1", frozenset({"grafana"})),
+        (("pbs",), TASK, frozenset()),
+        (("pbs",), TASK, frozenset({"npm"})),
+    ],
+)
+def test_ineligible_legacy_profile_never_rotates_or_prunes(
+    tmp_path: Path, store: CheckpointStore, profiles, path, archive_profiles,
+):
+    """A recognized legacy source outside the immutable selection stays read-only.
+
+    Empty and wrong-profile restrictions must both preserve the acknowledged
+    file; the probe repeatedly observes a full profile/filesystem, so only the
+    caller's eligibility can explain the refusal.
+    """
+    root = tmp_path / "ineligible"
+    root.mkdir()
+    guest = Guest(root, profiles=profiles)
+    coverage = setup(store, guest, path)
+    pending_intent(store, coverage)
+    before = guest.path(path).read_bytes()
+    with Loki(guest) as loki:
+        result = run(guest, store, loki, [coverage], archive_profiles=archive_profiles)
+    assert result.failed is False
+    assert result.files_pruned == 0
+    assert result.bytes_reclaimed == 0
+    assert guest.pruned == []
+    assert guest.path(path).read_bytes() == before
+    assert not guest.path(retention.quarantine_path_for(path)).exists()
+    # Journald policy/vacuum remains independently gated and operative.
+    assert guest.path(native.JOURNALD_DROPIN).exists()
+    profile = profiles[0]
+    assert any(profile in warning and "paused" in warning for warning in result.warnings)
+    verification = store.delivery_verification(KEY)
+    assert verification is not None
+    assert verification.journal_marker_ns is not None
+    # A journal-only proof must not be reusable as a file-marker proof.
+    assert verification.file_marker_ns is None
+    if profile == "npm":
+        assert not guest.path(native.NPM_LOGROTATE_BACKUP).exists()
+        assert not guest.path(native.NPM_LOGROTATE_MANAGED).exists()
+        assert guest.path(native.NPM_LOGROTATE_ORIGINAL).read_text() == NATIVE
+        assert not any(
+            path.startswith(retention.NPM_LOG_DIR + "/" + retention.NPM_MARKER_PREFIX)
+            for path in guest.native_writes
+        )
+
+
+@pytest.mark.parametrize(
+    ("profiles", "path", "archive_profiles"),
+    [
+        (("npm",), "/data/logs/proxy_access.log.1", frozenset()),
+        (("pbs",), TASK, frozenset({"npm"})),
+    ],
+)
+def test_ineligible_pending_quarantine_intent_is_preserved(
+    tmp_path: Path, store: CheckpointStore, profiles, path, archive_profiles,
+):
+    """Crash-resume state survives an ineligible selection without resolution."""
+    root = tmp_path / "ineligible-recovery"
+    root.mkdir()
+    guest = Guest(root, profiles=profiles)
+    coverage = setup(store, guest, path)
+    pending_intent(store, coverage)
+    source_before = store.source(KEY, coverage["source_id"])
+    manifest_before = store.initial_manifest_state(KEY)
+    quarantine = retention.quarantine_path_for(path)
+    guest.path(quarantine).parent.mkdir(parents=True, exist_ok=True)
+    guest.path(path).rename(guest.path(quarantine))
+    with Loki(guest) as loki:
+        result = run(guest, store, loki, [coverage], archive_profiles=archive_profiles)
+    assert result.failed is False
+    assert result.files_pruned == 0
+    assert guest.pruned == []
+    intent = store.prune_intent("pi-" + coverage["source_id"])
+    assert intent.state == "pending"
+    assert store.source(KEY, coverage["source_id"]) == source_before
+    assert store.initial_manifest_state(KEY) == manifest_before
+    assert guest.path(quarantine).exists()
+    assert not guest.path(path).exists()
+    assert any(path in warning and "paused" in warning for warning in result.warnings)
+
+
+def test_new_application_fields_cannot_authorize_legacy_deletion(guest, store):
+    """Only the fixed npm/pbs archive enum participates in delete authorization."""
+    coverage = setup(store, guest)
+    forged = {**coverage, "profile": "grafana", "log_kind": "application"}
+    with Loki(guest) as loki:
+        result = run(
+            guest, store, loki, [forged],
+            archive_profiles=frozenset({"npm", "grafana"}),
+        )
+    assert result.failed is False
+    assert result.files_pruned == 0
+    assert guest.pruned == []
+    assert guest.path(coverage["path"]).read_text() == "old retained content\n"
+    assert any("malformed" in warning for warning in result.warnings)
 
 
 def test_closed_acked_file_deleted_but_current_and_recent_files_preserved(guest, store):

@@ -1,0 +1,13 @@
+---
+schema_version: 1
+id: byparr
+display_name: Proxmox community script byparr
+community_script_ids:
+  - byparr
+journal_units:
+  - name: byparr.service
+layouts:
+  - id: default
+    required_units:
+      - name: byparr.service
+    sources: []

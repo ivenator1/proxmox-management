@@ -1,0 +1,17 @@
+---
+schema_version: 1
+id: redis
+display_name: Redis
+kind: dependency
+community_script_ids: []
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: redis-server.service
+    sources:
+      - id: cache-service
+        app: redis
+        log_kind: cache-service
+        exact_files:
+          - /var/log/redis/redis-server.log

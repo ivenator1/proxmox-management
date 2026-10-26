@@ -1,0 +1,13 @@
+---
+schema_version: 1
+id: forgejo
+display_name: Proxmox community script forgejo
+community_script_ids:
+  - forgejo
+journal_units:
+  - name: forgejo.service
+layouts:
+  - id: default
+    required_units:
+      - name: forgejo.service
+    sources: []

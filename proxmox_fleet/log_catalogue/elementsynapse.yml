@@ -1,0 +1,21 @@
+---
+schema_version: 1
+id: elementsynapse
+display_name: Proxmox community script elementsynapse
+community_script_ids:
+  - elementsynapse
+journal_units: []
+includes:
+  - synapse-admin
+layouts:
+  - id: default
+    required_units:
+      - name: matrix-synapse.service
+    sources:
+      - id: application
+        app: elementsynapse
+        log_kind: application
+        allowed_roots:
+          - /var/log/matrix-synapse
+        paths:
+          - /var/log/matrix-synapse/homeserver.log

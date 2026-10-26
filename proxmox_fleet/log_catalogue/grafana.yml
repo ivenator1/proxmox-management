@@ -1,0 +1,19 @@
+---
+schema_version: 1
+id: grafana
+display_name: Proxmox community script grafana
+community_script_ids:
+  - grafana
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: grafana-server.service
+    sources:
+      - id: application
+        app: grafana
+        log_kind: application
+        allowed_roots:
+          - /var/log/grafana
+        paths:
+          - /var/log/grafana/grafana.log

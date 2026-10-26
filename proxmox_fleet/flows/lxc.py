@@ -19,10 +19,18 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from proxmox_fleet import http as http_mod
+from proxmox_fleet.briefing import format_disk_usage_warning
 from proxmox_fleet.changes import lxc_os_changed, lxc_os_pkg_count
 from proxmox_fleet.cluster import DEFAULT_CLUSTER, api_creds, map_lookup, matches_any, split_qualified
+from proxmox_fleet.disk_usage import collect_lxc_disk_insight
 from proxmox_fleet.executor import Executor, snapshot_failure_warning, snapshot_with_retry
 from proxmox_fleet.flows._pkg import kuma_healthy
+from proxmox_fleet.log_plugins import (
+    LogCatalogue,
+    community_script_identity,
+    resolve_disk_usage_policy,
+)
+from proxmox_fleet.models.log_plugins import GuestLogOverride
 from proxmox_fleet.lxc_parse import (
     os_version_matches,
     parse_ct_script,
@@ -32,12 +40,12 @@ from proxmox_fleet.lxc_parse import (
     parse_pct_config,
     parse_pct_status,
     resource_scale_plan,
-    script_name_from_update,
 )
 from proxmox_fleet.models.settings import GlobalSettings
 from proxmox_fleet.pkg_detail import parse_upgraded, pkg_mgr_for_ostype
 from proxmox_fleet.runner import UnreachableHostError
 from proxmox_fleet.models.state import (
+    DiskUsageInsight,
     ErrorEntry,
     HousekeepingSummary,
     LxcRecord,
@@ -164,6 +172,59 @@ def disk_warning(
         f"rootfs {used}% full{free} — apt can fail to unpack; keep at least "
         f"{minimum_free_gb:g} GiB free"
     )
+
+
+_DISK_INSIGHT_DETAIL_MAX = 160
+
+
+def _disk_insight_with_finding(
+    insight: DiskUsageInsight, finding: Optional[str]
+) -> DiskUsageInsight:
+    """Fold the bounded disk-policy finding into the insight detail."""
+    if not finding:
+        return insight
+    detail = "; ".join(
+        part for part in (insight.detail.strip(), finding.strip()) if part
+    )
+    try:
+        return insight.with_detail(detail[:_DISK_INSIGHT_DETAIL_MAX])
+    except ValueError:
+        # A diagnostic detail problem must never discard a valid measurement.
+        return insight
+
+
+def _disk_usage_insight(
+    executor: Executor,
+    lxc_id: str,
+    *,
+    introspect_facts: Dict[str, Any],
+    catalogue: Optional[LogCatalogue],
+    script_id: Optional[str],
+    log_override: Optional[GuestLogOverride],
+    auto: bool,
+) -> Optional[DiskUsageInsight]:
+    """One bounded rootfs breakdown for an already-existing low-space warning.
+
+    Read-only and strictly optional diagnostics: an unavailable catalogue,
+    invalid policy, transport failure or malformed helper result returns None
+    so the caller keeps the original warning and the update continues.
+    """
+    try:
+        policy, policy_finding = resolve_disk_usage_policy(
+            catalogue,
+            script_id=script_id,
+            override=log_override,
+            auto=auto,
+        )
+        insight = collect_lxc_disk_insight(
+            executor,
+            lxc_id,
+            df_stdout=str(introspect_facts.get("df_stdout", "")),
+            policy=policy,
+        )
+        return _disk_insight_with_finding(insight, policy_finding)
+    except Exception:  # noqa: BLE001 - diagnostics must never gate the update
+        return None
 
 
 def _ct_script_uses_storage_guard(content: str) -> bool:
@@ -313,6 +374,8 @@ def run_lxc_update(
     cluster: str = DEFAULT_CLUSTER,
     alloy_config: Optional[Any] = None,
     alloy_only: bool = False,
+    catalogue: Optional[LogCatalogue] = None,
+    log_override: Optional[GuestLogOverride] = None,
 ) -> LxcFlowOutcome:
     """Run the whole lxc_update flow for one container. Never raises — failures
     are captured into the outcome (FAILED record + error entry), mirroring rescue.
@@ -328,6 +391,13 @@ def run_lxc_update(
         cluster:   The owning node's cluster — resolves qualified (``cluster/id``)
                    entries in the exclude lists and lxc_kuma_map against this
                    container; a bare token still matches in any cluster.
+        catalogue: Immutable log catalogue loaded once by the driver. Required
+                   whenever Alloy logging preparation can run; an unavailable
+                   catalogue leaves the installed Alloy config untouched rather
+                   than enforcing a journal-only fallback. It is also consulted
+                   (optionally, fail-open) for per-service disk-ratio
+                   expectations when an existing low-space warning fires.
+        log_override: Already full-discovery-validated guest override, if any.
     """
 
     # ------------------------------------------------------------------
@@ -341,6 +411,12 @@ def run_lxc_update(
     lxc_os: str = pct_info["os_type"]
     is_template: bool = pct_info["is_template"]
 
+    # Resolve the community-script identity exactly once, immediately after
+    # introspection: logging selection is offline and must never infer a
+    # service from the container hostname or a running unit. The detect phase
+    # below reuses this value instead of parsing the same update script again.
+    script_id: Optional[str] = community_script_identity(introspect_res.facts)
+
     if is_template:
         return LxcFlowOutcome()  # skipped, no record
 
@@ -348,6 +424,13 @@ def run_lxc_update(
     status_info = parse_pct_status(status_stdout)
     is_running: bool = status_info["is_running"]
     was_stopped: bool = status_info["was_stopped"]
+
+    # --alloy-only is logging audit/preparation only: a stopped guest is not
+    # made reachable (and never started) because there is nothing it can
+    # verify while stopped. Ordinary updates keep their existing start/stop
+    # behaviour.
+    if alloy_only and (was_stopped or not is_running):
+        return LxcFlowOutcome()
 
     if was_stopped:
         executor.pct_start(lxc_id)
@@ -387,30 +470,63 @@ def run_lxc_update(
                 notifying=True,
             ))
 
-    # Opted-in log/cache housekeeping runs after the container is reachable but
-    # before any disk decision, snapshot or package work: reclaiming cache space
-    # here is what can keep a full container from refusing the update. It never
-    # rolls back with the update, and its failures are warnings — never a failed
-    # OS/app status. --alloy-only must not run it (that mode is logging-only).
+    # Alloy-enabled guests always receive shared logging preparation on a
+    # normal run — even when housekeeping is disabled and the guest is not a
+    # timer target — because the later _enforce_alloy() must not reconcile the
+    # journal-only base over the guest's managed file sources. Only the
+    # housekeeping opt-in adds acknowledged archival, retention and cache
+    # cleanup. Failures here are warnings, never a failed OS/app status.
     housekeeping_summary: Optional[HousekeepingSummary] = None
     housekeeping_changed = False
-    # Explicit schedule targets retain their live sources even while the timer
-    # is paused. Neither this nor an enabled timer opts ordinary updates into
-    # archival, retention or cache cleanup.
-    scheduled_logging = (
-        (settings.housekeeping_timer_effective_enabled or bool(settings.housekeeping_timer_targets))
-        and alloy_config is not None
-        and not matches_any(settings.lxc_housekeeping_exclude_list, cluster, lxc_id)
-        and (
-            not settings.housekeeping_timer_targets
-            or node in settings.housekeeping_timer_targets
-            or matches_any(settings.housekeeping_timer_targets, cluster, lxc_id)
-        )
-    )
-    if not alloy_only and (settings.housekeeping_enabled or scheduled_logging):
-        housekeeping_mod = importlib.import_module("proxmox_fleet.housekeeping")
-        try:
-            if settings.housekeeping_enabled:
+
+    def _fold_housekeeping(hk: Any) -> None:
+        nonlocal alloy_config, housekeeping_changed, housekeeping_summary
+        housekeeping_changed = hk.changed
+        housekeeping_summary = hk.summary
+        for message in hk.warnings:
+            outcome.warnings.append(WarningEntry(
+                host=f"{node}/{lxc_id}",
+                task="Housekeeping",
+                warning=message,
+                notifying=hk.failed,
+            ))
+        # A failed/unverified selection or explicit empty result never falls
+        # back to the journal-only base: leave the guest's installed Alloy
+        # config untouched instead of erasing managed file readers. Only a
+        # verified effective config (including the intentional base) may be
+        # enforced later.
+        if hk.failed or hk.effective_alloy is None:
+            alloy_config = None
+        else:
+            alloy_config = hk.effective_alloy
+        if housekeeping_summary is not None and housekeeping_summary.bytes_reclaimed > 0:
+            try:
+                introspect_res.facts.update(_read_disk_facts(executor, lxc_id))
+            except Exception:  # noqa: BLE001 - best-effort refresh, keep prior facts
+                pass
+
+    if not alloy_only and matches_any(
+        settings.lxc_housekeeping_exclude_list, cluster, lxc_id
+    ):
+        # Exclusion must not rewrite the guest's installed managed readers
+        # from the journal-only base: no preparation and no later enforcement.
+        alloy_config = None
+    elif not alloy_only and settings.housekeeping_enabled:
+        if catalogue is None:
+            # Production fails fast before workers when the catalogue cannot be
+            # loaded; a direct caller without one must not run a partial policy
+            # or rewrite managed sources from the base.
+            outcome.warnings.append(WarningEntry(
+                host=f"{node}/{lxc_id}",
+                task="Housekeeping",
+                warning="log catalogue unavailable; housekeeping and Alloy "
+                        "reconciliation skipped",
+                notifying=True,
+            ))
+            alloy_config = None
+        else:
+            housekeeping_mod = importlib.import_module("proxmox_fleet.housekeeping")
+            try:
                 hk = housekeeping_mod.run_housekeeping(
                     executor,
                     settings,
@@ -419,10 +535,33 @@ def run_lxc_update(
                     lxc_id=lxc_id,
                     name=name,
                     desired_alloy=alloy_config,
+                    catalogue=catalogue,
+                    script_id=script_id,
+                    log_override=log_override,
                     dry_run=dry_run,
                 )
+            except Exception as exc:  # noqa: BLE001 - maintenance must never abort an update
+                outcome.warnings.append(WarningEntry(
+                    host=f"{node}/{lxc_id}",
+                    task="Housekeeping",
+                    warning=f"housekeeping unavailable ({type(exc).__name__})",
+                    notifying=True,
+                ))
+                alloy_config = None
             else:
-                assert alloy_config is not None  # scheduled_logging requires it
+                _fold_housekeeping(hk)
+    elif not alloy_only and alloy_config is not None:
+        if catalogue is None:
+            outcome.warnings.append(WarningEntry(
+                host=f"{node}/{lxc_id}",
+                task="Housekeeping",
+                warning="log catalogue unavailable; Alloy configuration left unchanged",
+                notifying=True,
+            ))
+            alloy_config = None
+        else:
+            housekeeping_mod = importlib.import_module("proxmox_fleet.housekeeping")
+            try:
                 hk = housekeeping_mod.prepare_lxc_logging(
                     executor,
                     settings,
@@ -431,39 +570,22 @@ def run_lxc_update(
                     lxc_id=lxc_id,
                     name=name,
                     base=alloy_config,
+                    catalogue=catalogue,
+                    script_id=script_id,
+                    log_override=log_override,
                     dry_run=dry_run,
                     allow_install=False,
                 )
-        except Exception as exc:  # noqa: BLE001 - maintenance must never abort an update
-            outcome.warnings.append(WarningEntry(
-                host=f"{node}/{lxc_id}",
-                task="Housekeeping",
-                warning=f"housekeeping unavailable ({type(exc).__name__})",
-                notifying=True,
-            ))
-            alloy_config = None
-        else:
-            housekeeping_changed = hk.changed
-            housekeeping_summary = hk.summary
-            for message in hk.warnings:
+            except Exception as exc:  # noqa: BLE001 - maintenance must never abort an update
                 outcome.warnings.append(WarningEntry(
                     host=f"{node}/{lxc_id}",
                     task="Housekeeping",
-                    warning=message,
-                    notifying=hk.failed,
+                    warning=f"housekeeping unavailable ({type(exc).__name__})",
+                    notifying=True,
                 ))
-            if hk.failed:
-                # An unverified/unavailable config (e.g. probe failure) must never
-                # be reconciled over the guest's managed file sources; leave Alloy
-                # as-is.
                 alloy_config = None
-            elif hk.effective_alloy is not None:
-                alloy_config = hk.effective_alloy
-            if housekeeping_summary is not None and housekeeping_summary.bytes_reclaimed > 0:
-                try:
-                    introspect_res.facts.update(_read_disk_facts(executor, lxc_id))
-                except Exception:  # noqa: BLE001 - best-effort refresh, keep prior facts
-                    pass
+            else:
+                _fold_housekeeping(hk)
 
     # Health warnings are raised before any update runs — and outside the try, so
     # they survive a later failure and are emitted on the dry-run path too, which
@@ -476,7 +598,36 @@ def run_lxc_update(
         settings.lxc_disk_min_free_gb,
     )
     if disk_msg:
-        outcome.warnings.append(WarningEntry(host=f"{node}/{lxc_id}", task="disk space", warning=disk_msg))
+        # Only the already-existing low-space warning gets one bounded rootfs
+        # breakdown. Healthy/ample-free guests and a warning cleared by the
+        # post-cleanup df refresh above do no diagnostic work, and this never
+        # sets notifying/failed or creates a separate notification.
+        disk_insight = _disk_usage_insight(
+            executor,
+            lxc_id,
+            introspect_facts=introspect_res.facts,
+            catalogue=catalogue,
+            script_id=script_id,
+            log_override=log_override,
+            auto=settings.alloy_log_plugins_auto,
+        )
+        disk_text = disk_msg
+        if disk_insight is not None:
+            try:
+                disk_text = format_disk_usage_warning(disk_msg, disk_insight)
+            except Exception:  # noqa: BLE001 - keep the plain warning
+                disk_insight = None
+        if disk_insight is not None:
+            outcome.warnings.append(WarningEntry(
+                host=f"{node}/{lxc_id}",
+                task="disk space",
+                warning=disk_text,
+                disk_usage=disk_insight,
+            ))
+        else:
+            outcome.warnings.append(WarningEntry(
+                host=f"{node}/{lxc_id}", task="disk space", warning=disk_text
+            ))
 
     api_params: Dict[str, Any] = {
         "api_host": api_host,
@@ -487,11 +638,18 @@ def run_lxc_update(
 
     try:
         # Alloy-only deliberately skips snapshots and all package/application
-        # work.  The surrounding introspection/start/finally logic still makes
-        # stopped managed containers safely reachable for the audit.
+        # work and never starts a stopped guest (the earlier stop check returns
+        # before pct_start); a running guest is only probed/reconciled.
         if alloy_only:
-            if alloy_config is not None:
-                # Logging-only preparation: probe profile/access, repair scoped
+            if alloy_config is not None and catalogue is None:
+                outcome.warnings.append(WarningEntry(
+                    host=f"{node}/{lxc_id}",
+                    task="Alloy logging",
+                    warning="log catalogue unavailable; Alloy configuration left unchanged",
+                    notifying=True,
+                ))
+            elif alloy_config is not None:
+                # Logging-only preparation: probe layout/access, repair scoped
                 # ACLs, render live file sources and reconcile for real. Unlike
                 # run_housekeeping it never archives/caches/prunes. The installer
                 # capability is preserved here (allow_install=True) so the audit
@@ -505,10 +663,16 @@ def run_lxc_update(
                     lxc_id=lxc_id,
                     name=name,
                     base=alloy_config,
+                    catalogue=catalogue,
+                    script_id=script_id,
+                    log_override=log_override,
                     dry_run=dry_run,
                     allow_install=True,
                 )
                 outcome.changed = prepared.changed
+                # A logging-only run's exit status must reflect a rejected
+                # preparation: there is no package/OS work to report instead.
+                outcome.failed = prepared.failed
                 for message in prepared.warnings:
                     outcome.warnings.append(WarningEntry(
                         host=f"{node}/{lxc_id}",
@@ -535,34 +699,31 @@ def run_lxc_update(
         ct_script_content = ""
         ct_info: Dict[str, Any] = {}
 
-        pull_rc_val = introspect_res.facts.get("pull_rc", 1)
-        lxc_no_update_script = int(pull_rc_val) != 0
+        # Use the identity already resolved from the introspect facts; this
+        # phase adds no second parser and makes no service/hostname guess.
+        lxc_no_update_script = script_id is None
         app_excluded = matches_any(settings.app_update_exclude_list, cluster, lxc_id)
 
         if settings.lxc_verbose:
-            _vprint(node, lxc_id, name, f"script={'NONE (pull failed)' if lxc_no_update_script else 'found'}")
+            _vprint(node, lxc_id, name, f"script={'NONE' if lxc_no_update_script else 'found'}")
 
         if not lxc_no_update_script:
-            update_content = str(introspect_res.facts.get("script_stdout", ""))
-            ct_script_name_raw = script_name_from_update(update_content) or ""
+            ct_script_name = script_id
+            assert ct_script_name is not None  # lxc_no_update_script is script_id is None
 
             if settings.lxc_verbose:
-                _vprint(node, lxc_id, name, f"ct_script={ct_script_name_raw or 'NOT FOUND'}")
+                _vprint(node, lxc_id, name, f"ct_script={ct_script_name}")
 
-            if ct_script_name_raw:
-                ct_script_name = ct_script_name_raw
-                # Fetch the ct script from GitHub (local manager has outbound HTTPS)
-                gh_url = (
-                    f"https://raw.githubusercontent.com/community-scripts/ProxmoxVE"
-                    f"/main/ct/{ct_script_name}.sh"
-                )
-                try:
-                    ct_script_content = http_mod.request(gh_url).body
-                    ct_info = parse_ct_script(ct_script_content)
-                except Exception:  # noqa: BLE001 - fail-open like detect.yml failed_when: false
-                    ct_info = parse_ct_script("")
-            else:
-                lxc_no_update_script = True
+            # Fetch the ct script from GitHub (local manager has outbound HTTPS)
+            gh_url = (
+                f"https://raw.githubusercontent.com/community-scripts/ProxmoxVE"
+                f"/main/ct/{ct_script_name}.sh"
+            )
+            try:
+                ct_script_content = http_mod.request(gh_url).body
+                ct_info = parse_ct_script(ct_script_content)
+            except Exception:  # noqa: BLE001 - fail-open like detect.yml failed_when: false
+                ct_info = parse_ct_script("")
 
         # Placed after detect (it needs the ct script's var_os/var_version) but
         # before the dry-run return, so --dry-run reports it too.

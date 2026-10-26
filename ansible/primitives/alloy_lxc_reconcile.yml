@@ -30,10 +30,10 @@
             apt-get install -y alloy
       environment:
         LC_ALL: C
-      when: alloy_install | bool
+      when: (alloy_install | bool) and not (alloy_validate_only | default(false) | bool)
 
     - name: "Validate and install desired Alloy configuration in container"
-      when: alloy_configure | bool
+      when: (alloy_configure | bool) or (alloy_validate_only | default(false) | bool)
       block:
         - name: "Stage desired Alloy configuration on Proxmox node"
           ansible.builtin.copy:
@@ -82,6 +82,7 @@
               - "{{ _alloy_guest_stage }}"
               - /etc/alloy/config.alloy
           changed_when: true
+          when: not (alloy_validate_only | default(false) | bool)
       always:
         - name: "Remove staged Alloy configuration from container"
           ansible.builtin.command:
@@ -98,14 +99,14 @@
     - name: "Add Alloy service user to systemd-journal in container"
       ansible.builtin.command:
         argv: [pct, exec, "{{ lxc_id }}", --, usermod, -aG, systemd-journal, alloy]
-      when: alloy_add_journal_group | bool
+      when: (alloy_add_journal_group | bool) and not (alloy_validate_only | default(false) | bool)
 
     - name: "Enable Alloy service in container"
       ansible.builtin.command:
         argv: [pct, exec, "{{ lxc_id }}", --, systemctl, enable, alloy]
-      when: alloy_repair_service | bool
+      when: (alloy_repair_service | bool) and not (alloy_validate_only | default(false) | bool)
 
     - name: "Restart Alloy service in container"
       ansible.builtin.command:
         argv: [pct, exec, "{{ lxc_id }}", --, systemctl, restart, alloy]
-      when: alloy_repair_service | bool
+      when: (alloy_repair_service | bool) and not (alloy_validate_only | default(false) | bool)

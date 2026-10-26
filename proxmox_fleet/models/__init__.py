@@ -10,6 +10,8 @@ from proxmox_fleet.models.config import (
 )
 from proxmox_fleet.models.state import (
     CustomRecord,
+    DiskUsageEntry,
+    DiskUsageInsight,
     ErrorEntry,
     FleetState,
     HousekeepingSummary,
@@ -28,6 +30,8 @@ __all__ = [
     "MaintenanceWindow",
     "UpdateStep",
     "CustomRecord",
+    "DiskUsageEntry",
+    "DiskUsageInsight",
     "ErrorEntry",
     "FleetState",
     "HousekeepingSummary",

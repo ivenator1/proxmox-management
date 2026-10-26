@@ -1,0 +1,28 @@
+---
+schema_version: 1
+id: fleet-manager
+display_name: Fleet manager
+community_script_ids: []
+journal_units:
+  - name: fleet-dashboard.service
+  - name: fleet-scan.service
+  - name: fleet-housekeeping.service
+layouts:
+  - id: default
+    required_units: []
+    running_units_any:
+      - name: fleet-dashboard.service
+      - name: fleet-scan.service
+      - name: fleet-housekeeping.service
+    sources:
+      - id: application
+        app: fleet-manager
+        log_kind: application
+        allowed_roots:
+          - /var/log/fleet-update
+        exact_files:
+          - /var/log/fleet-update.log
+          - /var/log/ansible-fleet-update.log
+        paths:
+          - /var/log/fleet-update/dashboard-runs/*.log
+        required: false

@@ -15,12 +15,26 @@ handed to the notifier embed and recorded in the run history.
 
 from __future__ import annotations
 
-from proxmox_fleet.models.state import FleetState
+from proxmox_fleet.models.state import (
+    DiskUsageEntry,
+    DiskUsageInsight,
+    FleetState,
+    WarningEntry,
+)
 
 # Discord embed colours — kept identical to fleet-update.yml Phase 4.
 _COLOR_FAILED = 15158332
 _COLOR_WARNING = 16766720
 _COLOR_OK = 3066993
+
+# Budgets for the structured disk-usage enrichment. The enriched warning keeps
+# the original message prefix and stays compact; the priority block stays well
+# inside the overall 4000-character body budget even behind a long error log.
+_DISK_USAGE_WARNING_LIMIT = 512
+_DISK_USAGE_MAX_ENTRIES = 3
+_DISK_DISPLAY_PATH_LIMIT = 80
+_DISK_DETAIL_DISPLAY_LIMIT = 120
+_DISK_PRIORITY_BLOCK_LIMIT = 1600
 
 
 def human_bytes(value: int) -> str:
@@ -34,6 +48,160 @@ def human_bytes(value: int) -> str:
         if size < 1024 or unit == "PiB":
             return f"{size:.1f} {unit}"
     raise AssertionError("unreachable byte unit")
+
+
+def _sanitize_display_text(value: str) -> str:
+    """Make a metadata string safe for a single-line Markdown warning.
+
+    Backticks are replaced with apostrophes so an embedded path cannot escape
+    its code span; control/format characters become spaces. Metadata itself is
+    never mutated — only this rendered copy.
+    """
+    chars: list[str] = []
+    for char in value:
+        if char == "`":
+            chars.append("'")
+        elif char.isprintable():
+            chars.append(char)
+        else:
+            chars.append(" ")
+    return " ".join("".join(chars).split())
+
+
+def _bounded_display(value: str, limit: int) -> str:
+    """Sanitize and clip a display string to ``limit`` characters."""
+    text = _sanitize_display_text(value)
+    if len(text) > limit:
+        text = text[: max(1, limit - 1)].rstrip() + "…"
+    return text
+
+
+def _format_share_percent(value: float) -> str:
+    rounded = round(float(value), 1)
+    if rounded == int(rounded):
+        return f"{int(rounded)}%"
+    return f"{rounded:.1f}%"
+
+
+def _disk_entry_label(entry: DiskUsageEntry) -> str:
+    if entry.kind == "root-files":
+        return "files directly under /"
+    path = _bounded_display(entry.path, _DISK_DISPLAY_PATH_LIMIT)
+    if entry.kind == "directory-other":
+        return f"other contents under {path}"
+    return path
+
+
+def _disk_entry_clause(entry: DiskUsageEntry) -> str:
+    return (
+        f"`{_disk_entry_label(entry)}`: {human_bytes(entry.allocated_bytes)} "
+        f"({_format_share_percent(entry.share_percent)} of used; "
+        f"limit {_format_share_percent(entry.max_expected_share_percent)})"
+    )
+
+
+def _disk_omitted_clause(count: int) -> str:
+    if count == 1:
+        return "1 more oversized directory not shown"
+    return f"{count} more oversized directories not shown"
+
+
+def _disk_status_clause(insight: DiskUsageInsight) -> str:
+    """One bounded clause explaining a non-list outcome (never a second warning)."""
+    if insight.status == "unavailable":
+        return "breakdown unavailable"
+    if insight.status == "partial":
+        return "breakdown incomplete; more may be oversized"
+    if not insight.entries:
+        return "no dominant directory on the used space"
+    return ""
+
+
+def format_disk_usage_warning(base: str, insight: DiskUsageInsight) -> str:
+    """Append compact oversized consumers to an existing disk warning.
+
+    The original message prefix is preserved verbatim. At most three entries are
+    shown; the complete warning is bounded to 512 characters without a trailing
+    newline. Full paths/bytes remain in the structured ``DiskUsageInsight``;
+    only this display copy sanitizes control characters/backticks and clips
+    paths.
+    """
+    considered = [] if insight.status == "unavailable" else list(insight.entries)
+    entries = considered[:_DISK_USAGE_MAX_ENTRIES]
+    mandatory = _disk_status_clause(insight)
+    detail = (
+        _bounded_display(insight.detail, _DISK_DETAIL_DISPLAY_LIMIT)
+        if insight.detail
+        else ""
+    )
+    if insight.status == "unavailable" and detail:
+        mandatory = f"breakdown unavailable: {detail}"
+        detail = ""
+
+    def compose(shown: list[DiskUsageEntry], *, with_detail: bool, with_omitted: bool) -> str:
+        clauses = [_disk_entry_clause(entry) for entry in shown]
+        if mandatory:
+            clauses.append(mandatory)
+        if with_detail and detail:
+            clauses.append(detail)
+        hidden = insight.omitted + len(considered) - len(shown)
+        if with_omitted and insight.status != "unavailable" and hidden > 0:
+            clauses.append(_disk_omitted_clause(hidden))
+        return base + "".join(f"; {clause}" for clause in clauses)
+
+    shown = list(entries)
+    while True:
+        for with_detail, with_omitted in ((True, True), (True, False), (False, False)):
+            candidate = compose(shown, with_detail=with_detail, with_omitted=with_omitted)
+            if len(candidate) <= _DISK_USAGE_WARNING_LIMIT:
+                return candidate
+        if not shown:
+            break
+        shown.pop()
+
+    # Even a status-only suffix can exceed the budget behind an unusually long
+    # legacy prefix; the prefix wins because it is the original warning text.
+    return base
+
+
+def _disk_priority_omitted_line(count: int) -> str:
+    noun = "warning" if count == 1 else "warnings"
+    return f"\n- *{count} more disk {noun} in full history.*"
+
+
+def _render_disk_priority_block(warnings: list[WarningEntry]) -> str:
+    """Render the leading, bounded disk-space block for enriched warnings.
+
+    The block is placed before node/error sections so a long error log cannot
+    hide the disk insight behind the overall 4000-character truncation. Full
+    warnings stay in state/history; only the block's display is bounded.
+    """
+    if not warnings:
+        return ""
+    header = "**⚠️ Disk space**"
+    lines: list[str] = []
+    used = len(header)
+    total = len(warnings)
+    for index, warning in enumerate(warnings):
+        line = f"\n- **{warning.host}** at `{warning.task}`: {warning.warning}"
+        remaining_after = total - (index + 1)
+        reserve = len(_disk_priority_omitted_line(remaining_after)) if remaining_after else 0
+        if used + len(line) + reserve > _DISK_PRIORITY_BLOCK_LIMIT:
+            break
+        lines.append(line)
+        used += len(line)
+    omitted = total - len(lines)
+    if omitted:
+        suffix = _disk_priority_omitted_line(omitted)
+        while lines and used + len(suffix) > _DISK_PRIORITY_BLOCK_LIMIT:
+            used -= len(lines.pop())
+            omitted = total - len(lines)
+            suffix = _disk_priority_omitted_line(omitted)
+        if used + len(suffix) <= _DISK_PRIORITY_BLOCK_LIMIT:
+            lines.append(suffix)
+        else:
+            return header[: _DISK_PRIORITY_BLOCK_LIMIT]
+    return (header + "".join(lines))[: _DISK_PRIORITY_BLOCK_LIMIT]
 
 
 def render_briefing(state: FleetState, *, manual_section: str = "") -> str:
@@ -138,14 +306,24 @@ def render_briefing(state: FleetState, *, manual_section: str = "") -> str:
         for e in state.errors:
             parts.append(f"\n- **{e.host}** failed at `{e.task}`: `{e.error}`")
 
-    if state.warnings:
+    # Warnings carrying a structured disk insight render in the leading
+    # priority block; legacy warnings keep the exact historical section bytes.
+    disk_warnings = [w for w in state.warnings if w.disk_usage is not None]
+    generic_warnings = [w for w in state.warnings if w.disk_usage is None]
+    if generic_warnings:
         parts.append("\n\n**⚠️ Warnings**")
-        for w in state.warnings:
+        for w in generic_warnings:
             parts.append(f"\n- **{w.host}** at `{w.task}`: {w.warning}")
 
     # No trailing newline: the template's final source newline is stripped by
     # Jinja's keep_trailing_newline=False (and the driver applies `| trim` anyway).
-    return "".join(parts)
+    body = "".join(parts)
+    priority = _render_disk_priority_block(disk_warnings)
+    if not priority:
+        return body
+    if not body:
+        return priority
+    return f"{priority}\n\n{body}"
 
 
 def _truncate(s: str, length: int = 255, killwords: bool = False,

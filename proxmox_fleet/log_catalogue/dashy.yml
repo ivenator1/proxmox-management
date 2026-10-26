@@ -1,0 +1,13 @@
+---
+schema_version: 1
+id: dashy
+display_name: Proxmox community script dashy
+community_script_ids:
+  - dashy
+journal_units:
+  - name: dashy.service
+layouts:
+  - id: default
+    required_units:
+      - name: dashy.service
+    sources: []

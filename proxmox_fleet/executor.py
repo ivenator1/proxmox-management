@@ -9,10 +9,11 @@ reboot_host primitives via ansible-runner; tests supply a fake.
 from __future__ import annotations
 
 import json
+import posixpath
 import shlex
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence
 
 from proxmox_fleet.alloy import AlloyExecutor
 from proxmox_fleet.runner import PrimitiveResult, invoke_primitive
@@ -28,19 +29,56 @@ def housekeeping_helper_source() -> str:
     return _HELPER_PATH.read_text(encoding="utf-8")
 
 
-def _housekeeping_extravars(lxc_id: str, request: Dict[str, Any]) -> Dict[str, Any]:
+def _housekeeping_extravars(
+    lxc_id: str,
+    request: Dict[str, Any],
+    *,
+    operation: Optional[str] = None,
+) -> Dict[str, Any]:
     """Build the transport extravars shared by all housekeeping primitives.
 
     The request carries no policy: it is the exact manager-built JSON object of
-    file wire records (and capture_id where applicable). It is serialized
+    file wire records (and capture_id where applicable), the optional
+    declarative logging descriptor for the probe, or the validated
+    root/exact-file targets for the ``logging_acl`` action.  It is serialized
     compactly and staged as a file so no log bodies or request text can leak
-    into runner facts/stdout.
+    into runner facts/stdout.  ``operation`` selects the helper dispatch;
+    ``None`` keeps the primitive's default ``probe`` operation for every
+    legacy caller.
     """
-    return {
+    extravars: Dict[str, Any] = {
         "lxc_id": lxc_id,
         "housekeeping_helper_content": housekeeping_helper_source(),
         "housekeeping_request_json": json.dumps(request, separators=(",", ":")),
     }
+    if operation is not None:
+        extravars["housekeeping_operation"] = operation
+    return extravars
+
+
+def _log_acl_paths(values: Sequence[str], *, field: str) -> List[str]:
+    """Validate and deduplicate manager-built logging ACL targets.
+
+    The caller only ever passes catalogue-resolved roots/exact files, so this
+    is a defensive boundary: a settings or future-caller mistake must fail
+    before a primitive is invoked rather than reach the guest helper.
+    """
+    collected: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError(f"{field} entries must be strings")
+        if not value or not value.startswith("/") or value.startswith("//"):
+            raise ValueError(f"{field} entries must be absolute paths")
+        if value == "/" or value != posixpath.normpath(value):
+            raise ValueError(f"{field} entries must be normalized non-root paths")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+            raise ValueError(f"{field} entries must not contain control characters")
+        if any(ch in value for ch in "{}") or "\\" in value or "://" in value:
+            raise ValueError(f"{field} entries must be literal filesystem paths")
+        if any(ch in value for ch in "*?["):
+            raise ValueError(f"{field} entries must not contain glob characters")
+        collected.add(value)
+    return sorted(collected)
 
 
 class SnapshotExecutor(Protocol):
@@ -192,13 +230,22 @@ class Executor(AlloyExecutor, Protocol):
         """Stop a container via the pct_stop primitive."""
         ...
 
-    def housekeeping_probe(self, lxc_id: str) -> PrimitiveResult:
+    def housekeeping_probe(
+        self,
+        lxc_id: str,
+        *,
+        logging_request: Optional[Dict[str, Any]] = None,
+    ) -> PrimitiveResult:
         """Read-only housekeeping facts for one container via its node.
 
         Returns facts keys ``guest``, ``disk``, ``journal_bytes``, ``profiles``,
         ``files``, ``cache_paths``, ``busy_tools``, ``binaries``,
-        ``log_access_ready`` and ``policy_sha256``. The primitive runs under
-        check mode too; it performs no guest writes.
+        ``log_access_ready``, ``log_access_detail``, ``policy_sha256``,
+        ``profile_evidence`` and ``logging``.  ``logging_request`` is the
+        optional manager-built declarative descriptor; the helper only measures
+        its requested unit/source keys and always returns the ``logging`` maps
+        (empty when no request was sent or the guest is stopped). The primitive
+        runs under check mode too; it performs no guest writes.
         """
         ...
 
@@ -211,6 +258,23 @@ class Executor(AlloyExecutor, Protocol):
         the sharded spool namespace. Returns facts ``capture_id`` and ``files``
         (wire records plus ``sha256`` and ``blob_path``). The persistent spool is
         never cleaned up here — only the transient helper/request stage is.
+        """
+        ...
+
+    def lxc_disk_usage(
+        self, lxc_id: str, *, extra_paths: Sequence[str] = ()
+    ) -> PrimitiveResult:
+        """One bounded, read-only rootfs directory-usage snapshot for a guest.
+
+        Reuses the shared housekeeping probe primitive with the fixed
+        ``disk_usage`` operation. ``extra_paths`` is the sorted set of resolved
+        deep policy prefixes (at most 32, depth at most 16) that need their own
+        counter inside the same root walk. Returns the helper's raw wire
+        snapshot directly in ``facts`` (not wrapped in another key): status,
+        root_used_bytes, root_device, directories, visited_entries,
+        excluded_mounts, error_count and reason. Mounts are never traversed and
+        nothing is deleted; a missing pct/Python/stopped guest is ``unavailable``
+        and is never downgraded to a node-root walk or a container start.
         """
         ...
 
@@ -231,6 +295,26 @@ class Executor(AlloyExecutor, Protocol):
         Quoting is shlex-safe and ``lxc_id`` must be numeric; the manager
         constructs every command and controls dry-run, so no policy lives here.
         The real container exit status is preserved.
+        """
+        ...
+
+    def housekeeping_log_acl(
+        self,
+        lxc_id: str,
+        *,
+        roots: Sequence[str] = (),
+        exact_files: Sequence[str] = (),
+    ) -> PrimitiveResult:
+        """Grant the Alloy user scoped log access through the descriptor helper.
+
+        Runs the shared housekeeping probe primitive with the fixed
+        ``logging_acl`` operation and the request object
+        ``{"roots": [...], "exact_files": [...]}``. Targets are manager-built
+        catalogue roots/exact files only. The helper returns facts ``status``
+        (``complete``/``failed``), ``changed``, ``repaired_roots``,
+        ``repaired_files``, ``skipped_missing``, ``error_count`` and a bounded
+        ``reason``; callers must require ``complete`` plus a successful
+        transport before any environment or live-config change.
         """
         ...
 
@@ -454,12 +538,51 @@ class RunnerExecutor:
             check=self.check,
         ))
 
-    def housekeeping_probe(self, lxc_id: str) -> PrimitiveResult:
+    def housekeeping_probe(
+        self,
+        lxc_id: str,
+        *,
+        logging_request: Optional[Dict[str, Any]] = None,
+    ) -> PrimitiveResult:
+        request: Dict[str, Any] = (
+            {} if logging_request is None else {"logging": logging_request}
+        )
         return _merge_facts(invoke_primitive(
             "lxc_housekeeping_probe",
             inventory=self.inventory,
             host_pattern=self.host,
-            extravars=_housekeeping_extravars(lxc_id, {}),
+            extravars=_housekeeping_extravars(lxc_id, request),
+            check=self.check,
+        ))
+
+    def lxc_disk_usage(
+        self, lxc_id: str, *, extra_paths: Sequence[str] = ()
+    ) -> PrimitiveResult:
+        extras = sorted({str(path) for path in extra_paths})
+        if len(extras) > 32:
+            return PrimitiveResult(
+                rc=1,
+                stdout="",
+                stderr=(
+                    "lxc_disk_usage refused more than 32 extra paths: "
+                    f"{len(extras)}"
+                ),
+                changed=False,
+                failed=True,
+            )
+        request = {
+            "max_depth": 3,
+            "max_entries": 200000,
+            "timeout_seconds": 15,
+            "extra_paths": extras,
+        }
+        return _merge_facts(invoke_primitive(
+            "lxc_housekeeping_probe",
+            inventory=self.inventory,
+            host_pattern=self.host,
+            extravars=_housekeeping_extravars(
+                lxc_id, request, operation="disk_usage"
+            ),
             check=self.check,
         ))
 
@@ -506,6 +629,48 @@ class RunnerExecutor:
         wrapped = f"pct exec {container_id} -- sh -c {shlex.quote(command)}"
         return self.run_shell(wrapped, ignore_errors=True)
 
+    def housekeeping_log_acl(
+        self,
+        lxc_id: str,
+        *,
+        roots: Sequence[str] = (),
+        exact_files: Sequence[str] = (),
+    ) -> PrimitiveResult:
+        container_id = str(lxc_id).strip()
+        if not container_id.isdigit():
+            return PrimitiveResult(
+                rc=1,
+                stdout="",
+                stderr=(
+                    "housekeeping_log_acl refused non-numeric lxc_id: "
+                    f"{lxc_id!r}"
+                ),
+                changed=False,
+                failed=True,
+            )
+        try:
+            request = {
+                "roots": _log_acl_paths(roots, field="roots"),
+                "exact_files": _log_acl_paths(exact_files, field="exact_files"),
+            }
+        except (TypeError, ValueError) as exc:
+            return PrimitiveResult(
+                rc=1,
+                stdout="",
+                stderr=f"housekeeping_log_acl refused invalid targets: {exc}",
+                changed=False,
+                failed=True,
+            )
+        return _merge_facts(invoke_primitive(
+            "lxc_housekeeping_probe",
+            inventory=self.inventory,
+            host_pattern=self.host,
+            extravars=_housekeeping_extravars(
+                container_id, request, operation="logging_acl"
+            ),
+            check=self.check,
+        ))
+
     def housekeeping_prune(
         self,
         lxc_id: str,
@@ -542,7 +707,24 @@ class RunnerExecutor:
         configure: bool,
         add_journal_group: bool,
         repair_service: bool,
+        validate_only: bool = False,
     ) -> PrimitiveResult:
+        if validate_only and (
+            lxc_id is None
+            or install
+            or add_journal_group
+            or repair_service
+        ):
+            return PrimitiveResult(
+                rc=1,
+                stdout="",
+                stderr=(
+                    "alloy_reconcile validate_only requires an lxc_id and must not "
+                    "install, add the journal group or repair the service"
+                ),
+                changed=False,
+                failed=True,
+            )
         primitive = "alloy_lxc_reconcile" if lxc_id is not None else "alloy_vm_reconcile"
         extravars: Dict[str, Any] = {
             "alloy_config_content": desired_content,
@@ -551,6 +733,10 @@ class RunnerExecutor:
             "alloy_add_journal_group": add_journal_group,
             "alloy_repair_service": repair_service,
         }
+        if validate_only:
+            # Only sent for the explicit validation path so the default VM/LXC
+            # reconcile extravars stay byte-compatible with existing behaviour.
+            extravars["alloy_validate_only"] = True
         if lxc_id is not None:
             extravars["lxc_id"] = lxc_id
         return _merge_facts(invoke_primitive(

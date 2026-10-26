@@ -1,0 +1,19 @@
+---
+schema_version: 1
+id: qbittorrent
+display_name: Proxmox community script qbittorrent
+community_script_ids:
+  - qbittorrent
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: qbittorrent-nox.service
+    sources:
+      - id: application
+        app: qbittorrent
+        log_kind: application
+        allowed_roots:
+          - /root/.local/share/qBittorrent/logs
+        paths:
+          - /root/.local/share/qBittorrent/logs/qbittorrent.log

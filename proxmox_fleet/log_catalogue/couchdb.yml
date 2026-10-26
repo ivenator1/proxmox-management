@@ -1,0 +1,19 @@
+---
+schema_version: 1
+id: couchdb
+display_name: CouchDB
+kind: dependency
+community_script_ids: []
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: couchdb.service
+    sources:
+      - id: database
+        app: couchdb
+        log_kind: database
+        allowed_roots:
+          - /var/log/couchdb
+        paths:
+          - /var/log/couchdb/couchdb.log

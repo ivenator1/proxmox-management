@@ -14,10 +14,11 @@ The assertions are about observable policy, cadence and allocated-size results
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import pytest
 
@@ -45,6 +46,7 @@ _ABSENT_RESOLVED = {
     "yarn": "/usr/local/share/.cache/yarn/v6",
     "npm": "/root/.npm",
     "pnpm": "/root/.local/share/pnpm/store/v11",
+    "bun": "/root/.bun/install/cache",
 }
 
 
@@ -64,6 +66,9 @@ class ToolSpec:
     error: Optional[str] = None
     command_rc: int = 0
     prune_keep: tuple = ()
+    binary: Optional[str] = "/usr/bin/bun"
+    cache_prune_supported: bool = True
+    reclaimable: object = _UNSET
 
 
 def _measure(root: Optional[Path]) -> int:
@@ -78,6 +83,31 @@ def _measure(root: Optional[Path]) -> int:
                 continue
             if stat.S_ISREG(st.st_mode):
                 total += st.st_blocks * 512
+    return total
+
+
+def _bun_reclaimable(root: Optional[Path]) -> int:
+    """Test-local mirror of the helper's conservative Bun reclaimable total."""
+    if root is None or not root.exists():
+        return 0
+    links = root / "links"
+    total = 0
+    seen = set()
+    for dirpath, _dirnames, filenames in os.walk(root):
+        current = Path(dirpath)
+        in_links = current == links or links in current.parents
+        for name in filenames:
+            try:
+                st = os.lstat(current / name)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or in_links:
+                continue
+            identity = (st.st_dev, st.st_ino)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            total += st.st_blocks * 512
     return total
 
 
@@ -98,13 +128,29 @@ def _tool_for_command(command: str) -> Optional[str]:
         return "npm"
     if "pnpm store prune" in command:
         return "pnpm"
+    if (
+        command.startswith("LC_ALL=C BUN_INSTALL_CACHE_DIR=")
+        and " pm cache prune --max-age 30" in command
+    ):
+        return "bun"
     return None
 
 
 def _reclaim(tool: str, spec: ToolSpec) -> None:
-    """Delete files the way the native tool would (keeping pnpm-referenced)."""
+    """Delete files the way the native tool would (keeping referenced entries)."""
     directory = spec.directory
     if directory is None:
+        return
+    if tool == "bun":
+        # Native prune preserves the global store's links/ subtree and removes
+        # aged entries; external hardlink targets are untouched.
+        for entry in sorted(directory.iterdir(), key=lambda p: p.name):
+            if entry.name == "links" or entry.name in spec.prune_keep:
+                continue
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
         return
     for path in sorted(directory.rglob("*"), key=lambda p: len(p.parts), reverse=True):
         if not path.is_file():
@@ -127,8 +173,10 @@ class FakeCacheExecutor:
         os_type: str = "debian",
         running: bool = True,
         template: bool = False,
+        fresh_tools: Optional[Dict[str, ToolSpec]] = None,
     ) -> None:
         self.tools = tools
+        self.fresh_tools = fresh_tools
         self.busy = list(busy)
         self.os_type = os_type
         self.running = running
@@ -136,15 +184,15 @@ class FakeCacheExecutor:
         self.applied: List[str] = []
         self.probe_calls = 0
 
-    def _entry(self, tool: str) -> Dict[str, Any]:
-        spec = self.tools[tool]
+    def _entry(self, tool: str, tools: Dict[str, ToolSpec]) -> Dict[str, Any]:
+        spec = tools[tool]
         directory = spec.directory
         exists = spec.exists if spec.exists is not None else bool(directory is not None and directory.exists())
         if spec.allocated is _UNSET:
             allocated = _measure(directory) if exists else 0
         else:
             allocated = spec.allocated
-        return {
+        entry = {
             "tool": tool,
             "root": spec.root if spec.root is not None else spec.resolved,
             "resolved": spec.resolved,
@@ -158,8 +206,19 @@ class FakeCacheExecutor:
             "error": spec.error,
             "root_owned": spec.root_owned,
         }
+        if tool == "bun":
+            entry["binary"] = spec.binary
+            entry["cache_prune_supported"] = spec.cache_prune_supported
+            if spec.reclaimable is _UNSET:
+                entry["reclaimable_bytes"] = _bun_reclaimable(directory) if exists else 0
+            else:
+                entry["reclaimable_bytes"] = spec.reclaimable
+        return entry
 
     def _facts(self) -> Dict[str, Any]:
+        # The first call is the caller's initial probe; every later call is the
+        # policy's fresh before/after probe.
+        tools = self.fresh_tools if (self.fresh_tools is not None and self.probe_calls >= 2) else self.tools
         return {
             "guest": {
                 "name": "guest",
@@ -171,16 +230,22 @@ class FakeCacheExecutor:
             "journal_bytes": 0,
             "profiles": [],
             "files": [],
-            "cache_paths": {tool: self._entry(tool) for tool in self.tools},
+            "cache_paths": {tool: self._entry(tool, tools) for tool in tools},
             "busy_tools": list(self.busy),
             "binaries": {name: "/usr/bin/" + name for name in REQUIRED_BINARIES},
             "log_access_ready": True,
             "log_access_detail": {"alloy_user": True, "dirs": {}, "files": {}},
             "policy_sha256": {"journald": "", "alloy_env": "", "npm_logrotate": ""},
             "profile_evidence": {"npm": {"detected": False}, "pbs": {"detected": False}},
+            "logging": {"plugins": {}, "sources": {}},
         }
 
-    def housekeeping_probe(self, lxc_id: str) -> PrimitiveResult:
+    def housekeeping_probe(
+        self,
+        lxc_id: str,
+        *,
+        logging_request: Optional[Dict[str, Any]] = None,
+    ) -> PrimitiveResult:
         self.probe_calls += 1
         return PrimitiveResult(rc=0, changed=False, failed=False, facts=self._facts())
 
@@ -197,6 +262,28 @@ class FakeCacheExecutor:
             failed=rc != 0,
             stderr=("native failure" if rc != 0 else ""),
             facts={},
+        )
+
+    def housekeeping_log_acl(
+        self,
+        lxc_id: str,
+        *,
+        roots: Sequence[str] = (),
+        exact_files: Sequence[str] = (),
+    ) -> PrimitiveResult:
+        changed = bool(tuple(roots) or tuple(exact_files))
+        return PrimitiveResult(
+            rc=0,
+            changed=changed,
+            facts={
+                "status": "complete",
+                "changed": changed,
+                "repaired_roots": len(tuple(roots)),
+                "repaired_files": len(tuple(exact_files)),
+                "skipped_missing": 0,
+                "error_count": 0,
+                "reason": "",
+            },
         )
 
 
@@ -712,3 +799,320 @@ def test_ineligible_guest_state_never_mutates(tmp_path, store, kwargs, needle):
     assert any(needle in warning for warning in result.warnings)
     assert _measure(directory) == before
     assert store.last_cache_clean(KEY, "yarn") is None
+
+
+# --------------------------------------------------------------------------- #
+# Bun: native 30-day prune, links/ preserved, conservative accounting
+# --------------------------------------------------------------------------- #
+
+
+def _bun_cache(tmp_path: Path, name: str = "bun") -> Path:
+    root = tmp_path / name
+    (root / "links").mkdir(parents=True)
+    return root
+
+
+def _bun_file(root: Path, rel: str, size: int = 8192) -> Path:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"x" * size)
+    return path
+
+
+def _bun_spec(root: Optional[Path], **overrides: Any) -> ToolSpec:
+    values: Dict[str, Any] = {
+        "resolved": hc.BUN_CACHE_ROOT,
+        "directory": root,
+        "version": "1.4.4",
+    }
+    values.update(overrides)
+    return ToolSpec(**values)
+
+
+def test_bun_due_prune_reclaims_aged_entries_and_records_success(tmp_path, store):
+    root = _bun_cache(tmp_path)
+    old = _bun_file(root, "pkg-old/index.js")
+    old_bytes = os.lstat(old).st_blocks * 512
+    fresh = _bun_file(root, "fresh-pkg/index.js", size=4096)
+    (root / "links" / "dep").symlink_to(root / "fresh-pkg")
+    before_reclaim = _bun_reclaimable(root)
+    assert before_reclaim > old_bytes  # the retained fresh package is included
+
+    executor = FakeCacheExecutor(
+        tools=_specs(
+            tmp_path,
+            bun=_bun_spec(root, prune_keep=("fresh-pkg",)),
+        )
+    )
+
+    result = _run(executor, store)
+
+    assert executor.applied == [hc.bun_clean_command("/usr/bin/bun")]
+    assert result.failed is False
+    assert result.changed is True
+    assert not old.parent.exists()
+    assert fresh.exists()
+    # links/ is the retained global-store subtree: native prune never removes it.
+    assert (root / "links" / "dep").is_symlink()
+    assert (root / "links" / "dep").resolve() == (root / "fresh-pkg").resolve()
+    after_reclaim = _bun_reclaimable(root)
+    assert result.bytes_reclaimed == before_reclaim - after_reclaim
+    assert result.bytes_reclaimed == old_bytes
+    assert store.last_cache_clean(KEY, "bun") == _NOW
+
+    # A successful prune advances the cadence: a within-window refill is untouched.
+    refill = _bun_file(root, "pkg-old-again/index.js")
+    second = _run(executor, store, clock_ns=lambda: _NOW + 23 * _HOUR_NS)
+    assert second.changed is False
+    assert second.bytes_reclaimed == 0
+    assert len(executor.applied) == 1
+    assert refill.exists()
+
+
+def test_bun_successful_zero_reclaim_still_advances_cadence(tmp_path, store):
+    root = _bun_cache(tmp_path)
+    kept = _bun_file(root, "links/keep/index.js", size=16384)
+    before = _measure(root)
+    assert before > 0
+    assert _bun_reclaimable(root) == 0
+
+    executor = FakeCacheExecutor(tools=_specs(tmp_path, bun=_bun_spec(root)))
+    result = _run(executor, store)
+
+    assert executor.applied == [hc.bun_clean_command("/usr/bin/bun")]
+    assert result.failed is False
+    assert result.changed is False
+    assert result.bytes_reclaimed == 0
+    assert kept.exists()
+    assert _measure(root) == before
+    assert store.last_cache_clean(KEY, "bun") == _NOW
+
+
+def test_bun_failed_native_prune_preserves_cache_and_cadence(tmp_path, store):
+    root = _bun_cache(tmp_path)
+    old = _bun_file(root, "pkg-old/index.js")
+    before_reclaim = _bun_reclaimable(root)
+    executor = FakeCacheExecutor(
+        tools=_specs(tmp_path, bun=_bun_spec(root, command_rc=1))
+    )
+
+    result = _run(executor, store)
+
+    assert executor.applied == [hc.bun_clean_command("/usr/bin/bun")]
+    assert result.failed is True
+    assert result.bytes_reclaimed == 0
+    assert any("bun" in warning and "failed" in warning for warning in result.warnings)
+    assert old.exists()
+    assert _bun_reclaimable(root) == before_reclaim
+    assert store.last_cache_clean(KEY, "bun") is None
+
+
+def test_bun_unsupported_native_prune_is_preserved(tmp_path, store):
+    root = _bun_cache(tmp_path)
+    old = _bun_file(root, "pkg-old/index.js")
+    executor = FakeCacheExecutor(
+        tools=_specs(
+            tmp_path, bun=_bun_spec(root, cache_prune_supported=False)
+        )
+    )
+
+    result = _run(executor, store)
+
+    assert executor.applied == []
+    assert result.failed is False
+    assert any("unsupported" in warning for warning in result.warnings)
+    assert old.exists()
+    assert store.last_cache_clean(KEY, "bun") is None
+
+
+def test_bun_unmeasured_reclaimable_bytes_skip_action(tmp_path, store):
+    root = _bun_cache(tmp_path)
+    old = _bun_file(root, "pkg-old/index.js")
+    executor = FakeCacheExecutor(
+        tools=_specs(tmp_path, bun=_bun_spec(root, reclaimable=None))
+    )
+
+    result = _run(executor, store)
+
+    assert executor.applied == []
+    assert any("could not be measured" in warning for warning in result.warnings)
+    assert old.exists()
+    assert store.last_cache_clean(KEY, "bun") is None
+
+
+def test_bun_malformed_reclaimable_facts_fail_closed(tmp_path, store):
+    root = _bun_cache(tmp_path)
+    old = _bun_file(root, "pkg-old/index.js")
+    executor = FakeCacheExecutor(
+        tools=_specs(tmp_path, bun=_bun_spec(root, reclaimable="lots"))
+    )
+
+    result = _run(executor, store)
+
+    assert executor.applied == []
+    assert any("malformed cache facts" in warning for warning in result.warnings)
+    assert old.exists()
+    assert store.last_cache_clean(KEY, "bun") is None
+
+
+@pytest.mark.parametrize(
+    "busy,needle",
+    [
+        (["bun"], "activity"),
+        (["build"], "build"),
+    ],
+)
+def test_bun_package_or_build_activity_skips_without_action(
+    tmp_path, store, busy, needle
+):
+    root = _bun_cache(tmp_path)
+    old = _bun_file(root, "pkg-old/index.js")
+    executor = FakeCacheExecutor(
+        tools=_specs(tmp_path, bun=_bun_spec(root)), busy=busy
+    )
+
+    result = _run(executor, store)
+
+    assert executor.applied == []
+    assert any(needle in warning for warning in result.warnings)
+    assert old.exists()
+    assert store.last_cache_clean(KEY, "bun") is None
+
+
+@pytest.mark.parametrize(
+    "overrides,needle",
+    [
+        ({"resolved": hc.BUN_CACHE_ROOT + "/nested"}, "allowlisted"),
+        ({"escaped": True}, "symlink"),
+        ({"root_owned": False}, "root-owned"),
+        ({"dependency_referenced": True}, "dependencies"),
+        ({"source": "allowlist"}, "native cache directory"),
+        ({"binary": "/tmp/bun"}, "fixed system binary"),
+        ({"binary": None}, "fixed system binary"),
+    ],
+)
+def test_bun_unsafe_facts_preserve_cache(tmp_path, store, overrides, needle):
+    root = _bun_cache(tmp_path)
+    old = _bun_file(root, "pkg-old/index.js")
+    executor = FakeCacheExecutor(
+        tools=_specs(tmp_path, bun=_bun_spec(root, **overrides))
+    )
+
+    result = _run(executor, store)
+
+    assert executor.applied == []
+    assert any(needle in warning for warning in result.warnings)
+    assert old.exists()
+    assert store.last_cache_clean(KEY, "bun") is None
+
+
+@pytest.mark.parametrize(
+    "fresh_overrides,needle",
+    [
+        ({"binary": "/usr/bin/bun"}, "changed before cleanup"),
+        ({"resolved": hc.BUN_CACHE_ROOT + "/nested"}, "aborted"),
+        ({"cache_prune_supported": False}, "unsupported"),
+    ],
+)
+def test_bun_change_between_initial_and_fresh_probe_aborts(
+    tmp_path, store, fresh_overrides, needle
+):
+    root = _bun_cache(tmp_path)
+    old = _bun_file(root, "pkg-old/index.js")
+    initial = _specs(
+        tmp_path, bun=_bun_spec(root, binary="/usr/local/bin/bun")
+    )
+    overrides = {"binary": "/usr/local/bin/bun", **fresh_overrides}
+    fresh = _specs(tmp_path, bun=_bun_spec(root, **overrides))
+    executor = FakeCacheExecutor(tools=initial, fresh_tools=fresh)
+
+    result = _run(executor, store)
+
+    assert executor.applied == []
+    assert any(needle in warning for warning in result.warnings)
+    assert old.exists()
+    assert store.last_cache_clean(KEY, "bun") is None
+
+
+def test_bun_externally_hardlinked_bytes_are_not_reported_reclaimed(tmp_path, store):
+    root = _bun_cache(tmp_path)
+    hardlinked = _bun_file(root, "pkg-hard/blob.bin")
+    outside = tmp_path / "outside-blob.bin"
+    os.link(hardlinked, outside)
+    normal = _bun_file(root, "pkg-normal/blob.bin")
+    normal_bytes = os.lstat(normal).st_blocks * 512
+    assert _bun_reclaimable(root) == normal_bytes  # hardlinked bytes are not freeable
+
+    executor = FakeCacheExecutor(tools=_specs(tmp_path, bun=_bun_spec(root)))
+    result = _run(executor, store)
+
+    assert executor.applied == [hc.bun_clean_command("/usr/bin/bun")]
+    assert outside.exists() and outside.read_bytes() == b"x" * 8192
+    assert result.bytes_reclaimed == normal_bytes
+    assert _bun_reclaimable(root) == 0
+    assert store.last_cache_clean(KEY, "bun") == _NOW
+
+
+def test_bun_dry_run_reports_conservative_reclaimable_value(tmp_path, store):
+    root = _bun_cache(tmp_path)
+    _bun_file(root, "links/keep.bin", size=16384)
+    old = _bun_file(root, "pkg-old/blob.bin")
+    allocated = _measure(root)
+    reclaimable = _bun_reclaimable(root)
+    assert 0 < reclaimable < allocated
+
+    executor = FakeCacheExecutor(tools=_specs(tmp_path, bun=_bun_spec(root)))
+    result = _run(executor, store, dry_run=True)
+
+    assert executor.applied == []
+    assert result.findings is True
+    assert result.changed is False
+    assert result.bytes_reclaimed == 0
+    assert any(
+        warning.startswith("bun:") and f"up to {reclaimable} " in warning
+        for warning in result.warnings
+    )
+    assert not any(f"up to {allocated} " in warning for warning in result.warnings)
+    assert old.exists()
+    assert store.cache_clean_times(KEY) == {}
+
+
+def test_bun_dry_run_with_only_retained_bytes_has_no_finding(tmp_path, store):
+    root = _bun_cache(tmp_path)
+    _bun_file(root, "links/keep.bin", size=16384)
+    assert _measure(root) > 0
+    assert _bun_reclaimable(root) == 0
+
+    executor = FakeCacheExecutor(tools=_specs(tmp_path, bun=_bun_spec(root)))
+    result = _run(executor, store, dry_run=True)
+
+    assert executor.applied == []
+    assert result.findings is False
+    assert result.warnings == []
+
+
+def test_bun_empty_or_absent_cache_stays_idle(tmp_path, store):
+    empty = tmp_path / "bun-empty"
+    empty.mkdir()
+    executor = FakeCacheExecutor(tools=_specs(tmp_path, bun=_bun_spec(empty)))
+    result = _run(executor, store)
+    assert executor.applied == []
+    assert result.warnings == []
+    assert store.cache_clean_times(KEY) == {}
+
+    absent = FakeCacheExecutor(
+        tools=_specs(
+            tmp_path,
+            bun=ToolSpec(
+                resolved=hc.BUN_CACHE_ROOT,
+                directory=None,
+                exists=False,
+                source="tool",
+                version="1.4.4",
+            ),
+        )
+    )
+    result = _run(absent, store)
+    assert absent.applied == []
+    assert result.warnings == []
+    assert store.cache_clean_times(KEY) == {}

@@ -1,0 +1,17 @@
+---
+schema_version: 1
+id: valkey
+display_name: Valkey
+kind: dependency
+community_script_ids: []
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: valkey-server.service
+    sources:
+      - id: database
+        app: valkey
+        log_kind: database
+        exact_files:
+          - /var/log/valkey/valkey-server.log

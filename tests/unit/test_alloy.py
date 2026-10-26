@@ -5,10 +5,13 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+from dataclasses import replace
 from typing import Any
 
 import pytest
 
+from proxmox_fleet import log_plugins
+from proxmox_fleet.models.log_plugins import GuestLogOverride, MultilineOptions
 from proxmox_fleet.runner import PrimitiveResult
 
 alloy_mod: Any = importlib.import_module("proxmox_fleet.alloy")
@@ -243,156 +246,326 @@ _GUEST_BASE = (
 )
 
 
-def _render(profiles: set[str], **overrides: object) -> Any:
+def _render(sources: Any = (), **overrides: object) -> Any:
     kwargs: dict[str, object] = {
         "node": "pve1",
         "cluster": "main",
         "lxc_id": "123",
         "name": "npm",
-        "profiles": profiles,
+        "sources": tuple(sources),
         "retention_hours": 48,
     }
     kwargs.update(overrides)
     return render_lxc_log_config(_desired(_GUEST_BASE), **kwargs)
 
 
-def test_render_appends_npm_source_and_preserves_base_verbatim():
-    base = _desired(_GUEST_BASE)
-    result = render_lxc_log_config(
-        base,
-        node="pve1",
-        cluster="main",
-        lxc_id="123",
-        name="npm",
-        profiles={"npm"},
-        retention_hours=48,
+_CATALOGUE = log_plugins.load_log_catalogue()
+
+# Exact pre-cutover renderer output for the literal identity below, captured
+# before the catalogue/profiles migration (base ``logging {}\n``, retention 168).
+_LEGACY_BASELINE_SHA256 = {
+    "none": "cb9576f4ac801880f97de9b603eae7be7ff1f76ebd97dd3202dad2c657e7e1ae",
+    "npm": "8331c2431701e8ba5b359695d9c3abb3f08cf7880845aa657754aa7ae60c8532",
+    "pbs": "f60a0dda210cc84215d7f51163528171967b65899cab073261040682967b5599",
+    "npm+pbs": "e4b83a4879656a829bcb6bd29623e650445ee7f9ede9bae086aabf6497441d64",
+}
+
+
+def _active_probe_facts(request: dict[str, Any]) -> dict[str, Any]:
+    """Synthesize complete readable/quiet probe facts for a logging request."""
+    units: dict[str, Any] = {}
+
+    def _collect(section: dict[str, Any]) -> None:
+        for layout in section.get("layouts", []):
+            for unit in (
+                *layout.get("required_units", []),
+                *layout.get("running_units_any", []),
+            ):
+                units[unit["key"]] = {"status": "active"}
+        for unit in section.get("journal_units", []):
+            units[unit["key"]] = {"status": "active"}
+
+    for entry in request["plugins"].values():
+        _collect(entry)
+        for included in entry.get("includes", {}).values():
+            _collect(included)
+
+    plugins: dict[str, Any] = {}
+    for owner_id, entry in request["plugins"].items():
+        payload: dict[str, Any] = {"units": units}
+        if entry.get("includes"):
+            payload["includes"] = {
+                dependency_id: {"units": units}
+                for dependency_id in entry["includes"]
+            }
+        plugins[owner_id] = payload
+
+    sources: dict[str, Any] = {}
+    for key, entry in request["sources"].items():
+        layouts: dict[str, Any] = {}
+        for layout_id, payload in entry["layouts"].items():
+            roots = {
+                root: {
+                    "status": "ok",
+                    "exists": True,
+                    "is_dir": True,
+                    "is_symlink": False,
+                    "blocked_ancestor": False,
+                    "device": 1,
+                    "access": {
+                        "traversable": True,
+                        "readable": True,
+                        "default_acl": True,
+                    },
+                }
+                for root in payload["roots"]
+            }
+            matches = [
+                {
+                    "pattern": pattern,
+                    "status": "quiet",
+                    "matched": 0,
+                    "skipped": 0,
+                    "truncated": False,
+                    "files": [],
+                }
+                for pattern in payload["paths"]
+            ]
+            exact_files = {
+                path: {
+                    "status": "quiet",
+                    "exists": False,
+                    "is_symlink": False,
+                    "parent_traversable": True,
+                }
+                for path in payload["exact_files"]
+            }
+            layouts[layout_id] = {
+                "roots": roots,
+                "matches": matches,
+                "exact_files": exact_files,
+            }
+        sources[key] = {"layouts": layouts}
+    return {"plugins": plugins, "sources": sources}
+
+
+def _resolved_sources(
+    script_id: str | None,
+    *,
+    plugins: tuple[str, ...] | None = None,
+) -> Any:
+    """Resolve the real built-in catalogue for one identity/manual selection."""
+    override = (
+        None
+        if plugins is None
+        else GuestLogOverride(mode="replace", plugins=list(plugins))
     )
-    assert result.content.startswith(_GUEST_BASE)
-    assert result.content != base.content
-    assert result.sha256 == hashlib.sha256(result.content.encode("utf-8")).hexdigest()
-    # base journal component names and storage config are untouched
-    assert 'loki.source.journal "journal"' in result.content
-    assert 'loki.write "default"' in result.content
-    # only the npm source plus the shared packer are generated
-    assert 'loki.source.file "fleet_npm"' in result.content
-    assert 'loki.process "fleet_file_pack"' in result.content
-    assert 'loki.source.file "fleet_pbs_tasks"' not in result.content
-    assert alloy_mod.NPM_LIVE_LOG_GLOB in result.content
+    selection = log_plugins.select_log_plugins(
+        _CATALOGUE,
+        script_id=script_id,
+        override=override,
+        auto=True,
+    )
+    request = log_plugins.build_logging_request(selection)
+    return log_plugins.validate_log_layout(selection, _active_probe_facts(request))
 
 
-def test_render_npm_labels_and_quarantine_exclusion():
-    result = _render({"npm"})
-    expected = {
-        "job": "lxc-file",
-        "delivery": "live",
-        "cluster": "main",
-        "node": "pve1",
-        "guest_id": "123",
-        "host": "npm",
+def _baseline_render(sources: Any) -> Any:
+    return render_lxc_log_config(
+        _desired("logging {}\n"),
+        node="pve01",
+        cluster="default",
+        lxc_id="123",
+        name="legacy-smoke",
+        sources=tuple(sources),
+        retention_hours=168,
+    )
+
+
+def _source(**overrides: Any) -> Any:
+    defaults: dict[str, Any] = {
+        "owner_id": "nginxproxymanager",
+        "service_id": "nginxproxymanager",
+        "source_id": "application",
+        "key": "nginxproxymanager/application",
+        "layout_id": "default",
+        "kind": "app",
         "app": "nginxproxymanager",
         "log_kind": "application",
+        "component": "fleet_npm",
+        "required": True,
+        "multiline": None,
+        "paths": ("/data/logs/**/*.log",),
+        "exclude_paths": ("/data/logs/**/.fleet-housekeeping-quarantine/**",),
+        "roots": ("/data/logs",),
+        "exact_files": (),
+        "service_user": None,
+        "status": "active",
     }
-    for key, value in expected.items():
-        assert f"{key} = {json.dumps(value)}" in result.content
-    quarantine = f"/data/logs/**/{alloy_mod.QUARANTINE_DIRNAME}/**"
-    assert quarantine in result.content
-    # filename is packed into the JSON body, never an indexed label
-    assert "filename = " not in result.content
-    assert json.dumps("filename") in result.content
+    defaults.update(overrides)
+    return log_plugins.ResolvedLogSource(**defaults)
 
 
-def test_render_pbs_covers_tasks_and_api_sources():
-    result = _render({"pbs"})
-    assert 'loki.source.file "fleet_pbs_tasks"' in result.content
-    assert 'loki.source.file "fleet_pbs_api"' in result.content
-    assert 'loki.source.file "fleet_npm"' not in result.content
-    assert alloy_mod.PBS_LIVE_TASKS_GLOB in result.content
-    for api_path in alloy_mod.PBS_LIVE_API_GLOBS:
-        assert api_path in result.content
-    assert f"/var/log/proxmox-backup/tasks/**/{alloy_mod.QUARANTINE_DIRNAME}/**" in result.content
-    assert f'app = {json.dumps("proxmox-backup")}' in result.content
-    assert f"log_kind = {json.dumps('task')}" in result.content
-    assert f"log_kind = {json.dumps('api')}" in result.content
-    # UPID identity stays inside the glob only, never an indexed label
-    assert "UPID = " not in result.content
+@pytest.mark.parametrize(
+    ("script_id", "plugins", "baseline"),
+    [
+        ("nginxproxymanager", None, "npm"),
+        ("proxmox-backup-server", None, "pbs"),
+        (None, ("nginxproxymanager", "proxmox-backup-server"), "npm+pbs"),
+    ],
+)
+def test_render_default_selections_match_precutover_baseline(
+    script_id, plugins, baseline
+):
+    resolved = _resolved_sources(script_id, plugins=plugins)
+    result = _baseline_render(resolved.renderable_sources)
+    assert result.sha256 == _LEGACY_BASELINE_SHA256[baseline]
+    assert result.sha256 == hashlib.sha256(result.content.encode("utf-8")).hexdigest()
 
 
-def test_render_both_profiles_generates_every_source():
-    result = _render({"npm", "pbs"})
-    for component in ("fleet_npm", "fleet_pbs_tasks", "fleet_pbs_api"):
-        assert f'loki.source.file "{component}"' in result.content
-
-
-def test_render_retention_hours_drive_ignore_older_than():
-    result = _render({"npm"}, retention_hours=24)
-    assert json.dumps("24h") in result.content
-    assert json.dumps("12h") not in result.content
-
-
-def test_render_without_discovered_profiles_returns_base_unchanged():
-    base = _desired(_GUEST_BASE)
+def test_render_empty_selection_returns_base_bytes_unchanged():
+    base = _desired("logging {}\n")
     result = render_lxc_log_config(
         base,
-        node="pve1",
-        cluster="main",
+        node="pve01",
+        cluster="default",
         lxc_id="123",
-        name="npm",
-        profiles=set(),
-        retention_hours=48,
+        name="legacy-smoke",
+        sources=(),
+        retention_hours=168,
     )
-    assert result.content == base.content
-    assert result.sha256 == base.sha256
+    assert result is base
+    assert result.sha256 == _LEGACY_BASELINE_SHA256["none"]
 
 
-def test_render_rejects_unknown_profiles():
-    with pytest.raises(AlloyConfigError, match="unsupported log profile"):
-        _render({"nginx"})
-    with pytest.raises(AlloyConfigError, match="unsupported log profile"):
-        _render({"npm", "pbs", "docker"})
+def test_render_legacy_components_labels_and_source_order():
+    resolved = _resolved_sources(
+        None, plugins=("nginxproxymanager", "proxmox-backup-server")
+    )
+    content = _baseline_render(resolved.renderable_sources).content
+    order = [
+        'loki.source.file "fleet_npm"',
+        'loki.source.file "fleet_pbs_tasks"',
+        'loki.source.file "fleet_pbs_api"',
+    ]
+    positions = [content.index(name) for name in order]
+    assert positions == sorted(positions)
+    assert 'loki.process "fleet_file_pack"' in content
+    assert "forward_to = [loki.write.default.receiver]" in content
+    assert json.dumps("/data/logs/**/*.log") in content
+    assert json.dumps("/data/logs/**/.fleet-housekeeping-quarantine/**") in content
+    assert json.dumps(
+        "/var/log/proxmox-backup/tasks/[0-9A-F][0-9A-F]/UPID:*"
+    ) in content
+    assert json.dumps(
+        "/var/log/proxmox-backup/tasks/**/.fleet-housekeeping-quarantine/**"
+    ) in content
+    api = content.split('loki.source.file "fleet_pbs_api"')[1]
+    # Literal (non-quarantine) read paths never carry the auto quarantine glob.
+    assert "__path_exclude__" not in api
+    assert json.dumps("/var/log/proxmox-backup/api/access.log") in api
+    assert json.dumps("/var/log/proxmox-backup/api/auth.log") in api
+    assert api.index("access.log") < api.index("auth.log")
+    assert f"app = {json.dumps('proxmox-backup')}" in content
+    assert f"log_kind = {json.dumps('application')}" in content
+    assert f"log_kind = {json.dumps('task')}" in content
+    assert f"log_kind = {json.dumps('api')}" in content
+    # filename is packed into the JSON body, never an indexed label
+    assert "filename = " not in content
+    assert json.dumps("filename") in content
 
 
-def test_render_rejects_reserved_component_conflicts():
-    for snippet in (
-        'loki.process "fleet_file_pack" {}',
-        'loki.source.file "fleet_npm" {}',
-        'loki.source.file "fleet_pbs_api" {}',
-    ):
-        base = _desired(_GUEST_BASE + "\n" + snippet + "\n")
-        with pytest.raises(AlloyConfigError, match="reserved"):
-            render_lxc_log_config(
-                base,
-                node="pve1",
-                cluster="main",
-                lxc_id="123",
-                name="npm",
-                profiles={"npm"},
-                retention_hours=48,
-            )
+def test_render_candidate_and_final_sources_produce_identical_bytes():
+    resolved = _resolved_sources("nginxproxymanager")
+    candidate = tuple(
+        replace(source, status="acl-needed") for source in resolved.sources
+    )
+    assert len(candidate) == 1
+    candidate_config = _baseline_render(candidate)
+    final_config = _baseline_render(resolved.renderable_sources)
+    assert candidate_config.content == final_config.content
+    assert candidate_config.sha256 == _LEGACY_BASELINE_SHA256["npm"]
 
 
-def test_render_refuses_to_double_render_generated_config():
-    first = _render({"npm"})
+def test_render_rejects_unverified_source_status():
+    for status in ("blocked", "inactive", "partial", "unmeasurable"):
+        with pytest.raises(AlloyConfigError, match="not deployable"):
+            _render([_source(status=status)])
+
+
+def test_render_rejects_duplicate_components_and_overlapping_paths():
+    first = _source(
+        component="fleet_dup",
+        key="owner/first",
+        paths=("/data/logs/a/**/*.log",),
+        roots=("/data/logs/a",),
+    )
+    second = _source(
+        component="fleet_dup",
+        key="owner/second",
+        paths=("/data/logs/b/**/*.log",),
+        roots=("/data/logs/b",),
+    )
+    with pytest.raises(AlloyConfigError, match="claimed by both"):
+        _render([first, second])
+    overlapping = _source(
+        component="fleet_other",
+        key="owner/third",
+        paths=("/data/logs/a/specific.log",),
+        roots=("/data/logs/a",),
+        exclude_paths=(),
+    )
+    with pytest.raises(AlloyConfigError, match="ownership conflict"):
+        _render([first, overlapping])
+
+
+def test_render_rejects_invalid_component_names():
+    with pytest.raises(AlloyConfigError, match="invalid Alloy component"):
+        _render([_source(component="bad-name")])
+
+
+def test_render_rejects_base_with_generated_component_names():
+    source = _source()
+    npm_base = _desired(_GUEST_BASE + '\nloki.source.file "fleet_npm" {}\n')
     with pytest.raises(AlloyConfigError, match="reserved"):
         render_lxc_log_config(
-            DesiredAlloyConfig(content=first.content, sha256=first.sha256),
+            npm_base,
             node="pve1",
             cluster="main",
             lxc_id="123",
             name="npm",
-            profiles={"npm"},
+            sources=[source],
+            retention_hours=48,
+        )
+    pack_base = _desired(_GUEST_BASE + '\nloki.process "fleet_file_pack" {}\n')
+    with pytest.raises(AlloyConfigError, match="reserved"):
+        render_lxc_log_config(
+            pack_base,
+            node="pve1",
+            cluster="main",
+            lxc_id="123",
+            name="npm",
+            sources=[source],
             retention_hours=48,
         )
 
 
-def test_render_escapes_hostile_label_values():
+def test_render_retention_controls_ignore_older_than_and_rejects_zero():
+    result = _render([_source()], retention_hours=24)
+    assert json.dumps("24h") in result.content
+    assert json.dumps("12h") not in result.content
+    with pytest.raises(AlloyConfigError, match="positive integer"):
+        _render([_source()], retention_hours=0)
+
+
+def test_render_escapes_hostile_values_and_keeps_hcl_balanced():
     hostile = 'na"me\\path\nnext'
     cluster = 'we"ird'
-    result = _render({"npm"}, name=hostile, cluster=cluster)
+    result = _render([_source()], name=hostile, cluster=cluster)
     assert json.dumps(hostile) in result.content
     assert hostile not in result.content
     assert json.dumps(cluster) in result.content
     assert cluster not in result.content
-    # escaping must keep the appended HCL structurally balanced
     assert result.content.count("{") == result.content.count("}")
 
 
@@ -404,8 +577,106 @@ def test_render_handles_base_without_trailing_newline():
         cluster="main",
         lxc_id="123",
         name="npm",
-        profiles={"npm"},
+        sources=[_source()],
         retention_hours=48,
     )
     assert result.content.startswith(base.content)
     assert 'loki.source.file "fleet_npm"' in result.content
+
+
+def test_render_combines_multiple_exclusions_into_one_brace_union():
+    source = _source(
+        exclude_paths=(
+            "/data/logs/**/.fleet-housekeeping-quarantine/**",
+            "/data/logs/**/rotated/**",
+        )
+    )
+    content = _render([source]).content
+    expected = (
+        "{/data/logs/**/.fleet-housekeeping-quarantine/**,/data/logs/**/rotated/**}"
+    )
+    assert f"__path_exclude__ = {json.dumps(expected)}," in content
+    assert content.count("__path_exclude__") == 1
+
+
+def test_render_literal_exact_file_drops_only_auto_quarantine_exclusion():
+    source = _source(
+        component="fleet_kuma",
+        key="uptimekuma/error",
+        source_id="error",
+        app="uptimekuma",
+        log_kind="error",
+        paths=(),
+        exact_files=("/opt/uptime-kuma/data/error.log",),
+        roots=("/opt/uptime-kuma/data",),
+        exclude_paths=("/opt/uptime-kuma/data/**/.fleet-housekeeping-quarantine/**",),
+    )
+    content = _render([source]).content
+    stanza = content.split('loki.source.file "fleet_kuma"')[1]
+    assert "__path_exclude__" not in stanza
+    assert json.dumps("/opt/uptime-kuma/data/error.log") in stanza
+    authored = replace(
+        source, exclude_paths=("/opt/uptime-kuma/data/*.old",)
+    )
+    authored_stanza = _render([authored]).content.split(
+        'loki.source.file "fleet_kuma"'
+    )[1]
+    assert json.dumps("/opt/uptime-kuma/data/*.old") in authored_stanza
+
+
+def test_render_exact_only_source_renders_one_literal_target():
+    source = _source(
+        component="fleet_kuma",
+        key="uptimekuma/error",
+        source_id="error",
+        app="uptimekuma",
+        log_kind="error",
+        paths=(),
+        exact_files=("/opt/uptime-kuma/data/error.log",),
+        roots=(),
+        exclude_paths=(),
+    )
+    content = _render([source]).content
+    assert content.count("__path__") == 1
+    assert json.dumps("/opt/uptime-kuma/data/error.log") in content
+
+
+def test_render_multiline_source_chains_into_shared_pack_process():
+    multiline = MultilineOptions(
+        firstline=r"^\d{4}-\d{2}-\d{2}", max_lines=200, max_wait_seconds=5
+    )
+    source = _source(
+        component="fleet_custom",
+        key="custom/app/application",
+        owner_id="custom",
+        service_id="app",
+        source_id="application",
+        app="custom",
+        log_kind="application",
+        multiline=multiline,
+        paths=("/srv/app/logs/*.log",),
+        roots=("/srv/app/logs",),
+        exclude_paths=(),
+    )
+    content = _render([source]).content
+    assert "stage.multiline {" in content
+    assert f"firstline = {json.dumps(multiline.firstline)}" in content
+    assert "max_lines = 200" in content
+    assert 'max_wait_time = "5s"' in content
+    multiline_component = content.split('loki.process "fleet_multiline_')[1].split(
+        '"'
+    )[0]
+    assert "fleet_multiline_" in content
+    assert (
+        f"forward_to = [loki.process.fleet_multiline_{multiline_component}.receiver]"
+        in content
+    )
+    source_stanza = content.split('loki.source.file "fleet_custom"')[1]
+    assert (
+        f"forward_to = [loki.process.fleet_multiline_{multiline_component}.receiver]"
+        in source_stanza
+    )
+    # the shared packing process remains the single writer stage
+    assert 'loki.process "fleet_file_pack"' in content
+    assert "stage.pack {" in content
+    assert "ingest_timestamp = true" in content

@@ -1,0 +1,25 @@
+---
+schema_version: 1
+id: homepage
+display_name: Proxmox community script homepage
+community_script_ids:
+  - homepage
+journal_units: []
+layouts:
+  - id: default
+    required_units:
+      - name: homepage.service
+    sources:
+      - id: application
+        app: homepage
+        log_kind: application
+        allowed_roots:
+          - /opt/homepage/config/logs
+        alternate_roots:
+          - /opt/homepage/.next/standalone/config/logs
+        paths:
+          - /opt/homepage/config/logs/homepage.log
+disk_usage:
+  path_max_share_percent:
+    /root/.npm: 20.0
+    /root/.local/share/pnpm/store: 20.0

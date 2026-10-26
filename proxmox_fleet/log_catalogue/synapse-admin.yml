@@ -1,0 +1,13 @@
+---
+schema_version: 1
+id: synapse-admin
+display_name: Synapse Admin
+kind: dependency
+community_script_ids: []
+journal_units:
+  - name: synapse-admin.service
+layouts:
+  - id: default
+    required_units:
+      - name: synapse-admin.service
+    sources: []

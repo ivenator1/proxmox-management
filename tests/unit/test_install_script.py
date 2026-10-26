@@ -27,6 +27,8 @@ from typing import Dict, Optional
 
 import pytest
 
+from proxmox_fleet.models.settings import GlobalSettings
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 INSTALL_SH = REPO_ROOT / "install.sh"
 
@@ -240,6 +242,49 @@ def test_unchanged_installer_applies_changed_scope(tmp_path: Path) -> None:
     assert installed is not None
     argv = shlex.split(installed.partition("=")[2])
     assert set(argv[argv.index("--limit") + 1].split(",")) == {"default/123"}
+
+    # Scheduled-coverage cutover: enrolling the Homepage (135) pnpm guest and the
+    # gitea-mirror (122) Bun guest must reach the *installed* unit without any
+    # installer change, because the timer service hard-codes the --limit at
+    # install/update time. The scope stays timer-only: housekeeping_enabled is
+    # never set here, so ordinary updates still do not clean caches.
+    vars_path.write_text(
+        "housekeeping_timer_enabled: true\n"
+        "housekeeping_timer_targets:\n"
+        "  - default/123\n"
+        "  - default/135\n"
+        "  - default/122\n"
+        "housekeeping_loki_url: http://127.0.0.1:3100\n",
+        encoding="utf-8",
+    )
+    expanded_vars = vars_path.read_bytes()
+
+    enrolled = _run_update(fx)
+    assert enrolled.returncode == 0, enrolled.stderr
+    installed = _exec_start(_unit(fx, "fleet-housekeeping.service"))
+    assert installed is not None
+    argv = shlex.split(installed.partition("=")[2])
+    assert "--housekeeping-only" in argv
+    assert set(argv[argv.index("--limit") + 1].split(",")) == {
+        "default/122",
+        "default/123",
+        "default/135",
+    }
+    # The regenerated unit replaced the previous narrower scope rather than
+    # accumulating stale entries, and operator config survives byte-for-byte.
+    assert "default/120" not in installed
+    assert _unit(fx, "fleet-housekeeping.service").count("--limit") == 1
+    assert vars_path.read_bytes() == expanded_vars
+    # Same model the installer resolves through `resolve_setting`: enrolling a
+    # target must not implicitly switch ordinary-run housekeeping on.
+    resolved = GlobalSettings.load(vars_path)
+    assert resolved.housekeeping_enabled is False
+    assert resolved.housekeeping_timer_enabled is True
+    # The installed unit carries exactly the config-derived scope the CLI parses:
+    # no additional target can appear in the scheduled service from elsewhere.
+    assert set(argv[argv.index("--limit") + 1].split(",")) == set(
+        resolved.housekeeping_timer_limit.split(",")
+    )
 
 
 def test_failed_pull_preserves_installed_configuration(tmp_path: Path) -> None:

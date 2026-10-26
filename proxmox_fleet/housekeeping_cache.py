@@ -1,7 +1,7 @@
 """Short-retention cache cleanup for managed LXC guests (the cache slice).
 
 This module owns *only* cache housekeeping: bounded, native-tool cache
-reclamation for the four fixed profiles (APT, Yarn 1, npm, pnpm).  It is
+reclamation for the five fixed profiles (APT, Yarn 1, npm, pnpm, Bun).  It is
 deliberately independent of Loki readiness, import/backfill state and Alloy
 delivery: cache space is local, so a central-store outage must never prevent
 reclaiming it.  It never deletes dependency trees, build output, databases,
@@ -14,6 +14,15 @@ facts from the reported resolved path (never trusting a lone ``allowlisted``
 boolean) and refuses to act unless every one holds, then re-probes immediately
 before and after the native command to measure the real allocated-block change.
 
+Bun differs in three ways.  Its executable may be missing from a noninteractive
+``PATH``, so the action uses the freshly validated absolute binary from the
+helper's fixed binary directories.  Its native ``prune`` is feature-detected
+from bounded ``bun pm --help`` (never a ``--dry-run`` probe) and preserves the
+global store's ``links/``, git clones and manifests.  And the measured reclaim
+is the delta of the helper's conservative ``reclaimable_bytes`` (unique regular
+files with no other hardlink, outside ``links/``), not ``allocated_bytes``:
+retained link targets and externally hardlinked bytes were never freeable.
+
 Cadence is the trusted per-guest/per-tool checkpoint: a *successful* native
 command advances it (even when the measured reclamation is zero), while a busy
 skip or a failed command never does.  Missing cache directories are idle and an
@@ -22,6 +31,7 @@ empty root does not create a no-op record.
 from __future__ import annotations
 
 import re
+import shlex
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
@@ -43,9 +53,11 @@ if TYPE_CHECKING:  # avoid runtime cycles; used for typing only
 # --------------------------------------------------------------------------- #
 
 #: Tools cleaned, in a stable order.
-CACHE_TOOLS: Tuple[str, ...] = ("apt", "yarn", "npm", "pnpm")
+CACHE_TOOLS: Tuple[str, ...] = ("apt", "yarn", "npm", "pnpm", "bun")
 
 #: The exact native command per tool.  No arbitrary paths or shell fragments.
+#: Bun's command is built from the freshly validated binary instead: see
+#: :func:`bun_clean_command`.
 CACHE_CLEAN_COMMANDS: Dict[str, str] = {
     "apt": "LC_ALL=C apt-get clean",
     "yarn": "yarn cache clean",
@@ -53,12 +65,17 @@ CACHE_CLEAN_COMMANDS: Dict[str, str] = {
     "pnpm": "pnpm store prune",
 }
 
+#: Bun's exact allowlisted native cache root and native prune age.
+BUN_CACHE_ROOT = "/root/.bun/install/cache"
+BUN_PRUNE_MAX_AGE_DAYS = 30
+
 #: Allowlisted native cache roots (mirrors the node helper's CACHE_SPECS).
 _ALLOWED_ROOTS: Dict[str, Tuple[str, ...]] = {
     "apt": ("/var/cache/apt/archives",),
     "yarn": ("/usr/local/share/.cache/yarn", "/root/.cache/yarn"),
     "npm": ("/root/.npm",),
     "pnpm": ("/root/.local/share/pnpm/store",),
+    "bun": (BUN_CACHE_ROOT,),
 }
 
 #: An exact immediate version child that is also allowed (never a deeper path).
@@ -69,7 +86,7 @@ _ALLOWED_CHILD: Dict[str, "re.Pattern[str]"] = {
 
 #: Tools whose resolved directory must be reported by the tool itself, so the
 #: native command and the verified path cannot disagree.
-_NATIVE_RESOLVED = frozenset({"yarn", "npm", "pnpm"})
+_NATIVE_RESOLVED = frozenset({"yarn", "npm", "pnpm", "bun"})
 
 #: Activity that blocks one tool (a "build" entry blocks every tool).
 _BUSY_BLOCKS: Dict[str, Tuple[str, ...]] = {
@@ -77,7 +94,14 @@ _BUSY_BLOCKS: Dict[str, Tuple[str, ...]] = {
     "yarn": ("yarn",),
     "npm": ("npm",),
     "pnpm": ("pnpm",),
+    "bun": ("bun",),
 }
+
+#: Fixed system binary directories Bun may be executed from.  Never a PATH
+#: lookup and never a settings-provided executable.
+_BUN_BIN_DIRS = frozenset(
+    {"/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"}
+)
 
 #: Guest OS IDs the fixed apt-based profiles are trusted on.
 _SUPPORTED_OS = frozenset({"debian", "ubuntu"})
@@ -94,6 +118,13 @@ _REQUIRED_ENTRY_KEYS: Tuple[str, ...] = (
     "version",
     "dependency_referenced",
     "error",
+)
+
+#: Additional Bun-only per-entry facts required before any safety decision.
+_BUN_ENTRY_KEYS: Tuple[str, ...] = (
+    "binary",
+    "cache_prune_supported",
+    "reclaimable_bytes",
 )
 
 
@@ -127,6 +158,34 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def bun_clean_command(binary: str) -> str:
+    """Exact native Bun prune command with the freshly validated binary.
+
+    ``BUN_INSTALL_CACHE_DIR`` is pinned so a tool config/env change cannot
+    redirect cleanup, and every manager-constructed value is quoted.  ``prune``
+    preserves the global store's ``links/``, git clones and manifests, unlike
+    ``bun pm cache rm``.
+    """
+    return (
+        f"LC_ALL=C BUN_INSTALL_CACHE_DIR={shlex.quote(BUN_CACHE_ROOT)} "
+        f"{shlex.quote(binary)} pm cache prune --max-age {BUN_PRUNE_MAX_AGE_DAYS}"
+    )
+
+
+def _bun_binary(entry: Dict[str, Any]) -> Optional[str]:
+    """Return the fact-reported Bun binary only if it is a fixed system path."""
+    binary = entry.get("binary")
+    if not isinstance(binary, str) or not binary.startswith("/") or "\x00" in binary:
+        return None
+    parts = binary.split("/")
+    if parts[-1] != "bun" or any(part in ("", ".", "..") for part in parts[1:-1]):
+        return None
+    parent = binary.rsplit("/", 1)[0]
+    if parent not in _BUN_BIN_DIRS:
+        return None
+    return binary
+
+
 def _detail(result: Any) -> str:
     detail = str(
         getattr(result, "stderr", "") or getattr(result, "stdout", "") or "command failed"
@@ -152,11 +211,13 @@ def _root_allowed(tool: str, resolved: str) -> bool:
     return False
 
 
-def _facts_incomplete(entry: Dict[str, Any]) -> Optional[str]:
+def _facts_incomplete(tool: str, entry: Dict[str, Any]) -> Optional[str]:
     """Return a bounded description of missing/malformed facts, or ``None``."""
     missing = [key for key in _REQUIRED_ENTRY_KEYS if key not in entry]
     if entry.get("exists") and "root_owned" not in entry:
         missing.append("root_owned")
+    if tool == "bun" and entry.get("exists"):
+        missing.extend(key for key in _BUN_ENTRY_KEYS if key not in entry)
     if missing:
         return "incomplete cache facts (missing: " + ", ".join(missing) + ")"
     for key in ("exists", "allowlisted", "escaped", "dependency_referenced"):
@@ -171,6 +232,16 @@ def _facts_incomplete(entry: Dict[str, Any]) -> Optional[str]:
             return f"malformed cache facts ({key} is not a string or null)"
     if entry["source"] not in (None, "tool", "allowlist"):
         return "malformed cache facts (source is not tool/allowlist)"
+    if tool == "bun" and entry.get("exists"):
+        binary = entry["binary"]
+        if binary is not None and not isinstance(binary, str):
+            return "malformed cache facts (binary is not a string or null)"
+        if not isinstance(entry["cache_prune_supported"], bool):
+            return "malformed cache facts (cache_prune_supported is not a boolean)"
+        for key in ("allocated_bytes", "reclaimable_bytes"):
+            value = entry[key]
+            if value is not None and (not _is_int(value) or value < 0):
+                return f"malformed cache facts ({key} is not a non-negative integer or null)"
     return None
 
 
@@ -191,6 +262,14 @@ def _safety_problem(tool: str, entry: Dict[str, Any]) -> Optional[str]:
         return f"cache root {resolved!r} is referenced by installed dependencies"
     if tool in _NATIVE_RESOLVED and entry.get("source") != "tool":
         return f"{tool} could not report its native cache directory"
+    if tool == "bun":
+        if entry.get("cache_prune_supported") is not True:
+            return "Bun native cache prune is unsupported by this build; cache preserved"
+        if _bun_binary(entry) is None:
+            return (
+                "Bun executable could not be resolved to a fixed system binary "
+                "directory; cache preserved"
+            )
     return None
 
 
@@ -294,12 +373,20 @@ def clean_guest_caches(
         if not entry.get("exists"):
             # A missing cache directory is idle.
             continue
+        # Presence/due stays on allocated bytes for every tool.  Bun reports a
+        # separate conservative reclaimable value: retained links/ and
+        # externally hardlinked bytes are present but never freeable.
+        measure_key = "reclaimable_bytes" if tool == "bun" else "allocated_bytes"
         last = store.last_cache_clean(key, tool)
         if last is not None and interval_ns > 0 and (now - int(last)) < interval_ns:
             continue  # cleaned within the cadence window; silent
 
         if dry_run:
-            problem = _facts_incomplete(entry) or _safety_problem(tool, entry) or _version_problem(tool, entry)
+            problem = (
+                _facts_incomplete(tool, entry)
+                or _safety_problem(tool, entry)
+                or _version_problem(tool, entry)
+            )
             if problem is not None:
                 warnings.append(f"{tool}: {problem}; would skip cache cleanup")
                 continue
@@ -313,11 +400,17 @@ def clean_guest_caches(
                 continue
             if not _is_int(allocated) or allocated <= 0:
                 continue  # empty cache is idle
-            warnings.append(f"{tool}: cache cleanup is due (up to {allocated} allocated bytes reclaimable)")
+            potential = entry.get(measure_key)
+            if potential is None:
+                warnings.append(f"{tool}: cache size could not be measured; audit is incomplete")
+                continue
+            if not _is_int(potential) or potential <= 0:
+                continue  # nothing reclaimable is idle
+            warnings.append(f"{tool}: cache cleanup is due (up to {potential} allocated bytes reclaimable)")
             result.findings = True
             continue
 
-        incomplete = _facts_incomplete(entry)
+        incomplete = _facts_incomplete(tool, entry)
         if incomplete is not None:
             warnings.append(f"{tool}: {incomplete}; skipping cache cleanup")
             continue
@@ -350,7 +443,7 @@ def clean_guest_caches(
             fresh_problem = "cache facts are missing or malformed"
         else:
             fresh_problem = (
-                _facts_incomplete(fresh)
+                _facts_incomplete(tool, fresh)
                 or _safety_problem(tool, fresh)
                 or _version_problem(tool, fresh)
                 or _busy_problem(tool, {str(name) for name in fresh_probe.busy_tools})
@@ -358,14 +451,41 @@ def clean_guest_caches(
         if fresh is None or fresh_problem is not None:
             warnings.append(f"{tool}: {fresh_problem}; cache cleanup aborted")
             continue
-        before = fresh.get("allocated_bytes")
+        fresh_allocated = fresh.get("allocated_bytes")
+        if not isinstance(fresh_allocated, int) or isinstance(fresh_allocated, bool):
+            warnings.append(f"{tool}: cache size could not be measured before cleanup; aborted")
+            continue
+        if fresh_allocated <= 0:
+            continue  # became idle
+        before = fresh.get(measure_key)
         if not isinstance(before, int) or isinstance(before, bool):
             warnings.append(f"{tool}: cache size could not be measured before cleanup; aborted")
             continue
-        if before <= 0:
+        if tool == "bun":
+            if before < 0:
+                warnings.append(
+                    f"{tool}: cache size could not be measured before cleanup; aborted"
+                )
+                continue
+        elif before <= 0:
             continue  # became idle
+        if tool == "bun":
+            # The action must use the fresh probe's validated executable, and a
+            # binary that changed between probes invalidates the candidate.
+            initial_binary = _bun_binary(entry)
+            fresh_binary = _bun_binary(fresh)
+            if (
+                initial_binary is None
+                or fresh_binary is None
+                or initial_binary != fresh_binary
+            ):
+                warnings.append(f"{tool}: Bun executable changed before cleanup; aborted")
+                continue
+            command = bun_clean_command(fresh_binary)
+        else:
+            command = CACHE_CLEAN_COMMANDS[tool]
 
-        applied = executor.housekeeping_apply(lxc_id, command=CACHE_CLEAN_COMMANDS[tool])
+        applied = executor.housekeeping_apply(lxc_id, command=command)
         if getattr(applied, "failed", False) or getattr(applied, "rc", 1) != 0:
             result.failed = True
             warnings.append(f"{tool}: cache cleanup command failed: {_detail(applied)}")
@@ -377,8 +497,12 @@ def clean_guest_caches(
 
         after_probe = _reprobe(executor, lxc_id, tool, "after", warnings)
         after_entry = _tool_entry(after_probe, tool) if after_probe is not None else None
-        after = after_entry.get("allocated_bytes") if isinstance(after_entry, dict) else None
-        if not isinstance(after, int) or isinstance(after, bool):
+        after = after_entry.get(measure_key) if isinstance(after_entry, dict) else None
+        if (
+            not isinstance(after, int)
+            or isinstance(after, bool)
+            or (tool == "bun" and after < 0)
+        ):
             warnings.append(
                 f"{tool}: cache cleanup succeeded but reclaimed bytes could not be measured"
             )
