@@ -86,10 +86,16 @@ def _unit_records(entry: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _logging_facts(
-    request: Optional[Dict[str, Any]], *, ready: bool = True
+    request: Optional[Dict[str, Any]],
+    *,
+    ready: bool = True,
+    status: Optional[str] = None,
 ) -> Dict[str, Any]:
     if request is None:
         return {"plugins": {}, "sources": {}}
+    # ``status="unavailable"`` mirrors the real helper when the collector
+    # prerequisite (ACL tools) is missing: no access could be measured.
+    unavailable = status == "unavailable"
     plugins: Dict[str, Any] = {}
     for owner, entry in request.get("plugins", {}).items():
         includes = {
@@ -103,6 +109,17 @@ def _logging_facts(
         for layout_id, spec in source_entry.get("layouts", {}).items():
             roots: Dict[str, Any] = {}
             for root in spec.get("roots", []):
+                if unavailable:
+                    roots[root] = {
+                        "exists": False,
+                        "is_dir": False,
+                        "is_symlink": False,
+                        "device": None,
+                        "blocked_ancestor": False,
+                        "status": "unavailable",
+                        "error": "the guest ACL tools are unavailable",
+                    }
+                    continue
                 roots[root] = {
                     "exists": True,
                     "is_dir": True,
@@ -116,19 +133,45 @@ def _logging_facts(
                         "default_acl": ready,
                     },
                 }
-            matches = [
-                {
-                    "pattern": pattern,
-                    "matched": 0,
-                    "skipped": 0,
-                    "truncated": False,
-                    "status": "quiet" if ready else "denied",
-                    "files": [],
-                }
-                for pattern in spec.get("paths", [])
-            ]
+            if unavailable:
+                matches = [
+                    {
+                        "pattern": pattern,
+                        "matched": 0,
+                        "skipped": 0,
+                        "truncated": False,
+                        "status": "unavailable",
+                        "error": "the guest ACL tools are unavailable",
+                        "files": [],
+                    }
+                    for pattern in spec.get("paths", [])
+                ]
+            else:
+                matches = [
+                    {
+                        "pattern": pattern,
+                        "matched": 0,
+                        "skipped": 0,
+                        "truncated": False,
+                        "status": "quiet" if ready else "denied",
+                        "files": [],
+                    }
+                    for pattern in spec.get("paths", [])
+                ]
             exact: Dict[str, Any] = {}
             for path in spec.get("exact_files", []):
+                if unavailable:
+                    exact[path] = {
+                        "exists": False,
+                        "is_symlink": False,
+                        "device": None,
+                        "inode": None,
+                        "size": None,
+                        "mtime_ns": None,
+                        "status": "unavailable",
+                        "error": "the guest ACL tools are unavailable",
+                    }
+                    continue
                 exact[path] = {
                     "exists": True,
                     "is_symlink": False,
@@ -143,7 +186,11 @@ def _logging_facts(
                     "is_file": True,
                 }
             layouts[layout_id] = {
-                "status": "ok" if ready else "denied",
+                "status": (
+                    "unavailable"
+                    if unavailable
+                    else "ok" if ready else "denied"
+                ),
                 "truncated": False,
                 "roots": roots,
                 "exact_files": exact,
@@ -224,6 +271,7 @@ class ScriptedExecutor:
         alloy_config_sha: str = "",
         validation_fails: bool = False,
         deploy_fails: bool = False,
+        install_fails: bool = False,
     ) -> None:
         self._probes = list(probes)
         self._applies = list(apply_results or [])
@@ -232,6 +280,7 @@ class ScriptedExecutor:
         self.config_sha = alloy_config_sha
         self.validation_fails = validation_fails
         self.deploy_fails = deploy_fails
+        self.install_fails = install_fails
         self.applied: List[str] = []
         self.acl_calls: List[Dict[str, Any]] = []
         self.reconciled: List[Dict[str, Any]] = []
@@ -303,6 +352,8 @@ class ScriptedExecutor:
             return PrimitiveResult(rc=0, changed=False, facts={})
         if self.deploy_fails:
             return PrimitiveResult(rc=1, failed=True, stderr="alloy deploy failed", facts={})
+        if kwargs.get("install") and self.install_fails:
+            return PrimitiveResult(rc=1, failed=True, stderr="apt failed", facts={})
         if kwargs.get("install"):
             self.binary_present = True
         if kwargs.get("configure"):
@@ -665,7 +716,236 @@ def test_missing_acl_tools_blocks_without_running_commands():
     assert result.failed is True
     assert executor.applied == []
     assert executor.acl_calls == []
+    assert all(not call.get("install") for call in executor.reconciled)
+    assert all(not call.get("configure") for call in executor.reconciled)
     assert any("ACL tools missing" in w for w in result.warnings)
+    assert any("--alloy-only" in w for w in result.warnings)
+
+
+def test_explicit_alloy_setup_installs_missing_acl_prerequisite():
+    """An existing Alloy install with absent ACL tools is bootstrapped by setup.
+
+    The real helper reports file sources as unmeasurable when ``getfacl`` is
+    unavailable; the explicit install path must still provision the guest ACL
+    prerequisite, re-probe the same selection and finish configuring Alloy.
+    """
+    base = _base()
+    missing_tools = {**_ALL_BINARIES, "setfacl": None, "getfacl": None}
+    ready_logging = _logging_facts(_REQUEST)
+    executor = ScriptedExecutor(
+        [
+            _probe(
+                _facts(
+                    logging=_logging_facts(_REQUEST, status="unavailable"),
+                    binaries=missing_tools,
+                    alloy_env_hash=_env_hash(),
+                )
+            ),
+            _probe(_facts(logging=ready_logging, alloy_env_hash=_env_hash())),
+            _probe(_facts(logging=ready_logging, alloy_env_hash=_env_hash())),
+        ]
+    )
+
+    result = _prepare(executor, base=base, allow_install=True)
+
+    assert result.summary is not None and result.summary.status == "Configured"
+    assert result.failed is False
+    assert result.effective_alloy is not None
+    install_calls = [call for call in executor.reconciled if call.get("install")]
+    assert len(install_calls) == 1
+    assert install_calls[0]["configure"] is False
+    live_calls = [call for call in executor.reconciled if call.get("configure")]
+    assert live_calls
+    assert executor.reconciled.index(install_calls[0]) < executor.reconciled.index(
+        live_calls[0]
+    )
+    assert executor.config_sha == result.effective_alloy.sha256
+    assert executor.acl_calls == []
+
+
+def _missing_acl_tools() -> Dict[str, Any]:
+    return {**_ALL_BINARIES, "setfacl": None, "getfacl": None}
+
+
+def test_explicit_alloy_setup_failure_blocks_before_validation_acl_or_config():
+    base = _base()
+    executor = ScriptedExecutor(
+        [
+            _probe(
+                _facts(
+                    logging=_logging_facts(_REQUEST, status="unavailable"),
+                    binaries=_missing_acl_tools(),
+                    alloy_env_hash=_env_hash(),
+                )
+            )
+        ],
+        install_fails=True,
+    )
+
+    result = _prepare(executor, base=base, allow_install=True)
+
+    assert result.summary is not None and result.summary.status == "Blocked"
+    assert result.failed is True
+    assert result.effective_alloy is None
+    assert any("installation failed" in w for w in result.warnings)
+    assert executor.validation_calls == []
+    assert executor.acl_calls == []
+    assert executor.applied == []
+    assert all(not call.get("configure") for call in executor.reconciled)
+
+
+def test_explicit_alloy_setup_still_missing_tools_blocks_before_mutation():
+    base = _base()
+    unavailable = _logging_facts(_REQUEST, status="unavailable")
+    executor = ScriptedExecutor(
+        [
+            _probe(
+                _facts(
+                    logging=unavailable,
+                    binaries=_missing_acl_tools(),
+                    alloy_env_hash=_env_hash(),
+                )
+            ),
+            _probe(
+                _facts(
+                    logging=unavailable,
+                    binaries=_missing_acl_tools(),
+                    alloy_env_hash=_env_hash(),
+                )
+            ),
+        ]
+    )
+
+    result = _prepare(executor, base=base, allow_install=True)
+
+    assert result.summary is not None and result.summary.status == "Blocked"
+    assert result.failed is True
+    assert result.effective_alloy is None
+    assert any(
+        "ACL tools missing" in warning and "--alloy-only" in warning
+        for warning in result.warnings
+    )
+    assert executor.validation_calls == []
+    assert executor.acl_calls == []
+    assert executor.applied == []
+    assert all(not call.get("configure") for call in executor.reconciled)
+
+
+def test_dry_run_reports_acl_package_without_install():
+    base = _base()
+    executor = ScriptedExecutor(
+        [
+            _probe(
+                _facts(
+                    logging=_logging_facts(_REQUEST, status="unavailable"),
+                    binaries=_missing_acl_tools(),
+                    alloy_env_hash=_env_hash(),
+                )
+            )
+        ]
+    )
+
+    result = _prepare(executor, base=base, allow_install=True, dry_run=True)
+
+    assert result.summary is not None and result.summary.status == "Audit"
+    assert result.failed is False
+    assert executor.reconciled == []
+    assert executor.acl_calls == []
+    assert executor.applied == []
+    assert executor.probe_calls == 1
+    assert any(
+        "acl' package" in warning and "--alloy-only" in warning
+        for warning in result.warnings
+    )
+
+
+def test_explicit_alloy_setup_repairs_access_after_installing_one_tool():
+    base = _base()
+    denied = _logging_facts(_REQUEST, ready=False)
+    executor = ScriptedExecutor(
+        [
+            _probe(
+                _facts(
+                    logging=denied,
+                    access_ready=False,
+                    binaries={**_ALL_BINARIES, "setfacl": None},
+                    alloy_env_hash=_env_hash(),
+                )
+            ),
+            _probe(
+                _facts(
+                    logging=denied,
+                    access_ready=False,
+                    alloy_env_hash=_env_hash(),
+                )
+            ),
+            _probe(_facts(logging=_logging_facts(_REQUEST), alloy_env_hash=_env_hash())),
+        ]
+    )
+
+    result = _prepare(executor, base=base, allow_install=True)
+
+    assert result.summary is not None and result.summary.status == "Configured"
+    assert result.failed is False
+    assert result.effective_alloy is not None
+    install_calls = [call for call in executor.reconciled if call.get("install")]
+    assert len(install_calls) == 1
+    assert install_calls[0]["configure"] is False
+    assert executor.acl_calls
+    assert executor.acl_calls[0]["roots"] == ("/data/logs",)
+    assert executor.config_sha == result.effective_alloy.sha256
+
+
+def test_journal_only_selection_does_not_install_acl_tools():
+    base = _base()
+    selection = lp.select_log_plugins(
+        _catalogue(), script_id="dashy", override=None, auto=True
+    )
+    logging = _logging_facts(lp.build_logging_request(selection))
+    executor = ScriptedExecutor(
+        [
+            _probe(_facts(logging=logging, binaries=_missing_acl_tools(), alloy_env_hash=_env_hash())),
+            _probe(_facts(logging=logging, binaries=_missing_acl_tools(), alloy_env_hash=_env_hash())),
+        ]
+    )
+
+    result = _prepare(executor, base=base, script_id="dashy", allow_install=True)
+
+    assert result.failed is False
+    assert result.effective_alloy is not None
+    assert all(not call.get("install") for call in executor.reconciled)
+
+
+def test_empty_selection_does_not_install_acl_tools():
+    base = _base()
+    executor = ScriptedExecutor(
+        [
+            _probe(
+                _facts(
+                    logging=_logging_facts(None),
+                    binaries=_missing_acl_tools(),
+                    alloy_env_hash=_env_hash(),
+                )
+            ),
+            _probe(
+                _facts(
+                    logging=_logging_facts(None),
+                    binaries=_missing_acl_tools(),
+                    alloy_env_hash=_env_hash(),
+                )
+            ),
+        ]
+    )
+
+    result = _prepare(
+        executor,
+        base=base,
+        allow_install=True,
+        log_override=GuestLogOverride(mode="replace", plugins=[]),
+    )
+
+    assert result.failed is False
+    assert all(not call.get("install") for call in executor.reconciled)
 
 
 def test_missing_alloy_blocks_when_install_disallowed():
@@ -709,6 +989,40 @@ def test_missing_alloy_installs_when_allowed_then_reprobes():
     assert result.summary is not None and result.summary.status == "Configured"
     assert result.failed is False
     assert result.effective_alloy is not None
+
+
+def test_fresh_alloy_setup_provisions_acl_tools_in_the_same_install():
+    base = _base()
+    ready_logging = _logging_facts(_REQUEST)
+    executor = ScriptedExecutor(
+        [
+            _probe(
+                _facts(
+                    logging=_logging_facts(_REQUEST, status="unavailable"),
+                    binaries={
+                        **_ALL_BINARIES,
+                        "alloy": None,
+                        "setfacl": None,
+                        "getfacl": None,
+                    },
+                    alloy_env_hash=_env_hash(),
+                )
+            ),
+            _probe(_facts(logging=ready_logging, alloy_env_hash=_env_hash())),
+            _probe(_facts(logging=ready_logging, alloy_env_hash=_env_hash())),
+        ],
+        alloy_binary=False,
+    )
+
+    result = _prepare(executor, base=base, allow_install=True)
+
+    assert result.summary is not None and result.summary.status == "Configured"
+    assert result.failed is False
+    assert result.effective_alloy is not None
+    install_calls = [call for call in executor.reconciled if call.get("install")]
+    assert len(install_calls) == 1
+    assert install_calls[0]["configure"] is False
+    assert executor.config_sha == result.effective_alloy.sha256
 
 
 def test_unsupported_guest_os_blocks():
