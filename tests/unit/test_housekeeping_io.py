@@ -2847,6 +2847,75 @@ layouts:
     assert resolved.sources[0].live_files == count
 
 
+@pytest.mark.parametrize(
+    ("script_id", "units", "tasks_root", "upid"),
+    [
+        (
+            "proxmox-backup-server",
+            ("proxmox-backup.service", "proxmox-backup-proxy.service"),
+            "/var/log/proxmox-backup/tasks",
+            "UPID:pbs:0000A1B2:00000000:00000000:00000000:backup:"
+            "store1\\x3act-100:root@pam:",
+        ),
+        (
+            "proxmox-datacenter-manager",
+            (
+                "proxmox-datacenter-api.service",
+                "proxmox-datacenter-privileged-api.service",
+            ),
+            "/var/log/proxmox-datacenter-manager/tasks",
+            "UPID:pdm:0000A1B2:00000000:00000000:00000000:backup:"
+            "store1\\x3act-100:root@pam:",
+        ),
+    ],
+)
+def test_probe_logging_preserves_escaped_task_filename_identity(
+    guest: Path, script_id: str, units, tasks_root: str, upid: str
+) -> None:
+    """Real probe output keeps PBS/PDM systemd-style backslash escapes verbatim.
+
+    The helper observes the raw filename; validating it as a resolved source
+    must not treat the literal ``\\x3a`` as an authored exact-file path.
+    """
+    _add_acl_tools(guest)
+    _mkdir(guest, f"{tasks_root}/AB", 0o755)
+    task = _write(guest, f"{tasks_root}/AB/{upid}", "task output\n")
+    if script_id == "proxmox-backup-server":
+        _mkdir(guest, "/var/log/proxmox-backup/api", 0o755)
+        _write(guest, "/var/log/proxmox-backup/api/access.log", "api access\n")
+        _write(guest, "/var/log/proxmox-backup/api/auth.log", "api auth\n")
+
+    catalogue = lp.load_log_catalogue()
+    selection = lp.select_log_plugins(
+        catalogue, script_id=script_id, override=None, auto=True
+    )
+    assert selection.status == "selected"
+    request = lp.build_logging_request(selection)
+    facts = _probe_logging(
+        guest, request, _systemd_runner({unit: "active" for unit in units})
+    )
+    logging = facts["logging"]
+    _validate_logging_facts(logging, request)
+
+    resolved = lp.validate_log_layout(selection, logging)
+
+    assert resolved.complete is True
+    tasks = next(
+        source for source in resolved.sources if source.source_id == "tasks"
+    )
+    assert tasks.status == "active"
+    assert tasks.live_files == 1
+    record = logging["sources"][f"{script_id}/tasks"]["layouts"]["default"][
+        "matches"
+    ][0]["files"][0]
+    assert "\\x3a" in record["path"]
+    assert record["path"] == f"{tasks_root}/AB/{upid}"
+    assert task.name == upid
+    assert task.is_file()
+    observed = task.lstat()
+    assert (record["device"], record["inode"]) == (observed.st_dev, observed.st_ino)
+
+
 def test_probe_logging_serialized_response_budget_marks_partial(
     guest: Path, monkeypatch
 ) -> None:

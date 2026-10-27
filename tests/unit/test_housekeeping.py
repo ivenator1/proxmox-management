@@ -1038,24 +1038,25 @@ def _prepare(
 
 
 def test_general_exclusion_is_cluster_qualified(history: Path, guest: Guest):
-    base = _base("http://127.0.0.1:9")
-    settings = _settings(
-        history, url="http://127.0.0.1:9", exclude_list=["alpha/120"]
-    )
+    with LokiStub() as stub:
+        base = _base(stub.url)
+        settings = _settings(
+            history, url=stub.url, exclude_list=["alpha/120"]
+        )
 
-    excluded = _run(guest, settings, base)
-    assert guest.probe_calls == 0
-    assert excluded.summary is None
-    assert excluded.failed is False
-    assert not (history / "housekeeping.sqlite3").exists()
+        excluded = _run(guest, settings, base)
+        assert guest.probe_calls == 0
+        assert excluded.summary is None
+        assert excluded.failed is False
+        assert not (history / "housekeeping.sqlite3").exists()
 
-    other = Guest(Path(guest.guest_root), Path(guest.spool))
-    matched = _run(other, settings, base, cluster="beta")
+        other = Guest(Path(guest.guest_root), Path(guest.spool))
+        matched = _run(other, settings, base, cluster="beta")
     assert other.probe_calls >= 2
     assert matched.failed is False
     # No recognized identity: the sanitized coverage finding is reported and
-    # no unverified config is enforced.
-    assert matched.effective_alloy is None
+    # the fleet base journal config (no app readers) is still enforced.
+    assert matched.effective_alloy == base
     assert any("unsupported" in warning for warning in matched.warnings)
 
 
@@ -1866,6 +1867,143 @@ def test_explicit_alloy_setup_install_failure_blocks_before_acl_or_environment(
     assert guest.acl_roots == set()
     assert guest.binaries["setfacl"] is None
     assert guest.binaries["getfacl"] is None
+
+
+def _unknown_identity_guest(guest: Guest, *, binary: bool = True) -> None:
+    """Resolved guest the catalogue cannot map to any application profile."""
+    guest.script_id = "unmapped-service"
+    guest.profiles = ["npm"]
+    guest.alloy_binary = binary
+
+
+def _desired_env_hash(settings: GlobalSettings) -> str:
+    return hashlib.sha256(
+        housekeeping.journal_env_content(
+            settings.housekeeping_local_retention_hours
+        ).encode()
+    ).hexdigest()
+
+
+def test_unknown_identity_replaces_stale_app_readers_with_base(
+    history: Path, guest: Guest
+):
+    settings = _settings(history, url="http://127.0.0.1:9")
+    base = _base("http://127.0.0.1:9")
+    _unknown_identity_guest(guest)
+    # An identity the manager cannot resolve still owns the guest's logging:
+    # the previously generated application reader is replaced by the exact
+    # fleet base journal config, not preserved and not guessed again.
+    guest.alloy_config_sha = hashlib.sha256(
+        b'loki.source.file "fleet_npm_application" {}\n'
+    ).hexdigest()
+    guest.alloy_env_hash = _desired_env_hash(settings)
+
+    result = _prepare(guest, settings, base)
+
+    assert result.failed is False
+    assert result.summary is not None and result.summary.status == "Configured"
+    assert result.effective_alloy == base
+    assert guest.alloy_config_sha == base.sha256
+    assert guest.validation_calls == [base.content]
+    deployed = [call for call in guest.alloy_reconciles if not call["validate_only"]]
+    assert len(deployed) == 1 and deployed[0]["configure"] is True
+    # No application file sources or scoped file ACLs are fabricated for an
+    # identity the catalogue cannot resolve.
+    assert guest.log_acl_calls == []
+    assert guest.acl_roots == set() and guest.acl_files == set()
+    assert guest.applied == []
+    assert "loki.source.file" not in base.content
+    # Application coverage stays a diagnostic only.
+    assert any("unsupported" in warning for warning in result.warnings)
+
+
+def test_unknown_identity_alloy_only_installs_missing_alloy_then_enforces_base(
+    history: Path, guest: Guest
+):
+    settings = _settings(history, url="http://127.0.0.1:9")
+    base = _base("http://127.0.0.1:9")
+    _unknown_identity_guest(guest, binary=False)
+
+    result = _prepare(guest, settings, base, allow_install=True)
+
+    assert result.failed is False
+    assert result.summary is not None and result.summary.status == "Configured"
+    assert result.effective_alloy == base
+    installs = [call for call in guest.alloy_reconciles if call["install"]]
+    assert len(installs) == 1
+    assert installs[0]["configure"] is False
+    assert guest.alloy_binary is True
+    assert guest.alloy_config_sha == base.sha256
+    assert guest.validation_calls == [base.content]
+    assert guest.log_acl_calls == []
+    assert guest.acl_roots == set() and guest.acl_files == set()
+    # The real post-reconcile journal membership/service state is verified.
+    assert guest.alloy_journal and guest.alloy_enabled and guest.alloy_active
+
+
+def test_unknown_identity_missing_alloy_blocks_recurring_preparation(
+    history: Path, guest: Guest
+):
+    settings = _settings(history, url="http://127.0.0.1:9")
+    base = _base("http://127.0.0.1:9")
+    _unknown_identity_guest(guest, binary=False)
+
+    result = _prepare(guest, settings, base, allow_install=False)
+
+    assert result.failed is True
+    assert result.summary is not None and result.summary.status == "Blocked"
+    assert result.effective_alloy is None
+    assert any("Alloy is not installed" in warning for warning in result.warnings)
+    assert guest.alloy_reconciles == []
+    assert guest.log_acl_calls == []
+    assert guest.applied == []
+    assert guest.alloy_binary is False
+
+
+def test_unknown_identity_dry_run_reports_without_mutation(
+    history: Path, guest: Guest
+):
+    settings = _settings(history, url="http://127.0.0.1:9")
+    base = _base("http://127.0.0.1:9")
+    _unknown_identity_guest(guest, binary=False)
+
+    result = _prepare(guest, settings, base, dry_run=True)
+
+    assert result.failed is False
+    assert result.summary is not None and result.summary.status == "Audit"
+    assert result.changed is False
+    assert result.effective_alloy == base
+    assert guest.alloy_reconciles == []
+    assert guest.validation_calls == []
+    assert guest.applied == []
+    assert guest.log_acl_calls == []
+    assert guest.alloy_binary is False
+    assert any("unsupported" in warning for warning in result.warnings)
+    assert any("Alloy is not installed" in warning for warning in result.warnings)
+
+
+def test_unknown_identity_does_not_authorize_app_archive_or_prune(
+    history: Path, guest: Guest
+):
+    source = Path(guest.guest_root) / NPM_ARCHIVE.lstrip("/")
+    source.write_bytes(b"old npm access line\n")
+    _unknown_identity_guest(guest)
+    guest.files = [_wire(Path(guest.guest_root), NPM_ARCHIVE)]
+
+    with LokiStub() as stub:
+        base = _base(stub.url)
+        settings = _settings(history, url=stub.url, housekeeping_enabled=True)
+        result = _run(guest, settings, base)
+
+    assert result.failed is False
+    assert result.effective_alloy == base
+    # A profile the probe recognizes is not archive authority: the unresolved
+    # selection yields no legacy eligibility, so capture, archival and file
+    # pruning stay paused.
+    assert guest.capture_calls == 0
+    assert guest.prune_calls == []
+    assert source.read_bytes() == b"old npm access line\n"
+    assert any("archive work paused" in warning for warning in result.warnings)
 
 
 def test_legacy_archive_eligibility_requires_default_complete_sources(

@@ -2318,25 +2318,22 @@ def test_logging_desired_config_is_identical_across_update_alloy_and_housekeepin
     assert len({hashlib.sha256(text.encode("utf-8")).hexdigest() for text in contents}) == 1
 
 
-def test_unknown_identity_leaves_installed_alloy_config_untouched(monkeypatch, tmp_path):
-    """No community-script identity is an unsupported finding, not an implicit
-    journal-only deployment: the installed managed readers survive an update."""
+def test_unsupported_identity_enforces_base_journal_config(monkeypatch, tmp_path):
+    """An unrecognized application identity is an unsupported application
+    finding, not a reason to skip base Alloy: ordinary logging preparation
+    (housekeeping disabled) installs the journal-only base and replaces stale
+    generated file readers with no fabricated file sources or app ACLs."""
     monkeypatch.setattr(time, "sleep", lambda s: None)
     _stub_github(monkeypatch)
-    alloy_mod = importlib.import_module("proxmox_fleet.alloy")
     base = _base("http://127.0.0.1:9")
-    installed = base.content + '# previously managed file sources\n'
     guest = _isolated_policy_guest(tmp_path, monkeypatch, "unknown")
     deployed = Path(guest.guest_root) / "etc/alloy/config.alloy"
     deployed.parent.mkdir(parents=True, exist_ok=True)
-    deployed.write_text(installed)
-
-    def _forbidden(*args, **kwargs):  # pragma: no cover - would fail the test
-        raise AssertionError("unsupported identity must not reconcile Alloy")
-
-    monkeypatch.setattr(alloy_mod, "reconcile_alloy", _forbidden)
+    deployed.write_text(base.content + '# previously managed file sources\n')
     ex = HousekeepingPolicyExecutor(
-        introspect_facts=_INTROSPECT_NO_SCRIPT,
+        introspect_facts=dict(
+            _INTROSPECT_WITH_SCRIPT, script_stdout="source ct/debian.sh"
+        ),
         script=_ordinary_script(),
         lxc_os_result=_ok(stdout="2 upgraded, 0 newly installed"),
         post_update_facts={"dpkg_hash_after": "hash_before  -\n", "version_after": "1.1"},
@@ -2349,9 +2346,71 @@ def test_unknown_identity_leaves_installed_alloy_config_untouched(monkeypatch, t
     )
 
     assert out.failed is False
-    assert deployed.read_text() == installed
+    content = deployed.read_text()
+    assert content == base.content
+    assert 'loki.source.journal "journal"' in content
+    assert "loki.source.file" not in content
+    assert "fleet_" not in content
+    # No selected application source: the unsupported identity never grants
+    # scoped app ACLs or deploys a fabricated reader.
+    assert guest.log_acl_calls == []
+    assert guest.acl_roots == set()
+    assert guest.acl_files == set()
+    # The existing collector is left installed, journal-enabled and active with
+    # the base configuration observed by the post-reconcile verification.
+    assert guest.alloy_binary is True
+    assert guest.alloy_journal is True
+    assert guest.alloy_enabled is True
+    assert guest.alloy_active is True
+    assert guest.alloy_config_sha == base.sha256
+    # The application-coverage diagnostic survives without pinning its prose.
     assert any("unsupported" in w.warning for w in out.warnings)
     assert all(not w.notifying for w in out.warnings)
+
+
+def test_alloy_only_unknown_identity_installs_base_journal_config(monkeypatch, tmp_path):
+    """--alloy-only with no resolved identity still bootstraps a missing Alloy
+    and deploys the base journal pipeline, rather than skipping installation."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    _stub_github(monkeypatch)
+    base = _base("http://127.0.0.1:9")
+    guest = _isolated_policy_guest(tmp_path, monkeypatch, "unknown-alloy")
+    guest.alloy_binary = False
+    deployed = Path(guest.guest_root) / "etc/alloy/config.alloy"
+    ex = HousekeepingPolicyExecutor(
+        introspect_facts=_INTROSPECT_NO_SCRIPT,
+        script=_ordinary_script(),
+        lxc_os_result=_ok(stdout="2 upgraded, 0 newly installed"),
+        post_update_facts={"dpkg_hash_after": "hash_before  -\n", "version_after": "1.1"},
+        hk_guest=guest,
+    )
+
+    out = run_lxc_update(
+        "pve-01", "101", ex, _upkeep_settings(tmp_path),
+        api_host="192.168.1.10", alloy_config=base, catalogue=_log_catalogue(),
+        alloy_only=True,
+    )
+
+    assert out.failed is False
+    content = deployed.read_text()
+    assert content == base.content
+    assert 'loki.source.journal "journal"' in content
+    assert "loki.source.file" not in content
+    assert "fleet_" not in content
+    # The explicit setup path performed the install-only step, then the real
+    # configuration reconcile; neither fabricated app sources nor ACLs.
+    install_calls = [call for call in guest.alloy_reconciles if call["install"]]
+    assert len(install_calls) == 1
+    assert install_calls[0]["configure"] is False
+    assert any(call["configure"] for call in guest.alloy_reconciles)
+    assert guest.log_acl_calls == []
+    assert guest.acl_roots == set()
+    assert guest.alloy_binary is True
+    assert guest.alloy_journal is True
+    assert guest.alloy_enabled is True
+    assert guest.alloy_active is True
+    assert guest.alloy_config_sha == base.sha256
+    assert any("unsupported" in w.warning for w in out.warnings)
 
 
 def test_intentional_empty_selection_enforces_base_and_removes_readers(monkeypatch, tmp_path):

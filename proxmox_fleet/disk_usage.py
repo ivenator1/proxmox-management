@@ -605,11 +605,10 @@ def _filter_strict(facts: DiskUsageFacts, policy: DiskUsagePolicy) -> DiskUsageI
     omitted = max(0, len(entries) - _MAX_ENTRIES)
     kept = entries[:_MAX_ENTRIES]
     if status == "partial":
-        detail = (
-            "scan incomplete; shares are partial estimates"
-            if kept
-            else "scan incomplete; oversized directories may be missing"
-        )
+        # The formatter owns the incomplete-coverage safety statement; the
+        # insight carries the collector's sanitized cause (or nothing) so
+        # callers can tell why the scan stopped without duplicate prose.
+        detail = _bounded_detail(facts.reason, "")
     else:
         detail = "" if kept else "no directory exceeds its expected share"
     return DiskUsageInsight(
@@ -640,7 +639,8 @@ def filter_disk_usage(
 
     A partial snapshot is a lower bound, so its measured below-cap subtrees are
     not treated as proven expected-normal coverage; only complete snapshots may
-    apply that normal-budget inference. Partial results stay labeled incomplete.
+    apply that normal-budget inference. Partial results keep the ``partial``
+    status and carry the collector's bounded reason as ``detail`` when present.
     """
     if not isinstance(facts, DiskUsageFacts):
         return _unavailable_insight(None, "malformed disk-usage facts")

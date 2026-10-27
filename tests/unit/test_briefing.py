@@ -22,6 +22,8 @@ from proxmox_fleet.briefing import (
     render_briefing,
     should_notify,
 )
+from proxmox_fleet.disk_usage import filter_disk_usage, parse_disk_usage_facts
+from proxmox_fleet.models.log_plugins import DiskUsagePolicy
 from proxmox_fleet.models.state import (
     DiskUsageEntry,
     DiskUsageInsight,
@@ -464,6 +466,113 @@ def test_disk_usage_warning_total_budget_with_long_paths():
     assert text.startswith("Disk space low")
     assert not text.endswith("\n")
     assert text.count(" of used; limit ") <= 3
+
+
+# End-to-end regression: real helper facts -> parse -> filter -> warning. The
+# helper reason belongs to the consumer-visible warning exactly once, and a
+# partial scan without measured entries must not imply earlier findings.
+_CT127_BASE = (
+    "CT127 rootfs 76% full, 6.9 GiB free — apt can fail to unpack; "
+    "keep at least 10 GiB free"
+)
+
+
+def _partial_pipeline_insight(*, measured=(), reason="", used=22 * 1024**3):
+    directories = [
+        {"path": "/", "depth": 0, "allocated_bytes": used, "direct_bytes": 0}
+    ]
+    for path, allocated in measured:
+        directories.append(
+            {
+                "path": path,
+                "depth": len([part for part in path.split("/") if part]),
+                "allocated_bytes": allocated,
+                "direct_bytes": allocated,
+            }
+        )
+    facts = parse_disk_usage_facts(
+        {
+            "status": "partial",
+            "root_used_bytes": used,
+            "root_device": 0xD15C,
+            "directories": directories,
+            "visited_entries": len(directories),
+            "excluded_mounts": 1,
+            "error_count": 0,
+            "reason": reason,
+        }
+    )
+    assert facts.status == "partial"
+    return filter_disk_usage(
+        facts,
+        policy=DiskUsagePolicy(default_max_share_percent=20.0, min_directory_mb=0),
+    )
+
+
+def test_disk_usage_warning_partial_pipeline_keeps_ct127_reason_without_entries():
+    reason = "the scan entry limit was reached"
+    insight = _partial_pipeline_insight(measured=[("/var", 3 * 1024**3)], reason=reason)
+    assert insight.entries == []
+
+    text = format_disk_usage_warning(_CT127_BASE, insight)
+
+    assert text.startswith(_CT127_BASE)
+    assert text.count(_CT127_BASE) == 1
+    assert text.lower().count("incomplete") == 1
+    assert reason in text
+    assert text.count(reason) == 1
+    # No entries were measured, so nothing may imply hidden prior findings.
+    assert "more" not in text.lower()
+    assert len(text) <= 512
+    assert not text.endswith("\n")
+
+
+def test_disk_usage_warning_partial_pipeline_keeps_reason_with_measured_entries():
+    reason = "the scan entry limit was reached"
+    insight = _partial_pipeline_insight(measured=[("/var", 15 * 1024**3)], reason=reason)
+    assert [entry.path for entry in insight.entries] == ["/var"]
+
+    text = format_disk_usage_warning(_CT127_BASE, insight)
+
+    assert text.startswith(_CT127_BASE)
+    assert text.count(_CT127_BASE) == 1
+    assert "`/var`" in text
+    assert " of used; limit " in text
+    assert text.lower().count("incomplete") == 1
+    assert reason in text
+    assert text.count(reason) == 1
+    assert len(text) <= 512
+    assert not text.endswith("\n")
+
+
+def test_disk_usage_warning_partial_pipeline_without_reason_stays_safe():
+    insight = _partial_pipeline_insight(measured=[("/var", 3 * 1024**3)], reason="")
+    assert insight.entries == []
+    assert insight.detail == ""
+
+    text = format_disk_usage_warning(_CT127_BASE, insight)
+
+    assert text.startswith(_CT127_BASE)
+    assert text.lower().count("incomplete") == 1
+    assert "more" not in text.lower()
+    assert len(text) <= 512
+    assert not text.endswith("\n")
+
+
+def test_disk_usage_warning_partial_pipeline_sanitizes_and_bounds_reason():
+    reason = "scan entry `limit`\nreached " + "x" * 200
+    insight = _partial_pipeline_insight(reason=reason)
+    assert insight.entries == []
+
+    text = format_disk_usage_warning("Disk space low", insight)
+
+    assert text.startswith("Disk space low")
+    assert text.lower().count("incomplete") == 1
+    assert "\n" not in text
+    assert "`" not in text  # no entries, and the reason's backticks are neutralized
+    assert "…" in text
+    assert len(text) <= 512
+    assert not text.endswith("\n")
 
 
 def test_enriched_warning_priority_block_precedes_errors_and_survives_truncation():
