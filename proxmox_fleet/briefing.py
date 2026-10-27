@@ -111,7 +111,9 @@ def _disk_status_clause(insight: DiskUsageInsight) -> str:
     if insight.status == "unavailable":
         return "breakdown unavailable"
     if insight.status == "partial":
-        return "breakdown incomplete; more may be oversized"
+        if insight.entries:
+            return "breakdown incomplete; more may be oversized"
+        return "breakdown incomplete; oversized directories may be missing"
     if not insight.entries:
         return "no dominant directory on the used space"
     return ""

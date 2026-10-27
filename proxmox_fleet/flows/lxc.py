@@ -473,9 +473,11 @@ def run_lxc_update(
     # Alloy-enabled guests always receive shared logging preparation on a
     # normal run — even when housekeeping is disabled and the guest is not a
     # timer target — because the later _enforce_alloy() must not reconcile the
-    # journal-only base over the guest's managed file sources. Only the
-    # housekeeping opt-in adds acknowledged archival, retention and cache
-    # cleanup. Failures here are warnings, never a failed OS/app status.
+    # journal-only base over a selected guest's managed file sources. A
+    # source-free selection (intentional empty or unresolved identity) yields
+    # the exact base instead. Only the housekeeping opt-in adds acknowledged
+    # archival, retention and cache cleanup. Failures here are warnings, never
+    # a failed OS/app status.
     housekeeping_summary: Optional[HousekeepingSummary] = None
     housekeeping_changed = False
 
@@ -490,11 +492,11 @@ def run_lxc_update(
                 warning=message,
                 notifying=hk.failed,
             ))
-        # A failed/unverified selection or explicit empty result never falls
-        # back to the journal-only base: leave the guest's installed Alloy
-        # config untouched instead of erasing managed file readers. Only a
-        # verified effective config (including the intentional base) may be
-        # enforced later.
+        # A failed/unverified selection never falls back to the journal-only
+        # base: leave the guest's installed Alloy config untouched. Only a
+        # verified effective config is enforced later — including the
+        # source-free base for an intentional empty selection or an unresolved
+        # identity, whose old generated app readers are replaced by base.
         if hk.failed or hk.effective_alloy is None:
             alloy_config = None
         else:

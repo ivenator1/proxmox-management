@@ -801,7 +801,8 @@ def _render_effective(
     """Append live file sources for the verified selection.
 
     A source-free selection keeps the base config byte-for-byte, so a guest with
-    no managed application logs never gains a generated component.
+    no managed application logs — an intentional empty selection or an
+    unresolved/unsupported identity — never gains a generated component.
     """
     if not sources:
         return base
@@ -1064,6 +1065,13 @@ def prepare_lxc_logging(
 
     A ``dry_run`` performs no staging/validation-only/install/ACL/environment/
     live mutation and returns an ``Audit`` summary with findings.
+
+    An unsupported or missing community-script identity cannot disable baseline
+    logging: the source-free layout is exactly the fleet's desired base config
+    (system journal only), so it is validated and enforced like an intentional
+    empty selection.  No application file source is fabricated or guessed, no
+    application-scoped ACL is repaired, and the unsupported coverage evidence
+    is retained as a diagnostic.
     """
     try:
         selection = select_log_plugins(
@@ -1084,20 +1092,20 @@ def prepare_lxc_logging(
             [],
         )
 
-    enforce_config = selection.status != "unsupported"
     try:
         probe = probe_housekeeping(executor, lxc_id, logging_request=logging_request)
     except Exception as exc:  # noqa: BLE001 - probe boundary stays best-effort
         return _blocked(f"housekeeping probe failed: {_sanitize_finding(str(exc))}", None, [])
     warnings: List[str] = list(probe.warnings)
 
-    if not enforce_config:
+    if selection.status == "unsupported":
         coverage = _sanitize_finding(
             "; ".join(selection.evidence) or "no recognized service profile"
         )
         warnings.append(
-            "logging selection unsupported; managed log sources are left unchanged: "
-            + coverage
+            "logging selection unsupported; preparing the fleet base "
+            "system-journal configuration only and no application log files are "
+            "configured: " + coverage
         )
 
     if not probe.is_running or probe.is_template:
@@ -1112,8 +1120,7 @@ def prepare_lxc_logging(
         )
 
     if (
-        enforce_config
-        and selection.status == "selected"
+        selection.status == "selected"
         and probe.os_type not in _SUPPORTED_OS
     ):
         return _blocked(
@@ -1131,7 +1138,7 @@ def prepare_lxc_logging(
             None,
             warnings,
         )
-    if enforce_config and resolved.blocked:
+    if resolved.blocked:
         return _blocked(
             "selected log sources have blocked or partial probe evidence; "
             "candidate syntax was not validated and Alloy was not changed",
@@ -1146,7 +1153,7 @@ def prepare_lxc_logging(
             cluster=cluster,
             lxc_id=lxc_id,
             name=name,
-            sources=resolved.validation_candidate_sources if enforce_config else (),
+            sources=resolved.validation_candidate_sources,
             retention_hours=settings.housekeeping_local_retention_hours,
         )
     except Exception as exc:  # noqa: BLE001 - renderer validation boundary
@@ -1157,7 +1164,7 @@ def prepare_lxc_logging(
         )
 
     endpoint_conflict = False
-    if enforce_config and settings.housekeeping_loki_url:
+    if settings.housekeeping_loki_url:
         endpoint = guest_write_endpoint(base.content)
         if endpoint is None:
             endpoint_conflict = True
@@ -1177,14 +1184,9 @@ def prepare_lxc_logging(
     env_drift = env_supported and probe.policy_sha256.get(
         "alloy_env", ""
     ) != desired_env_hash
-    acl_needed = enforce_config and resolved.acl_repair_needed
+    acl_needed = resolved.acl_repair_needed
     missing_tools = [tool for tool in _ACL_TOOLS if not probe.binaries.get(tool)]
     alloy_present = bool(probe.binaries.get("alloy"))
-    unsupported_os = (
-        enforce_config
-        and selection.status == "selected"
-        and probe.os_type not in _SUPPORTED_OS
-    )
 
     if dry_run:
         findings = list(warnings)
@@ -1192,11 +1194,7 @@ def prepare_lxc_logging(
             findings.append(
                 "guest Alloy write endpoint conflicts with the configured housekeeping Loki base"
             )
-        if unsupported_os:
-            findings.append(
-                f"guest OS {probe.os_type or 'unknown'!r} is not Debian/apt-based"
-            )
-        if enforce_config and missing_tools and resolved.sources:
+        if missing_tools and resolved.sources:
             if resolved.unmeasurable:
                 findings.append(
                     f"required ACL tools missing ({', '.join(missing_tools)}); "
@@ -1210,7 +1208,7 @@ def prepare_lxc_logging(
                     "--alloy-only would install the guest 'acl' package "
                     "(dry run installs nothing)"
                 )
-        elif enforce_config and resolved.unmeasurable:
+        elif resolved.unmeasurable:
             findings.append(
                 "log source access is unmeasurable (collector prerequisite missing)"
             )
@@ -1237,29 +1235,28 @@ def prepare_lxc_logging(
             )
         if not alloy_present:
             findings.append("Alloy is not installed")
-        if enforce_config:
-            alloy_state = None
-            try:
-                alloy_state = _alloy_state(executor, lxc_id)
-            except Exception:  # noqa: BLE001 - audit reports the finding only
-                findings.append("Alloy state could not be read")
-            if alloy_state is not None and (
-                not alloy_state.binary_present
-                or alloy_state.config_sha256 != candidate.sha256
-            ):
-                findings.append(
-                    "candidate Alloy syntax validation is pending (dry run)"
-                )
-            audit = reconcile_alloy(executor, candidate, dry_run=True, lxc_id=lxc_id)
-            if audit.warning:
-                findings.append(audit.warning)
+        alloy_state = None
+        try:
+            alloy_state = _alloy_state(executor, lxc_id)
+        except Exception:  # noqa: BLE001 - audit reports the finding only
+            findings.append("Alloy state could not be read")
+        if alloy_state is not None and (
+            not alloy_state.binary_present
+            or alloy_state.config_sha256 != candidate.sha256
+        ):
+            findings.append(
+                "candidate Alloy syntax validation is pending (dry run)"
+            )
+        audit = reconcile_alloy(executor, candidate, dry_run=True, lxc_id=lxc_id)
+        if audit.warning:
+            findings.append(audit.warning)
         if selection.status == "selected":
             findings.extend(resolved.evidence)
             findings.extend(resolved.findings)
-        if enforce_config and (resolved.blocked or resolved.unmeasurable):
+        if resolved.blocked or resolved.unmeasurable:
             effective: Optional[DesiredAlloyConfig] = None
         else:
-            effective = candidate if enforce_config else None
+            effective = candidate
         if findings:
             return HousekeepingResult(
                 summary=HousekeepingSummary(status="Audit"),
@@ -1281,13 +1278,6 @@ def prepare_lxc_logging(
             None,
             warnings,
         )
-    if unsupported_os:
-        return _blocked(
-            f"guest OS {probe.os_type or 'unknown'!r} is not Debian/apt-based; "
-            "logging preparation is not attempted",
-            None,
-            warnings,
-        )
 
     changed = False
     try:
@@ -1299,27 +1289,14 @@ def prepare_lxc_logging(
             warnings,
         )
 
-    if not enforce_config and not alloy_state.binary_present:
-        warnings.append(
-            "Alloy is not installed; the journal-retention environment was not configured"
-        )
-        return HousekeepingResult(
-            changed=False,
-            warnings=_dedup(warnings),
-            failed=False,
-            effective_alloy=None,
-        )
-
     # The explicit installer path (--alloy-only) is the single bootstrap action
     # for a missing Alloy *and* for the guest ACL prerequisite: the same
     # install-only step provisions both.  A helper without getfacl reports
     # selected file sources as unmeasurable, so this must run before that hard
     # block instead of keying off the resolved ACL repair state.  Recurring
     # maintenance (allow_install=False) never installs either prerequisite.
-    needs_acl_tools = bool(
-        enforce_config and allow_install and resolved.sources and missing_tools
-    )
-    if enforce_config and (not alloy_state.binary_present or needs_acl_tools):
+    needs_acl_tools = bool(allow_install and resolved.sources and missing_tools)
+    if not alloy_state.binary_present or needs_acl_tools:
         if not allow_install:
             return _blocked(
                 "Alloy is not installed; install it (or run --alloy-only) before "
@@ -1394,7 +1371,7 @@ def prepare_lxc_logging(
         acl_needed = resolved.acl_repair_needed
         missing_tools = [tool for tool in _ACL_TOOLS if not probe.binaries.get(tool)]
 
-    if enforce_config and resolved.unmeasurable:
+    if resolved.unmeasurable:
         if missing_tools:
             return _blocked(
                 f"required ACL tools missing ({', '.join(missing_tools)}); log "
@@ -1416,7 +1393,7 @@ def prepare_lxc_logging(
     # Validate the exact candidate with real Alloy before touching ACLs, the
     # environment drop-in or the live config.  A config that is already the
     # observed active file has already passed that validation.
-    if enforce_config and alloy_state.config_sha256 != candidate.sha256:
+    if alloy_state.config_sha256 != candidate.sha256:
         validation = executor.alloy_reconcile(
             lxc_id=lxc_id,
             desired_content=candidate.content,
@@ -1532,20 +1509,6 @@ def prepare_lxc_logging(
         changed |= env_changed
         if env_error is not None:
             return _blocked(env_error, None, warnings, changed=changed)
-
-    if not enforce_config:
-        # Selection is unsupported: never enforce a config that could erase
-        # sources selected by an identity the manager cannot verify.  The
-        # independent retention environment above may still have been applied.
-        return HousekeepingResult(
-            summary=(
-                HousekeepingSummary(status="Configured") if changed else None
-            ),
-            changed=changed,
-            warnings=_dedup(warnings),
-            failed=False,
-            effective_alloy=None,
-        )
 
     final_sources = resolved.renderable_sources
     try:
@@ -1751,8 +1714,10 @@ def run_housekeeping(
                     dry_run=dry_run,
                     allow_install=False,
                 )
-                # Only preparation's verified (or explicit-empty) result may be
-                # enforced; a rejected probe/selection never falls back to base.
+                # Only preparation's verified result may be enforced — the
+                # exact base when the selection has no sources (intentional
+                # empty or unresolved identity). A rejected probe/selection
+                # never falls back to base.
                 result.effective_alloy = prepared.effective_alloy
                 result.changed |= prepared.changed
                 result.failed |= prepared.failed

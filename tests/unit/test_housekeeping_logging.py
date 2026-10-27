@@ -483,15 +483,26 @@ def test_probe_housekeeping_forwards_the_request():
 # --------------------------------------------------------------------------- #
 
 
-def test_unsupported_identity_returns_none_without_enforcing_config():
+def test_unknown_identity_enforces_base_config_without_app_sources():
+    base = _base()
     executor = ScriptedExecutor(
-        [_probe(_facts(alloy_env_hash=_env_hash()))], alloy_binary=True
+        [_probe(_facts(alloy_env_hash=_env_hash()))],
+        alloy_config_sha="d" * 64,
     )
-    result = _prepare(executor, script_id=None)
+    result = _prepare(executor, base=base, script_id=None)
 
     assert result.failed is False
-    assert result.effective_alloy is None
-    assert executor.reconciled == []
+    assert result.summary is not None and result.summary.status == "Configured"
+    assert result.effective_alloy == base
+    # The exact fleet base config is validated and deployed; an unresolvable
+    # identity never blocks baseline system logging.
+    assert executor.validation_calls == [base.content]
+    deploys = [call for call in executor.reconciled if not call.get("validate_only")]
+    assert len(deploys) == 1
+    assert deploys[0]["desired_content"] == base.content
+    assert executor.config_sha == base.sha256
+    assert executor.acl_calls == []
+    # Application coverage stays visible as a diagnostic only.
     assert any("unsupported" in warning for warning in result.warnings)
 
 
@@ -1064,11 +1075,16 @@ def test_probe_failure_blocks_without_effective_config():
 
 def test_custom_journal_source_reports_explicit_migration():
     base = _base(env=False)
-    executor = ScriptedExecutor([_probe(_facts())])
-    result = _prepare(executor, base=base, script_id=None)
+    executor = ScriptedExecutor(
+        [_probe(_facts())], alloy_config_sha=base.sha256
+    )
+    result = _prepare(
+        executor, base=base, log_override=GuestLogOverride(mode="disabled")
+    )
 
     assert result.summary is None
     assert executor.applied == []
+    assert executor.reconciled == []
     assert any("explicit migration" in w for w in result.warnings)
     assert not result.failed
 
@@ -1185,11 +1201,14 @@ def test_environment_configuration_requires_observed_safe_file_state(tmp_path, f
         path.symlink_to(outside)
     guest.acknowledge_without_write = fault == "noop"
     base = _base()
+    # The guest already runs the exact base config, so these cases exercise
+    # only the environment drop-in write and its verification.
+    guest.put("/etc/alloy/config.alloy", base.content)
     result = _prepare(
         guest,
         GlobalSettings(housekeeping_loki_url="http://10.0.0.1:3100"),
         base=base,
-        script_id=None,
+        log_override=GuestLogOverride(mode="disabled"),
     )
     if fault == "none":
         assert path.read_text() == housekeeping.journal_env_content(48)

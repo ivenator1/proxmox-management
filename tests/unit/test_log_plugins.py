@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 import yaml
@@ -1277,6 +1277,96 @@ def test_layout_validation_resolves_owner_dependency_and_labels():
     assert resolved.sources[0].status == "active"
     assert resolved.complete is True
     assert not resolved.blocked
+
+
+def _pbs_task_source_facts(observed: Any) -> Tuple[Any, Dict[str, Any]]:
+    root = "/var/log/proxmox-backup/tasks"
+    pattern = f"{root}/[0-9A-F][0-9A-F]/UPID:*"
+    catalogue = _load(
+        [
+            _manifest(
+                "pbs-tasks",
+                sources=[
+                    _source("tasks", "pbs-tasks", root=root, paths=[pattern])
+                ],
+            )
+        ]
+    )
+    selection = _selected(catalogue, "pbs-tasks")
+    facts = {
+        "plugins": {
+            "pbs-tasks": {
+                "units": {"system:pbs-tasks.service": {"status": "active"}}
+            }
+        },
+        "sources": {
+            "pbs-tasks/tasks": {
+                "layouts": {
+                    "default": _simple_source_fact(
+                        root, pattern, [_file_entry(observed)]
+                    )
+                }
+            }
+        },
+    }
+    return selection, facts
+
+
+def test_observed_file_evidence_accepts_literal_pbs_backslash_escapes():
+    observed = (
+        "/var/log/proxmox-backup/tasks/0A/UPID:pbs:0000A1B2:00000000:00000000:"
+        "00000000:backup:store1\\x3act-100:root@pam:"
+    )
+    selection, facts = _pbs_task_source_facts(observed)
+
+    resolved = validate_log_layout(selection, facts)
+
+    assert resolved.complete is True
+    assert resolved.sources[0].status == "active"
+    assert resolved.sources[0].live_files == 1
+
+
+@pytest.mark.parametrize(
+    "observed",
+    [
+        "var/log/proxmox-backup/tasks/0A/UPID:pbs:1",
+        "//var/log/proxmox-backup/tasks/0A/UPID:pbs:1",
+        "",
+        None,
+        42,
+        "/var/log/proxmox-backup/tasks/0A/../0A/UPID:pbs:1",
+        "/var/log/proxmox-backup/tasks/./0A/UPID:pbs:1",
+        "/var/log/proxmox-backup/tasks//0A/UPID:pbs:1",
+        "/var/log/proxmox-backup/tasks/0A/UPID:pbs:1/",
+        "/var/log/proxmox-backup/tasks/0A/UPID:pbs:\x001",
+        "/var/log/proxmox-backup/tasksX/0A/UPID:pbs:1",
+    ],
+)
+def test_observed_file_evidence_rejects_unsafe_paths(observed: Any):
+    selection, facts = _pbs_task_source_facts(observed)
+
+    with pytest.raises(LogLayoutError):
+        validate_log_layout(selection, facts)
+
+
+def test_authored_exact_files_still_forbid_backslashes():
+    authored = _manifest(
+        "demoapp",
+        sources=[
+            _source(
+                "application",
+                "demoapp",
+                root=None,
+                paths=[],
+                exact_files=[
+                    "/var/log/demoapp/UPID:pbs:store1\\x3act-100:root@pam:"
+                ],
+            )
+        ],
+    )
+
+    with pytest.raises(LogCatalogueError):
+        _load([authored])
 
 
 def test_standalone_dependency_source_uses_its_own_owner_id():

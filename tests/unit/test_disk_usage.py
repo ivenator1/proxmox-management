@@ -474,7 +474,6 @@ def test_filter_normal_database_never_reappears_as_a_coarse_ancestor():
     assert partial.status == "partial"
     assert list(partial_entries) == ["/var/lib"]
     assert partial_entries["/var/lib"].share_percent == pytest.approx(70.0)
-    assert "incomplete" in partial.detail.lower()
 
 
 def test_filter_normal_subtree_residual_is_directory_other_not_full_parent():
@@ -741,7 +740,6 @@ def test_filter_fully_credited_normal_subtree_never_becomes_a_parent_total():
     assert list(partial_entries) == ["/ancestor"]
     assert partial_entries["/ancestor"].kind == "directory"
     assert partial_entries["/ancestor"].allocated_bytes == 20 * GIB
-    assert "incomplete" in partial.detail.lower()
 
 
 def test_filter_nested_specific_inside_normal_subtree_is_retained():
@@ -818,6 +816,77 @@ def test_filter_zero_and_unknown_denominators_are_unavailable():
     assert unknown.used_bytes is None
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "the scan entry limit was reached",
+        "the scan time budget was exhausted",
+        "/var/lib metadata could not be read",
+    ],
+)
+@pytest.mark.parametrize("eligible_consumer", [False, True])
+def test_filter_partial_preserves_collector_reason(
+    reason: str, eligible_consumer: bool
+) -> None:
+    policy = _policy(floor=0)
+    rows = [_dir("/var", 14 * GIB)] if eligible_consumer else [_dir("/quiet", MIB)]
+    insight = _insight(policy, status="partial", reason=reason, rows=rows)
+    assert insight.status == "partial"
+    assert insight.detail == reason
+    assert bool(insight.entries) is eligible_consumer
+
+
+@pytest.mark.parametrize("eligible_consumer", [False, True])
+def test_filter_partial_without_reason_does_not_invent_detail(
+    eligible_consumer: bool,
+) -> None:
+    policy = _policy(floor=0)
+    rows = [_dir("/var", 14 * GIB)] if eligible_consumer else [_dir("/quiet", MIB)]
+    insight = _insight(policy, status="partial", rows=rows)
+    assert insight.status == "partial"
+    assert insight.detail == ""
+    assert bool(insight.entries) is eligible_consumer
+
+
+def test_filter_partial_detail_sanitizes_and_bounds_passed_through_reason():
+    policy = _policy(floor=0)
+    insight = _insight(
+        policy,
+        status="partial",
+        reason="entry\nlimit\x00 " + "x" * 400,
+        rows=[_dir("/quiet", MIB)],
+    )
+    assert insight.status == "partial"
+    assert insight.detail
+    assert len(insight.detail) <= 160
+    assert "\n" not in insight.detail
+    assert "\x00" not in insight.detail
+
+
+def test_filter_partial_detail_bounds_typed_facts_that_bypass_the_parser():
+    policy = _policy(floor=0)
+    facts = DiskUsageFacts(
+        status="partial",
+        root_used_bytes=20 * GIB,
+        root_device=0xD15C,
+        directories=(
+            DiskUsageDirectory(
+                path="/", depth=0, allocated_bytes=0, direct_bytes=0
+            ),
+        ),
+        visited_entries=1,
+        excluded_mounts=0,
+        error_count=1,
+        reason="entry\nlimit\x00 " + "y" * 400,
+    )
+    insight = filter_disk_usage(facts, policy=policy)
+    assert insight.status == "partial"
+    assert insight.detail
+    assert len(insight.detail) <= 160
+    assert "\n" not in insight.detail
+    assert "\x00" not in insight.detail
+
+
 def test_filter_complete_empty_partial_empty_and_partial_with_rows():
     policy = _policy(floor=0)
     complete = _insight(policy, rows=[_dir("/quiet", MIB)])
@@ -828,13 +897,10 @@ def test_filter_complete_empty_partial_empty_and_partial_with_rows():
     partial_empty = _insight(
         policy,
         status="partial",
-        error_count=1,
-        reason="deadline",
         rows=[_dir("/quiet", MIB)],
     )
     assert partial_empty.status == "partial"
     assert partial_empty.entries == []
-    assert "incomplete" in partial_empty.detail.lower()
 
     partial_rows = _insight(
         policy,
@@ -843,7 +909,6 @@ def test_filter_complete_empty_partial_empty_and_partial_with_rows():
     )
     assert partial_rows.status == "partial"
     assert [entry.path for entry in partial_rows.entries] == ["/var"]
-    assert "incomplete" in partial_rows.detail.lower()
 
     complete_with_errors = _insight(
         policy,

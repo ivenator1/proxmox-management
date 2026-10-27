@@ -112,6 +112,7 @@ the complete returned file list only.
 from __future__ import annotations
 
 import hashlib
+import posixpath
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
@@ -146,7 +147,6 @@ from proxmox_fleet.models.log_plugins import (
     MultilineOptions,
     UnitEvidence,
     literal_prefix,
-    normalize_exact_file,
     pattern_beneath,
     path_depth,
     patterns_overlap,
@@ -1479,6 +1479,29 @@ def _validate_optional_metric(entry: Mapping[str, Any], key: str, label: str) ->
     _require_nonnegative_int(entry, key, label)
 
 
+def _validate_observed_path(value: object) -> str:
+    """Validate one observed regular-file path from probe evidence.
+
+    Observed filenames are evidence, not authored configuration, so their exact
+    spelling is preserved.  PBS task filenames legitimately contain
+    systemd-style backslash escapes (for example ``store1\\x3act-100``); only
+    structural path safety is enforced here.
+    """
+    if not isinstance(value, str):
+        raise ValueError("path must be a string")
+    if not value:
+        raise ValueError("path must not be empty")
+    if "\x00" in value:
+        raise ValueError("path must not contain NUL")
+    if not value.startswith("/") or value.startswith("//"):
+        raise ValueError("path must be an absolute Linux path")
+    if value != posixpath.normpath(value):
+        raise ValueError(
+            "path must be normalized (no '.', '..', '//' or trailing slash)"
+        )
+    return value
+
+
 def _resolve_source_facts(
     source: ResolvedLogSource,
     facts: Mapping[str, Any],
@@ -1682,7 +1705,7 @@ def _resolve_source_facts(
             file_label = f"{label} file evidence"
             file_entry = _mapping(raw_file, file_label)
             try:
-                path = normalize_exact_file(file_entry.get("path"))
+                path = _validate_observed_path(file_entry.get("path"))
             except ValueError as exc:
                 raise LogLayoutError(f"{label} has invalid file evidence: {exc}") from exc
             if not path.startswith(prefix):

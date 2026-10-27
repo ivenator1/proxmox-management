@@ -1882,7 +1882,8 @@ def test_lxc_phase_bare_override_requires_complete_fleet_discovery(tmp_path, mon
 def test_alloy_only_full_override_key_beats_bare_key_in_guest_config(tmp_path, monkeypatch):
     """A full cluster/node/id override wins over a bare id for the same guest:
     alpha-01/101 receives Sonarr's live reader even though the bare ``101`` rule
-    is 'disabled', while beta-01/102 (a different id) is untouched."""
+    is 'disabled', while beta-01/102 (an unrelated guest with no app override)
+    still receives the normal journal base config, not Sonarr's reader."""
     inv = _log_phase_inventory(tmp_path)
     harness = _HousekeepingHarness(tmp_path)
     harness.add_node("alpha-01", ["101"])
@@ -1922,9 +1923,12 @@ def test_alloy_only_full_override_key_beats_bare_key_in_guest_config(tmp_path, m
         call["configure"] and not call["validate_only"]
         for call in alpha.alloy_reconciles
     )
-    # The colliding-but-unique other guest id was not given a Sonarr reader.
+    # The colliding-but-unique other guest id still receives the managed
+    # journal base config, with no Sonarr reader leaking from alpha.
     beta = harness.guest("beta-01", "102")
-    assert not (Path(beta.guest_root) / "etc/alloy/config.alloy").exists()
+    beta_config = Path(beta.guest_root) / "etc/alloy/config.alloy"
+    assert beta_config.is_file()
+    assert beta_config.read_text() == base.content
 
 
 def test_lxc_phase_unknown_override_plugin_rejected_before_workers(tmp_path, monkeypatch):

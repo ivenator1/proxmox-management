@@ -69,6 +69,14 @@ class FlowGuest(Guest):
         }
         return PrimitiveResult(rc=0, facts=facts)
 
+    def alloy_reconcile(self, **kwargs: Any) -> PrimitiveResult:
+        result = super().alloy_reconcile(**kwargs)
+        if result.ok and kwargs.get("configure"):
+            deployed = Path(self.guest_root) / "etc/alloy/config.alloy"
+            deployed.parent.mkdir(parents=True, exist_ok=True)
+            deployed.write_text(kwargs["desired_content"])
+        return result
+
 
 def _settings(history: Path, *, url: str = "", **overrides: Any) -> GlobalSettings:
     values = {
@@ -222,9 +230,41 @@ def test_compliant_guest_produces_no_record(history, guest):
     assert out.record is None
     assert out.changed is False
     assert out.failed is False
-    # No community-script identity: the guest is left with its installed log
-    # sources and reports a sanitized coverage finding, never a false success.
+    # No community-script identity: the already-installed base journal config
+    # is enforced and the sanitized application-coverage finding is reported.
     assert any("unsupported" in w.warning for w in out.warnings)
     assert all(not w.notifying for w in out.warnings)
     # Idle maintenance still ran: absence of a record must not hide recovery.
     assert out.housekeeping_attempted is True
+
+
+def test_unsupported_identity_housekeeping_enforces_base_journal_config(history, guest):
+    """Housekeeping-only preparation is not skipped for an unknown application:
+    it replaces stale generated readers with the base journal pipeline, records
+    the configuration, and retains the unsupported coverage diagnostic."""
+    with LokiStub() as stub:
+        base = _base(stub.url)
+        settings = _settings(history, url=stub.url)
+        deployed = Path(guest.guest_root) / "etc/alloy/config.alloy"
+        deployed.parent.mkdir(parents=True, exist_ok=True)
+        deployed.write_text(base.content + "# previously managed file sources\n")
+        out = _run(guest, settings, base)
+
+    assert out.failed is False
+    assert out.record is not None
+    assert out.record.housekeeping.status == "Configured"
+    content = deployed.read_text()
+    assert content == base.content
+    assert 'loki.source.journal "journal"' in content
+    assert "loki.source.file" not in content
+    assert "fleet_" not in content
+    assert guest.log_acl_calls == []
+    assert guest.acl_roots == set()
+    assert guest.acl_files == set()
+    assert guest.alloy_binary is True
+    assert guest.alloy_journal is True
+    assert guest.alloy_enabled is True
+    assert guest.alloy_active is True
+    assert guest.alloy_config_sha == base.sha256
+    assert any("unsupported" in w.warning for w in out.warnings)
+    assert all(not w.notifying for w in out.warnings)
